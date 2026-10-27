@@ -1,0 +1,25 @@
+# Shovel Knight (PCSE00640, EU/US Vita release) - the platform's first proof.
+# Only facts about the game; nothing of its code or data (the format: pipeline/packconf.py).
+NAME = "Shovel Knight"
+# REGION: the release this pack plays (its content id: UP..., North America); another region's release is another build,
+# not played yet -- a search names it and says this release is the one Ativ plays
+REGION = "US"
+BASE = "sk"                 # file stem of the recompiled C and the image (historical; new games default to "game")
+SPLIT = 16                # recompiled C split into this many part files (~10 MB each)
+# a scripted run into the first level from a fresh profile (frames:buttons, hex Vita masks: 4000
+# cross, 8 start, 10 up, 20 right, 40 down, 80 left; directions are held 20 frames to register):
+# title -> new adventure -> name "A" (left wraps to the K column, down x4 reaches DONE) -> choose
+# the profile -> skip the intro -> walk right and jump
+TEST_INPUT = "450-455:4000,520-525:4000,600-605:4000,700-705:4000,800-805:4000,850-870:80,890-910:40,930-950:40,970-990:40,1010-1030:40,1060-1066:4000,1200-1206:4000,1300-1306:4000,1600-1605:8,1700-1705:8,2000-2300:20,2320-2326:4000"
+TEST_FRAMES = 2400        # the frame the test captures (the player in Plains of Passage, mid-jump)
+RUN_ENV = ""   # play: the GPU renderer, the real clock
+TEST_ENV = "RECOMP_GFX=soft RECOMP_CLOCK=fixed"       # the gate renders on the software backend: the reference the GPU path is measured against
+MODULES = "libc libgxm_es4 libgpu_es4 libfios2"   # sce_module/libc.suprx (C runtime, libm, the C++ library), and the firmware's libgxm and its GPU services library (GXM runs as Sony's code; gxm_sony.c observes its rendering boundary); libfios2: the game's own sce_module copy of Sony's FIOS (scheduler, PSARC dearchiver) over the host's sceIo calls (io.c)
+
+# The build of the game this pack plays: [versions."<version>"], the SHA-256 of its eboot.bin.elf and its status
+# (vitarecomp import refuses another version or region). 1.00, the game as installed: matched 2026-10-22 against a Vita's own copy
+# (its ux0:app eboot, decrypted with its licence); Shovel Knight's 1.08 update (Treasure Trove) isn't played yet -- its copy is told "not supported yet" and the game
+# plays without it.
+[versions."1.00"]
+sha256 = "e0e2415fdcec9f6ddb37a9f456320c99e6b2f3c95cf0318b6094539c57102538"
+status = "supported"

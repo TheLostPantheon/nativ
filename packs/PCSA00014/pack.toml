@@ -1,0 +1,38 @@
+# Unit 13 (PCSA00014, US). Only facts about the game (the format: pipeline/packconf.py).
+NAME = "Unit 13"
+# REGION: the release this pack plays (its content id: UP..., North America); another region's release is another build,
+# not played yet -- a search names it and says this release is the one Ativ plays
+REGION = "US"
+SPLIT = 24                # recompiled C split into this many part files
+MODULES = "libc libgxm_es4 libgpu_es4 libfios2 np_matching2 libssl np_common"   # sce_module/libc.suprx (C runtime, libm, the C++ library) and the firmware's libgxm (GXM runs as Sony's code; gxm_sony.c observes its rendering boundary); libgpu_es4: the GPU driver's user library under libgxm; np_matching2, libssl and np_common: online co-op (below) (the host implements its kernel bridge); libfios2: the game's own sce_module copy of Sony's FIOS (scheduler, PSARC dearchiver) over the host's sceIo calls (io.c)
+HOOKS = "0x81113916:u13_cam_begin 0x813b8fac:u13_cam_end 0x8131a730:u13_aim 0x812e6a10:u13_set_yaw 0x812e6b50:u13_set_pitch 0x81341db0:u13_cover_pitch 0x813414ae:u13_cover_yaw"   # the per-frame camera update: its fov fields widened by the "fov" setting / RECOMP_FOV for the length of the update (runtime/core/hooks.c), so the world camera, the culling cameras and the stored fov all agree; the weapon camera stays
+IHOOKS = "0x813dc99e:u13_frame_dt 0x813df694:u13_frame_dt 0x813ea576:u13_frame_dt 0x813e83a4:u13_frame_dt 0x813e77e6:u13_frame_dt 0x813e7a3a:u13_frame_dt 0x8113aa08:u13_frame_dt 0x81184ea2:u13_frame_dt 0x813ddc4e:u13_frame_dt 0x813ddffa:u13_frame_dt 0x81a8e17c:u13_frame_dt 0x81113bc6:u13_aspect"   # the movt of each 1/30 s "one frame" constant the game uses once per presented frame (particle min steps, velocity x dt, a timer, a frame-time getter): runtime/core/hooks.c gives it the real frame time at 60 fps (the "frame_rate" setting); its fixed-step loops stay
+# a scripted run to the main menu: tap "TOUCH TO LAUNCH" on the title; the game's real shaders
+# then (after the frame-700 menu reference) SOLO MISSIONS, and the TRAINING mission: 3D by frame ~1200
+TEST_TOUCH = "675-690:400,620;1200-1215:260,480;1500-1515:960,610"   # (frames x1.5 on 2026-10-10: the fixed clock had counted three vblanks a 30 fps frame, its menus ran 1.5x)
+# RECOMP_SRGB=1: the game's lighting is gamma-correct -- its albedo textures are sRGB (decoded to linear
+# when sampled) and its tonemap writes an sRGB surface the final pass copies raw. Without the modes
+# the sunlit sand lit at ~2.5 instead of ~0.85 and the filmic curve (x2 after it) clipped it to white
+RUN_ENV = "RECOMP_GAME_OPTIONS=fov,online RECOMP_ADDCONT_MARKERS=UNIT13ONLINEPASS/unlock.dat RECOMP_SRGB=1 RECOMP_ASPECT_HOOK=1 RECOMP_TARGET_SCALE=720x408:1.3333"   # play: the GPU renderer (which always runs the real shaders), the real clock
+TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed RECOMP_SRGB=1 RECOMP_ADDCONT_MARKERS=UNIT13ONLINEPASS/unlock.dat"   # the gate renders on the interpreter: the reference the GPU path is measured against
+TEST_FRAMES = 1050        # the main menu (SOLO MISSIONS / ONLINE COOPERATIVE / HIGH VALUE TARGETS / DAILY CHALLENGE)
+TEST_TOLERANCE = 5         # the menu is animated (its scrolling ticker and scan line): with the fixed test clock the frame was identical run to run for days, then drifted to 1.63% on 2026-10-16 with unchanged code -- only the ticker's and scan line's phase; 5% passes that and still fails a broken frame
+
+# The build of the game this pack plays: [versions."<version>"], the SHA-256 of its eboot.bin.elf and its status
+# (vitarecomp import refuses another version or region). 1.00, the game as installed: matched 2026-10-22 against a Vita's own copy
+# (its ux0:app eboot, decrypted with its licence); Unit 13's 1.01 update (2013) isn't played yet -- its copy is told "not supported yet" and the game
+# plays without it.
+[versions."1.00"]
+sha256 = "77b86659096472ef25871ee15fba9c15732ee2df109ab8e7a31fb94026008672"
+status = "supported"
+
+# Online co-op (2026-10-26): Sony's matchmaking as Killzone runs it -- the firmware's np_matching2 (rooms, signaling),
+# libssl (its TLS) and np_common (its XML parser and timers), last in MODULES so the ones before keep their bases. Unit 13
+# talks to its partner over plain sceNet sockets afterwards (no librudp; its TCP over STREAM_P2P, runtime/net/net.c).
+# Its Network Pass (the add-on UNIT13ONLINEPASS) is checked by opening the add-on's unlock.dat: every add-on counts as
+# owned, so the runtime makes that file (RECOMP_ADDCONT_MARKERS, runtime/core/io.c addcont_marker). Zipper's online
+# files are answered in the game (zipper.c).
+# U13_NET_DIAG=1 (a regenerate): the game's peer connection and np callbacks logged (hooks.c, "u13:" lines)
+[when.U13_NET_DIAG]
+append.IHOOKS = "0x810cc3f8:u13_sig_first 0x810cc464:u13_sig_check"
+append.HOOKS = "0x810cc398:u13_conn_state 0x810bf1c4:u13_room_event 0x810bf298:u13_signaling_event"

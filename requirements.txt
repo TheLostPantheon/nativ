@@ -1,0 +1,3 @@
+# what the shipped scripts import (the install: vitarecomp dist); developer tools also use unicorn, pyelftools, pyflakes
+capstone==5.0.9
+pycryptodome==3.24.0

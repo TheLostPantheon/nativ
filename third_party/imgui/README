@@ -1,0 +1,8 @@
+Dear ImGui (https://github.com/ocornut/imgui) at tag v1.92.9b (f1cc2ae15e53a861a874c3034aae6798fde194ab,
+2026-07-31), unmodified. Core files plus the SDL3 platform backend and SDL_GPU renderer backend
+(backends/imgui_impl_sdl3.*, backends/imgui_impl_sdlgpu3.*, backends/imgui_impl_sdlgpu3_shaders.h);
+imgui_demo.cpp and every other backend are left out -- host/overlay.cpp is the only user. MIT
+licence: LICENSE.txt. Picked as the newest tagged release at the time (checked against every
+v1.9x tag back to v1.91.6, the first whose sdlgpu3 backend exists at all) whose imgui_impl_sdl3.cpp
+and imgui_impl_sdlgpu3.cpp both compile clean against the SDL3 this project builds against
+(`pkg-config --modversion sdl3`).

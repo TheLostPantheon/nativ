@@ -1,0 +1,5 @@
+#!/bin/zsh
+# vitarecomp: a Vita game from a player's own decrypted dump to a native program, stage by stage -- pipeline/vitarecomp.py,
+# the same program on macOS, Linux and Windows (its commands: vitarecomp with none), run on the repository's Python (.venv).
+R=${0:A:h}; PY=$R/.venv/bin/python; [[ -x $PY ]] || PY=python3
+exec $PY $R/pipeline/vitarecomp.py "$@"

@@ -1,0 +1,14 @@
+-Icore
+-Igfx
+-Iaudio
+-Imedia
+-Iinput
+-Inet
+-Iui
+-Iplatform
+-Idebug
+-I../recompiler
+-I..
+-I/opt/homebrew/include
+-D_THREAD_SAFE
+-std=gnu11

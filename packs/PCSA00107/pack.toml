@@ -1,0 +1,64 @@
+# Killzone: Mercenary (PCSA00107, US). Only facts about the game (the format: pipeline/packconf.py).
+NAME = "Killzone: Mercenary"
+# REGION: the release this pack plays (its content id: UP..., North America); another region's release is another build,
+# not played yet -- a search names it and says this release is the one Ativ plays
+REGION = "US"
+UPDATE_NOTE = "Update 1.12 adds Botzone and online play"
+SPLIT = 32                # recompiled C split into this many part files (an 11.7 MB ELF, half again Unit 13's)
+MODULES = "libc libgxm_es4 libgpu_es4 libfios2 libscemp4 libsceavplayer np_matching2 libssl np_common librudp"   # np_matching2 libssl np_common librudp: online play (below); libscemp4 + libsceavplayer: the firmware's MP4 demuxer and movie player behind its SceAvPlayer movies (Movies_KZV/*.mp4, H.264 decoded by runtime/media/video.c); its sce_module: libc, libfios2, libult, libface, libsmart (dump/decrypted/PCSA00107/elf/); GXM as Sony's code like the other games; libfios2 as Sony's code because the game's data is a PSARC archive (game_data/data_ngp.psarc) read through FIOS's dearchiver
+# transferred 2026-10-07: game files mirrored from the Vita (VitaShell FTP), executable and modules
+# decrypted by FAGDec on the Vita and converted with decrypt/fself2elf.py (all SHA-256 verified).
+# Frame 900 (30 s at its 30 fps) is the "Connection preferences" dialog (title, body text, three
+# buttons: strips, UBC4 and U4U4U4U4 textures, the F16 text shader) -- the first thing the game draws.
+# Its UI is SceSystemGesture drags over the front panel (runtime/input/gesture.c): a tap on NEVER CONNECT at
+# frame 950 brings the Valor Update card, a tap on its CONTINUE at 1300 the main menu, the test frame.
+# The software path takes ~0.28 s a frame on its UI, so the run needs more than the 300 s default.
+# RECOMP_SRGB=1 (2026-10-16): its albedo textures are sRGB-encoded and its front end renders into an sRGB
+# surface. Read as linear, every lit surface in the level came out several times too bright and the
+# tonemap clipped the lobby to white ("lights way over saturated"); the menus get their teal fill and glow
+MOD_HOOKS = "0x89016ce0:gxm_fp_create 0x8901620c:gxm_vp_create"   # Sony's shader patcher in the recompiled libgxm (runtime/core/hooks.c gxm_*: RECOMP_GXM_PATCHER_LOG); its RegisterProgram hook (the shader recipes) is vitarecomp's for every game
+MOD_IHOOKS = "0x89017034:gxm_fp_made"   # CreateFragmentProgram's tail, just after it hands back the variant (the shader prebuild)
+RUN_ENV = "RECOMP_GAME_OPTIONS=fov,scenery_detail,character_detail,online,private_server RECOMP_NET_SERVERS=kzv.online.scee.com,beta.kzv.online.scee.com RECOMP_SRGB=1 RECOMP_ASPECT_HOOK=1 RECOMP_HUD_DRAWS=scene RECOMP_SSAO=0x1000000:1:24 RECOMP_KZ_EVENTS=1 RECOMP_NGS_VO_LOG=2 RECOMP_NGS_AT9_LOG=1 RECOMP_KZ_SND_REQ=1"   # RECOMP_ASPECT_HOOK: wider aspect ratios on (IHOOKS kz_hfov + kz_aspect_b: Hor+, checked headless at 21:9 2026-10-17)
+TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed RECOMP_SRGB=1"
+TEST_TOUCH = "950-960:690,916;1300-1310:1564,830"
+TEST_FRAMES = 1500
+TEST_TIMEOUT = 600
+TEST_TOLERANCE = 1
+
+# Online play (docs/online.md; the online build of 2026-10-24, KZ_NP_MODULES=1, is every build since 2026-10-25): matchmaking
+# as Sony's own code, the firmware's np_matching2 (what sceSysmoduleLoadModule(NP_MATCHING2) loads on a Vita: rooms,
+# signaling), libssl (its TLS connections, crypto in software), np_common (the XML parser and timer service it uses; the
+# host keeps its NP auth calls, runtime/core/main.c host_preferred) and librudp (the game's own transport between players),
+# last in MODULES so the ones before keep their bases (MOD_HOOKS); the game's login server answered in its own process
+# (server.c). Online is the player's setting (settings "online", on unless turned off; runtime/net/net.h net_online).
+
+# The builds of the game this pack plays, a [versions."<version>"] table each: the SHA-256 of its eboot.bin.elf and its
+# status (recommended: the one to play; supported: plays). vitarecomp import tells a copy's version by that hash and
+# records it (the per-version settings below); a copy matching none is refused. 1.12 is the August 2015 update
+# (ux0:patch/PCSA00107, layered over the game as app0_patched); Botzone (add-on P000000000001957) and the
+# online modes exist only in its code.
+# Per version: the hooks (HOOKS, IHOOKS) sit at different addresses in each build, the addresses their host code
+# uses (GAME_ADDRS, runtime/core/hooks.c game_addr) too, and the functions the analysis misses (FUNCTION_SEEDS, from runs).
+[versions."1.00"]
+sha256 = "7c2dd42df06a6fbd178b5662b2f4b8711d54217d515fcb91e21003f24b725b20"
+status = "supported"
+HOOKS = "0x8179d6c0:kz_q_push 0x8148bf18:kz_loco 0x81568842:kz_gesture 0x81177972:kz_sdl 0x814347e6:kz_valve 0x8142d294:kz_bomb 0x810044c6:kz_event 0x81088772:kz_wake 0x81239b76:kz_groups 0x813d746e:kz_entity 0x8158b886:kz_world 0x8112f5a4:kz_substep 0x81061da4:kz_budget"   # the job system trace (runtime/core/hooks.c, RECOMP_KZ_JOBTRACE): the idle queue's push and the hand-off
+IHOOKS = "0x8105245e:kz_pad_stamp 0x8157344a:kz_drop 0x8148a858:kz_fall 0x814737b0:kz_fall 0x8123a252:kz_period 0x8123a2b6:kz_period 0x8158bd2e:kz_sched 0x8112f5a6:kz_phys_dt 0x81174e6a:kz_lod 0x81172db8:kz_char_lod 0x8158b9d4:kz_world_dt 0x8158c00a:kz_tick_gate 0x8158c09a:kz_tick_log 0x8158bd72:kz_sched_period 0x8158bdd4:kz_sched_period 0x8158bf9c:kz_sched_period 0x8158c1e2:kz_sched_period 0x8155c782:kz_aim 0x8155c6ae:kz_aim 0x8155c79a:kz_aim_term 0x815d9bf0:kz_cam_begin 0x815d9164:kz_hfov 0x815d9c0e:kz_cam_end 0x815b1528:kz_aspect_b 0x8116be86:kz_aspect_a 0x81089456:kz_pop 0x8108858a:kz_sleep 0x810885d4:kz_woke 0x8105bb24:kz_avp_unlock 0x8105bb28:kz_avp_relock 0x8105b952:kz_avp_unlock 0x8105b954:kz_avp_relock 0x81061f7c:kz_budget_over 0x815d99f8:kz_world_cam 0x817d024c:kz_cell_fov"   # kz_avp_*: the video wrapper's lock let go of around its sceAvPlayerJumpToTime and sceAvPlayerClose (runtime/core/hooks.c: their wait for the controller deadlocked against its event callback); the main camera (runtime/core/hooks.c, Killzone): kz_hfov the horizontal fov inside the projection builder FUN_815d9130, on fn_815d9892's call only (kz_cam_begin/end around it) -- widened by the aspect widening (that camera is the first-person weapon's); kz_world_cam the world's camera, built each frame in fn_815d9892, its edges widened by the fov setting and the aspect widening before the projection is made from them; kz_aspect_b the 960/544 aspect it is given (the getter fn_815b1516's movt) -- widened for wider aspect ratios; together Hor+. kz_aspect_a (0x8116be86, a 2D offset scaled by the aspect) only under RECOMP_KZ_ASPECT=a
+GAME_ADDRS = "kz_avp_lock=0x81b351f0 kz_vblank_flag=0x81ab0b00 kz_set_period=0x81244553 kz_pad_stamp_sp=0x218 kz_move_ground=0x1d4 kz_jobs_lo=0x81089000 kz_jobs_hi=0x8108b000"   # guest addresses the hooks' host code uses (runtime/core/hooks.c game_addr): the video wrapper's lock, the scheduler's frames-by-vblank flag, FUN_81244552 (set an entity's update period), the job system's code
+FUNCTION_SEEDS = "0x818b28c6:thumb 0x818b2902:thumb 0x818b2912:thumb 0x818b2926:thumb 0x818b2936:thumb 0x818b294a:thumb 0x818b295a:thumb 0x818b296e:thumb 0x818b297e:thumb"
+
+[versions."1.12"]
+sha256 = "2d9bf0670fe79382c7a577cf00e83628967d4cd3e1ece8ea0322f2b89e811734"
+status = "recommended"
+# 1.12: 1.00's hooks carried over by dev/hookmap.py (exact matches, and fuzzy ones checked instruction by
+# instruction); found by hand: the 60 fps scheduler (rewritten: its frame-time clamp moved into FUN_815c25a4, the fourth
+# period load with it), kz_pad_stamp (the pad thread's stamp at sp+0x238), kz_bomb (ExplosiveLocationController vtable
+# 0x81a3d320), kz_drop at 0x815a97c0, where 1.12's three stores of the drop (+0x74) meet, the ground height at +0x230 (the
+# movement grew 0x5c from +0x174; the riders' path still takes |ground - z| unguarded: a 1.12 test session, ~8138
+# damage each). Not carried: the second kz_avp site (1.12 stops the player and waits before sceAvPlayerClose, without the
+# lock: Guerrilla's own fix of the title-loop deadlock); kz_pop (job-system diagnostics only). The comments on 1.00's lines
+# below describe the same hooks.
+HOOKS = "0x8179d8f8:kz_strm_voice 0x8179a282:kz_strm_api_a 0x8179a134:kz_strm_api_b 0x817d9358:kz_q_push 0x814c14a0:kz_loco 0x8159e684:kz_gesture 0x8117a276:kz_sdl 0x814683e6:kz_valve 0x81087140:kz_wake 0x8123b996:kz_groups 0x8140be94:kz_entity 0x815c20a8:kz_world 0x8113276c:kz_substep 0x81062a78:kz_budget 0x810040f8:kz_event 0x8100c7d0:kz_event 0x81460d36:kz_bomb"
+IHOOKS = "0x814bfde8:kz_fall 0x814a8e36:kz_fall 0x8123c072:kz_period 0x8123c0d6:kz_period 0x8113276e:kz_phys_dt 0x8117777e:kz_lod 0x811756cc:kz_char_lod 0x815c21f6:kz_world_dt 0x81592274:kz_aim 0x815921a0:kz_aim 0x8159228c:kz_aim_term 0x81614c26:kz_cam_begin 0x81614198:kz_hfov 0x81614c44:kz_cam_end 0x815e9db8:kz_aspect_b 0x8116e8ea:kz_aspect_a 0x81086f4a:kz_sleep 0x81086f94:kz_woke 0x8105c74a:kz_avp_unlock 0x8105c74e:kz_avp_relock 0x81062c50:kz_budget_over 0x815c2664:kz_sched 0x815c28aa:kz_tick_gate 0x815c293e:kz_tick_log 0x815c26a8:kz_sched_period 0x815c25de:kz_sched_period 0x815c2840:kz_sched_period 0x815c2a1c:kz_sched_period 0x8105312e:kz_pad_stamp 0x815a97c0:kz_drop 0x81614a2e:kz_world_cam 0x8180bdb2:kz_cell_fov"
+GAME_ADDRS = "kz_avp_lock=0x81b78ca0 kz_vblank_flag=0x81af1f1c kz_set_period=0x81245fd1 kz_pad_stamp_sp=0x238 kz_move_ground=0x230 kz_jobs_lo=0x81087a00 kz_jobs_hi=0x81089600"   # 1.12's: hookmap.py --data and the functions that build them; the vblank flag from the rewritten scheduler; the pad thread's frame grew 0x20
+FUNCTION_SEEDS = "0x818edd76:thumb 0x818eddb2:thumb 0x818eddc2:thumb 0x818eddd6:thumb 0x818edde6:thumb 0x818eddfa:thumb 0x818ede0a:thumb 0x818ede1e:thumb 0x818ede2e:thumb"

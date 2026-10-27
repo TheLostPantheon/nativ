@@ -1,0 +1,18 @@
+# game and firmware data -- decrypted titles, firmware, recompiled game C and images, captures, saves,
+# settings: local to each machine, never committed (vitarecomp reads it from dump/)
+dump/
+# the repository's Python environment (./vitarecomp setup)
+.venv/
+__pycache__/
+.DS_Store
+# build outputs: Dear ImGui's objects, gfxreplay and the other tools, the gate's logs; the launcher beside its source
+build/
+launcher/nativ
+launcher/nativ.exe
+launcher/SDL3.dll
+launcher/obj_win/
+# agent worktrees
+.claude/
+# kept on each machine, not shared: plans that aren't the project's yet, and this machine's defaults for the dev scripts
+docs/android.md
+dev/local.env
