@@ -597,7 +597,14 @@ static void build_steps(std::vector<Step> &steps, const std::string &id, int gro
 	steps.push_back(step("Ready to play", {}, group));
 }
 static void start_build(const Game &g) { std::vector<Step> s; build_steps(s, g.id); task_start("Building " + g.name, "build", g.id, s); }
-static void start_play(const Game &g) {   /* (ATIV_LAUNCHER: the game's menu offers "Back to the library"; the launcher comes back to the front when it ends) */
+static bool needs_online_name(const Game &g);   /* (below: an online game, and no name of the player's own yet) */
+static std::string g_name_game;                  /* the game waiting on the online name prompt (online_name_modal) */
+static void start_play_now(const Game &g);
+static void start_play(const Game &g) {
+	if (needs_online_name(g)) { g_name_game = g.id; return; }
+	start_play_now(g);
+}
+static void start_play_now(const Game &g) {   /* (ATIV_LAUNCHER: the game's menu offers "Back to the library"; the launcher comes back to the front when it ends) */
 	/* ready first: a build older than these tools (Nativ was updated) is brought up to date before the game starts, so an
 	 * update reaches every game; when it's current that's a moment */
 	Step r = step("Checking " + g.name + "'s build is up to date", vitarecomp({"ready", g.id}));
@@ -1078,6 +1085,13 @@ static std::string online_name(const Ini &shared) {   /* the chosen name, withou
 	for (const char *tag : {"ntv_", "nativ_", "ativ_"}) if (!strncasecmp(n.c_str(), tag, strlen(tag))) return n.substr(strlen(tag));
 	return n;
 }
+static bool game_option(const Game &g, const char *name);
+static bool needs_online_name(const Game &g) {   /* asked once: an online game, online on, and the player hasn't named themselves */
+	if (g_prefs["online_name_asked"] == "1" || !game_option(g, "online")) return false;
+	const Ini sh = ini_load(shared_path());
+	const std::string *on = ini_find(sh, "online");
+	return !(on && atoi(on->c_str()) == 0) && online_name(sh).empty();
+}
 static std::string online_tag(Ini &shared) {
 	const std::string *a = ini_find(shared, "np_account_id");
 	uint64_t v = a ? strtoull(a->c_str(), nullptr, 16) : 0;
@@ -1243,6 +1257,45 @@ static void game_settings_modal(void) {
  * Windows has no exception for one program. The dialog opens when Windows refused a game: vitarecomp's SAC_BLOCKED line */
 static bool g_sac_open, g_sac_rebuilt;   /* (rebuilt: the player already rebuilt it once and it was refused again) */
 static std::string g_sac_game;            /* the game Windows refused */
+/* ---- the online name, before the first online game: what other players will see (the same field as Settings' Online name
+ * and setup's). Asked once; Play with it empty keeps the tag made for this computer */
+static void online_name_modal(void) {
+	const ImGuiViewport *vp = ImGui::GetMainViewport();
+	const float em = ImGui::GetFontSize();
+	static std::string name;
+	if (!g_name_game.empty() && !ImGui::IsPopupOpen("Online name")) { name.clear(); ImGui::OpenPopup("Online name"); }
+	ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x < 40 * em ? vp->WorkSize.x * 0.94f : 32 * em, 0), ImGuiCond_Always);
+	ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(1.6f * em, 1.3f * em)); ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+	if (!ImGui::BeginPopupModal("Online name", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) { ImGui::PopStyleVar(2); return; }
+	ImGui::PopStyleVar(2);
+	const Game *g = nullptr; for (const Game &x : g_games) if (x.id == g_name_game) g = &x;
+	if (!g) { g_name_game.clear(); ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+	ui::heading("Your online name", em * 1.4f);
+	ImGui::PushTextWrapPos(0);
+	ImGui::TextUnformatted((g->name + " plays online with other Project Nativ players. Choose the name they'll see: it shows as ntv_ and your name.").c_str());
+	ImGui::Dummy(ImVec2(0, em * 0.3f));
+	ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("ntv_"); ImGui::SameLine(0, 0);
+	if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	input_text("##name_oid", name, em * 12, "your name");
+	const bool ok = online_name_ok(name);
+	if (!ok) ui::muted_wrapped("Up to 10 letters, digits, '-' or '_'.");
+	else if (name.empty()) ui::muted_wrapped(("Left empty, you play as ntv_" + online_tag(g_shared) + ", a tag made for this computer.").c_str());
+	ui::muted_wrapped("You can change it any time in Settings.");
+	ImGui::PopTextWrapPos();
+	ImGui::Dummy(ImVec2(0, em * 0.4f));
+	ImGui::BeginDisabled(!ok);
+	if (ui::primary_button("Play") || (ok && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
+		if (!name.empty() && g_settings_writable) target_write(SetTarget{&g_shared, shared_path(), SHARED_HEADER}, "online_id", name);
+		prefs_set("online_name_asked", "1");
+		const Game game = *g; g_name_game.clear(); ImGui::CloseCurrentPopup(); ImGui::EndDisabled(); ImGui::EndPopup();
+		start_play_now(game);
+		return;
+	}
+	ImGui::EndDisabled();
+	ImGui::SameLine(); if (ImGui::Button("Not now") || ImGui::IsKeyPressed(ImGuiKey_Escape)) { g_name_game.clear(); ImGui::CloseCurrentPopup(); }
+	ImGui::EndPopup();
+}
 static void sac_modal(void) {
 	const ImGuiViewport *vp = ImGui::GetMainViewport();
 	const float em = ImGui::GetFontSize();
@@ -1356,8 +1409,9 @@ static void setup_modal(SDL_Window *win) {
 		}
 		ImGui::Dummy(ImVec2(0, em * 0.2f)); task_line();
 		ImGui::Dummy(ImVec2(0, em * 0.5f));
-		if (g_firmware) { if (ui::primary_button("Continue")) g_setup_step = 2; }
-		else { ImGui::BeginDisabled(g_task.running); if (ImGui::Button("Skip for now")) g_setup_step = 2; ImGui::EndDisabled(); }
+		if (g_task.running) ui::muted_wrapped("It carries on in the background: continue whenever you like.");
+		if (g_firmware || g_task.running) { if (ui::primary_button("Continue")) g_setup_step = 2; }
+		else if (ImGui::Button("Skip for now")) g_setup_step = 2;
 		ImGui::SameLine(); if (ImGui::Button("Back")) g_setup_step = 0;
 		break;
 	case 2: {
@@ -1374,9 +1428,8 @@ static void setup_modal(SDL_Window *win) {
 			for (const Game &g : g_games) if (g.imported) { ImGui::Bullet(); ImGui::TextUnformatted(g.name.c_str()); }
 		}
 		ImGui::Dummy(ImVec2(0, em * 0.5f));
-		ImGui::BeginDisabled(g_task.running);
-		if (have ? ui::primary_button("Continue") : ImGui::Button("Skip for now")) g_setup_step = 3;
-		ImGui::EndDisabled();
+		if (g_task.running) ui::muted_wrapped("Adding and building carry on in the background: continue whenever you like.");
+		if (have || g_task.running ? ui::primary_button("Continue") : ImGui::Button("Skip for now")) g_setup_step = 3;   /* (never waits on a running task: the bar at the bottom shows it) */
 		ImGui::SameLine(); if (ImGui::Button("Back")) g_setup_step = 1;
 		break;
 	}
@@ -1415,6 +1468,7 @@ static void setup_modal(SDL_Window *win) {
 		ImGui::Bullet(); ImGui::TextWrapped("In a game, F10 (or the PS button) opens the menu: display, controls, frame rate, field of view.");
 		ImGui::Bullet(); ImGui::TextWrapped("Settings, at the top right, holds the display, controls and sound for every game; a card's … menu has that game's own options.");
 		ImGui::Bullet(); ImGui::TextWrapped("Setup is at the top right whenever you need it again.");
+		if (g_task.running) { ImGui::Dummy(ImVec2(0, em * 0.3f)); ui::muted_wrapped("Still working on your games: the bar at the bottom of the library shows how far it's got."); }
 		ImGui::Dummy(ImVec2(0, em * 0.6f));
 		if (ui::primary_button("Go to my library")) finish();
 		ImGui::SameLine(); if (ImGui::Button("Back")) g_setup_step = 3;
@@ -1648,6 +1702,7 @@ static void hub_ui(SDL_Window *win) {
 		ImGui::EndPopup();
 	} else ImGui::PopStyleVar(2);
 	sac_modal();
+	online_name_modal();
 	setup_modal(win);
 	settings_modal();
 	game_settings_modal();
@@ -1803,6 +1858,12 @@ int main(int, char **) {
 	if (!shot_path && !mac_preflight()) return 0;
 #endif
 	if (!getenv("PYTHONPYCACHEPREFIX")) set_env("PYTHONPYCACHEPREFIX", pref_dir() + "pycache");   /* (the stages' compiled Python beside the settings: an install is never written) */
+#if !defined(_WIN32) && !defined(__APPLE__)
+	if (!getenv("ZIG_GLOBAL_CACHE_DIR")) {   /* (Linux's compiler's own cache, kept per user: an AppImage's install can't be written, and it outlives an update) */
+		const char *x = getenv("XDG_CACHE_HOME"), *h = getenv("HOME");
+		set_env("ZIG_GLOBAL_CACHE_DIR", (x && *x ? std::string(x) : std::string(h ? h : "/tmp") + "/.cache") + "/ProjectNativ/zig");
+	}
+#endif
 	if (!shot_path) {   /* (the last launcher's log kept beside this one's) */
 		const std::string d = pref_dir();
 		if (!d.empty()) { g_log_file = d + "launcher.log"; remove((d + "launcher.prev.log").c_str()); rename(g_log_file.c_str(), (d + "launcher.prev.log").c_str()); }
@@ -1848,6 +1909,7 @@ int main(int, char **) {
 		g_sac_open = ui_sel.rfind("sac", 0) == 0; g_sac_game = "PCSE00640"; g_sac_rebuilt = ui_sel == "sac:again";
 		g_settings_open = ui_sel.rfind("settings", 0) == 0; if (g_settings_open && ui_sel.size() > 9) g_settings_tab = atoi(ui_sel.c_str() + 9);
 		if (ui_sel.rfind("game:", 0) == 0) g_game_settings = ui_sel.substr(5);
+		if (ui_sel.rfind("name:", 0) == 0) g_name_game = ui_sel.substr(5);
 		if (getenv("ATIV_SHOT_NOFW") && *getenv("ATIV_SHOT_NOFW")) { g_firmware = false; g_firmware_version.clear(); }
 		if (const char *u = getenv("ATIV_SHOT_UPDATE")) { g_update.tag = u; g_update.page = "https://example.invalid/"; }   /* (the notice, without asking anyone) */
 		int r = shot(win, shot_path, sw, sh);

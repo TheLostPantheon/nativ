@@ -24,7 +24,7 @@
  *       RECOMP_OVERLAY_DUMP=f.ppm  headless: renders the in-game menu once, open, over the next
  *                           presented frame, into an offscreen texture, and writes it to f -- so the
  *                           menu can be looked at without a screen (see overlay_dump_maybe below)
- *       RECOMP_OVERLAY_DUMP_UI=menu|menu:<tab>|bar|Game|View|Controls|Help|toast|intro[:pad|:touch][,...]  what that dump
+ *       RECOMP_OVERLAY_DUMP_UI=menu|menu:<tab>|bar|Game|View|Controls|Help|toast|intro[:pad|:touch]|quit[,...]  what that dump
  *                           shows (overlay.h: overlay_render_forced); several, comma-separated, write
  *                           one file each, f_<name>.ppm
  */
@@ -803,9 +803,14 @@ void window_run(void *(*fn)(void *), void *arg) {
 	int scale = getenv("RECOMP_SCALE") ? atoi(getenv("RECOMP_SCALE")) : 1;
 	if (scale < 1) scale = 1;
 	{ const char *name = getenv("RECOMP_GAME_NAME"); win = SDL_CreateWindow(name && *name ? name : "Project Nativ", 960 * scale, 544 * scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY); }
+	{	/* the app icon (assets/brand): the install's, as vitarecomp run names it (an AppImage's moves on every start), else
+		 * the one the build saw */
+		const char *ip = getenv("RECOMP_ICON");
 #ifdef RECOMP_ICON
-	{ SDL_Surface *icon = SDL_LoadPNG(RECOMP_ICON); if (icon) { SDL_SetWindowIcon(win, icon); SDL_DestroySurface(icon); } }   /* the app icon (assets/brand; build.sh) */
+		if (!ip) ip = RECOMP_ICON;
 #endif
+		SDL_Surface *icon = ip ? SDL_LoadPNG(ip) : NULL; if (icon) { SDL_SetWindowIcon(win, icon); SDL_DestroySurface(icon); }
+	}
 	SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	{ extern void *gfx_gpu_create_device(void); gpu = gfx_gpu_create_device(); }
 	if (gpu) SDL_ClaimWindowForGPUDevice(gpu, win);
@@ -843,7 +848,9 @@ void window_run(void *(*fn)(void *), void *arg) {
 			 * into SDL (audio_output, window_present) or guest code; tearing down SDL subsystems
 			 * out from under it raced into a SIGSEGV at a null host function pointer. The OS
 			 * reclaims everything on process exit; skip the unsafe graceful-shutdown step. */
-			if (e.type == SDL_EVENT_QUIT) { extern void host_summary(const char *why); extern void gfx_gpu_quit(void); host_summary("window closed"); gfx_gpu_quit(); _exit(0); }   /* the import histogram and the stubbed-import list land in the log */
+			/* (a close request asks first: the quit card, overlay.cpp; a second one while it's up quits) */
+			if (e.type == SDL_EVENT_QUIT && !overlay_quit_confirm()) { extern void host_summary(const char *why); extern void gfx_gpu_quit(void); host_summary("window closed"); gfx_gpu_quit(); _exit(0); }   /* the import histogram and the stubbed-import list land in the log */
+			if (e.type == SDL_EVENT_QUIT) { buttons = 0; touch_down = 0; gamepad_touch_release(); continue; }
 			/* fullscreen however it was entered or left -- the window's own button (macOS's green one), the OS's
 			 * shortcut, the menu -- is the setting: the next game starts the same way */
 			if ((e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) && settings_int("fullscreen", 0) != (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN)) {

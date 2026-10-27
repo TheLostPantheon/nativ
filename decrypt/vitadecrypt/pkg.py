@@ -123,7 +123,7 @@ def _head(read, size: int) -> tuple[PkgInfo, tuple]:
         raise PkgError(f"unknown PKG key revision {key_type} (only 2-4 are known retail keys)")
     main_key = AES.new(pkg_vita_key, AES.MODE_ECB).encrypt(pkg_data_iv)
 
-    sfo_bytes = _ctr_decrypt(main_key, pkg_data_iv, sfo_offset // 16, read(data_offset + sfo_offset, sfo_size))
+    sfo_bytes = read(sfo_offset, sfo_size)   # (unencrypted, at its offset from the file's start: Vita3K's pkg.cpp, pkg2zip)
     app_sfo = SFO.parse_sfo(sfo_bytes)
     app_info = SFO.get_app_info(app_sfo)
 
@@ -249,11 +249,10 @@ def _build_synthetic_pkg(
     blobs = [files[n] for n in names]
     name_blobs = [n.encode("utf-8") for n in names]
 
-    # Data-region layout (everything below is relative to this region's own
-    # start, i.e. relative to the header's data_offset -- same convention
-    # extract_pkg reads): [param.sfo][entry table][names...][file data...]
-    sfo_offset = 0
-    items_offset = sfo_offset + len(_pad16(tmp_sfo))
+    # A retail PKG's layout: header, info table, the param.sfo unencrypted (the info table's type 14 gives its offset
+    # from the file's start), then the encrypted data region, whose offsets are relative to the header's data_offset:
+    # [entry table][names...][file data...]
+    items_offset = 0
     body_offset = items_offset + len(names) * _ENTRY.size  # _ENTRY.size (32) is already 16-aligned
 
     name_offsets, data_offsets = [], []
@@ -267,7 +266,6 @@ def _build_synthetic_pkg(
     region_size = cursor
 
     region = bytearray(region_size)
-    region[sfo_offset: sfo_offset + len(tmp_sfo)] = tmp_sfo
     entries = bytearray()
     for nb, blob, noff, doff in zip(name_blobs, blobs, name_offsets, data_offsets):
         entries += _ENTRY.pack(noff, len(nb), doff, len(blob), 1, 0)
@@ -277,13 +275,14 @@ def _build_synthetic_pkg(
 
     region_enc = enc(0, bytes(region))
 
+    info_offset = _HEADER.size + _EXT_HEADER.size
+    sfo_offset = info_offset + 3 * 16   # (just after the three-entry info table)
     info_table = (
         struct.pack(">4I", 2, 8, content_type, 0)
         + struct.pack(">4I", 13, 8, items_offset, 0)
         + struct.pack(">4I", 14, 8, sfo_offset, len(tmp_sfo))
     )
-    info_offset = _HEADER.size + _EXT_HEADER.size
-    data_offset_abs = info_offset + len(info_table)
+    data_offset_abs = sfo_offset + len(_pad16(tmp_sfo))
     total_size = data_offset_abs + region_size
 
     content_id = b"IP0177-PCSB00013_00-GOLFDS00000000".ljust(48, b"\x00")
@@ -293,7 +292,7 @@ def _build_synthetic_pkg(
         content_id, bytes(16), pkg_data_iv, bytes(64),
     )
     ext_header = _EXT_HEADER.pack(EXT_MAGIC, 0, _EXT_HEADER.size, 0, 0, 0, 0, 0, key_type, 0, 0, 0, 0)
-    return header + ext_header + info_table + region_enc
+    return header + ext_header + info_table + _pad16(tmp_sfo) + region_enc
 
 
 def _selftest() -> None:

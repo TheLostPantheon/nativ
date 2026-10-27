@@ -586,7 +586,8 @@ def cmd_run(g, frames):
     # log on for frames over 50 ms -- what a first-use stutter did, from the player's own session (RECOMP_HITCH_LOG=0: off)
     # RECOMP_SHADER_RECIPES_SHIPPED: packs/<title>/shaders.txt, the shader recipes that ship (gfx_gpu.c: built as the game registers each program)
     shipped = os.path.join(PACKS, g.PACK, "shaders.txt")
-    fixed = ([("RECOMP_SHADER_RECIPES_SHIPPED", shipped)] if os.path.isfile(shipped) else []) + [
+    icon = os.path.join(ROOT, "assets", "brand", "png", "icon-" + ("macos-512" if sys.platform == "darwin" else "256") + ".png")   # (the window's: window.c)
+    fixed = ([("RECOMP_SHADER_RECIPES_SHIPPED", shipped)] if os.path.isfile(shipped) else []) + ([("RECOMP_ICON", icon)] if os.path.isfile(icon) and sys.platform != "win32" else []) + [
         ("RECOMP_TITLE", g.TITLE_ID), ("RECOMP_GAME_NAME", g.NAME), ("RECOMP_LOG", ENV.get("RECOMP_LOG") or "0"),
         ("RECOMP_HITCH_LOG", ENV.get("RECOMP_HITCH_LOG") or "50"), ("RECOMP_STALL_PROF", ENV.get("RECOMP_STALL_PROF") or "150")]
     # ATIV_PRE_LAUNCH / ATIV_POST_EXIT (the environment): commands run before the game starts and after it exits. On a machine

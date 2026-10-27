@@ -40,6 +40,7 @@ player's machine needs nothing else. Each sits in the install with its licence (
 | [Zig](https://ziglang.org), its Clang and LLVM (Linux) | 0.15.2 | MIT; LLVM: Apache 2.0 with LLVM exceptions | `toolchain/zig/` |
 | [zlib](https://zlib.net) (Linux, Windows) | 1.3.1 | zlib | `toolchain/zlib/share/licenses/` |
 | [llvm-mingw](https://github.com/mstorsjo/llvm-mingw), its Clang, LLVM and mingw-w64 (Windows) | 20261006 | ISC; LLVM: Apache 2.0 with LLVM exceptions; mingw-w64: ZPL and public domain | `toolchain/llvm-mingw/` |
+| [AppImage's runtime](https://github.com/AppImage/type2-runtime) (Linux) | 20251108 | MIT; it includes libfuse 3 (LGPL 2.1) and squashfuse (BSD 2-clause) | the start of the `.AppImage` file |
 | [Python](https://www.python.org), from [python-build-standalone](https://github.com/astral-sh/python-build-standalone) | 3.13.17 | PSF, and its parts' own | `python/` |
 | [Capstone](https://www.capstone-engine.org) | 5.0.9 | BSD 3-clause | `python/`, installed by pip with its licence |
 | [PyCryptodome](https://www.pycryptodome.org) | 3.24.0 | BSD 2-clause, parts public domain | `python/`, installed by pip with its licence |

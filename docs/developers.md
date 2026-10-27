@@ -97,8 +97,9 @@ are MSL inside `gfx_gpu.c` and `post.c`; change both sides together.
 
 A release is three downloads, one per OS, each the whole install: the tools (`vitarecomp dist`), the toolchain a game
 build needs, a standalone Python and the launcher. On a Mac that is one app, Project Nativ.app, in a `.dmg` beside a
-link to Applications (the tools in its `Contents/Resources`, the launcher as its program); on Windows and Linux a zip
-holding a `ProjectNativ` folder. `dev/macos-install.sh`,
+link to Applications (the tools in its `Contents/Resources`, the launcher as its program); on Windows a zip holding a
+`ProjectNativ` folder; on Linux an AppImage, that same folder in one file (`appimagetool`, pinned, made into one by
+`release.sh`). `dev/macos-install.sh`,
 `dev/windows-install.sh` (made on macOS or Linux) and `dev/linux-install.sh` (made on Linux) build them, each from a
 toolchain built first by `runtime/platform/<os>/setup-toolchain.sh`. Every download those scripts make is pinned by
 its SHA-256.

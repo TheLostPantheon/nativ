@@ -28,6 +28,8 @@
  *     paused, input the overlay's): how to touch the Vita's screen with a keyboard and mouse, a controller or
  *     a touch screen, the device in use highlighted, closed by doing it once (or Escape / F10 / Guide). Once
  *     per player: shared settings key touch_intro_shown.
+ *   - the quit card (build_quit): a request to close the game window (Cmd+W, Cmd+Q, the close button, Alt+F4) opens it
+ *     first, the game paused: Keep playing, or Quit; a second request while it's up quits (window.c).
  *   - headless, one-shot (overlay_render_forced, RECOMP_OVERLAY_DUMP: window.c's own comment) --
  *     never touches overlay_is_open()/open/close, so it can never leave the real pause/input/audio
  *     state the rest of the host keys off that open flag for stuck on. No platform backend (no
@@ -96,6 +98,7 @@ static bool g_has_window;      /* overlay_init was given a real SDL_Window: the 
  * in the menu bar -- the game held (display.c, as for the menu) with nothing but a banner on screen */
 static std::atomic<bool> g_open, g_want_quit, g_want_capture, g_paused;
 static std::atomic<bool> g_intro, g_intro_tap;   /* the touch card is what the open overlay shows; a pad's touchpad touched meanwhile */
+static std::atomic<bool> g_quit_card;             /* the quit card is (overlay_quit_confirm) */
 
 int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt) {
 	if (!device) return 0;
@@ -137,12 +140,17 @@ static void apply_pause(void) { display_set_paused(g_open || g_paused); }
 void overlay_open(void) { if (g_ctx) { g_open = true; apply_pause(); } }
 void overlay_close(void) {   /* closing the menu resumes: a Game > Pause doesn't outlive it */
 	if (g_intro) { g_intro = false; settings_set_int("touch_intro_shown", 1); settings_save(); }   /* (the touch card, done or skipped: never again) */
+	g_quit_card = false;
 	g_open = false; g_paused = false; apply_pause();
 }
 void overlay_toggle(void) { if (g_open) overlay_close(); else overlay_open(); }
 void overlay_set_paused(int on) { if (g_ctx) { g_paused = on != 0; apply_pause(); } }
 int overlay_game_paused(void) { return g_ctx && (g_open || g_paused); }
 int overlay_wants_quit(void) { return g_want_quit.exchange(false); }
+int overlay_quit_confirm(void) {   /* (window.c, on a request to close the window) 1: the card is up now; 0: it already was, or can't be: quit */
+	if (!g_ctx || !g_has_window || g_quit_card) return 0;
+	g_quit_card = true; overlay_open(); return 1;
+}
 /* quitting a game the launcher started (ATIV_LAUNCHER, hub.cpp) returns to the launcher's library, which comes to the
  * front: the button says so */
 static const char *quit_label(void) { return std::getenv("ATIV_LAUNCHER") ? "Back to the library" : "Quit game"; }
@@ -1113,9 +1121,31 @@ static void build_intro(void) {
 	ImGui::End();
 	ImGui::PopStyleVar();
 }
+/* ---- the quit card (this file's header) */
+static void build_quit(void) {
+	const ImGuiViewport *vp = ImGui::GetMainViewport(); const float em = ImGui::GetFontSize();
+	ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), ui::u32(ui::bg, 0.55f));
+	const char *game = std::getenv("RECOMP_GAME_NAME"); char title[160];
+	snprintf(title, sizeof title, "Quit %s?", game && *game ? game : "the game");
+	ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSizeConstraints(ImVec2(fminf(vp->Size.x - 2 * em, 24 * em), 0), ImVec2(fminf(vp->Size.x - 2 * em, 24 * em), vp->Size.y));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.4f, em * 1.2f));
+	ImGui::Begin("##quitcard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+	ui::heading(title, em * 1.35f);
+	ui::muted_wrapped("Progress since your last save will be lost.");
+	ImGui::Dummy(ImVec2(0, em * 0.3f));
+	if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	if (ui::primary_button("Keep playing")) overlay_close();
+	ImGui::SameLine();
+	ImGui::PushStyleColor(ImGuiCol_Text, ui::error);
+	if (ImGui::Button(quit_label())) g_want_quit = true;
+	ImGui::PopStyleColor();
+	ImGui::End();
+	ImGui::PopStyleVar();
+}
 void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s) {
 	if (!overlay_is_open()) return;
-	render_frame(cmd, target, w, h, dt_s, g_has_window, g_intro ? build_intro : build_ui);
+	render_frame(cmd, target, w, h, dt_s, g_has_window, g_quit_card ? build_quit : g_intro ? build_intro : build_ui);
 }
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
@@ -1159,6 +1189,7 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 		for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_ui);
 		return;
 	}
+	if (!strcmp(ui, "quit")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_quit); return; }   /* (the quit card) */
 	if (!strncmp(ui, "intro", 5)) {   /* "intro", "intro:pad", "intro:touch": the touch card with that device highlighted */
 		g_intro_dev = !strcmp(ui, "intro:pad") ? DEV_PAD : !strcmp(ui, "intro:touch") ? DEV_TOUCH : DEV_KBM; g_intro_done = -1;
 		for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_intro);

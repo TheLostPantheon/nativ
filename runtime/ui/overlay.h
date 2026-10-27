@@ -65,6 +65,7 @@ void overlay_bar_dismiss(void);
 /* one-shot flags the Quit and Capture frame buttons set; window.c polls and clears them once a loop
  * iteration, the same way it reacts to SDL_EVENT_QUIT and F12 */
 int overlay_wants_quit(void);
+int overlay_quit_confirm(void);   /* a request to close the window: 1 when the quit card is now up (stay), 0 to quit (it was up, or headless) */
 int overlay_wants_capture(void);
 
 /* interactive mode only (window != NULL at overlay_init): forwards one SDL event to ImGui. A no-op,
@@ -107,7 +108,7 @@ int overlay_draws_hud(void);
  * entry of RECOMP_OVERLAY_DUMP_UI (window.c): NULL or "menu" the full menu (the default), "menu:<tab>"
  * the full menu on that page (Display, Performance, Game, Controls, Help); "bar" the menu bar slid
  * down; "Game", "View", "Controls" or "Help" the bar with that menu open; "toast" the first-launch
- * hint with the pull tab; "intro", "intro:pad" or "intro:touch" the touch card with that device highlighted. */
+ * hint with the pull tab; "intro", "intro:pad" or "intro:touch" the touch card with that device highlighted; "quit" the quit card. */
 void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t w, uint32_t h, const char *ui);
 
 #ifdef __cplusplus

@@ -3,7 +3,9 @@
 #   mac      ProjectNativ-<tag>-mac.dmg: Project Nativ.app (dev/macos-install.sh) beside a link to Applications, the
 #            player drags one onto the other; made on a Mac
 #   windows  ProjectNativ-<tag>-windows.zip, one ProjectNativ folder inside (dev/windows-install.sh; on macOS or Linux)
-#   linux    ProjectNativ-<tag>-linux.zip, the same (dev/linux-install.sh; on Linux)
+#   linux    ProjectNativ-<tag>-linux.AppImage: the install (dev/linux-install.sh) as one file the player marks
+#            executable and runs, a Steam Deck's non-Steam game too; made on Linux (appimagetool and its runtime fetched
+#            once, pinned by SHA-256)
 # then SHA256SUMS over every download there (a release made on two machines: copy the other's in, run again with no OS).
 # The tag must be what's checked out, with nothing uncommitted: the installs' version.txt is the tag, which is what their
 # update check compares (vitarecomp update-check).
@@ -84,13 +86,24 @@ for os in "$@"; do
       (cd "$W" && zipdir "$Z" ProjectNativ);;
     linux)
       [[ $(uname) == Linux ]] || { echo "release.sh: the Linux install is made on Linux"; exit 1; }
-      bash "$H/linux-install.sh" "$I"
-      (cd "$W" && zipdir "$Z" ProjectNativ);;
+      bash "$H/linux-install.sh" "$I"; Z=$OUT/ProjectNativ-$TAG-linux.AppImage; rm -f "$Z"
+      AT_VER=1.9.1 AT_SHA=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0   # appimagetool
+      RT_VER=20251108 RT_SHA=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d   # its runtime (static: no libfuse2 needed)
+      DL=${ATIV_LINUX_TOOLCHAIN:-$HOME/toolchains/ativ-linux}/dl; mkdir -p "$DL"
+      getv() { [[ -f $DL/$1 ]] && [[ "$(sha "$DL/$1" | cut -d' ' -f1)" == "$3" ]] && return; curl -fL --retry 3 -o "$DL/$1.part" "$2"
+               [[ "$(sha "$DL/$1.part" | cut -d' ' -f1)" == "$3" ]] || { echo "checksum mismatch: $1"; rm -f "$DL/$1.part"; exit 1; }; mv -f "$DL/$1.part" "$DL/$1"; }
+      getv appimagetool-$AT_VER "https://github.com/AppImage/appimagetool/releases/download/$AT_VER/appimagetool-x86_64.AppImage" "$AT_SHA"
+      getv appimage-runtime-$RT_VER "https://github.com/AppImage/type2-runtime/releases/download/$RT_VER/runtime-x86_64" "$RT_SHA"
+      chmod +x "$DL/appimagetool-$AT_VER"
+      printf '#!/bin/sh\nexec "$APPDIR/launcher/nativ" "$@"\n' > "$I/AppRun"; chmod +x "$I/AppRun"   # (the AppImage's start: the launcher, which finds its folder)
+      printf '[Desktop Entry]\nType=Application\nName=Project Nativ\nComment=Your PS Vita games, rebuilt natively\nExec=nativ\nIcon=project-nativ\nCategories=Game;\nTerminal=false\n' > "$I/project-nativ.desktop"
+      cp "$I/assets/brand/png/icon-256.png" "$I/project-nativ.png"; rm -f "$I/Project Nativ.sh"
+      ARCH=x86_64 "$DL/appimagetool-$AT_VER" --appimage-extract-and-run --no-appstream --runtime-file "$DL/appimage-runtime-$RT_VER" "$I" "$Z" >/dev/null;;
     *) echo "release.sh: mac, windows or linux, not $os"; exit 1;;
   esac
   rm -rf "$W"
   echo "$Z ($(du -h "$Z" | cut -f1))"
 done
 
-(cd "$OUT" && rm -f SHA256SUMS && shopt -s nullglob && sha ProjectNativ-"$TAG"-*.{zip,dmg} > SHA256SUMS && cat SHA256SUMS)
-echo "to publish: gh release create $TAG $OUT/ProjectNativ-$TAG-*.{zip,dmg} $OUT/SHA256SUMS --repo ${NATIV_RELEASES:-<owner>/<repo>} --title \"Project Nativ $TAG\" --notes-file <notes.md>"
+(cd "$OUT" && rm -f SHA256SUMS && shopt -s nullglob && sha ProjectNativ-"$TAG"-*.{zip,dmg,AppImage} > SHA256SUMS && cat SHA256SUMS)
+echo "to publish: gh release create $TAG $OUT/ProjectNativ-$TAG-*.{zip,dmg,AppImage} $OUT/SHA256SUMS --repo ${NATIV_RELEASES:-<owner>/<repo>} --title \"Project Nativ $TAG\" --notes-file <notes.md>"

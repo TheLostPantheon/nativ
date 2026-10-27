@@ -32,18 +32,19 @@ Nothing you add leaves your computer, and Nativ itself contains no Sony or game 
 2. Double-click **Project Nativ.exe**. Nativ isn't signed yet, so Windows may say it protected your PC: choose
    **More info**, then **Run anyway**. You only do this once per download.
 
-**On Linux**
+**On Linux and Steam Deck**
 
-1. Unzip the download anywhere you like.
-2. Run `Project Nativ.sh`. On a Steam Deck, add it to Steam as a non-Steam game and start it from Game Mode.
+1. Put the `.AppImage` anywhere you like and allow it to run as a program: in the file manager, its Properties ›
+   Permissions (or `chmod +x` on it).
+2. Open it. On a Steam Deck, in Desktop Mode, add it to Steam as a non-Steam game, then start it from Game Mode.
 
 Nativ keeps your games, builds and saves in its library, a folder apart from the install, so replacing the install never
 touches them: `~/Library/Application Support/ProjectNativ/Nativ/library` on a Mac,
 `%LOCALAPPDATA%\ProjectNativ\Nativ\library` on Windows and `~/.local/share/ProjectNativ/Nativ/library` on Linux.
 
 **Updating:** when a new version is out, the launcher says so above your library, with a link to its download page.
-On a Mac, drag the new Project Nativ into Applications and replace the old one; elsewhere, replace the `ProjectNativ`
-folder with the new one. Your library stays where it is. Each game rebuilds once with the new version the next time
+On a Mac, drag the new Project Nativ into Applications and replace the old one; on Windows, replace the `ProjectNativ`
+folder with the new one; on Linux, the `.AppImage` with the new one. Your library stays where it is. Each game rebuilds once with the new version the next time
 you play it.
 
 ## The first run
@@ -103,6 +104,9 @@ appears only once.
 - **F8**: switch direct mouse aim on or off (the mouse turns the game's camera itself, rather than acting as a stick).
 - **F12**: capture a frame's graphics, for graphics bugs.
 
+Closing the game's window (Cmd+W or Cmd+Q on a Mac, Alt+F4 elsewhere, or its close button) asks first, so a stray
+shortcut doesn't lose your progress: **Keep playing** or **Quit**, and closing it again quits.
+
 ## Settings
 
 **Settings**, at the top right of the launcher, holds the display, controls and sound for every game. Each game's card
@@ -117,7 +121,7 @@ has a menu with that game's own options. Some worth knowing:
 
 Killzone: Mercenary plays online (multiplayer and Botzone), and Unit 13 plays two-player co-op. The **Play online**
 switch is on by default, in Settings, the first-run setup and the F10 menu's Game page. Unit 13's Network Pass counts
-as owned.
+as owned. If you haven't chosen an online name, Nativ asks for one the first time you start a game that plays online.
 
 - **On the same network**, copies of Nativ find each other by themselves. If one computer has a firewall that blocks
   incoming traffic, allow UDP ports 36580 and 36581 from your local network. On Linux with ufw:
