@@ -56,6 +56,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <sys/mount.h>
+#include <sys/xattr.h>
+#endif
 
 #ifndef REPO_ROOT
 #define REPO_ROOT "."
@@ -1571,7 +1575,11 @@ static void hub_ui(SDL_Window *win) {
 		if (!tag.empty()) {   /* a newer release: its page, where the download is */
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(ui::accent.x, ui::accent.y, ui::accent.z, 0.10f));
 			ImGui::BeginChild("updnote", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+#ifdef __APPLE__
+			ui::dot(ui::accent); ImGui::TextWrapped("Project Nativ %s is out. Download it and drag it into Applications, replacing this one: your games, saves and settings stay as they are.", tag.c_str());
+#else
 			ui::dot(ui::accent); ImGui::TextWrapped("Project Nativ %s is out. Download it and replace this folder with it: your games, saves and settings stay as they are.", tag.c_str());
+#endif
 			if (ui::primary_button("Download")) SDL_OpenURL(page.c_str());
 			ImGui::SameLine(); if (ImGui::Button("Not now")) { std::lock_guard<std::mutex> l(g_update.m); g_update.dismissed = true; }
 			ImGui::EndChild(); ImGui::PopStyleColor();
@@ -1751,8 +1759,39 @@ static int task_cli(const std::string &t) {   /* ATIV_TASK */
 	return g_task.ok ? 0 : 1;
 }
 
+#ifdef __APPLE__
+/* the Mac app's own checks, before its window: where it runs from (a temporary copy macOS makes of a downloaded app
+ * opened where it landed, or a read-only disk image: it belongs in Applications), the download's quarantine on its own
+ * files (cleared once the player has opened it), and Apple's Command Line Tools (every game build needs their compiler
+ * and SDK: Apple's to install, not ours to ship). False: it said why and the launcher stops. */
+static bool mac_preflight(void) {
+	struct statfs fs;
+	const bool in_place = g_root.find("/AppTranslocation/") == std::string::npos && !(statfs(g_root.c_str(), &fs) == 0 && (fs.f_flags & MNT_RDONLY));
+	if (!in_place) {
+		const SDL_MessageBoxButtonData b[2] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Open Applications"}, {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Quit"}};
+		const SDL_MessageBoxData m = {SDL_MESSAGEBOX_INFORMATION, nullptr, "Project Nativ", "Drag Project Nativ into your Applications folder first, then open it from there.", 2, b, nullptr};
+		int hit = 0; SDL_ShowMessageBox(&m, &hit);
+		if (hit == 1) SDL_OpenURL("file:///Applications");
+		return false;
+	}
+	const size_t c = g_root.rfind("/Contents/Resources");   /* (inside the app: its bundle) */
+	const std::string app = c != std::string::npos ? g_root.substr(0, c) : g_root;
+	if (getxattr(app.c_str(), "com.apple.quarantine", nullptr, 0, 0, 0) >= 0) (void)!system(("xattr -dr com.apple.quarantine '" + app + "' 2>/dev/null").c_str());
+	if (system("xcode-select -p >/dev/null 2>&1") != 0) {
+		(void)!system("xcode-select --install >/dev/null 2>&1");
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Project Nativ", "Project Nativ builds each game on your Mac with Apple's free Command Line Tools.\n\nInstall them from the window that just opened, then open Project Nativ again.", nullptr);
+		return false;
+	}
+	return true;
+}
+#endif
+
 int main(int, char **) {
 	g_root = find_root();
+	if (!exists(g_root + "/pipeline/vitarecomp.py")) {   /* (the launcher apart from its folder: run from inside the zip, or copied out alone) */
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Project Nativ", "Project Nativ can't find the rest of its files.\n\nIf you opened it from inside the zip, extract the whole zip first (on Windows: right-click it, Extract All), then open Project Nativ from the extracted folder.", nullptr);
+		return 1;
+	}
 	g_dump = library_dir();
 	set_env("ATIV_DUMP", g_dump);   /* (the stages it runs: the same library whatever their own rule finds) */
 	const char *shot_path = getenv("ATIV_SHOT");
@@ -1760,6 +1799,10 @@ int main(int, char **) {
 	signal(SIGPIPE, SIG_IGN);
 #endif
 	if (const char *t = getenv("ATIV_TASK")) return task_cli(t);
+#ifdef __APPLE__
+	if (!shot_path && !mac_preflight()) return 0;
+#endif
+	if (!getenv("PYTHONPYCACHEPREFIX")) set_env("PYTHONPYCACHEPREFIX", pref_dir() + "pycache");   /* (the stages' compiled Python beside the settings: an install is never written) */
 	if (!shot_path) {   /* (the last launcher's log kept beside this one's) */
 		const std::string d = pref_dir();
 		if (!d.empty()) { g_log_file = d + "launcher.log"; remove((d + "launcher.prev.log").c_str()); rename(g_log_file.c_str(), (d + "launcher.prev.log").c_str()); }

@@ -95,8 +95,10 @@ are MSL inside `gfx_gpu.c` and `post.c`; change both sides together.
 
 ## Making a release
 
-A release is three zips, one per OS, each holding a `ProjectNativ` folder that is the whole install: the tools
-(`vitarecomp dist`), the toolchain a game build needs, a standalone Python and the launcher. `dev/macos-install.sh`,
+A release is three downloads, one per OS, each the whole install: the tools (`vitarecomp dist`), the toolchain a game
+build needs, a standalone Python and the launcher. On a Mac that is one app, Project Nativ.app, in a `.dmg` beside a
+link to Applications (the tools in its `Contents/Resources`, the launcher as its program); on Windows and Linux a zip
+holding a `ProjectNativ` folder. `dev/macos-install.sh`,
 `dev/windows-install.sh` (made on macOS or Linux) and `dev/linux-install.sh` (made on Linux) build them, each from a
 toolchain built first by `runtime/platform/<os>/setup-toolchain.sh`. Every download those scripts make is pinned by
 its SHA-256.
@@ -111,10 +113,12 @@ its SHA-256.
 `updates.txt`, and the launcher runs `vitarecomp update-check` at start (GitHub asked at most once a day), which shows a
 newer release's tag above the library. Versions compare as `vX.Y.Z`; a build that isn't a release is never told.
 
-Signing is optional and needs your own accounts: `NATIV_SIGN_ID` (a Developer ID identity) and `NATIV_NOTARY_PROFILE` (a
-`notarytool` profile) sign and notarise the Mac zip; `NATIV_SIGN_CMD` signs the Windows launcher. Without them the
-installs are unsigned, and the player guide's steps for that apply. The signing steps haven't run against real
-credentials yet.
+Signing needs your own accounts, set in the ignored `dev/local.env`: `NATIV_SIGN_ID` (a Developer ID Application
+identity) signs every program and library in the Mac app, the app and the `.dmg`, with the hardened runtime;
+`NATIV_NOTARY_PROFILE` (a `notarytool` profile) notarises the app and then the `.dmg`, stapling both, so a player's
+Mac opens it with one "downloaded from the internet" question. `NATIV_SIGN_CMD` signs the Windows launcher. Nothing
+writes inside the app once it's made (a signed app must match its signature): builds go to the library and compiled
+Python to the settings folder.
 
 ## House rules
 

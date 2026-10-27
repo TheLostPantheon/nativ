@@ -21,13 +21,10 @@ Nothing you add leaves your computer, and Nativ itself contains no Sony or game 
 
 **On a Mac**
 
-1. Unzip the download and move the `ProjectNativ` folder wherever you like, such as your Applications folder.
-2. Tell macOS you trust it. Nativ isn't notarised by Apple yet, so macOS blocks a downloaded copy. Open Terminal, type
-   `xattr -dr com.apple.quarantine ` (with the space at the end), drag the `ProjectNativ` folder into the window, and
-   press Return. You only do this once per download.
-3. Double-click **Project Nativ.app**.
-4. If your Mac doesn't have Apple's free Command Line Tools, Nativ asks you to install them. Nativ uses them to build
-   each game on your Mac. Install them from the window that opens, then start Nativ again.
+1. Open the `.dmg` and drag **Project Nativ** into Applications.
+2. Open it from Applications. macOS asks once whether to open an app downloaded from the internet: choose **Open**.
+3. If your Mac doesn't have Apple's free Command Line Tools, Nativ asks you to install them. Nativ uses them to build
+   each game on your Mac. Install them from the window that opens, then open Nativ again.
 
 **On Windows**
 
@@ -45,8 +42,9 @@ touches them: `~/Library/Application Support/ProjectNativ/Nativ/library` on a Ma
 `%LOCALAPPDATA%\ProjectNativ\Nativ\library` on Windows and `~/.local/share/ProjectNativ/Nativ/library` on Linux.
 
 **Updating:** when a new version is out, the launcher says so above your library, with a link to its download page.
-Replace the `ProjectNativ` folder with the new one; your library stays where it is. On a Mac, run the Terminal command
-from step 2 on the new folder. Each game rebuilds once with the new version the next time you play it.
+On a Mac, drag the new Project Nativ into Applications and replace the old one; elsewhere, replace the `ProjectNativ`
+folder with the new one. Your library stays where it is. Each game rebuilds once with the new version the next time
+you play it.
 
 ## The first run
 

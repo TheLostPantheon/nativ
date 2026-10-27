@@ -184,11 +184,12 @@ def main(argv):
         if not os.path.isfile(o) or newer(s, o) or newer(rt, o): work.append(([CC, "-c"] + FLAGS + [s, "-o", o], s, o, CC, False))
     # the in-game overlay (runtime/ui/overlay.cpp, this project's one C++ file) and Dear ImGui itself
     # (third_party/imgui/, MIT: see its own README for the pinned release): built once into their own
-    # cached objects -- nothing here depends on which game is being linked -- and reused across every
-    # game's build while newer than overlay.h or their own sources, the same "newer than" test as above.
-    # Shared by every title, so two builds at once may compile the same object: each writes its own
-    # temporary and renames it into place (whole or not at all), never a half-written .o for the other.
-    IMGUI = os.path.join(ROOT, "third_party", "imgui"); IMGUIOBJ = os.path.join(ROOT, "build", "imgui", "obj" + ("_win" if WIN else "_lt" if LT else "_mt" if MT else "")); os.makedirs(IMGUIOBJ, exist_ok=True)
+    # cached objects -- nothing here depends on which game is being linked -- and reused by that game's later builds
+    # while newer than overlay.h or their own sources, the same "newer than" test as above.
+    # In the game's own object folder (OBJ/imgui), not the install's: an install is never written (a signed Mac app
+    # would no longer match its signature). Each object is written to a temporary and renamed into place (whole or not
+    # at all), so two builds of one title never see a half-written .o.
+    IMGUI = os.path.join(ROOT, "third_party", "imgui"); IMGUIOBJ = os.path.join(OBJ, "imgui"); os.makedirs(IMGUIOBJ, exist_ok=True)
     CXXFLAGS = ["-O2", "-std=c++17", "-w", "-I", IMGUI, "-I", os.path.join(IMGUI, "backends")] + INCLUDES + sdl_cflags
     if WIN: CXXFLAGS += ["-D_FILE_OFFSET_BITS=64", "-include", os.path.join(RT, "platform", "win32_compat.h")]
     imgui_srcs = [os.path.join(IMGUI, f) for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", os.path.join("backends", "imgui_impl_sdl3.cpp"), os.path.join("backends", "imgui_impl_sdlgpu3.cpp"))] + [os.path.join(RT, "ui", "overlay.cpp")]
