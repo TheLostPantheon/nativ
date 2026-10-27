@@ -24,7 +24,7 @@
  *       RECOMP_OVERLAY_DUMP=f.ppm  headless: renders the in-game menu once, open, over the next
  *                           presented frame, into an offscreen texture, and writes it to f -- so the
  *                           menu can be looked at without a screen (see overlay_dump_maybe below)
- *       RECOMP_OVERLAY_DUMP_UI=menu|menu:<tab>|bar|Game|View|Controls|Help|toast[,...]  what that dump
+ *       RECOMP_OVERLAY_DUMP_UI=menu|menu:<tab>|bar|Game|View|Controls|Help|toast|intro[:pad|:touch][,...]  what that dump
  *                           shows (overlay.h: overlay_render_forced); several, comma-separated, write
  *                           one file each, f_<name>.ppm
  */
@@ -303,12 +303,12 @@ static void touch_to_point(int tx, int ty, float *x, float *y) {
  * sync with the event loop below. */
 static const char *const ctrl_rows[][3] = {
 	{"D-pad", "Arrow keys", "D-pad"},
-	{"Cross / Circle / Square / Triangle", "Space / C / F / E", "South / East / West / North (A/B/X/Y)"},
-	{"Start / Select", "Enter / Tab", "Start / Back"},
-	{"L / R", "Right mouse / left mouse (or Q / R)", "Left / Right trigger"},
+	{"Cross / Circle / Square / Triangle", "Space / C / F / E", "Cross / Circle / Square / Triangle (Xbox: A / B / X / Y)"},
+	{"Start / Select", "Enter / Tab", "Options / Share or Create (Xbox: Menu / View)"},
+	{"L / R", "Right mouse / left mouse (or Q / R)", "L2 / R2 (Xbox: LT / RT)"},
 	{"Left / right stick", "WASD / the mouse", "Left / right stick"},
-	{"Front touch panel", "Left mouse button (click, drag); hold Alt first while the mouse looks; a swipe prompt: just drag; a two-finger turn: hold and drag down / up; a touchscreen: touch the picture", "Touchpad; or hold LB: a stick + Cross / LT / RT (both sticks: two fingers); a two-finger turn: both sticks out, rolled"},
-	{"Rear touch panel", "Right mouse button (click, drag); hold Alt first while the mouse looks; a touchscreen: touch with RB held", "Touchpad with RB held; or hold RB: a stick + Cross / LT / RT (both sticks: two fingers)"},
+	{"Front touch panel", "Left mouse button (click, drag); hold Alt first while the mouse looks; a swipe prompt: just drag; a two-finger turn: hold and drag down / up; a touchscreen: touch the picture", "Touchpad; or hold L1: a stick + Cross / L2 / R2 (both sticks: two fingers); a two-finger turn: both sticks out, rolled"},
+	{"Rear touch panel", "Right mouse button (click, drag); hold Alt first while the mouse looks; a touchscreen: touch with R1 held", "Touchpad with R1 held; or hold R1: a stick + Cross / L2 / R2 (both sticks: two fingers)"},
 	{"Motion sensor (tilt, aim)", "--", "Gyro (DS4/DualSense); R3 recentres"},
 };
 int window_controls_count(void) { return (int)(sizeof ctrl_rows / sizeof ctrl_rows[0]); }
@@ -862,7 +862,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (pad_back && pad_start && !pad_combo_latch) { pad_combo_latch = 1; overlay_toggle(); if (overlay_is_open()) { buttons = 0; touch_down = 0; gamepad_touch_release(); } }
 			/* exclusive while open: the menu gets every key/mouse/gamepad event instead of the game
 			 * (which is paused anyway -- display.c) */
-			if (overlay_is_open()) { overlay_process_event(&e); continue; }
+			if (overlay_is_open()) { if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN) overlay_intro_touchpad(); overlay_process_event(&e); continue; }
 			/* the save-data dialog waiting on the player (overlay_dialog_active): it has the keys and the mouse;
 			 * the game is polling the dialog, not the pad */
 			if (overlay_dialog_active()) { overlay_process_event(&e); continue; }

@@ -78,19 +78,25 @@ later sessions run smoothly.
 | Vita | Keyboard and mouse | Gamepad |
 |---|---|---|
 | D-pad | Arrow keys | D-pad |
-| Cross, Circle, Square, Triangle | Space, C, F, E | A, B, X, Y (South, East, West, North) |
-| Start, Select | Enter, Tab | Start, Back |
-| L, R | Right and left mouse buttons (or Q and R) | Left and right triggers |
+| Cross, Circle, Square, Triangle | Space, C, F, E | Cross, Circle, Square, Triangle (Xbox: A, B, X, Y) |
+| Start, Select | Enter, Tab | Options, Share or Create (Xbox: Menu, View) |
+| L, R | Right and left mouse buttons (or Q and R) | L2, R2 (Xbox: LT, RT) |
 | Sticks | WASD, and the mouse | Sticks |
-| Front touch panel | Left mouse button: click or drag. In games where the mouse aims, hold Alt first for a cursor. | The touchpad, or hold LB and move a cursor with a stick, touching with Cross |
-| Rear touch panel | Right mouse button, the same way | The touchpad with RB held, or hold RB and use a stick and Cross |
+| Front touch panel | Hold Alt (Option on a Mac) and click or drag. Where the mouse doesn't aim, a plain click works too. | The touchpad, or hold L1 and steer a cursor with a stick, touching with Cross |
+| Rear touch panel | Right mouse button, the same way | The touchpad with R1 held, or hold R1 and use a stick and Cross |
 | Motion sensor | | A gamepad's gyro, such as a DualShock 4's or DualSense's; R3 recentres it |
 
-On a touchscreen, touch the picture: that's the front panel. Hold RB as a finger lands for the rear panel.
+On a touchscreen, touch the picture: that's the front panel. Hold R1 as a finger lands for the rear panel.
+
+Buttons are named as on a PlayStation controller; on an Xbox controller, L1 and R1 are LB and RB, and Cross is A.
+
+The first time you start a game, a card shows how to touch the screen with a keyboard and mouse, a controller or a
+touch screen, with the one you're using highlighted. Touch once the way it shows to carry on (Esc skips it). It
+appears only once.
 
 **Keys while playing:**
 
-- **F10**, or the Guide button: the in-game menu, with display, controls, frame rate and field of view. The game
+- **F10**, or the PS button: the in-game menu, with display, controls, frame rate and field of view. The game
   pauses while it's open.
 - **F1**: the frame-rate overlay.
 - **F2**: cycle the render scale (sharper picture, more GPU work).

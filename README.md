@@ -124,3 +124,8 @@ the projects parts of Nativ are ported from.
 
 Nativ contains no Sony or game code. You supply your own games and the firmware from Sony's site; the games are
 recompiled on your machine and never leave it.
+
+## Supporting Nativ
+
+Nativ is free, and everything in it is for everyone. If you'd like to support its development, you can leave a tip on
+[Ko-fi](https://ko-fi.com/kingtorro).

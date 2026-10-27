@@ -63,6 +63,7 @@
 static std::string g_root = REPO_ROOT;   /* the repository (ATIV_ROOT overrides; else found from where the launcher is) */
 static std::string g_dump;               /* the player's library: games, firmware, licences, builds, saves (library_dir) */
 static const char *const SONY_FIRMWARE_PAGE = "https://www.playstation.com/en-us/support/hardware/psvita/system-software/";
+static const char *const SUPPORT_PAGE = "https://ko-fi.com/kingtorro";   /* (a tip jar for the work: nothing is sold or held back) */
 
 static bool exists(const std::string &p) { struct stat st; return stat(p.c_str(), &st) == 0; }
 #ifdef _WIN32   /* (paths are UTF-8 throughout: the launcher's manifest sets the process code page, launcher/nativ.manifest) */
@@ -1407,7 +1408,7 @@ static void setup_modal(SDL_Window *win) {
 	default:
 		ui::heading("You’re set", em * 1.55f);
 		ImGui::TextWrapped("Each game is built into a native program the first time — a few minutes per game — and starts straight away after that.");
-		ImGui::Bullet(); ImGui::TextWrapped("In a game, F10 (or the Guide button) opens the menu: display, controls, frame rate, field of view.");
+		ImGui::Bullet(); ImGui::TextWrapped("In a game, F10 (or the PS button) opens the menu: display, controls, frame rate, field of view.");
 		ImGui::Bullet(); ImGui::TextWrapped("Settings, at the top right, holds the display, controls and sound for every game; a card's … menu has that game's own options.");
 		ImGui::Bullet(); ImGui::TextWrapped("Setup is at the top right whenever you need it again.");
 		ImGui::Dummy(ImVec2(0, em * 0.6f));
@@ -1602,7 +1603,15 @@ static void hub_ui(SDL_Window *win) {
 	{
 		const ImGuiStyle &sty = ImGui::GetStyle();
 		float lw = ImGui::CalcTextSize(g_drawer ? "Hide log" : "Show log").x + sty.FramePadding.x * 2, cw2 = busy ? ImGui::CalcTextSize("Cancel").x + sty.FramePadding.x * 2 + sty.ItemSpacing.x : 0;
-		ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - lw - cw2);
+		const bool tip = !busy && !narrow; const float sw = tip ? ImGui::CalcTextSize("Support Nativ").x + sty.ItemSpacing.x * 3 : 0;
+		ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - lw - cw2 - sw);
+		if (tip) {   /* a quiet link to the developer's tip jar: never a popup, never in a game */
+			ImGui::AlignTextToFramePadding(); ImGui::PushStyleColor(ImGuiCol_TextLink, ui::muted);
+			if (ImGui::TextLink("Support Nativ")) SDL_OpenURL(SUPPORT_PAGE);
+			ImGui::PopStyleColor();
+			if (ImGui::IsItemHovered()) ImGui::SetTooltip("Nativ is free. If you'd like to support its development, you can leave a tip on Ko-fi.");
+			ImGui::SameLine(0, sty.ItemSpacing.x * 2);
+		}
 	}
 	if (busy) { if (ImGui::Button("Cancel")) task_cancel(); ImGui::SameLine(); }
 	if (ImGui::Button(g_drawer ? "Hide log" : "Show log")) g_drawer = !g_drawer;

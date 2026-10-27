@@ -24,6 +24,10 @@
  *     before it turns a mouse event into a touch, so a click or drag on the bar never reaches the
  *     game. Also here: a one-time hint toast (settings key menu_hint_shown), Game > Pause without
  *     the menu, and the OS cursor hidden after a few seconds still over the picture.
+ *   - the touch card (build_intro): the first game a player starts opens it, as the menu opens (the game
+ *     paused, input the overlay's): how to touch the Vita's screen with a keyboard and mouse, a controller or
+ *     a touch screen, the device in use highlighted, closed by doing it once (or Escape / F10 / Guide). Once
+ *     per player: shared settings key touch_intro_shown.
  *   - headless, one-shot (overlay_render_forced, RECOMP_OVERLAY_DUMP: window.c's own comment) --
  *     never touches overlay_is_open()/open/close, so it can never leave the real pause/input/audio
  *     state the rest of the host keys off that open flag for stuck on. No platform backend (no
@@ -91,6 +95,7 @@ static bool g_has_window;      /* overlay_init was given a real SDL_Window: the 
  * like every other flag that crosses those threads (rscale_req, osd_level_v). g_paused: Game > Pause
  * in the menu bar -- the game held (display.c, as for the menu) with nothing but a banner on screen */
 static std::atomic<bool> g_open, g_want_quit, g_want_capture, g_paused;
+static std::atomic<bool> g_intro, g_intro_tap;   /* the touch card is what the open overlay shows; a pad's touchpad touched meanwhile */
 
 int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt) {
 	if (!device) return 0;
@@ -130,7 +135,10 @@ int overlay_is_open(void) { return g_ctx && g_open; }
  * audio actually poll) */
 static void apply_pause(void) { display_set_paused(g_open || g_paused); }
 void overlay_open(void) { if (g_ctx) { g_open = true; apply_pause(); } }
-void overlay_close(void) { g_open = false; g_paused = false; apply_pause(); }   /* closing the menu resumes: a Game > Pause doesn't outlive it */
+void overlay_close(void) {   /* closing the menu resumes: a Game > Pause doesn't outlive it */
+	if (g_intro) { g_intro = false; settings_set_int("touch_intro_shown", 1); settings_save(); }   /* (the touch card, done or skipped: never again) */
+	g_open = false; g_paused = false; apply_pause();
+}
 void overlay_toggle(void) { if (g_open) overlay_close(); else overlay_open(); }
 void overlay_set_paused(int on) { if (g_ctx) { g_paused = on != 0; apply_pause(); } }
 int overlay_game_paused(void) { return g_ctx && (g_open || g_paused); }
@@ -398,7 +406,7 @@ static void page_controls(void) {
 		  if (ImGui::SliderFloat("##ms", &sens, 0.1f, 5.0f, "%.2f×", ImGuiSliderFlags_Logarithmic)) { settings_set_float("mouse_sens", sens); settings_save(); } }
 		ui::row("Invert vertical look");
 		{ bool inv = settings_int("mouse_invert", 0) != 0; if (ui::toggle("mi", &inv)) { settings_set_int("mouse_invert", inv ? 1 : 0); settings_save(); } }
-		ui::row("Touch cursor speed", "Hold a bumper and move a stick: the cursor is a finger on the touch screen (Cross, LT or RT presses). Move both sticks for two fingers.");
+		ui::row("Touch cursor speed", "Hold a bumper and move a stick: the cursor is a finger on the touch screen (Cross, L2 or R2 presses). Move both sticks for two fingers.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##tcs", &P.tcs, 0.25f, 3.0f, "%.2f×")) set_tcs(P.tcs);
 		ui::rows_end();
 	}
@@ -454,7 +462,7 @@ static void page_help(void) {
 	int v = SDL_GetVersion();
 	ImGui::TextDisabled("%s  ·  Dear ImGui %s  ·  SDL %d.%d.%d", title && *title ? title : "unknown title", IMGUI_VERSION, SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
 	ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * 0.3f));
-	ui::muted_wrapped("The menu bar: move the mouse to the top edge of the window (or tap the tab there). This menu: F10, or the Guide button; the game pauses while it's up.");
+	ui::muted_wrapped("The menu bar: move the mouse to the top edge of the window (or tap the tab there). This menu: F10, or the PS button; the game pauses while it's up.");
 }
 
 /* ---- the full menu (build_ui): a panel over the paused, dimmed game -- the game's name and a Paused chip, the
@@ -527,7 +535,7 @@ static void build_ui(void) {
 	/* the foot */
 	ImGui::Dummy(ImVec2(0, em * 0.15f));
 	if (ImGui::Button("Capture frame (F12)")) g_want_capture = true;
-	ImGui::SameLine(); ImGui::TextDisabled(SDL_HasGamepad() ? "L1 / R1: sections   Esc, F10 or the Guide button closes this menu" : "Esc, F10 or the Guide button closes this menu");
+	ImGui::SameLine(); ImGui::TextDisabled(SDL_HasGamepad() ? "L1 / R1: sections   Esc, F10 or the PS button closes this menu" : "Esc, F10 or the PS button closes this menu");
 	const char *quit = quit_label();
 	float qw = ImGui::CalcTextSize(quit).x + ImGui::GetStyle().FramePadding.x * 2;
 	ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - qw);
@@ -615,7 +623,7 @@ static void menu_view(void) {
 }
 static void menu_controls(void) {
 	prefs_load();
-	ImGui::TextDisabled("Touch cursor speed (hold LB/RB, either stick)");
+	ImGui::TextDisabled("Touch cursor speed (hold L1/R1, either stick)");
 	ImGui::SetNextItemWidth(170);
 	if (ImGui::SliderFloat("##tcs", &P.tcs, 0.25f, 3.0f, "%.2fx")) set_tcs(P.tcs);
 	ImGui::Separator();
@@ -932,7 +940,9 @@ static void build_closed(void) {
 	if (g_has_window) {
 		if (!g_toast_checked) {   /* the hint, once per game, on this overlay's first windowed frame */
 			g_toast_checked = true;
-			if (!settings_has("menu_hint_shown")) { g_toast_until = t + TOAST_S; overlay_toast_titled("Menu", "Move the mouse to the top -- or press [F10] / the Guide button", TOAST_S); settings_set_int("menu_hint_shown", 1); settings_save(); }
+			if (!settings_has("touch_intro_shown")) {   /* the player's first game: the touch card first (it says where the menu is too) */
+				g_intro = true; g_intro_tap = false; settings_set_int("menu_hint_shown", 1); settings_save(); overlay_open();
+			} else if (!settings_has("menu_hint_shown")) { g_toast_until = t + TOAST_S; overlay_toast_titled("Menu", "Move the mouse to the top, or press [F10] or the PS button", TOAST_S); settings_set_int("menu_hint_shown", 1); settings_save(); }
 		}
 		const ImVec2 m = io.MousePos;
 		const bool inside = ImGui::IsMousePosValid(&m) && m.x >= 0 && m.x < w && m.y >= 0 && m.y < hgt;   /* (focused but outside the window, e.g. on the title bar: the backend reports a position there too) */
@@ -956,7 +966,7 @@ static void build_closed(void) {
 		if (g_touch_cursor && g_bar_vis <= 0 && !popup_open && !io.WantCaptureMouse) ImGui::SetMouseCursor(ImGuiMouseCursor_None);   /* (the touch mark stands in for it) */
 	} else {   /* headless (the dump): no pointer; RECOMP_OVERLAY_DUMP_UI says what to show */
 		if (g_force_bar) { g_bar_vis = 1; g_bar_want = true; }
-		if (g_force_toast) { g_toast_until = t + TOAST_S; g_tab_a = 1; g_force_toast = false; overlay_toast_titled("Menu", "Move the mouse to the top -- or press [F10] / the Guide button", TOAST_S); overlay_toast_titled("Balance", "[A] [D] tilt left / right", TOAST_S); }
+		if (g_force_toast) { g_toast_until = t + TOAST_S; g_tab_a = 1; g_force_toast = false; overlay_toast_titled("Menu", "Move the mouse to the top, or press [F10] or the PS button", TOAST_S); overlay_toast_titled("Balance", "[A] [D] tilt left / right", TOAST_S); }
 	}
 	{	/* the slide, at a fixed rate either way */
 		const float target = g_bar_want ? 1.0f : 0.0f, step = dt > 0.1f ? 1.0f : dt / SLIDE_S;
@@ -1035,9 +1045,77 @@ static void render_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint
 	ImGui_ImplSDLGPU3_RenderDrawData(dd, cmd, rp);
 	SDL_EndGPURenderPass(rp);
 }
+/* ---- the touch card (this file's header): the three ways to touch, the device last used highlighted */
+enum { DEV_KBM, DEV_PAD, DEV_TOUCH };
+static int g_intro_dev = -1; static double g_intro_done = -1;   /* the device highlighted (-1: not yet chosen); when the touch was made */
+extern "C" void overlay_intro_touchpad(void) { if (g_intro) g_intro_tap = true; }   /* (window.c: a gamepad's touchpad, while the overlay has input) */
+static void pad_names(const char **l, const char **r, const char **a, bool *touchpad) {   /* the first pad's own button names */
+	*l = "L1"; *r = "R1"; *a = "Cross"; *touchpad = true;   /* (the Vita's own names, and a DualShock 4's or DualSense's: unless the pad says otherwise) */
+	int n = 0; SDL_JoystickID *ids = SDL_GetGamepads(&n);
+	if (ids && n > 0) {
+		const SDL_GamepadType t = SDL_GetGamepadTypeForID(ids[0]);
+		if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) { *l = "LB"; *r = "RB"; *a = "A"; *touchpad = false; }
+		else if (t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR) { *l = "L"; *r = "R"; *a = "B"; *touchpad = false; }
+		else if (t == SDL_GAMEPAD_TYPE_PS3) *touchpad = false;
+	}
+	SDL_free(ids);
+}
+static void build_intro(void) {
+	ImGuiIO &io = ImGui::GetIO(); const double t = ImGui::GetTime();
+	const bool touch = io.MouseSource == ImGuiMouseSource_TouchScreen;
+	if (g_intro_dev < 0) g_intro_dev = window_kbm_active() ? DEV_KBM : DEV_PAD;
+	/* the device in use: whatever the player last moved, pressed or touched */
+	if (io.MouseDelta.x != 0 || io.MouseDelta.y != 0 || ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1) || io.KeyAlt) g_intro_dev = touch ? DEV_TOUCH : DEV_KBM;
+	for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadR3; k++) if (ImGui::IsKeyDown((ImGuiKey)k)) { g_intro_dev = DEV_PAD; break; }
+	if (g_intro_done < 0) {   /* a touch, made the way the card says: done */
+		const bool click = ImGui::IsMouseClicked(0) || ImGui::IsMouseClicked(1);
+		const bool pad = (ImGui::IsKeyDown(ImGuiKey_GamepadL1) || ImGui::IsKeyDown(ImGuiKey_GamepadR1)) && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false);
+		if (click && touch) { g_intro_dev = DEV_TOUCH; g_intro_done = t; }
+		else if (click && io.KeyAlt) { g_intro_dev = DEV_KBM; g_intro_done = t; }
+		else if (pad || g_intro_tap.exchange(false)) { g_intro_dev = DEV_PAD; g_intro_done = t; }
+	} else if (g_has_window && t - g_intro_done > 1.2) overlay_close();   /* (a moment to see it worked, then the game) */
+	const char *pl, *pr, *pa; bool tp; pad_names(&pl, &pr, &pa, &tp);
+#ifdef __APPLE__
+	const char *alt = "Option";
+#else
+	const char *alt = "Alt";
+#endif
+	char kbm[200], padb[240];
+	snprintf(kbm, sizeof kbm, "Hold %s and click to touch the screen. Right-click instead to touch the rear pad.", alt);
+	snprintf(padb, sizeof padb, "Hold %s and steer the cursor with a stick, then press %s to touch. %s does the same on the rear pad.%s", pl, pa, pr, tp ? " The touchpad works too." : "");
+	const struct { const char *name, *how; } devs[3] = {{"Keyboard and mouse", kbm}, {"Controller", padb}, {"Touch screen", "Touch the picture, as you would the Vita's own screen."}};
+	const ImGuiViewport *vp = ImGui::GetMainViewport(); const float em = ImGui::GetFontSize();
+	ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), ui::u32(ui::bg, 0.55f));   /* (the paused game, dimmed behind it) */
+	const float cw = fminf(vp->Size.x - 2 * em, 32 * em);
+	ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSizeConstraints(ImVec2(cw, 0), ImVec2(cw, vp->Size.y - 2 * em));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.4f, em * 1.2f));
+	ImGui::Begin("##touchcard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav);
+	ui::heading(g_intro_done < 0 ? "Touching the screen" : "That's it", em * 1.35f);
+	ui::muted_wrapped("Vita games are played with the touch screen as well as buttons. Here's how to touch it:");
+	ImGui::Dummy(ImVec2(0, em * 0.2f));
+	for (int d = 0; d < 3; d++) {
+		const bool on = d == g_intro_dev;
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, on ? ui::with_alpha(ui::accent, 0.13f) : ui::card);
+		ImGui::PushStyleColor(ImGuiCol_Border, on ? ui::with_alpha(ui::accent, 0.55f) : ui::border);
+		ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, em * 0.4f);
+		char id[16]; snprintf(id, sizeof id, "##dev%d", d);
+		ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_Borders);
+		ImGui::PushStyleColor(ImGuiCol_Text, on ? ui::accent : ui::text); ImGui::TextUnformatted(devs[d].name); ImGui::PopStyleColor();
+		ImGui::PushStyleColor(ImGuiCol_Text, on ? ui::text : ui::muted); ImGui::TextWrapped("%s", devs[d].how); ImGui::PopStyleColor();
+		ImGui::EndChild();
+		ImGui::PopStyleVar(); ImGui::PopStyleColor(2);
+	}
+	ImGui::Dummy(ImVec2(0, em * 0.2f));
+	if (g_intro_done < 0) { ImGui::PushStyleColor(ImGuiCol_Text, ui::accent); ImGui::TextUnformatted("Try it now to continue."); ImGui::PopStyleColor(); }
+	else ImGui::TextUnformatted("Back to the game.");
+	ui::muted_wrapped("F10 opens the menu, with every control. Esc skips this.");
+	ImGui::End();
+	ImGui::PopStyleVar();
+}
 void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s) {
 	if (!overlay_is_open()) return;
-	render_frame(cmd, target, w, h, dt_s, g_has_window);
+	render_frame(cmd, target, w, h, dt_s, g_has_window, g_intro ? build_intro : build_ui);
 }
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
@@ -1079,6 +1157,12 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 		 * this: it runs every loop iteration while the menu is open, so the same one-frame blank
 		 * self-corrects at ~60 Hz, imperceptibly, on its own. */
 		for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_ui);
+		return;
+	}
+	if (!strncmp(ui, "intro", 5)) {   /* "intro", "intro:pad", "intro:touch": the touch card with that device highlighted */
+		g_intro_dev = !strcmp(ui, "intro:pad") ? DEV_PAD : !strcmp(ui, "intro:touch") ? DEV_TOUCH : DEV_KBM; g_intro_done = -1;
+		for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_intro);
+		g_intro_dev = -1;
 		return;
 	}
 	if (!strcmp(ui, "toast")) g_force_toast = true;
