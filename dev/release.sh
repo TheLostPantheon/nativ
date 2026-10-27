@@ -23,6 +23,23 @@ if (( $# )); then
 fi
 OUT=$ROOT/build/release/$TAG; mkdir -p "$OUT"
 sha() { sha256sum "$@" 2>/dev/null || shasum -a 256 "$@"; }
+zipdir() {   # zipdir <zip> <folder>, run where the folder is: zip -qry where there's one, else Python's zipfile, keeping the
+  # programs' modes and the symlinks as zip -y does (unzip and the desktops' tools restore both)
+  if command -v zip >/dev/null; then zip -qry "$1" "$2"; return; fi
+  python3 - "$1" "$2" <<'PY'
+import os, stat, sys, zipfile
+out, top = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    for root, dirs, files in os.walk(top):
+        dirs.sort(); z.write(root)
+        for n in sorted(files) + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+            p = os.path.join(root, n)
+            if os.path.islink(p):
+                zi = zipfile.ZipInfo(p); zi.create_system = 3; zi.external_attr = (stat.S_IFLNK | 0o777) << 16
+                z.writestr(zi, os.readlink(p))
+            else: z.write(p)
+PY
+}
 
 for os in "$@"; do
   W=$OUT/work-$os; rm -rf "$W"; mkdir -p "$W"; I=$W/ProjectNativ; Z=$OUT/ProjectNativ-$TAG-$os.zip; rm -f "$Z"
@@ -44,11 +61,11 @@ for os in "$@"; do
       fi;;
     windows)
       bash "$H/windows-install.sh" "$I"
-      (cd "$W" && zip -qry "$Z" ProjectNativ);;
+      (cd "$W" && zipdir "$Z" ProjectNativ);;
     linux)
       [[ $(uname) == Linux ]] || { echo "release.sh: the Linux install is made on Linux"; exit 1; }
       bash "$H/linux-install.sh" "$I"
-      (cd "$W" && zip -qry "$Z" ProjectNativ);;   # (zip keeps the programs' execute bits for unzip and the desktops' tools)
+      (cd "$W" && zipdir "$Z" ProjectNativ);;
     *) echo "release.sh: mac, windows or linux, not $os"; exit 1;;
   esac
   rm -rf "$W"
