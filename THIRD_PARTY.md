@@ -13,6 +13,7 @@ listed under "Ported from". Each keeps its own licence, whose text travels with 
 | [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) | | MIT | `third_party/libatrac9/` (`LICENSE`) |
 | [Monocypher](https://monocypher.org) | 4.0.2 | BSD 2-clause or CC0, your choice | `third_party/monocypher/` (`LICENCE.md`) |
 | HE-VAG coefficients from [vgmstream](https://github.com/vgmstream/vgmstream) | | ISC | `third_party/hevag/hevag_coefs.h` (in its header) |
+| [Input Prompts](https://kenney.nl/assets/input-prompts) by Kenney: the touch card's button icons | 1.5A | CC0 1.0 | `third_party/kenney-prompts/` (`License.txt`; `make.py` packs `prompts.png` from it) |
 
 ## Ported from
 

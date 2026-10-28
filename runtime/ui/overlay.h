@@ -21,7 +21,6 @@ extern "C" {
 /* a badge at the top right for `seconds` (any thread): a title (or none) over the text; "[F10]" in the text draws
  * as a key cap, "\n" breaks the line. Up to three stack, newest on top; the same one again runs on instead */
 void overlay_toast_titled(const char *title, const char *body, double seconds);
-void overlay_intro_touchpad(void);   /* a gamepad touchpad touched while the overlay has input (the touch card: overlay.cpp) */
 void overlay_toast(const char *msg, double seconds);   /* (no title) */
 /* the save-data dialog (apputil.c, savedlg.h) is waiting on the player -- a list to pick from or a yes/no
  * question -- and the overlay is drawing it: window.c then routes the keyboard to the overlay instead of the
@@ -108,7 +107,8 @@ int overlay_draws_hud(void);
  * entry of RECOMP_OVERLAY_DUMP_UI (window.c): NULL or "menu" the full menu (the default), "menu:<tab>"
  * the full menu on that page (Display, Performance, Game, Controls, Help); "bar" the menu bar slid
  * down; "Game", "View", "Controls" or "Help" the bar with that menu open; "toast" the first-launch
- * hint with the pull tab; "intro", "intro:pad" or "intro:touch" the touch card with that device highlighted; "quit" the quit card. */
+ * hint with the pull tab; "intro", "intro:pad" or "intro:touch" the touch card with that device
+ * highlighted, and after it "@<seconds>" that moment of its demonstration's loop; "quit" the quit card. */
 void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t w, uint32_t h, const char *ui);
 
 #ifdef __cplusplus

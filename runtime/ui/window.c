@@ -24,7 +24,7 @@
  *       RECOMP_OVERLAY_DUMP=f.ppm  headless: renders the in-game menu once, open, over the next
  *                           presented frame, into an offscreen texture, and writes it to f -- so the
  *                           menu can be looked at without a screen (see overlay_dump_maybe below)
- *       RECOMP_OVERLAY_DUMP_UI=menu|menu:<tab>|bar|Game|View|Controls|Help|toast|intro[:pad|:touch]|quit[,...]  what that dump
+ *       RECOMP_OVERLAY_DUMP_UI=menu|menu:<tab>|bar|Game|View|Controls|Help|toast|intro[:pad|:touch][@<s>]|quit[,...]  what that dump
  *                           shows (overlay.h: overlay_render_forced); several, comma-separated, write
  *                           one file each, f_<name>.ppm
  */
@@ -869,7 +869,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (pad_back && pad_start && !pad_combo_latch) { pad_combo_latch = 1; overlay_toggle(); if (overlay_is_open()) { buttons = 0; touch_down = 0; gamepad_touch_release(); } }
 			/* exclusive while open: the menu gets every key/mouse/gamepad event instead of the game
 			 * (which is paused anyway -- display.c) */
-			if (overlay_is_open()) { if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN) overlay_intro_touchpad(); overlay_process_event(&e); continue; }
+			if (overlay_is_open()) { overlay_process_event(&e); continue; }
 			/* the save-data dialog waiting on the player (overlay_dialog_active): it has the keys and the mouse;
 			 * the game is polling the dialog, not the pad */
 			if (overlay_dialog_active()) { overlay_process_event(&e); continue; }

@@ -193,9 +193,18 @@ def main(argv):
     CXXFLAGS = ["-O2", "-std=c++17", "-w", "-I", IMGUI, "-I", os.path.join(IMGUI, "backends")] + INCLUDES + sdl_cflags
     if WIN: CXXFLAGS += ["-D_FILE_OFFSET_BITS=64", "-include", os.path.join(RT, "platform", "win32_compat.h")]
     imgui_srcs = [os.path.join(IMGUI, f) for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", os.path.join("backends", "imgui_impl_sdl3.cpp"), os.path.join("backends", "imgui_impl_sdlgpu3.cpp"))] + [os.path.join(RT, "ui", "overlay.cpp")]
+    # the touch card's input icons (third_party/kenney-prompts/prompts.png) as bytes overlay.cpp includes: a game's binary
+    # carries them, wherever it runs from
+    PROMPTS = os.path.join(ROOT, "third_party", "kenney-prompts", "prompts.png"); PROMPTS_H = os.path.join(IMGUIOBJ, "prompts_png.h")
+    if not os.path.isfile(PROMPTS_H) or newer(PROMPTS, PROMPTS_H):
+        data = open(PROMPTS, "rb").read()
+        with open(f"{PROMPTS_H}.{os.getpid()}", "w") as f:
+            f.write("static const unsigned char prompts_png[] = {\n" + ",\n".join(",".join(map(str, data[i:i + 40])) for i in range(0, len(data), 40)) + "\n};\n")
+        os.replace(f"{PROMPTS_H}.{os.getpid()}", PROMPTS_H)
+    CXXFLAGS += ["-I", IMGUIOBJ]
     for s in imgui_srcs:
         o = os.path.join(IMGUIOBJ, os.path.splitext(os.path.basename(s))[0] + ".o")
-        if not os.path.isfile(o) or newer(s, o) or newer(os.path.join(RT, "ui", "overlay.h"), o):
+        if not os.path.isfile(o) or newer(s, o) or newer(os.path.join(RT, "ui", "overlay.h"), o) or (s.endswith("overlay.cpp") and newer(PROMPTS_H, o)):
             work.append(([CXX, "-c"] + CXXFLAGS + [s, "-o", f"{o}.{os.getpid()}"], s, o, CXX, True))
 
     def compile_one(w):
