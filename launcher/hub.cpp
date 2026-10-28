@@ -1853,9 +1853,8 @@ int main(int, char **) {
 #ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
 #endif
-	if (const char *t = getenv("ATIV_TASK")) return task_cli(t);
 #ifdef __APPLE__
-	if (!shot_path && !mac_preflight()) return 0;
+	if (!shot_path && !getenv("ATIV_TASK") && !mac_preflight()) return 0;
 #endif
 	if (!getenv("PYTHONPYCACHEPREFIX")) set_env("PYTHONPYCACHEPREFIX", pref_dir() + "pycache");   /* (the stages' compiled Python beside the settings: an install is never written) */
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -1864,6 +1863,7 @@ int main(int, char **) {
 		set_env("ZIG_GLOBAL_CACHE_DIR", (x && *x ? std::string(x) : std::string(h ? h : "/tmp") + "/.cache") + "/ProjectNativ/zig");
 	}
 #endif
+	if (const char *t = getenv("ATIV_TASK")) return task_cli(t);   /* (after the caches above: a task's steps run as the window's do) */
 	if (!shot_path) {   /* (the last launcher's log kept beside this one's) */
 		const std::string d = pref_dir();
 		if (!d.empty()) { g_log_file = d + "launcher.log"; remove((d + "launcher.prev.log").c_str()); rename(g_log_file.c_str(), (d + "launcher.prev.log").c_str()); }
