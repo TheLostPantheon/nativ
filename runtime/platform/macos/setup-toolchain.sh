@@ -16,7 +16,7 @@ SPIRV_CROSS=vulkan-sdk-1.4.363.0
 SPIRV_CROSS_SHA=f708982e88b763ef5b0394ed468fc2c3628f68cdab89f2e7a946cd628c04e721
 FFMPEG=7.1.1
 FFMPEG_SHA=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
-MIN=13.0
+MIN=11.0   # macOS Big Sur, the first on Apple silicon: every M-series Mac (the shaders are MSL 2.3, the pipeline archive MTLBinaryArchive: both 11.0)
 ARCH=arm64
 D=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
 mkdir -p "$D/dl"; cd "$D/dl"
@@ -27,6 +27,7 @@ fetch "https://github.com/libsdl-org/SDL/releases/download/release-$SDL/SDL3-$SD
 fetch "https://github.com/KhronosGroup/SPIRV-Cross/archive/refs/tags/$SPIRV_CROSS.tar.gz" "SPIRV-Cross-$SPIRV_CROSS.tar.gz" "$SPIRV_CROSS_SHA"
 fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz" "ffmpeg-$FFMPEG.tar.xz" "$FFMPEG_SHA"
 cd "$D"
+[[ $(cat min 2>/dev/null) == "$MIN" ]] || rm -rf SDL3 spirv-cross ffmpeg   # (built for another minimum macOS: again)
 GEN=; command -v ninja >/dev/null && GEN="-G Ninja"
 CM=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=$MIN -DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_INSTALL_LIBDIR=lib)
 if [[ ! -f SDL3/lib/libSDL3.0.dylib ]]; then
@@ -58,3 +59,4 @@ cp ffmpeg-src/LICENSE.md ffmpeg-src/COPYING.LGPLv2.1 ffmpeg/share/licenses/
 printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/macos/setup-toolchain.sh with only the H.264 decoder and parsers enabled.\n' "$FFMPEG" "$FFMPEG" > ffmpeg/share/licenses/SOURCE.txt
 ok() { [[ -f $1 ]] && echo built || echo MISSING; }
 echo "toolchain: $D (macOS $MIN, $ARCH; SDL3 $SDL $(ok SDL3/lib/libSDL3.0.dylib); SPIRV-Cross $SPIRV_CROSS $(ok spirv-cross/lib/libspirv-cross-c.a); FFmpeg $FFMPEG $(ok ffmpeg/lib/libavcodec.a))"
+echo "$MIN" > "$D/min"

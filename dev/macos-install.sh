@@ -12,7 +12,7 @@
 # Nothing writes inside the app once it's made (a signed one must match its signature): games, builds and settings live
 # in the player's library and settings folders, compiled Python in the settings folder (PYTHONPYCACHEPREFIX).
 # Run again over the same folder to update it (dist removes only what it wrote; python is kept when current). Apple
-# silicon (arm64), macOS 13 and later. Needs the toolchain built here first ($ATIV_MAC_TOOLCHAIN, default
+# silicon (arm64), macOS 11 (Big Sur) and later: every M-series Mac. Needs the toolchain built here first ($ATIV_MAC_TOOLCHAIN, default
 # ~/toolchains/ativ-mac). Signing, notarising and the .dmg: dev/release.sh.
 set -euo pipefail
 PY_VER=3.13.17
@@ -58,7 +58,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key><string>$BV</string>
   <key>CFBundleVersion</key><string>$BV</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSCameraUsageDescription</key><string>Some games use the Vita's rear camera; Nativ can use this Mac's camera for it.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Online play finds other players on your network.</string>

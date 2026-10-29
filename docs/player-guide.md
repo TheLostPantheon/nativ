@@ -5,7 +5,7 @@ controls, online play, and what to do when something goes wrong.
 
 ## What you need
 
-- **A computer:** a Mac with Apple silicon (M1 or later) on macOS 13 or newer, a Windows 10 or 11 PC on x86-64, or a
+- **A computer:** a Mac with Apple silicon (any M-series) on macOS 11 Big Sur or newer, a Windows 10 or 11 PC on x86-64, or a
   Linux PC on x86-64, including a Steam Deck.
 - **Your own copies of your games**, with their updates if you have them. Nativ takes game folders copied from your
   Vita, PKG files, or a whole folder to search. See [Supported games](../README.md#supported-games) for exactly which

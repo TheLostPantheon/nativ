@@ -43,7 +43,8 @@ else
   # SDL3): Apple's clang from the Command Line Tools, SDL3 copied beside the launcher (found through @executable_path)
   if [[ $(uname) == Darwin ]]; then
     MT=${ATIV_MAC_TOOLCHAIN:-}; [[ -z $MT && -f $ROOT/toolchain/SDL3/lib/libSDL3.0.dylib ]] && MT=$ROOT/toolchain
-    if [[ -n $MT ]]; then SDL_CFLAGS=(-I$MT/SDL3/include); SDL_LIBS=(-L$MT/SDL3/lib -lSDL3 -Wl,-rpath,@executable_path); IMGUIOBJ=$ROOT/build/imgui/obj_mt; ROOTDEF=.; fi
+    # (built for macOS 11, as the toolchain: an install runs on every Apple silicon Mac, not only the build machine's macOS)
+    if [[ -n $MT ]]; then SDL_CFLAGS=(-I$MT/SDL3/include -mmacosx-version-min=11.0); SDL_LIBS=(-L$MT/SDL3/lib -lSDL3 -Wl,-rpath,@executable_path -mmacosx-version-min=11.0); IMGUIOBJ=$ROOT/build/imgui/obj_mt11; ROOTDEF=.; fi
   fi
 fi
 mkdir -p $IMGUIOBJ
