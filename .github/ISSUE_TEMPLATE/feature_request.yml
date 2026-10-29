@@ -1,0 +1,11 @@
+name: Idea or request
+description: A feature, a setting or a game you'd like Nativ to support
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: What you'd like, and what it would help with. For a game, its name and title ID (PCSA00029, for example).
+    validations:
+      required: true

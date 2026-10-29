@@ -1,0 +1,54 @@
+name: Bug report
+description: Something in a game or the launcher doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The quickest fix starts with the report zip: press **F5** right after the problem happens, then in the launcher open the game's **⋯** menu and choose **Report a problem** ([how it works](https://github.com/TheLostPantheon/nativ/blob/main/docs/player-guide.md#reporting-a-bug)).
+        Please don't attach game files, firmware, saves or licences.
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      options:
+        - "Killzone: Mercenary"
+        - "Uncharted: Golden Abyss"
+        - Unit 13
+        - Shovel Knight
+        - The launcher, no game
+        - Another game
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Nativ version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: computer
+    attributes:
+      label: Your computer
+      description: The operating system and its version, and the CPU or GPU if you know them.
+      placeholder: macOS 15.3, MacBook Air M2
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: Where in the game, and what you did just before. Does it happen every time?
+  - type: textarea
+    id: report
+    attributes:
+      label: Report zip
+      description: Drag the zip from **Report a problem** here. Over 25 MB (with F5 pictures), share a link to it instead.

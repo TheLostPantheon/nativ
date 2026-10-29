@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Player guide
+    url: https://github.com/TheLostPantheon/nativ/blob/main/docs/player-guide.md
+    about: Setup, controls, settings and known issues
