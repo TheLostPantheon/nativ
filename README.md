@@ -123,7 +123,9 @@ the projects parts of Nativ are ported from.
 Nativ contains no Sony or game code. You supply your own games and the firmware from Sony's site; the games are
 recompiled on your machine and never leave it.
 
-Nativ is made with the help of AI: much of its code and documentation was written with Anthropic's Claude, under its
+## AI disclaimer
+
+Nativ is made with the help of AI tools: much of its code and documentation was written with AI assistance, under its
 developer's direction, and tested on the games themselves.
 
 ## Supporting Nativ
