@@ -313,6 +313,10 @@ class Game:
         # (a tap tried on Killzone's first dialog)
         for k in ("TEST_INPUT", "TEST_TOUCH", "TEST_FRAMES"):
             if ENV.get(k): c[k] = ENV[k]
+        # ONLINE_VERSIONS: the versions the game's online play is for (its rooms only match their own version); any other copy
+        # plays with online off and is told which update it needs (runtime/net/net.c net_online_needs)
+        ov = (c.get("ONLINE_VERSIONS") or "").split()
+        if ov and version not in ov: c["RUN_ENV"] = ((c.get("RUN_ENV") or "") + " RECOMP_ONLINE_NEEDS=" + ",".join(ov)).strip()
         self.c = c; self.VERSION = version
         # TITLE_ID: the title id the game is told it runs as (sceAppMgr's, RECOMP_TITLE) -- the pack's unless the pack says otherwise
         self.TITLE_ID = c.get("TITLE_ID") or self.PACK

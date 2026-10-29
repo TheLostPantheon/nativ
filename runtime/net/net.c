@@ -57,12 +57,13 @@ typedef int socklen_t;
 #include "online/overlay.h"
 
 static int net_log(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_NET_LOG"); v = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0; } return v; }
+const char *net_online_needs(void) { const char *e = getenv("RECOMP_ONLINE_NEEDS"); return e && *e ? e : 0; }   /* (net.h) */
 int net_online(void) {   /* (net.h) */
 	static int v = -1;
 	if (v < 0) {
 		const char *e = getenv("RECOMP_ONLINE");
-		v = e ? atoi(e) > 0 : !getenv("RECOMP_HEADLESS") && settings_game_option("online") && settings_int("online", 1) > 0;
-		if (!e && settings_game_option("online")) fprintf(stderr, "    net: online %s (settings \"online\")\n", v ? "on" : "off");
+		v = e ? atoi(e) > 0 : !getenv("RECOMP_HEADLESS") && settings_game_option("online") && settings_int("online", 1) > 0 && !net_online_needs();
+		if (!e && settings_game_option("online")) fprintf(stderr, "    net: online %s (settings \"online\")%s%s\n", v ? "on" : "off", net_online_needs() ? ": this copy isn't a version online play is for, which needs update " : "", net_online_needs() ? net_online_needs() : "");
 	}
 	return v;
 }

@@ -1531,7 +1531,7 @@ static void game_card(const Game &g, float w, float name_h) {
 		ImGui::TextDisabled("%s", line.c_str());
 		if (g.imported && !rec.empty() && g.version != rec) {
 			ImGui::SameLine();   /* (one unwrapped line of text, not a chip: every card's lines keep one height) */
-			ImGui::PushTextWrapPos(-1.0f); ImGui::TextColored(ui::warn, "Update %s", rec.c_str()); ImGui::PopTextWrapPos();
+			ImGui::PushTextWrapPos(-1.0f); ImGui::TextColored(ui::warn, "Update %s available", rec.c_str()); ImGui::PopTextWrapPos();   /* ("Update 1.12" beside the version read as the copy's own: a 1.00 copy was taken for 1.12) */
 			if (ImGui::IsItemHovered())
 				ImGui::SetTooltip("%s (this copy is %s).\nAdd it with + Add game: its update folder (ux0:patch/%s) or PKG,\nor search the folder you copied from your Vita.",
 				                  (g.update_note.empty() ? "Version " + rec + " is recommended" : g.update_note).c_str(), g.version.c_str(), g.id.c_str());

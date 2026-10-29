@@ -4,6 +4,7 @@ NAME = "Killzone: Mercenary"
 # not played yet -- a search names it and says this release is the one Ativ plays
 REGION = "US"
 UPDATE_NOTE = "Update 1.12 adds Botzone and online play"
+ONLINE_VERSIONS = "1.12"   # online play is 1.12's: its rooms only match copies of the same version (a 1.01 copy's were never found by 1.12's); other versions play offline and are told so
 SPLIT = 32                # recompiled C split into this many part files (an 11.7 MB ELF, half again Unit 13's)
 MODULES = "libc libgxm_es4 libgpu_es4 libfios2 libscemp4 libsceavplayer np_matching2 libssl np_common librudp"   # np_matching2 libssl np_common librudp: online play (below); libscemp4 + libsceavplayer: the firmware's MP4 demuxer and movie player behind its SceAvPlayer movies (Movies_KZV/*.mp4, H.264 decoded by runtime/media/video.c); its sce_module: libc, libfios2, libult, libface, libsmart (dump/decrypted/PCSA00107/elf/); GXM as Sony's code like the other games; libfios2 as Sony's code because the game's data is a PSARC archive (game_data/data_ngp.psarc) read through FIOS's dearchiver
 # transferred 2026-10-07: game files mirrored from the Vita (VitaShell FTP), executable and modules

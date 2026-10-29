@@ -18,6 +18,9 @@ int matching_local(void);   /* ssl_local.c: the game's matching server is this c
  * Otherwise those imports stay the not-implemented stubs every game had before: no network, signed out -- a game whose
  * servers are gone (Unit 13's co-op, its daily challenge) keeps its offline menus instead of opening paths nothing answers */
 int net_online(void);
+/* the update online play needs ("1.12"), when this copy isn't a version the pack's ONLINE_VERSIONS names (RECOMP_ONLINE_NEEDS,
+ * set by vitarecomp): online stays off, and the player is told (apputil.c's network check, the F10 menu); 0 otherwise */
+const char *net_online_needs(void);
 
 /* http.c: a game server answered inside this process -- a pack's stand-in for its long-gone server (Killzone's server.c),
  * used unless the player names a server of their own for that host (settings private_server, net_redirect). The handler

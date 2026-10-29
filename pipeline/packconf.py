@@ -21,7 +21,7 @@ import tomllib
 DEFAULTS = {
     "BASE": "game", "SPLIT": "16", "TEST_INPUT": "", "TEST_TOUCH": "", "TEST_ENV": "", "TEST_FRAMES": "600",
     "TEST_TOLERANCE": "1", "ELF": "eboot.bin.elf", "HOOKS": "", "IHOOKS": "", "MOD_HOOKS": "", "MOD_IHOOKS": "",
-    "GAME_ADDRS": "", "TITLE_ID": "", "VERSIONS": "", "UPDATE_NOTE": "", "FUNCTION_SEEDS": "",
+    "GAME_ADDRS": "", "TITLE_ID": "", "VERSIONS": "", "UPDATE_NOTE": "", "FUNCTION_SEEDS": "", "ONLINE_VERSIONS": "",
 }
 _KEY = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 STATUSES = ("recommended", "supported")

@@ -14,6 +14,7 @@
 #include "guestwatch.h"
 #include "hle.h"
 #include "net.h"
+#include "overlay.h"   /* (overlay_toast_titled: the network check's notice) */
 #include "platform.h"
 #include "savedlg.h"
 #include "settings.h"
@@ -35,7 +36,15 @@ static void h_dialog_result(Cpu *c) { if (A0) WR32(A0, 0); RET(0); }
 /* SceNetCheckDialogResult {result, psnModeSucceeded, ...}: online (net.h), connected and, in the PSN modes, signed in (np.c's
  * local account) -- with psnModeSucceeded left 0 Killzone took its Multiplayer connect as a failed sign-in and went quietly
  * back to the menu */
-static void h_net_dlg_result(Cpu *c) { if (A0) { WR32(A0, 0); WR32(A0 + 4, net_online() ? 1 : 0); } RET(0); }
+static void h_net_dlg_result(Cpu *c) {
+	if (A0) { WR32(A0, 0); WR32(A0 + 4, net_online() ? 1 : 0); }
+	if (!net_online() && net_online_needs()) {   /* the game went for its online modes on a version they aren't for: say why it can't (net.h) */
+		static double told; const double now = (double)time(0);
+		if (now - told > 20) { told = now; char b[200]; snprintf(b, sizeof b, "This copy of the game isn't the version online play is for. Add update %s in the launcher, then play again.", net_online_needs());
+			char t[64]; snprintf(t, sizeof t, "Online play needs update %s", net_online_needs()); overlay_toast_titled(t, b, 10); }
+	}
+	RET(0);
+}
 /* Common dialog 0x12, which no NID list names (Init 33626E2C, Term BEBAEF25, Abort B55CF0E3, GetStatus B7D4C911, GetResult
  * D1858A78 in libcdlg, between the Facebook and cross-controller dialogs; SDK 2.10+). Read from the firmware and Killzone: the param
  * after the common one is a SceNpCommunicationId (+0x50) and a 32-bit version the game keeps in its profile (+0x5c), the 0x2c-byte

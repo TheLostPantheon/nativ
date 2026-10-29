@@ -60,7 +60,7 @@
 
 extern "C" {
 #include "online/m2.h"   /* (online_status: the Game page's Online now) */
-int net_online(void);
+int net_online(void); const char *net_online_needs(void);
 /* display.c */
 void display_set_paused(int on);
 /* window.c */
@@ -352,7 +352,8 @@ static void page_game(void) {
 	}
 	if (game_option("online")) {
 		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. Applies the next time the game starts.");
-		{ bool on = settings_int("online", 1) != 0; if (ui::toggle("online", &on)) { settings_set_int("online", on ? 1 : 0); settings_save(); } }
+		if (net_online_needs()) { char t[128]; snprintf(t, sizeof t, "Needs update %s: this copy is another version, and rooms only match their own. Add the update in the launcher.", net_online_needs()); ImGui::TextWrapped("%s", t); }
+		else { bool on = settings_int("online", 1) != 0; if (ui::toggle("online", &on)) { settings_set_int("online", on ? 1 : 0); settings_save(); } }
 		if (net_online()) {   /* how it stands (status.c), every half second */
 			static OnlineStatus st; static double at = -1; const double now = ImGui::GetTime();
 			if (at < 0 || now - at > 0.5) { online_status(&st); at = now; }
