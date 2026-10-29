@@ -59,8 +59,10 @@ typedef struct Voice {
 	/* player state */
 	uint32_t buffer, byte_pos, samples_gen, bytes_consumed, loops_done;
 	uint32_t upd_active;                   /* system updates it has been active for since its play (SceNgsVoiceInfo.uUpdateCallsActive) */
-	double frac;
+	double frac;                           /* the read position past the resampler's centre, in source samples (rs_read) */
+	float rs_h[2][32]; int rs_i;           /* the last 16 source samples per channel, each stored twice (rs_push) */
 	int16_t *mix;                          /* a master bus's output granule (stereo) */
+	float lim_red;                         /* a master bus's limiter: its gain reduction now (master_limit) */
 	void *at9; uint32_t at9_cfg;           /* an ATRAC9 player's decoder, for its configuration word */
 	int16_t *pcm; int pcm_len, pcm_pos, at9_ch, at9_samples;   /* the last decoded frame */
 	/* an ADPCM player (type 1, HE-VAG): the decoded 16-byte frame per channel, which frame it is, the
@@ -101,7 +103,8 @@ static int stages_off(void); static int stage_module(const Voice *v, uint32_t id
 #define RV_COMBS 4
 static const int rv_comb_len[RV_COMBS] = { 1215, 1293, 1390, 1476 }, rv_ap_len[2] = { 605, 480 }, rv_spread = 23;
 #define RV_ER_LEN 16384   /* the early reflections' delay line: I3DL2's ReflectionsDelay reaches 0.3 s, 14400 samples at 48 kHz */
-typedef struct Reverb { float comb[2][RV_COMBS][1500]; float filt[2][RV_COMBS]; int ci[2][RV_COMBS]; float ap[2][2][640]; int ai[2][2]; float er[2][RV_ER_LEN]; int ei; } Reverb;
+typedef struct Reverb { float comb[2][RV_COMBS][1500]; float filt[2][RV_COMBS]; int ci[2][RV_COMBS]; float ap[2][2][640]; int ai[2][2]; float er[2][RV_ER_LEN]; int ei;
+	float erap[2][2][160]; int erai[2][2]; } Reverb;   /* erap: the early reflections' two diffusing allpasses per channel */
 typedef struct { float dry, wet_in, damp, fb[RV_COMBS], er_gain; int er_delay; } ReverbSet;   /* er_*: the early reflections (reverb_run) */   /* wet_in: the late reverb level, energy-normalised for the comb bank (reverb_settings) */
 #define REVERB_PARAMS_ID 0x5ce7   /* the low half of 0x01015CE7 and of 0x01025CE7 (V2, the same leading fields) */
 static float mb_gain(float mb) { if (mb <= -10000) return 0; if (mb > 2000) mb = 2000; return powf(10.0f, mb / 2000.0f); }
@@ -113,8 +116,15 @@ static void reverb_settings(const uint32_t params[MAX_MODULES], uint32_t sample_
 		float room, decay, reverb, ratio, dry, refl, refl_delay; memcpy(&room, G(p + 8), 4); memcpy(&decay, G(p + 16), 4); memcpy(&ratio, G(p + 20), 4); memcpy(&reverb, G(p + 32), 4); memcpy(&dry, G(p + 72), 4);
 		memcpy(&refl, G(p + 24), 4); memcpy(&refl_delay, G(p + 28), 4);   /* Reflections (mB), Reflections_delay (s) */
 		if (room == room && reverb == reverb) level_mb = room + reverb;
+		/* the reflections no louder than the room and no later than 40 ms, where the ear fuses them with the sound
+		 * (I3DL2 allows +1000 mB over the room and 0.3 s). Uncharted's jungle room asks for both limits (Room -952,
+		 * Reflections +1000 mB at 0.3 s) and Killzone's second bus for 0.25 s: rendered as asked, every sound sent to
+		 * them repeats a quarter of a second later at full level, a slapback no room of theirs has (2026-10-28).
+		 * RECOMP_NGS_ER_LITERAL=1: as asked. */
+		static int literal = -1; if (literal < 0) literal = getenv("RECOMP_NGS_ER_LITERAL") != 0;
+		if (!literal && refl > 0) refl = 0;
 		if (room == room && refl == refl) er_mb = room + refl;
-		if (refl_delay >= 0 && refl_delay <= 0.3f) er_delay = refl_delay;
+		if (refl_delay >= 0 && refl_delay <= 0.3f) er_delay = literal || refl_delay < 0.04f ? refl_delay : 0.04f;
 		if (decay > 0.1f && decay < 20) rt60 = decay;
 		if (ratio > 0 && ratio < 10) hf_ratio = ratio;
 		if (dry == dry && dry <= 2000) dry_mb = dry;
@@ -161,19 +171,37 @@ static int reverb_bypassed(const Voice *v) {
 	for (int m = 0; m < MAX_MODULES; m++) if (v->params[m] && (RD32(v->params[m]) & 0xffff) == REVERB_PARAMS_ID) return v->bypass[m] != 0;
 	return v->bypass[1] != 0;   /* no parameters yet: a reverb bus's reverb is its module 1 */
 }
-/* the early reflections as four taps per channel a little apart after the reflections delay (the right channel's offset for
- * spread), each at half amplitude: together the reflections carry the input's energy at er_gain */
-static const int rv_er_taps[2][4] = { { 0, 211, 433, 701 }, { 37, 269, 487, 757 } };
+/* the early reflections as a dense cluster: twelve taps per channel over the 28 ms after the reflections delay, uneven,
+ * signed and fading (the channels' patterns differ), through two short allpasses per channel that smear them; their
+ * energy together is the input's at er_gain. Four close taps of one sign before (2026-10-17 .. 10-28) summed to a copy
+ * of the input at up to twice its amplitude: Uncharted's jungle bus answered every sound with one clean repeat (its
+ * response peaked at 309 ms, 10 dB over its own reverb tail). */
+#define RV_ER_TAPS 12
+static const int rv_er_tap[2][RV_ER_TAPS] = { { 0, 89, 197, 263, 379, 461, 587, 683, 811, 947, 1103, 1289 },
+                                             { 41, 131, 229, 317, 421, 523, 641, 757, 877, 1009, 1171, 1361 } };
+static const signed char rv_er_sign[2][RV_ER_TAPS] = { { 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1 }, { -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1 } };
+static const int rv_er_ap[2][2] = { { 142, 107 }, { 151, 113 } };
+static float rv_er_g[2][RV_ER_TAPS];
 static void reverb_run(Reverb *r, const ReverbSet *s, const float *in, float *out, uint32_t gn) {
 	const float damp = s->damp, dry = s->dry, win = s->wet_in;
+	if (!rv_er_g[0][0]) for (int ch = 0; ch < 2; ch++) {   /* the taps' gains: fading 1.5 dB a tap, unit energy */
+		float e = 0; for (int t = 0; t < RV_ER_TAPS; t++) { rv_er_g[ch][t] = rv_er_sign[ch][t] * powf(10.0f, -0.075f * (float)t); e += rv_er_g[ch][t] * rv_er_g[ch][t]; }
+		for (int t = 0; t < RV_ER_TAPS; t++) rv_er_g[ch][t] /= sqrtf(e);
+	}
 	for (uint32_t f = 0; f < gn; f++) {
 		float x = (in[2 * f] + in[2 * f + 1]) * 0.5f * win;
 		float er[2] = { 0, 0 };
 		if (s->er_gain > 0) {
 			for (int ch = 0; ch < 2; ch++) {
 				r->er[ch][r->ei] = in[2 * f + ch];
-				for (int t = 0; t < 4; t++) { int d = s->er_delay + rv_er_taps[ch][t]; if (d >= RV_ER_LEN) d = RV_ER_LEN - 1; er[ch] += r->er[ch][(r->ei - d + RV_ER_LEN) % RV_ER_LEN]; }
-				er[ch] *= 0.5f * s->er_gain;
+				float acc = 0;
+				for (int t = 0; t < RV_ER_TAPS; t++) { int d = s->er_delay + rv_er_tap[ch][t]; if (d >= RV_ER_LEN) d = RV_ER_LEN - 1; acc += rv_er_g[ch][t] * r->er[ch][(r->ei - d + RV_ER_LEN) % RV_ER_LEN]; }
+				for (int k = 0; k < 2; k++) {   /* (Schroeder allpass, g 0.6) */
+					float *b = r->erap[ch][k]; int i = r->erai[ch][k], len = rv_er_ap[ch][k];
+					float dl = b[i], w = acc + 0.6f * dl; acc = dl - 0.6f * w; b[i] = w;
+					r->erai[ch][k] = i + 1 < len ? i + 1 : 0;
+				}
+				er[ch] = acc * s->er_gain;
 			}
 			r->ei = (r->ei + 1) % RV_ER_LEN;
 		}
@@ -220,7 +248,7 @@ static uint64_t updates;
 typedef struct { Wav out, src; uint32_t plays, src_frames; uint32_t ad_frames, ad_shift13, ad_he, ad_idx_bad, ad_flag7, ad_flag_other, ad_clip, clipped_out; uint32_t last_type, last_ch; float last_freq, last_scal; } VStat;
 static VStat vstat[512];
 static Wav master_wav[512];
-static uint32_t master_clips[512];
+static uint32_t master_clips[512], master_limited[512];   /* clips: samples over full scale before the limiter; limited: frames it took over 0.5 dB off (master_limit) */
 static void wav_put(Wav *w, const char *path, uint32_t rate, uint32_t ch, uint32_t fmt /* 1 s16, 3 f32 */, const void *data, uint32_t bytes) {
 	if (!w->f) {
 		w->f = fopen(path, "wb"); if (!w->f) return;
@@ -237,7 +265,7 @@ static void wav_put(Wav *w, const char *path, uint32_t rate, uint32_t ch, uint32
 }
 static void dump_report(void) {
 	if (!dump_dir) return;
-	for (int i = 0; i < 512; i++) if (master_wav[i].f) fprintf(stderr, "    ngs dump: master voice %d: %u granule samples clipped\n", i, master_clips[i]);
+	for (int i = 0; i < 512; i++) if (master_wav[i].f) fprintf(stderr, "    ngs dump: master voice %d: %u granule samples over full scale before the limiter, %u frames limited\n", i, master_clips[i], master_limited[i]);
 	for (int i = 0; i < 512; i++) {
 		VStat *st = &vstat[i]; if (!st->plays) continue;
 		fprintf(stderr, "    ngs dump: voice %d def %u: %u plays, last type %u ch %u freq %.0f scal %.3f, src frames %u, out clipped %u",
@@ -393,7 +421,8 @@ static void vo_state_log(Voice *v, uint32_t lr, uint64_t us) {
 /* ---- voices */
 static void h_voice_play(Cpu *c) {
 	Voice *v = voice_of(A0);
-	if (v) { v->playing = 1; v->paused = 0; v->buffer = 0; v->byte_pos = 0; v->frac = 0; v->samples_gen = v->bytes_consumed = 0; v->loops_done = 0; v->upd_active = 0;
+	if (v) { v->playing = 1; v->paused = 0; v->buffer = 0; v->byte_pos = 0; v->samples_gen = v->bytes_consumed = 0; v->loops_done = 0; v->upd_active = 0;
+		v->frac = 1; memset(v->rs_h, 0, sizeof v->rs_h); v->rs_i = 0;   /* (1: the first output fetches the first source sample) */
 		v->pcm_len = v->pcm_pos = 0; v->at9_cfg = 0; v->stage_on = 0;   /* (a fresh decoder: ATRAC9 frames carry state) */
 		v->ad_valid = 0; v->ad_idx = 0; memset(v->ad_hist, 0, sizeof v->ad_hist);
 		v->at9_waited = v->at9_decoded = 0; v->env_pt = 0; v->env_ms = 0; v->env_level = 0; v->releasing = v->released_out = 0; v->rel_ms = 0; memset(v->bq, 0, sizeof v->bq);
@@ -591,32 +620,70 @@ static void hevag_frame(const uint8_t *fr, float hist[4], int16_t out[28]) {
 		hist[3] = hist[2]; hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = sample;
 	}
 }
+/* ---- resampling: every player's source samples reach the system rate through a 16-tap windowed sinc (Kaiser, beta 7)
+ * read at the voice's fractional position, 8 source samples behind the newest one fetched (0.2-0.4 ms). Before
+ * 2026-10-28 each output sample was the nearest source sample held, no interpolation: every sound not at the system
+ * rate or not at pitch 1 (most effects: 22-32 kHz sources, pitch-varied gunshots) carried its spectrum's images above
+ * its Nyquist rate, a gritty, metallic top. Pitched up (step > 1) the cutoff drops with the output's Nyquist rate, in
+ * five bands, so what would fold back is filtered too. RECOMP_NGS_RESAMPLE=hold: the old way. */
+#define RS_TAPS 16
+#define RS_PHASES 128
+static const float rs_band_div[5] = { 1.0f, 1.25f, 1.6f, 2.2f, 3.2f };
+static float rs_tab[5][RS_PHASES + 1][RS_TAPS];
+static int rs_mode = -1;   /* 1: the sinc; 0: hold */
+static double bessel_i0(double x) { double s = 1, t = 1; for (int k = 1; k < 32; k++) { t *= (x / (2 * k)) * (x / (2 * k)); s += t; } return s; }
+static void rs_init(void) {
+	if (rs_mode >= 0) return;
+	const char *e = getenv("RECOMP_NGS_RESAMPLE"); rs_mode = !(e && !strcmp(e, "hold"));
+	const double pi = 3.14159265358979323846, beta = 7.0, i0b = bessel_i0(beta), half = RS_TAPS / 2.0;
+	for (int b = 0; b < 5; b++) for (int p = 0; p <= RS_PHASES; p++) {
+		double fc = 0.92 / rs_band_div[b], w[RS_TAPS], sum = 0;
+		for (int k = 0; k < RS_TAPS; k++) {
+			double d = k - (half - 1) - (double)p / RS_PHASES;   /* the tap's distance from the read point, between taps 7 and 8 */
+			double u = d / half, win = fabs(u) < 1 ? bessel_i0(beta * sqrt(1 - u * u)) / i0b : 0;
+			w[k] = (d == 0 ? fc : sin(pi * fc * d) / (pi * d)) * win; sum += w[k];
+		}
+		for (int k = 0; k < RS_TAPS; k++) rs_tab[b][p][k] = (float)(w[k] / sum);   /* unity at DC in every phase */
+	}
+}
+static void rs_push(Voice *v, float l, float r) {
+	v->rs_i = (v->rs_i + 1) & (RS_TAPS - 1);
+	v->rs_h[0][v->rs_i] = v->rs_h[0][v->rs_i + RS_TAPS] = l;   /* (twice: the last 16 are always contiguous) */
+	v->rs_h[1][v->rs_i] = v->rs_h[1][v->rs_i + RS_TAPS] = r;
+}
+static void rs_read(const Voice *v, double step, float *l, float *r) {
+	if (!rs_mode) { *l = v->rs_h[0][v->rs_i]; *r = v->rs_h[1][v->rs_i]; return; }   /* hold: the newest sample */
+	int b = 0; while (b < 4 && step > rs_band_div[b]) b++;
+	double pf = v->frac * RS_PHASES; int p = (int)pf; if (p > RS_PHASES - 1) p = RS_PHASES - 1; if (p < 0) p = 0;
+	const float a = (float)(pf - p), *w0 = rs_tab[b][p], *w1 = rs_tab[b][p + 1];
+	const float *hl = &v->rs_h[0][v->rs_i + 1], *hr = &v->rs_h[1][v->rs_i + 1];   /* oldest to newest */
+	float sl = 0, sr = 0;
+	for (int k = 0; k < RS_TAPS; k++) { float w = w0[k] + a * (w1[k] - w0[k]); sl += w * hl[k]; sr += w * hr[k]; }
+	*l = sl; *r = sr;
+}
+
 /* the Scream/simple player's ADPCM type (SCE_NGS_PLAYER_TYPE_ADPCM, 1): HE-VAG frames of 16 bytes
  * per channel (stereo: a left frame then a right frame), 28 samples each, through the same buffer
  * chain and resampling as PCM. Unit 13's weapon and world effects are all ADPCM -- 563 of its 565
  * effect voices in one session; only PCM was rendered, so its pistol never made a sound and the
  * rifle (PCM) did. */
-static void render_adpcm(Voice *v, float *out, uint32_t pp, int ch) {
-	float freq; memcpy(&freq, G(pp + P_FREQ), 4);
-	float scal; memcpy(&scal, G(pp + P_SCALAR), 4);
-	if (!(freq > 0)) freq = (float)sample_rate;
-	if (!(scal > 0)) scal = 1;
-	double step = freq * scal / sample_rate;
+/* the next source sample of an ADPCM player into *l, *r: 1, or 0 when its data ends */
+static int fetch_adpcm(Voice *v, uint32_t pp, int ch, float rate, float *l, float *r) {
 	uint32_t frame_bytes = 16u * (uint32_t)ch;
-	for (uint32_t f = 0; f < granularity; f++) {
-		if (v->buffer > 3) { v->playing = 0; return; }
+	for (;;) {
+		if (v->buffer > 3) return 0;
 		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
-		if (!data || bytes < frame_bytes) { v->playing = 0; return; }
+		if (!data || bytes < frame_bytes) return 0;
 		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next (as the PCM path) */
 			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
 			v->byte_pos = 0; v->ad_idx = 0; v->ad_valid = 0;
 			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
 			else {
 				uint32_t prev = v->buffer;
-				v->loops_done = 0; if (next < 0 || next > 3) { v->playing = 0; return; } v->buffer = next;
+				v->loops_done = 0; if (next < 0 || next > 3) return 0; v->buffer = next;
 				player_event(v, EV_SWAPPED, prev, RD32(pp + P_BUF(next)));
 			}
-			f--; continue;
+			continue;
 		}
 		if (!v->ad_valid || v->ad_frame_buf != v->buffer || v->ad_frame_pos != v->byte_pos) {
 			for (int c = 0; c < ch; c++) hevag_frame(G(data + v->byte_pos + 16u * (uint32_t)c), v->ad_hist[c], v->ad_pcm[c]);
@@ -629,19 +696,42 @@ static void render_adpcm(Voice *v, float *out, uint32_t pp, int ch) {
 					for (int i = 0; i < 28; i++) st->ad_clip += v->ad_pcm[c][i] == 32767 || v->ad_pcm[c][i] == -32768;
 				}
 				int16_t il[56]; for (int i = 0; i < 28; i++) for (int c = 0; c < ch; c++) il[i * ch + c] = v->ad_pcm[c][i];
-				dump_src(v, il, 28, (uint32_t)ch, freq * scal);
+				dump_src(v, il, 28, (uint32_t)ch, rate);
 			}
 			v->ad_valid = 1; v->ad_frame_buf = v->buffer; v->ad_frame_pos = v->byte_pos;
 			if (v->ad_idx > 27) v->ad_idx = 0;
 		}
-		int16_t l = v->ad_pcm[0][v->ad_idx], r = ch == 2 ? v->ad_pcm[1][v->ad_idx] : l;
-		out[2 * f] += l / 32768.0f; out[2 * f + 1] += r / 32768.0f;
-		v->frac += step;
-		while (v->frac >= 1.0) {
-			v->frac -= 1.0;
-			if (++v->ad_idx >= 28) { v->ad_idx = 0; v->byte_pos += frame_bytes; v->bytes_consumed += frame_bytes; }
-			v->samples_gen += (uint32_t)ch;   /* source samples, all channels (h_voice_state) */
+		int16_t a = v->ad_pcm[0][v->ad_idx], b = ch == 2 ? v->ad_pcm[1][v->ad_idx] : a;
+		*l = a / 32768.0f; *r = b / 32768.0f;
+		if (++v->ad_idx >= 28) { v->ad_idx = 0; v->byte_pos += frame_bytes; v->bytes_consumed += frame_bytes; }
+		v->samples_gen += (uint32_t)ch;   /* source samples, all channels (h_voice_state) */
+		return 1;
+	}
+}
+/* the next source sample of a PCM player: 1, or 0 when its data ends */
+static int fetch_pcm(Voice *v, uint32_t pp, int ch, float rate, float *l, float *r) {
+	uint32_t frame_bytes = 2u * (uint32_t)ch;
+	for (;;) {
+		if (v->buffer > 3) return 0;
+		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
+		if (!data || bytes < frame_bytes) return 0;
+		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next */
+			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
+			v->byte_pos = 0;
+			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
+			else {
+				uint32_t prev = v->buffer;
+				v->loops_done = 0; if (next < 0 || next > 3) return 0; v->buffer = next;
+				player_event(v, EV_SWAPPED, prev, RD32(pp + P_BUF(next)));
+			}
+			continue;
 		}
+		int16_t a = (int16_t)RD16(data + v->byte_pos), b = ch == 2 ? (int16_t)RD16(data + v->byte_pos + 2) : a;
+		*l = a / 32768.0f; *r = b / 32768.0f;
+		if (dump_dir) dump_src(v, (const int16_t *)G(data + v->byte_pos), 1, (uint32_t)ch, rate);
+		v->byte_pos += frame_bytes; v->bytes_consumed += frame_bytes;
+		v->samples_gen += (uint32_t)ch;   /* source samples, all channels (h_voice_state) */
+		return 1;
 	}
 }
 static void render_player(Voice *v, float *out /* stereo, granularity frames */) {
@@ -649,38 +739,22 @@ static void render_player(Voice *v, float *out /* stereo, granularity frames */)
 	int ch = (int8_t)RD8(pp + P_CHANNELS);
 	if (ch < 1 || ch > 2) ch = 1;
 	int type = (int8_t)RD8(pp + P_TYPE);
-	if (type == 1) { render_adpcm(v, out, pp, ch); return; }
-	if (type != 0) { static int said; if (!said++) fprintf(stderr, "    ngs: player type %d not rendered\n", type); return; }
+	if (type != 0 && type != 1) { static int said; if (!said++) fprintf(stderr, "    ngs: player type %d not rendered\n", type); return; }
 	float freq; memcpy(&freq, G(pp + P_FREQ), 4);
 	float scal; memcpy(&scal, G(pp + P_SCALAR), 4);
 	if (!(freq > 0)) freq = (float)sample_rate;
 	if (!(scal > 0)) scal = 1;
 	double step = freq * scal / sample_rate;
+	rs_init();
 	for (uint32_t f = 0; f < granularity; f++) {
-		if (v->buffer > 3) { v->playing = 0; return; }
-		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
-		uint32_t frame_bytes = 2 * ch;
-		if (!data || bytes < frame_bytes) { v->playing = 0; return; }
-		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next */
-			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
-			v->byte_pos = 0;
-			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
-			else {
-				uint32_t prev = v->buffer;
-				v->loops_done = 0; if (next < 0 || next > 3) { v->playing = 0; return; } v->buffer = next;
-				player_event(v, EV_SWAPPED, prev, RD32(pp + P_BUF(next)));
-			}
-			f--; continue;
+		while (v->frac >= 1.0) {   /* past the newest source sample: the next one */
+			float l, r;
+			if (!(type == 1 ? fetch_adpcm(v, pp, ch, freq * scal, &l, &r) : fetch_pcm(v, pp, ch, freq * scal, &l, &r))) { v->playing = 0; return; }
+			rs_push(v, l, r); v->frac -= 1.0;
 		}
-		int16_t l = (int16_t)RD16(data + v->byte_pos), r = ch == 2 ? (int16_t)RD16(data + v->byte_pos + 2) : l;
-		out[2 * f] += l / 32768.0f; out[2 * f + 1] += r / 32768.0f;
+		float l, r; rs_read(v, step, &l, &r);
+		out[2 * f] += l; out[2 * f + 1] += r;
 		v->frac += step;
-		while (v->frac >= 1.0) {
-			v->frac -= 1.0;
-			if (dump_dir && v->byte_pos + frame_bytes <= bytes) dump_src(v, (const int16_t *)G(data + v->byte_pos), 1, (uint32_t)ch, freq * scal);
-			v->byte_pos += frame_bytes; v->bytes_consumed += frame_bytes;
-			v->samples_gen += (uint32_t)ch;   /* source samples, all channels (h_voice_state) */
-		}
 	}
 }
 
@@ -693,6 +767,74 @@ static void at9_log(Voice *v, uint32_t pp, uint32_t prev, const char *what) {
 	fprintf(stderr, "    at9 v%d upd %llu %s %u->%u: bytes %u discard %d/%d next-bytes %u | out %u decoded %llu waited %llu\n", VIDX(v), (unsigned long long)updates, what, prev, v->buffer,
 	        RD32(pp + A_BUF(prev) + 4), (int16_t)RD16(pp + A_BUF(prev) + 12), (int16_t)RD16(pp + A_BUF(prev) + 14), RD32(pp + A_BUF(v->buffer) + 4),
 	        v->samples_gen, (unsigned long long)v->at9_decoded, (unsigned long long)v->at9_waited);
+}
+/* the next source sample of an ATRAC9 player: 1, 0 when its data ends (or fails), 2 while it waits for the game to
+ * queue more */
+static int fetch_at9(Voice *v, uint32_t pp, float rate, float *l, float *r) {
+	while (v->pcm_pos >= v->pcm_len) {   /* the next frame */
+		int used = 0, e;
+		if (v->stage_on) {   /* inside a superframe joined from two buffers */
+			e = Atrac9Decode(v->at9, v->stage + v->stage_pos, v->pcm, &used);
+			if (e) { fprintf(stderr, "    ngs: ATRAC9 frame (joined superframe) failed (%d)\n", e); player_event(v, EV_DECODE_ERROR, v->byte_pos, 0); return 0; }
+			v->stage_pos += used;
+			if (++v->at9_frame >= v->at9_sf_frames) { v->at9_frame = 0; v->stage_on = 0; }
+			v->pcm_len = v->at9_samples; v->pcm_pos = 0;
+			if (dump_dir) dump_src(v, v->pcm, (uint32_t)v->at9_samples, (uint32_t)v->at9_ch, rate);
+			continue;
+		}
+		if (v->buffer > 3) return 0;
+		uint32_t data = RD32(pp + A_BUF(v->buffer)), bytes = RD32(pp + A_BUF(v->buffer) + 4);
+		if (!data || !bytes) return 2;   /* waiting for the game to queue data */
+		if (v->byte_pos >= bytes) {   /* this buffer is done: repeat it, or move to the next */
+			int16_t loops = (int16_t)RD16(pp + A_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + A_BUF(v->buffer) + 10);
+			v->byte_pos = 0; v->at9_frame = 0;
+			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
+			else {
+				uint32_t prev = v->buffer;
+				v->loops_done = 0; if (next < 0 || next > 3) return 0; v->buffer = next;
+				player_event(v, EV_SWAPPED, prev, RD32(pp + A_BUF(next)));
+				at9_log(v, pp, prev, "swap");
+			}
+			continue;
+		}
+		if (v->at9_frame == 0 && v->byte_pos + (uint32_t)v->at9_sf_bytes > bytes && v->at9_sf_bytes <= (int)sizeof v->stage) {
+			/* the superframe continues in the next buffer: join its two parts, then decode from the join */
+			uint32_t part = bytes - v->byte_pos;
+			memcpy(v->stage, G(data + v->byte_pos), part);
+			int16_t loops = (int16_t)RD16(pp + A_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + A_BUF(v->buffer) + 10);
+			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
+			else {
+				uint32_t prev = v->buffer;
+				v->loops_done = 0; if (next < 0 || next > 3) return 0; v->buffer = next;
+				player_event(v, EV_SWAPPED, prev, RD32(pp + A_BUF(next)));
+				at9_log(v, pp, prev, "swap (joined)");
+			}
+			uint32_t ndata = RD32(pp + A_BUF(v->buffer));
+			if (!ndata) return 2;
+			memcpy(v->stage + part, G(ndata), (size_t)v->at9_sf_bytes - part);
+			v->byte_pos = (uint32_t)v->at9_sf_bytes - part; v->bytes_consumed += (uint32_t)v->at9_sf_bytes;
+			v->stage_on = 1; v->stage_pos = 0;
+			continue;
+		}
+		if (v->at9_frame == 0) v->at9_sf_start = v->byte_pos;
+		e = Atrac9Decode(v->at9, G(data + v->byte_pos), v->pcm, &used);
+		if (e || used <= 0) {
+			fprintf(stderr, "    ngs: ATRAC9 frame at %#x+%#x (buffer %u of %u bytes) failed (%d)\n", data, v->byte_pos, v->buffer, bytes, e);
+			player_event(v, EV_DECODE_ERROR, v->byte_pos, data); return 0;
+		}
+		/* within a superframe the next frame follows this one; after its last, the next superframe starts */
+		uint32_t was = v->byte_pos;
+		if (++v->at9_frame >= v->at9_sf_frames) { v->at9_frame = 0; v->byte_pos = v->at9_sf_start + v->at9_sf_bytes; }
+		else v->byte_pos += used;
+		v->bytes_consumed += v->byte_pos - was;
+		v->pcm_len = v->at9_samples; v->pcm_pos = 0; v->at9_decoded += (uint64_t)v->at9_samples;
+		if (dump_dir) dump_src(v, v->pcm, (uint32_t)v->at9_samples, (uint32_t)v->at9_ch, rate);
+	
+	}
+	int16_t a = v->pcm[v->pcm_pos * v->at9_ch], b = v->at9_ch > 1 ? v->pcm[v->pcm_pos * v->at9_ch + 1] : a;
+	*l = a / 32768.0f; *r = b / 32768.0f;
+	v->pcm_pos++; v->samples_gen += (uint32_t)v->at9_ch;   /* source samples, all channels (h_voice_state) */
+	return 1;
 }
 static void render_at9(Voice *v, float *out) {
 	uint32_t pp = v->params[0], cfg = RD32(pp + A_CONFIG);
@@ -714,70 +856,17 @@ static void render_at9(Voice *v, float *out) {
 	if (!(freq > 0)) freq = (float)sample_rate;
 	if (!(scal > 0)) scal = 1;
 	double step = freq * scal / sample_rate;
+	rs_init();
 	for (uint32_t f = 0; f < granularity; f++) {
-		while (v->pcm_pos >= v->pcm_len) {   /* the next frame */
-			int used = 0, e;
-			if (v->stage_on) {   /* inside a superframe joined from two buffers */
-				e = Atrac9Decode(v->at9, v->stage + v->stage_pos, v->pcm, &used);
-				if (e) { fprintf(stderr, "    ngs: ATRAC9 frame (joined superframe) failed (%d)\n", e); player_event(v, EV_DECODE_ERROR, v->byte_pos, 0); v->playing = 0; return; }
-				v->stage_pos += used;
-				if (++v->at9_frame >= v->at9_sf_frames) { v->at9_frame = 0; v->stage_on = 0; }
-				v->pcm_len = v->at9_samples; v->pcm_pos = 0;
-				if (dump_dir) dump_src(v, v->pcm, (uint32_t)v->at9_samples, (uint32_t)v->at9_ch, freq * scal);
-				continue;
-			}
-			if (v->buffer > 3) { v->playing = 0; return; }
-			uint32_t data = RD32(pp + A_BUF(v->buffer)), bytes = RD32(pp + A_BUF(v->buffer) + 4);
-			if (!data || !bytes) { v->at9_waited += granularity - f; return; }   /* waiting for the game to queue data */
-			if (v->byte_pos >= bytes) {   /* this buffer is done: repeat it, or move to the next */
-				int16_t loops = (int16_t)RD16(pp + A_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + A_BUF(v->buffer) + 10);
-				v->byte_pos = 0; v->at9_frame = 0;
-				if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
-				else {
-					uint32_t prev = v->buffer;
-					v->loops_done = 0; if (next < 0 || next > 3) { v->playing = 0; return; } v->buffer = next;
-					player_event(v, EV_SWAPPED, prev, RD32(pp + A_BUF(next)));
-					at9_log(v, pp, prev, "swap");
-				}
-				continue;
-			}
-			if (v->at9_frame == 0 && v->byte_pos + (uint32_t)v->at9_sf_bytes > bytes && v->at9_sf_bytes <= (int)sizeof v->stage) {
-				/* the superframe continues in the next buffer: join its two parts, then decode from the join */
-				uint32_t part = bytes - v->byte_pos;
-				memcpy(v->stage, G(data + v->byte_pos), part);
-				int16_t loops = (int16_t)RD16(pp + A_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + A_BUF(v->buffer) + 10);
-				if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
-				else {
-					uint32_t prev = v->buffer;
-					v->loops_done = 0; if (next < 0 || next > 3) { v->playing = 0; return; } v->buffer = next;
-					player_event(v, EV_SWAPPED, prev, RD32(pp + A_BUF(next)));
-					at9_log(v, pp, prev, "swap (joined)");
-				}
-				uint32_t ndata = RD32(pp + A_BUF(v->buffer));
-				if (!ndata) return;
-				memcpy(v->stage + part, G(ndata), (size_t)v->at9_sf_bytes - part);
-				v->byte_pos = (uint32_t)v->at9_sf_bytes - part; v->bytes_consumed += (uint32_t)v->at9_sf_bytes;
-				v->stage_on = 1; v->stage_pos = 0;
-				continue;
-			}
-			if (v->at9_frame == 0) v->at9_sf_start = v->byte_pos;
-			e = Atrac9Decode(v->at9, G(data + v->byte_pos), v->pcm, &used);
-			if (e || used <= 0) {
-				fprintf(stderr, "    ngs: ATRAC9 frame at %#x+%#x (buffer %u of %u bytes) failed (%d)\n", data, v->byte_pos, v->buffer, bytes, e);
-				player_event(v, EV_DECODE_ERROR, v->byte_pos, data); v->playing = 0; return;
-			}
-			/* within a superframe the next frame follows this one; after its last, the next superframe starts */
-			uint32_t was = v->byte_pos;
-			if (++v->at9_frame >= v->at9_sf_frames) { v->at9_frame = 0; v->byte_pos = v->at9_sf_start + v->at9_sf_bytes; }
-			else v->byte_pos += used;
-			v->bytes_consumed += v->byte_pos - was;
-			v->pcm_len = v->at9_samples; v->pcm_pos = 0; v->at9_decoded += (uint64_t)v->at9_samples;
-			if (dump_dir) dump_src(v, v->pcm, (uint32_t)v->at9_samples, (uint32_t)v->at9_ch, freq * scal);
+		while (v->frac >= 1.0) {   /* past the newest source sample: the next one */
+			float l, r; int st = fetch_at9(v, pp, freq * scal, &l, &r);
+			if (st == 0) { v->playing = 0; return; }
+			if (st == 2) { v->at9_waited += granularity - f; return; }
+			rs_push(v, l, r); v->frac -= 1.0;
 		}
-		int16_t l = v->pcm[v->pcm_pos * v->at9_ch], r = v->at9_ch > 1 ? v->pcm[v->pcm_pos * v->at9_ch + 1] : l;
-		out[2 * f] += l / 32768.0f; out[2 * f + 1] += r / 32768.0f;
+		float l, r; rs_read(v, step, &l, &r);
+		out[2 * f] += l; out[2 * f + 1] += r;
 		v->frac += step;
-		while (v->frac >= 1.0) { v->frac -= 1.0; v->pcm_pos++; v->samples_gen += (uint32_t)v->at9_ch; }   /* source samples, all channels (h_voice_state) */
 	}
 }
 
@@ -921,6 +1010,33 @@ static void route(Voice *v, const float *out, uint32_t gn) {
 	}
 }
 
+/* the master's limiter, before the s16 output: peaks over -1 dBFS are turned down instead of clipped. The gain follows
+ * what each sample needs over the next 1 ms of the granule (look-ahead inside it, no added latency), falls with a fast
+ * attack and recovers over 80 ms; anything still over the ceiling (a peak at a granule's very start) bends into it
+ * softly. Before 2026-10-28 the mix was cut at full scale: loud scenes crackled (Uncharted's mix once reached 16x full
+ * scale, 2026-10-13). RECOMP_NGS_LIMITER=0: the hard clip. */
+static void master_limit(Voice *v, float *acc, uint32_t gn) {
+	static int off = -1; if (off < 0) { const char *e = getenv("RECOMP_NGS_LIMITER"); off = e && !strcmp(e, "0"); }
+	if (off || gn > 4096) return;
+	const float ceil = 0.891f;   /* -1 dBFS */
+	const int la = (int)(sample_rate / 1000);
+	const float att = 1 - expf(-4.0f / (float)la), rel = 1 - expf(-1.0f / (0.08f * (float)sample_rate));
+	static float need[4096];
+	for (uint32_t k = 0; k < gn; k++) { float p = fmaxf(fabsf(acc[2 * k]), fabsf(acc[2 * k + 1])); need[k] = p > ceil ? ceil / p : 1; }
+	float g = 1 - v->lim_red;
+	for (uint32_t k = 0; k < gn; k++) {
+		float t = need[k]; for (uint32_t j = k + 1; j < gn && j < k + (uint32_t)la; j++) if (need[j] < t) t = need[j];
+		g += (t < g ? att : rel) * (t - g);
+		if (g < 0.944f) master_limited[VIDX(v)]++;   /* (more than 0.5 dB down) */
+		for (int c = 0; c < 2; c++) {
+			float y = acc[2 * k + c] * g, m = fabsf(y);
+			if (m > ceil) y = copysignf(ceil + (1 - ceil) * tanhf((m - ceil) / (1 - ceil)), y);
+			acc[2 * k + c] = y;
+		}
+	}
+	v->lim_red = 1 - g;
+}
+
 static void h_system_update(Cpu *c) {
 	/* the mixing is the DSP's work on the hardware, not the calling thread's: under the scheduler
 	 * (RECOMP_SCHED=vita) the thread gives its run slot up for it, and takes one back before the
@@ -1033,10 +1149,11 @@ static void h_system_update(Cpu *c) {
 	for (int i = 0; i < nvoices; i++) {
 		Voice *v = &voices[i];
 		if (!v->mix) continue;   /* master buses: the output granule */
+		if (dump_dir) for (uint32_t k = 0; k < 2 * gn; k++) master_clips[i] += v->acc[k] > 1 || v->acc[k] < -1;   /* (what a hard clip would cut) */
+		master_limit(v, v->acc, gn);
 		if (dump_dir) { char path[1024]; snprintf(path, sizeof path, "%s/master%d.wav", dump_dir, i); wav_put(&master_wav[i], path, sample_rate, 2, 3, v->acc, 2 * gn * 4); }
 		for (uint32_t k = 0; k < 2 * gn; k++) {
 			float s = v->acc[k] * 32767.0f;
-			if (dump_dir) master_clips[i] += s > 32767 || s < -32768;
 			v->mix[k] = (int16_t)(s > 32767 ? 32767 : s < -32768 ? -32768 : s);
 		}
 	}
