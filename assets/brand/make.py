@@ -4,7 +4,7 @@
   the icon      a Vita in outline, its screen lit amber, "nativ" beneath in white -- drawn per size: from 48 px down
                 the lines thicken and the letters spread; at 32 and 16 px the name goes (unreadable there) and the
                 Vita fills the square
-  the logo      the Vita with its screen empty, "nativ" beneath: the n white, "ativ" amber (Vita, backwards)
+  the logo      the Vita with its screen empty, "nativ" beneath: the n white, "ativ" amber
   the wordmark  "nativ", monoline lowercase, the same colouring
 
   python3 make.py     writes the SVGs, renders the PNGs (headless Chrome), builds nativ.icns (iconutil, macOS's

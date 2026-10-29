@@ -6,8 +6,6 @@ Project Nativ turns PS Vita games into native programs for macOS, Linux and Wind
 game. The tools recompile it on your machine, and it runs like any other program, with extras the Vita never had:
 higher resolutions, wider screens, 60 fps and mouse aiming, depending on the game.
 
-The name is "native" with the Vita inside it, spelled backwards: n·ATIV.
-
 ## How it works
 
 A Vita game is ARM code written against Sony's system software. Nativ handles the two separately.
@@ -124,6 +122,9 @@ the projects parts of Nativ are ported from.
 
 Nativ contains no Sony or game code. You supply your own games and the firmware from Sony's site; the games are
 recompiled on your machine and never leave it.
+
+Nativ is made with the help of AI: much of its code and documentation was written with Anthropic's Claude, under its
+developer's direction, and tested on the games themselves.
 
 ## Supporting Nativ
 
