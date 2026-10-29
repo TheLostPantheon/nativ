@@ -72,7 +72,7 @@ int window_gyro_present(void);
 void motion_recenter(void);
 void window_controls_row(int i, const char **action, const char **key, const char **pad);
 /* gfx_gpu.c: the GPU backend's internal resolution (1-gfx_gpu_render_scale_max) and F2's own cycle */
-int gfx_gpu_render_scale(void); void gfx_gpu_render_scale_request(int n); void gfx_gpu_render_scale_cycle(void); int gfx_gpu_render_scale_max(void);
+int gfx_gpu_render_scale(void); int gfx_gpu_render_scale_wanted(void); void gfx_gpu_render_scale_request(int n); void gfx_gpu_render_scale_cycle(void); int gfx_gpu_render_scale_max(void);
 int gfx_gpu_hud_supported(void);   /* the game names its HUD draws (RECOMP_HUD_DRAWS): the HUD row applies */
 int gfx_gpu_ssao_supported(void);   /* the game names its main 3D scene (RECOMP_SSAO): the ambient occlusion rows apply */
 int gfx_gpu_target_scale_supported(void);   /* the game names buffers it draws below the screen's resolution (RECOMP_TARGET_SCALE) */
@@ -258,7 +258,7 @@ static void slider_row(const char *id, float *v, float lo, float hi, const char 
 static void page_display(void) {
 	if (!ui::rows_begin("display")) return;
 	ui::row("Resolution", "The game drawn at a multiple of the Vita's 960 × 544. Higher is sharper; 4× and up want a fast GPU.");
-	{	int rs = gfx_gpu_render_scale(), mx = gfx_gpu_render_scale_max(), v = rs - 1;
+	{	int rs = gfx_gpu_render_scale_wanted(), mx = gfx_gpu_render_scale_max(), v = rs - 1;   /* (a pick shows at once: it applies at the game's next scene) */
 		static char names[8][16]; const char *labels[8];
 		for (int n = 1; n <= mx && n <= 8; n++) { std::snprintf(names[n - 1], sizeof names[0], "%d×##rs", n); labels[n - 1] = names[n - 1]; }
 		if (ui::segmented(labels, mx < 8 ? mx : 8, &v)) gfx_gpu_render_scale_request(v + 1);
@@ -604,7 +604,7 @@ static void menu_game(void) {
 }
 static void menu_view(void) {
 	if (ImGui::BeginMenu("Resolution")) {
-		int rs = gfx_gpu_render_scale();
+		int rs = gfx_gpu_render_scale_wanted();
 		for (int n = 1; n <= gfx_gpu_render_scale_max(); n++) { char l[48]; scale_label(l, sizeof l, n); if (ImGui::MenuItem(l, nullptr, rs == n)) gfx_gpu_render_scale_request(n); }
 		ImGui::Separator();
 		int mw = scale_for_window();

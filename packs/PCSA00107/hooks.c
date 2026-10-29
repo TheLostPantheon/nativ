@@ -668,15 +668,16 @@ static void kz_stall_long(uint64_t stall_us) {   /* stallprof.c's hook_stall_lon
 __attribute__((constructor)) static void kz_stall_hook(void) { hook_stall_long = kz_stall_long; }
 
 /*
- * Killzone: Mercenary (PCSA00107) doubled dialogue (2026-10-25). A line plays to its end and 0.4-0.7 s later the same line
- * starts again on the same voice: 8 of 373 speech plays in a 14-minute test session, 6 of them in one conversation.
- * Every stream voice starts in Scream's own tick: snd_ProcessStreamTick (fn_8179df98) -> sndsi_PlayStreamVoice
- * (fn_8179d8f8, r1 = the stream's state; its name at [[r1 + 0x1b74] + 0x198], as its "BufferLocationTracker full" error
- * prints it) -> the play request fn_8178fb5a, the one writer of the play-command word. The gap fits a stream restarted
- * from its start and read again. RECOMP_KZ_SND_REQ=1 logs each stream voice start by name (kz_strm_voice), and the
- * game's calls into the stream API (kz_strm_api: fn_8179a282 and fn_8179a134, called from the game's sound wrapper at
- * 0x81227e00-0x81228900) with the game's call chain: a repeat then shows whether the game asked twice or Scream
- * restarted the stream by itself.
+ * Killzone: Mercenary (PCSA00107, 1.12) said a line twice (2026-10-25..28): at 60 fps the same line again ~0.7 s after it
+ * ended, several times a conversation, now and then. How a line is said: the AI sets "say" in its state; each character's
+ * apply (fn_814b075a, or fn_8142363e for another controller class; job threads, every frame) reads the replicated copy of
+ * that state and, while its say flag (+0xf0) is set, either sends a type 0x45 speech message, which the main thread turns
+ * into a queued request (QueueSpeech fn_8148a912), or queues the request directly. The character says its queue's head
+ * (fn_8147ff5c -> SayLine fn_8147f886) and the next one after the line's length plus a pause. At 60 fps one snapshot's say
+ * can be read by two applies (every double seen: exactly 2 frames apart), so the line went into the queue twice. Fix: a say
+ * is queued once per snapshot (kz_speech_once on the message route, kz_say_send / kz_say_direct on the direct ones).
+ * RECOMP_KZ_SND_REQ=1 logs stream voice starts (kz_strm_voice), the game's stream API calls (kz_strm_api), every SayLine
+ * with its behaviour's call chain (kz_say) and every say the fix turns away.
  */
 void ngs_chain(char *out, size_t n);
 static int kz_snd_req(void) { static int on = -1; if (on < 0) { const char *e = getenv("RECOMP_KZ_SND_REQ"); on = e && atoi(e) > 0; } return on; }
@@ -710,3 +711,51 @@ static void kz_strm_api(Cpu *c, const char *which) {
 }
 void recomp_hook_kz_strm_api_a(Cpu *c) { kz_strm_api(c, "8179a282"); }
 void recomp_hook_kz_strm_api_b(Cpu *c) { kz_strm_api(c, "8179a134"); }
+/* a character's SayLine (fn_8147f886, via fn_8147fbfc from the behaviours fn_8147ff5c and fn_81480378): schedules Say
+ * (fn_814a2c10: stops the character's current speech, plays the line) and returns the line's length plus a pause */
+void recomp_hook_kz_say(Cpu *c) {
+	if (!kz_snd_req()) return;
+	char chain[600]; ngs_chain(chain, sizeof chain);
+	fprintf(stderr, "    kz snd: say char %#x line %#x r2 %#x r3 %#x s0 %.3f frame %llu from %s\n", c->r[0], c->r[1], c->r[2], c->r[3], c->vfp.f[0],
+	        (unsigned long long)display_frames(), chain);
+}
+static int kz_say_twice(uint32_t ctl, uint32_t src, const char *where) {
+	const uint64_t now = display_frames();
+	static struct { uint32_t ctl, src; uint64_t at; } last[64]; static int n;
+	int i; for (i = 0; i < n && last[i].ctl != ctl; i++) {}
+	if (i == n) { if (n == 64) i = (int)(now % 64); else n++; last[i].ctl = ctl; last[i].src = 0; last[i].at = 0; }
+	const int again = last[i].src == src && src && now - last[i].at <= 3;
+	if (kz_snd_req()) fprintf(stderr, "    kz snd: say %s %s controller %#x src %#x frame %llu\n", where, again ? "DROPPED (same snapshot again)" : "queued directly", ctl, src, (unsigned long long)now);
+	if (!again) { last[i].src = src; last[i].at = now; }
+	return again;
+}
+void recomp_ihook_kz_say_send(Cpu *c, int reg) {
+	(void)reg;
+	if (!c->r[0]) return;
+	const uint32_t sl = c->r[10], fp = c->r[11], ent = RD32(sl + 0x20);
+	if (ent && RD32(ent + 0x110)) { if (kz_snd_req()) fprintf(stderr, "    kz snd: say send copy %#x frame %llu\n", fp, (unsigned long long)display_frames()); return; }
+	if (kz_say_twice(sl, RD32(fp + 0xf4), "(814b075a)")) c->r[0] = 0;
+}
+void recomp_ihook_kz_say_direct(Cpu *c, int reg) {
+	(void)reg;
+	if (!c->r[0]) return;
+	if (kz_say_twice(c->r[4], RD32(c->r[5] + 0xf4), "(8142363e)")) c->r[0] = 0;
+}
+/* the message route: QueueSpeech (fn_8148a912, the main thread) just after it loads the character's speech state
+ * (0x8148a91a: r4 = [r7 + 0x164], 0 = nothing to queue; r7 = the character, r1 = the message, its line id at +0xc): the same
+ * line for the same character again within half a second is the same snapshot sent twice, turned away the function's own
+ * way (r4 = 0). A line said again on purpose comes much later. */
+void recomp_ihook_kz_speech_once(Cpu *c, int reg) {
+	(void)reg;
+	if (!c->r[4]) return;
+	const uint32_t ch = c->r[7], id = RD32(c->r[1] + 0xc);
+	const uint64_t now = display_frames();
+	static struct { uint32_t ch, id; uint64_t at; } last[64]; static int n;
+	int i; for (i = 0; i < n && last[i].ch != ch; i++) {}
+	if (i == n) { if (n == 64) i = (int)(now % 64); else n++; last[i].ch = ch; last[i].id = 0; last[i].at = 0; }
+	if (last[i].id == id && now - last[i].at <= 30) {
+		if (kz_snd_req()) fprintf(stderr, "    kz snd: speech %#x for char %#x again %llu frames later: not queued twice (frame %llu)\n", id, ch, (unsigned long long)(now - last[i].at), (unsigned long long)now);
+		c->r[4] = 0; return;
+	}
+	last[i].id = id; last[i].at = now;
+}

@@ -1676,6 +1676,7 @@ void gfx_gpu_render_scale_request(int n) {
 	__atomic_store_n(&rscale_req, n, __ATOMIC_RELAXED);
 }
 int gfx_gpu_render_scale(void) { return rscale; }
+int gfx_gpu_render_scale_wanted(void) { const int r = __atomic_load_n(&rscale_req, __ATOMIC_RELAXED); return r ? r : rscale; }   /* (the menus' pick: a request waits for the next scene, and the game is paused under the menu) */
 static uint16_t f2h(float f) {   /* round-to-nearest-even half, with the specials */
 	uint32_t b; memcpy(&b, &f, 4);
 	uint32_t s = (b >> 16) & 0x8000, e = (b >> 23) & 0xff, m = b & 0x7fffff;
