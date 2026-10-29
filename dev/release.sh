@@ -21,7 +21,7 @@
 # This machine's own values for these (a signing identity, a profile name) go in dev/local.env, which git ignores.
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$H")
-[[ -f $ROOT/dev/local.env ]] && source "$ROOT/dev/local.env"
+[[ -f $ROOT/dev/local.env ]] && { set -a; source "$ROOT/dev/local.env"; set +a; }   # (exported: the install scripts and vitarecomp dist read them)
 TAG=${1:?usage: release.sh <tag> [mac|windows|linux]...}; shift
 [[ $TAG =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "release.sh: a tag like v0.1.0"; exit 1; }
 if (( $# )); then

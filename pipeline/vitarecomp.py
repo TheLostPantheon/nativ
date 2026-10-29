@@ -815,14 +815,18 @@ def cmd_update_check():
     except (OSError, ValueError): pass
     if latest is None:
         import ssl, urllib.request
-        req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest", headers={"User-Agent": "ProjectNativ", "Accept": "application/vnd.github+json"})
+        # (the release list, not /releases/latest: that one leaves out pre-releases, and beta builds are published as those)
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases?per_page=30", headers={"User-Agent": "ProjectNativ", "Accept": "application/vnd.github+json"})
         ctx = ssl.create_default_context()
         for ca in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"):   # (a standalone Python finds no system store on macOS and Linux)
             if os.path.isfile(ca): ctx.load_verify_locations(ca); break
         try:
-            with urllib.request.urlopen(req, timeout=6, context=ctx) as r: d = json.load(r)
+            with urllib.request.urlopen(req, timeout=6, context=ctx) as r: rels = json.load(r)
         except Exception as e: say(f"update-check: {repo}: {e}"); return
-        latest = {"repo": repo, "at": now, "tag": d.get("tag_name", ""), "page": d.get("html_url", "")}
+        best = {"tag_name": "", "html_url": ""}   # (the highest vX.Y.Z tag; a draft, or a tag named otherwise, is never offered)
+        for d in rels if isinstance(rels, list) else []:
+            if not d.get("draft") and release_newer(d.get("tag_name", ""), best["tag_name"] or "v0.0.0"): best = d
+        latest = {"repo": repo, "at": now, "tag": best.get("tag_name", ""), "page": best.get("html_url", "")}
         try:
             os.makedirs(os.path.dirname(cache), exist_ok=True)
             with open(cache, "w", encoding="utf-8") as f: json.dump(latest, f)
