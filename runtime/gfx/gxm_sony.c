@@ -769,11 +769,15 @@ static void o_transfer_fill(Cpu *c) {
 	transfer_end("fill", t0, width, height, 0, base, dst_fmt);
 }
 
+/* sceGxmDisplayQueueAddEntry: the game's frame is done, on the thread that drew it (the flip itself lands later, on the
+ * display queue's thread: gfx_present) -- the motion vectors' frame boundary (gfx_gpu.c mv_frame_end) */
+static void o_display_queue(Cpu *c) { (void)c; gfx_frame_queued(); }
 static const HleEntry observers[] = {
 	{"sceGxmFinish", o_finish}, {"sceGxmShaderPatcherRegisterProgram", o_register_program},
 	{"sceGxmDraw", o_draw}, {"sceGxmDrawInstanced", o_draw_instanced}, {"sceGxmDrawPrecomputed", o_draw_precomputed},
 	{"sceGxmBeginScene", o_begin_scene}, {"sceGxmBeginSceneEx", o_begin_scene_ex}, {"sceGxmSetRegionClip", o_set_region_clip}, {"sceGxmEndScene", o_end_scene},
 	{"sceGxmTransferCopy", o_transfer_copy}, {"sceGxmTransferDownscale", o_transfer_downscale}, {"sceGxmTransferFill", o_transfer_fill},
+	{"sceGxmDisplayQueueAddEntry", o_display_queue},
 	{"sceGxmSetVisibilityBuffer", o_vis_buffer}, {"sceGxmSetFrontVisibilityTestEnable", o_vis_enable}, {"sceGxmSetFrontVisibilityTestIndex", o_vis_index}, {"sceGxmSetFrontVisibilityTestOp", o_vis_op}, {"sceGxmSetFrontDepthBias", o_depth_bias},
 	{0, 0},
 };

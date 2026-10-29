@@ -24,6 +24,10 @@
  *     before it turns a mouse event into a touch, so a click or drag on the bar never reaches the
  *     game. Also here: a one-time hint toast (settings key menu_hint_shown), Game > Pause without
  *     the menu, and the OS cursor hidden after a few seconds still over the picture.
+ *   - the shader prep card (build_prep): a start whose shader warm-up would take more than a few seconds (gfx_gpu.c's
+ *     shader prep: a first start, an update's new recipes, a cleared OS cache) pauses the game under it with the
+ *     progress and Skip; it closes by itself when the builds are done. Skipped (or closed any way: Escape, F10, the
+ *     quit card's Keep playing), the builds go on behind the game with a line in the corner until they're done.
  *   - the touch card (build_intro): the first game a player starts shows it over the game, paused as Game > Pause
  *     pauses it, so input keeps its in-game path (the hidden, captured mouse, Alt's touch pointer, a bumper's
  *     crosshair, the touchpad's marks): how to touch the Vita's screen with a keyboard and mouse, a controller or a
@@ -75,7 +79,9 @@ void window_controls_row(int i, const char **action, const char **key, const cha
 int gfx_gpu_render_scale(void); int gfx_gpu_render_scale_wanted(void); void gfx_gpu_render_scale_request(int n); void gfx_gpu_render_scale_cycle(void); int gfx_gpu_render_scale_max(void);
 int gfx_gpu_hud_supported(void);   /* the game names its HUD draws (RECOMP_HUD_DRAWS): the HUD row applies */
 int gfx_gpu_ssao_supported(void);   /* the game names its main 3D scene (RECOMP_SSAO): the ambient occlusion rows apply */
+int gfx_gpu_fsr_supported(void);   /* the game's pack verified FSR 3.1 (RECOMP_FSR_SUPPORTED): the anti-aliasing row offers it */
 int gfx_gpu_target_scale_supported(void);   /* the game names buffers it draws below the screen's resolution (RECOMP_TARGET_SCALE) */
+int gfx_gpu_shader_prep(int *done, int *total, double *eta_s); void gfx_gpu_shader_prep_skip(void);   /* the shader prep card's state (build_prep) */
 /* window.c: the swapchain's size in pixels (0 x 0 before the first frame); wider aspect support */
 void window_pixel_size(uint32_t *w, uint32_t *h);
 int window_aspect_supported(void);
@@ -103,6 +109,9 @@ static bool g_has_window;      /* overlay_init was given a real SDL_Window: the 
 static std::atomic<bool> g_open, g_want_quit, g_want_capture, g_paused;
 static std::atomic<bool> g_intro;                 /* the touch card is up (the game paused under it) */
 static void intro_end(void); static void build_intro(void);
+static std::atomic<bool> g_prep_card;             /* the shader prep card is up (in the menu's open state: the game paused, input to the card) */
+static int g_prep_demo[3] = {-1, 0, 0};           /* RECOMP_OVERLAY_DUMP_UI=prep: the card with these numbers (done, total, seconds left) */
+static void build_prep(void); static void build_prep_corner(float w, float hgt, int done, int total);
 static std::atomic<bool> g_quit_card;             /* the quit card is (overlay_quit_confirm) */
 
 int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt) {
@@ -150,6 +159,7 @@ static void intro_end(void) {   /* the touch card, done or skipped: never again 
 }
 void overlay_close(void) {   /* closing the menu resumes: a Game > Pause doesn't outlive it */
 	intro_end();
+	if (g_prep_card) { g_prep_card = false; gfx_gpu_shader_prep_skip(); }   /* (the card closed before the builds were done: Skip) */
 	g_quit_card = false;
 	g_open = false; g_paused = false; apply_pause();
 }
@@ -303,8 +313,15 @@ static void page_display(void) {
 	}
 	ui::row("Fullscreen");
 	{ bool fs = window_get_fullscreen() != 0; if (ui::toggle("fs", &fs)) window_set_fullscreen(fs ? 1 : 0); }
-	ui::row("Anti-aliasing", "Smooths jagged edges (FXAA).");
-	{ bool aa = settings_int("post_aa", 1) != 0; if (ui::toggle("aa", &aa)) { settings_set_int("post_aa", aa ? 1 : 0); settings_save(); } }
+	if (gfx_gpu_fsr_supported()) {   /* (this game's FSR is verified: the anti-aliasing is a choice) */
+		ui::row("Anti-aliasing", "Smooths jagged edges. FXAA: a light pass on the finished frame. FSR 3.1 (experimental): AMD's temporal anti-aliasing on the 3D world, steadier and cleaner, at a GPU cost; some surfaces may still shimmer (F4 compares it live).");
+		static const char *const names[3] = {"Off##aam", "FXAA##aam", "FSR 3.1 (experimental)##aam"};
+		int v = settings_int("fsr", 0) ? 2 : settings_int("post_aa", 1) ? 1 : 0;
+		if (ui::segmented(names, 3, &v)) { settings_set_int("fsr", v == 2); settings_set_int("post_aa", v == 1); settings_save(); }
+	} else {
+		ui::row("Anti-aliasing", "Smooths jagged edges (FXAA).");
+		{ bool aa = settings_int("post_aa", 1) != 0; if (ui::toggle("aa", &aa)) { settings_set_int("post_aa", aa ? 1 : 0); settings_save(); } }
+	}
 	ui::row("Sharpening", "Brings back detail lost to scaling and anti-aliasing.");
 	{	float sh = (float)settings_float("sharpen", 0.35) * 100.0f;
 		ImGui::SetNextItemWidth(-FLT_MIN);
@@ -991,6 +1008,12 @@ static void build_closed(void) {
 		const float target = g_bar_want ? 1.0f : 0.0f, step = dt > 0.1f ? 1.0f : dt / SLIDE_S;
 		g_bar_vis += target > g_bar_vis ? fminf(step, target - g_bar_vis) : -fminf(step, g_bar_vis - target);
 	}
+	if (g_has_window) {   /* the shader prep (gfx_gpu.c): the card when it asks (after the touch card), the corner line while skipped, a toast when done */
+		int done, total; double eta; const int ps = gfx_gpu_shader_prep(&done, &total, &eta);
+		if (ps == 1 && !g_intro && !g_open) { g_prep_card = true; g_open = true; apply_pause(); }
+		else if (ps == 2 && total > 0) build_prep_corner(w, hgt, done, total);
+		else if (ps == 3) overlay_toast_titled("Shaders ready", "Built for this computer: no more pauses to build them.", 4.0);
+	}
 	if (g_bar_vis > 0) build_bar(w);
 	if (g_tab_a > 0) build_tab(w, t);
 	if (g_intro) build_intro();   /* (the touch card in place of the pause banner; the markers drawn over it) */
@@ -1234,6 +1257,62 @@ static void build_intro(void) {
 	ImGui::End();
 	ImGui::PopStyleVar();
 }
+/* ---- the shader prep card and its corner line (this file's header) */
+static void fmt_count(char *out, size_t n, int v) {   /* 5837 -> "5,837" */
+	char d[16]; snprintf(d, sizeof d, "%d", v); const int len = (int)strlen(d); size_t o = 0;
+	for (int i = 0; i < len && o + 1 < n; i++) { if (i && (len - i) % 3 == 0 && o + 1 < n) out[o++] = ','; out[o++] = d[i]; }
+	out[o] = 0;
+}
+static void build_prep_corner(float w, float hgt, int done, int total) {
+	char line[64]; snprintf(line, sizeof line, "Building shaders %d%%", total ? (int)(100.0 * done / total) : 0);
+	ImFont *font = ImGui::GetFont(); const float fs = ImGui::GetFontSize(), pad = fs * 0.5f;
+	const ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, line);
+	const ImVec2 p0(w - sz.x - 3 * pad, hgt - sz.y - 3 * pad), p1(w - pad, hgt - pad);
+	ImDrawList *dl = ImGui::GetBackgroundDrawList();   /* (under the bar and its menus, like the HUD) */
+	dl->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 150), fs * 0.3f);
+	dl->AddText(font, fs, ImVec2(p0.x + pad, p0.y + pad * 0.6f), IM_COL32(220, 220, 228, 255), line);
+	const float bx0 = p0.x + pad, bx1 = p1.x - pad, by = p1.y - pad * 0.7f;
+	dl->AddLine(ImVec2(bx0, by), ImVec2(bx1, by), IM_COL32(255, 255, 255, 50), 2.0f);
+	if (total) dl->AddLine(ImVec2(bx0, by), ImVec2(bx0 + (bx1 - bx0) * done / total, by), ui::u32(ui::accent, 1.0f), 2.0f);
+}
+static void build_prep(void) {
+	int done, total; double eta; int ps = 1;
+	if (g_prep_demo[0] >= 0) { done = g_prep_demo[0]; total = g_prep_demo[1]; eta = g_prep_demo[2]; }
+	else ps = gfx_gpu_shader_prep(&done, &total, &eta);
+	if (ps != 1) {   /* the builds are done (or the card was never meant): back to the game */
+		g_prep_card = false; g_open = false; g_paused = false; apply_pause();
+		if (ps == 3) overlay_toast_titled("Shaders ready", "Built for this computer: no more pauses to build them.", 4.0);
+		return;
+	}
+	const ImGuiViewport *vp = ImGui::GetMainViewport(); const float em = ImGui::GetFontSize();
+	ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), ui::u32(ui::bg, 0.78f));   /* (the paused game, dimmed behind it) */
+	const float cw = fminf(vp->Size.x - 2 * em, 30 * em);
+	ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSizeConstraints(ImVec2(cw, 0), ImVec2(cw, vp->Size.y - 2 * em));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.4f, em * 1.2f));
+	ImGui::Begin("##prepcard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+	ui::heading("Preparing shaders", em * 1.35f);
+	const char *game = std::getenv("RECOMP_GAME_NAME"); char body[256];
+	snprintf(body, sizeof body, "Building %s's shaders for this computer, so it plays without pauses. This happens once: later starts are quick.", game && *game ? game : "the game");
+	ImGui::TextWrapped("%s", body);
+	ImGui::Dummy(ImVec2(0, em * 0.3f));
+	char a[16], b[16], over[48]; fmt_count(a, sizeof a, done); fmt_count(b, sizeof b, total); snprintf(over, sizeof over, "%s of %s", a, b);
+	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ui::accent);
+	ImGui::ProgressBar(total ? (float)done / (float)total : 0.0f, ImVec2(-1, em * 1.4f), over);
+	ImGui::PopStyleColor();
+	char left[64];
+	if (eta < 0) snprintf(left, sizeof left, "Working out the time left");
+	else if (eta < 60) snprintf(left, sizeof left, "Less than a minute left");
+	else snprintf(left, sizeof left, "About %d minute%s left", (int)ceil(eta / 60), eta > 60 ? "s" : "");
+	ui::muted_wrapped(left);
+	ImGui::Dummy(ImVec2(0, em * 0.4f));
+	if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	if (ImGui::Button("Skip")) overlay_close();   /* (closing is Skip: overlay_close) */
+	ImGui::Dummy(ImVec2(0, em * 0.2f));
+	ui::muted_wrapped("Skipping starts the game now. You may see short pauses until the shaders are built: they keep building while you play.");
+	ImGui::End();
+	ImGui::PopStyleVar();
+}
 /* ---- the quit card (this file's header) */
 static void build_quit(void) {
 	const ImGuiViewport *vp = ImGui::GetMainViewport(); const float em = ImGui::GetFontSize();
@@ -1258,7 +1337,7 @@ static void build_quit(void) {
 }
 void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s) {
 	if (!overlay_is_open()) return;
-	render_frame(cmd, target, w, h, dt_s, g_has_window, g_quit_card ? build_quit : build_ui);
+	render_frame(cmd, target, w, h, dt_s, g_has_window, g_quit_card ? build_quit : g_prep_card ? build_prep : build_ui);
 }
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
@@ -1303,6 +1382,7 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 		return;
 	}
 	if (!strcmp(ui, "quit")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_quit); return; }   /* (the quit card) */
+	if (!strcmp(ui, "prep")) { g_prep_demo[0] = 1240; g_prep_demo[1] = 5837; g_prep_demo[2] = 372; for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_prep); g_prep_demo[0] = -1; return; }   /* (the shader prep card, example numbers) */
 	if (!strncmp(ui, "intro", 5)) {   /* "intro", "intro:pad", "intro:touch": the touch card with that device highlighted; "@<seconds>" after it, that moment of its loop */
 		const char *at = strchr(ui, '@');
 		g_intro_dev = !strncmp(ui, "intro:pad", 9) ? DEV_PAD : !strncmp(ui, "intro:touch", 11) ? DEV_TOUCH : DEV_KBM; g_intro_done = -1; g_intro_at = at ? atof(at + 1) : 0;

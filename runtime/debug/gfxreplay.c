@@ -275,6 +275,7 @@ int main(int argc, char **argv) {
 			uint32_t p[5]; memcpy(p, buf, sizeof p);
 			if (dump) { printf("present %#x %ux%u pitch %u fmt %#x\n", p[0], p[1], p[2], p[3], p[4]); continue; }
 			gfx_present(p[0], p[1], p[2], p[3], p[4]);
+			{ extern void gfx_frame_queued(void); gfx_frame_queued(); }   /* (as the display queue's observer: RECOMP_MV's frames) */
 			write_frame(outp, p[0], p[1], p[2], p[3]);
 		} else if (!memcmp(tag, "DONE", 4)) break;
 		else { fprintf(stderr, "unknown record %.4s\n", tag); return 1; }
@@ -293,3 +294,4 @@ int main(int argc, char **argv) {
 /* replays compare against the software path: no anisotropic filtering unless RECOMP_ANISO asks (gfx_gpu.c aniso_want) */
 __attribute__((constructor)) static void replay_aniso_default(void) { setenv("RECOMP_ANISO", "1", 0); setenv("RECOMP_SHADOW_FILTER", "0", 0); }   /* (replays compare against the software path: no anisotropy, the game's own one-tap shadows, unless asked) */
 float window_aspect_widen(void) { const char *e = getenv("RECOMP_REPLAY_WIDEN"); return e ? (float)atof(e) : 1.0f; }   /* RECOMP_REPLAY_WIDEN=k: test the wider-x paths */
+void overlay_toast(const char *msg, double seconds) { (void)msg; (void)seconds; }   /* (F4's FSR toggle says so on screen: no window here) */

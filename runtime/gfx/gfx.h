@@ -200,6 +200,8 @@ void gfx_begin_scene(const GfxTarget *t);
 void gfx_draw(const GfxDraw *d);
 void gfx_end_scene(void);
 void gfx_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format);
+void gfx_frame_queued(void);   /* sceGxmDisplayQueueAddEntry, on the game's thread: its frame is done (the motion vectors' frame boundary) */
+void gfx_shader_prep_tick(void);   /* the window's loop while the game is paused: the shader warm-up steps on (gfx_gpu.c's shader prep card) */
 void gfx_sync_to_guest(void);   /* the active backend's render targets written back to guest memory */
 
 /* each backend (gfx_soft.c, gfx_gpu.c) implements this same set under its own prefix; gfx_dispatch.c forwards to one */
@@ -213,6 +215,11 @@ extern int gfx_soft_skip_window;    /* the GPU backend has shown this frame itse
 void gfx_gpu_begin_scene(const GfxTarget *t);
 void gfx_gpu_draw(const GfxDraw *d);
 void gfx_gpu_end_scene(void);
+void gfx_gpu_frame_queued(void);
+int gfx_gpu_mv_on(void);   /* the motion vectors are on (RECOMP_MV, or RECOMP_FSR which needs them): no lock needed */
+void gfx_gpu_shader_prep_tick(void);
+int gfx_gpu_shader_prep(int *done, int *total, double *eta_s);   /* the shader prep card's state for the overlay: no lock needed */
+void gfx_gpu_shader_prep_skip(void);
 void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format);
 int gfx_gpu_readbacks_due(void **fences, int max);   /* under the renderer lock, right before present: the fences of the readbacks present would wait for, pinned for the caller (gfx_gpu.c) */
 void gfx_gpu_readbacks_wait(void **fences, int n);   /* with the lock released: wait for them -- the presenting thread pacing itself to the GPU, not renderer time */
@@ -225,6 +232,7 @@ typedef struct { uint32_t draws, fallback, shaders, pipes, tex_uploads, tex_new,
 	const char *fb_why[4]; uint32_t fb_n[4];   /* why the software-path draws went there (the first four reasons) */
 	uint32_t nshaders, npipes; } GfxGpuFrameCosts;   /* the shader and pipeline tables' sizes so far (each has a fixed capacity) */
 void gfx_gpu_last_frame_costs(GfxGpuFrameCosts *out);
+void gfx_gpu_builds_stop(void);   /* before exit(): the build workers stop (gfx_gpu.c) */
 void gfx_gpu_builds_wait(void);   /* asynchronous shader/pipeline builds (RECOMP_GPU_ASYNC): wait for every queued one */
 void gfx_gpu_guest_writing(uint32_t addr, uint32_t len);   /* guest memory is about to change behind the GPU's back: overlapping GPU-drawn targets download first */
 void gfx_gpu_guest_written(uint32_t addr, uint32_t len);   /* ... and has changed: overlapping targets re-upload before their next GPU use */

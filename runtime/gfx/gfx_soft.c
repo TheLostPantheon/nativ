@@ -2421,7 +2421,7 @@ void gfx_soft_present(uint32_t base, uint32_t width, uint32_t height, uint32_t p
 	init();
 	if ((long)frame == dump_frame) fprintf(stderr, " present frame %llu: %u draws\n", (unsigned long long)frame, ndraw);
 	if (shot_every && frame % shot_every == 0 && shot_window()) shot(base, width, height, pitch);
-	if (shot_last >= 0 && (long)frame >= shot_last) { fprintf(stderr, "frame %llu shot: the last one asked for (RECOMP_SHOT_LAST), exiting\n", (unsigned long long)frame); fflush(stderr); exit(0); }   /* a scripted test used to run to its timeout: minutes for a frame that takes seconds */
+	if (shot_last >= 0 && (long)frame >= shot_last) { fprintf(stderr, "frame %llu shot: the last one asked for (RECOMP_SHOT_LAST), exiting\n", (unsigned long long)frame); fflush(stderr); gfx_gpu_builds_stop(); exit(0); }   /* a scripted test used to run to its timeout: minutes for a frame that takes seconds */
 	usse_profile_report();
 	extern void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch);
 	if (format == 0 && !gfx_soft_skip_window) window_present(base, width, height, pitch);   /* A8B8G8R8 */

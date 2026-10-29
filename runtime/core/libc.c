@@ -302,7 +302,8 @@ static void h_errno_loc(Cpu *c) { static uint32_t e; if (!e) e = guest_alloc(4, 
 static void h_guard_acquire(Cpu *c) { RET(!(RD8(A0) & 1)); }
 static void h_guard_release(Cpu *c) { WR8(A0, RD8(A0) | 1); }
 static void h_abort(Cpu *c) { (void)c; fprintf(stderr, "game called abort()\n"); exit(4); }
-static void h_exit(Cpu *c) { fprintf(stderr, "game called exit(%d)\n", (int)A0); exit(0); }
+void gfx_gpu_builds_stop(void);
+static void h_exit(Cpu *c) { fprintf(stderr, "game called exit(%d)\n", (int)A0); gfx_gpu_builds_stop(); exit(0); }   /* (the shader workers first: gfx.h) */
 static void h_stack_chk_fail(Cpu *c) { (void)c; fprintf(stderr, "stack check failed (stack smashing detected)\n"); exit(4); }
 
 /* ---- more of the C runtime */

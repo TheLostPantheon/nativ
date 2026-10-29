@@ -162,6 +162,12 @@ void gfx_end_scene(void) {
 	LOCKED(rc_on_end_scene(); gfxcap_end_scene(); if (gpu_backend()) gfx_gpu_end_scene(); else gfx_soft_end_scene());
 	if (m) metrics_add_render(now_us() - t0);
 }
+void gfx_frame_queued(void) {   /* (the game's thread: under the lock, as its draws; only the motion vectors use it: RECOMP_MV, RECOMP_FSR) */
+	if (gpu_backend() && gfx_gpu_mv_on()) LOCKED(gfx_gpu_frame_queued());
+}
+void gfx_shader_prep_tick(void) {   /* (the window's loop while the game is paused: gfx_gpu.c's shader prep) */
+	if (gpu_backend()) LOCKED(gfx_gpu_shader_prep_tick());
+}
 /* present: a readback the GPU has not finished and that present would wait for (gfx_gpu.c readbacks_complete_at_present:
  * RECOMP_GPU_READBACK_AGE presents old) is waited for BEFORE the lock is taken, so the render thread keeps recording the
  * next frame; under the lock the wait held it for as long as the GPU was behind (10-15 ms a frame at render scale 3) and

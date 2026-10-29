@@ -12,6 +12,7 @@ listed under "Ported from". Each keeps its own licence, whose text travels with 
 | [stb_image and stb_image_write](https://github.com/nothings/stb) | 2.28 and 1.16 | MIT or public domain, your choice | `third_party/stb/` (the licence closes each header) |
 | [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) | | MIT | `third_party/libatrac9/` (`LICENSE`) |
 | [Monocypher](https://monocypher.org) | 4.0.2 | BSD 2-clause or CC0, your choice | `third_party/monocypher/` (`LICENCE.md`) |
+| [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK): FSR 3.1's upscaler shaders | v1.1.4 | MIT | `third_party/fidelityfx/` (`LICENSE.txt`); compiled into `runtime/gfx/fsr_shaders.h` |
 | HE-VAG coefficients from [vgmstream](https://github.com/vgmstream/vgmstream) | | ISC | `third_party/hevag/hevag_coefs.h` (in its header) |
 | [Input Prompts](https://kenney.nl/assets/input-prompts) by Kenney: the touch card's button icons | 1.5A | CC0 1.0 | `third_party/kenney-prompts/` (`License.txt`; `make.py` packs `prompts.png` from it) |
 

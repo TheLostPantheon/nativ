@@ -19,6 +19,7 @@
  */
 #include <SDL3/SDL.h>
 #include "gpulock.h"   /* every SDL submit/fence call below is the locked one: Homebrew SDL 3.4.16's Metal fence race, see that header */
+#include "fsr/fsr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,7 +175,7 @@ extern void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch
  * fixes this regardless of which resources a given program happens to use. */
 static int hitch_log(void);
 static uint64_t us_now(void);
-static void *spirv_cross_to_msl(const uint32_t *words, uint32_t nwords, int is_fragment, int nsmp, int nsbuf, size_t *out_len) {   /* nsbuf: vertex storage buffers (PA input, LDST windows) */
+static void *spirv_cross_to_msl(const uint32_t *words, uint32_t nwords, int is_fragment, int nsmp, int nsbuf, int nub, size_t *out_len) {   /* nub: uniform buffers (2: a motion variant's, usse_spirv_set_motion) */   /* nsbuf: vertex storage buffers (PA input, LDST windows) */
 	uint64_t tq0 = us_now();
 	spvc_context ctx; spvc_context_create(&ctx);
 	spvc_parsed_ir ir;
@@ -198,9 +199,13 @@ static void *spirv_cross_to_msl(const uint32_t *words, uint32_t nwords, int is_f
 	{ spvc_msl_resource_binding_2 b; spvc_msl_resource_binding_init_2(&b);
 		b.stage = stage; b.desc_set = is_fragment ? 3 : 1; b.binding = 0; b.count = 1; b.msl_buffer = 0;
 		spvc_compiler_msl_add_resource_binding_2(comp, &b); }
+	if (nub > 1) {   /* the motion variant's previous-frame SA: set 1, binding 1 -> MSL buffer 1 (SDL's order: the uniform buffers, then the storage buffers) */
+		spvc_msl_resource_binding_2 b; spvc_msl_resource_binding_init_2(&b);
+		b.stage = stage; b.desc_set = 1; b.binding = 1; b.count = 1; b.msl_buffer = 1;
+		spvc_compiler_msl_add_resource_binding_2(comp, &b); }
 	for (int k = 0; !is_fragment && k < nsbuf; k++) {   /* vertex storage buffers: set 0, binding nsmp+k (after its textures) -> MSL buffer 1+k (right after the uniform buffer): the PA input, then the LDST windows */
 		spvc_msl_resource_binding_2 b; spvc_msl_resource_binding_init_2(&b);
-		b.stage = stage; b.desc_set = 0; b.binding = (unsigned)(nsmp + k); b.count = 1; b.msl_buffer = (unsigned)(1 + k);
+		b.stage = stage; b.desc_set = 0; b.binding = (unsigned)(nsmp + k); b.count = 1; b.msl_buffer = (unsigned)(nub + k);
 		spvc_compiler_msl_add_resource_binding_2(comp, &b);
 	}
 	for (int i = 0; i < nsmp; i++) {   /* sampled textures: set 2 (vertex: 0), binding i -> MSL texture/sampler i (a fetch-mode-2 module's input attachment is not a resource: no binding) */
@@ -404,7 +409,7 @@ static uint32_t index_at(const GfxDraw *d, uint32_t i) { return d->index_format 
 
 /* ---------------------------------------------------------------- shader modules, per translated program */
 typedef struct { uint32_t addr, hash, hash2; int kind; uint32_t cube_mask, snap_mask; int pa_words; SDL_GPUShader *shader;   /* hash: the program's content; hash2: the vertex program's for a fragment shader (its varyings) */ int ok, pending; int smp_units[16]; int nsmp; int fetch; int ldst_sa[8], nldst;
-	uint32_t layout_hash; int pcf_unit, pcf, points, fzero; int hnext; int low, prebuilt; uint64_t spv_hash, rid; int warm, wrefs, pred; uint64_t wkey; uint64_t lib_key; int on_disk; } ShaderEntry;   /* lib_key: its MSL cache file's, while that has no library yet (its first pipeline keeps one: mtl_archive.m); on_disk: that file is kept (not a predicted shader's) */   /* warm: a warm-up build's (outside the table: built, then released once wrefs reaches 0), wkey its key in warm.txt; low: queued behind every build a draw waits for (a shader recipe's prebuild; cleared when a draw wants it: bq_promote); prebuilt: made from a recipe, no draw has used it yet; spv_hash: its module's words (RECOMP_SHADER_RECIPES_VERIFY); rid: its recipe's id (0 none) */   /* pending: a build worker is compiling shader (gpu_async); shader and ok are final once it reads 0 */   /* fzero: a FRAGCOLOR program's blend-unit variant, its usse_fragment_fb_blend class (usse_spirv_set_fetch_zero; fetch 3 or 4), 0 none */   /* points: the point-sprite variant (usse_spirv_set_points) */   /* pcf: the filtered-shadow taps the module was built with (shadow_filter), on pcf_unit */   /* layout_hash: a vertex program's fetch plan (vf_plan: the draw's attribute layout the module decodes itself), 0 for the PA-record variant and for fragment programs */   /* ldst_sa: SA words holding the guest pointers the vertex program's LDSTs read through (SpirvModule.ldst_sa) */   /* fetch: SpirvModule.frag_fetch -- 1 samples the framebuffer copy at binding nsmp, 2 reads it as a framebuffer-fetch input */   /* kind: the colour target's, for fragment programs (-1 vertex); cube_mask: which units are cube maps (baked into the module) */
+	uint32_t layout_hash; int pcf_unit, pcf, points, fzero, motion; int hnext; int low, prebuilt; uint64_t spv_hash, rid; int warm, wrefs, pred; uint64_t wkey; uint64_t lib_key; int on_disk; } ShaderEntry;   /* lib_key: its MSL cache file's, while that has no library yet (its first pipeline keeps one: mtl_archive.m); on_disk: that file is kept (not a predicted shader's) */   /* warm: a warm-up build's (outside the table: built, then released once wrefs reaches 0), wkey its key in warm.txt; low: queued behind every build a draw waits for (a shader recipe's prebuild; cleared when a draw wants it: bq_promote); prebuilt: made from a recipe, no draw has used it yet; spv_hash: its module's words (RECOMP_SHADER_RECIPES_VERIFY); rid: its recipe's id (0 none) */   /* pending: a build worker is compiling shader (gpu_async); shader and ok are final once it reads 0 */   /* fzero: a FRAGCOLOR program's blend-unit variant, its usse_fragment_fb_blend class (usse_spirv_set_fetch_zero; fetch 3 or 4), 0 none */   /* points: the point-sprite variant (usse_spirv_set_points) */   /* pcf: the filtered-shadow taps the module was built with (shadow_filter), on pcf_unit */   /* layout_hash: a vertex program's fetch plan (vf_plan: the draw's attribute layout the module decodes itself), 0 for the PA-record variant and for fragment programs */   /* ldst_sa: SA words holding the guest pointers the vertex program's LDSTs read through (SpirvModule.ldst_sa) */   /* fetch: SpirvModule.frag_fetch -- 1 samples the framebuffer copy at binding nsmp, 2 reads it as a framebuffer-fetch input */   /* kind: the colour target's, for fragment programs (-1 vertex); cube_mask: which units are cube maps (baked into the module) */
 /* the shader table: never evicted (pipelines point at their shaders); looked up through a hash of the program's content
  * hash and its vertex program's -- a linear search over a long session's ~1500 variants ran for every draw. 2048 entries
  * filled in a 10-minute Killzone session with render-scale changes (each scale adds snap variants) */
@@ -457,7 +462,7 @@ static SDL_GPUShader *make_shader(SpirvModule *m, int is_fragment, int nsmp, int
 #endif
 		msl = msl_cache_get(key, m->words, m->nwords, is_fragment, nsmp, nsbuf, &mlen, want_lib);   /* the cache (above), else spirv-cross, and the cache remembers */
 		if (msl) { bt->cached = 1; bt->on_disk = 1; __atomic_add_fetch(&n_shader_cached, 1, __ATOMIC_RELAXED); }
-		else { msl = spirv_cross_to_msl(m->words, m->nwords, is_fragment, nsmp, nsbuf, &mlen); if (msl && !bt->no_disk) bt->on_disk = msl_cache_put(key, m->words, m->nwords, is_fragment, nsmp, nsbuf, msl, mlen); }
+		else { msl = spirv_cross_to_msl(m->words, m->nwords, is_fragment, nsmp, nsbuf, m->motion ? 2 : 1, &mlen); if (msl && !bt->no_disk) bt->on_disk = msl_cache_put(key, m->words, m->nwords, is_fragment, nsmp, nsbuf, msl, mlen); }
 		bt->msl_us = us_now() - tx0; __atomic_add_fetch(&t_shader_msl, bt->msl_us, __ATOMIC_RELAXED);
 		if (!msl) return 0;
 		/* RECOMP_GPU_DEBUG_DUMP=1: save each shader's cross-compiled MSL to /tmp/gpudump_<addr>_<stage>.metal
@@ -480,7 +485,7 @@ static SDL_GPUShader *make_shader(SpirvModule *m, int is_fragment, int nsmp, int
 	ci.stage = is_fragment ? SDL_GPU_SHADERSTAGE_FRAGMENT : SDL_GPU_SHADERSTAGE_VERTEX;
 	ci.num_samplers = !flat ? (uint32_t)nsmp : 0;   /* (a vertex program's own textures too: usse_spirv.c's vertex SMP) */
 	ci.num_storage_buffers = (!is_fragment && !flat) ? (uint32_t)nsbuf : 0;
-	ci.num_uniform_buffers = flat ? 0 : 1;   /* SA, both stages */
+	ci.num_uniform_buffers = flat ? 0 : m->motion ? 2 : 1;   /* SA, both stages (and a motion variant's previous-frame SA) */
 	uint64_t tc0 = us_now();
 	SDL_GPUShader *sh = SDL_CreateGPUShader(gpu(), &ci);
 #ifdef RECOMP_MTL_ARCHIVE
@@ -589,6 +594,7 @@ static int predict_on(void) {   /* (Metal by default, where the shader library i
  * shadow-map texels apart at 1x, whatever the render scale -- and averages its own compare over them. The Vita
  * takes one tap: at a PC resolution every sunlit leaf showed hard, texel-sized steps. */
 static int g_points_draw;   /* gfx_gpu_draw: this draw is SCE_GXM_PRIMITIVE_POINTS sprites (get_shader picks the point-sprite variants) */
+static int g_motion_draw;   /* gfx_gpu_draw: get_shader wants a vertex program's motion variant (usse_spirv_set_motion; the motion pass, RECOMP_MV) */
 static int g_fzero_draw;    /* gfx_gpu_draw: this draw's fragment program's framebuffer blend goes to the blend unit -- its usse_fragment_fb_blend class (get_shader picks that variant) */
 static int shadow_filter_want(void) {
 	extern int settings_int(const char *, int);
@@ -645,13 +651,14 @@ typedef struct { ShaderEntry *e; SpirvModule m; int is_frag, nsmp, nsbuf; uint32
 typedef struct { struct PipeEntry *p; SDL_GPUGraphicsPipelineCreateInfo ci; SDL_GPUColorTargetDescription ctd; uint32_t vprog, fprog; uint64_t t0; int async;
 	ShaderEntry *vse, *fse; int null_fs; int warm; uint64_t wkey; } PipeJob;   /* warm: a warm-up build's (p outside the table: the pipeline is released when built) */   /* vse/fse: its shaders -- their objects go into ci when it's built (gpu_overlap: queued while they were still building) */   /* ci's colour target is ctd (pipeline_build points it there) */
 typedef struct { struct ViewVariant *slot; char *src; const char *entry; SDL_GPUShader *vsh; int fmt; uint64_t t0; } ViewJob;   /* a baked view variant (view_pipeline_for): its MSL text, owned by the job */
-typedef struct BuildJob { struct BuildJob *next; int is_pipe; ShaderJob sj; PipeJob pj; ViewJob vj; int low, prebuild; } BuildJob;   /* is_pipe: 0 a shader, 1 a pipeline, 2 a view variant; low: in bq_head[2] (bq_promote clears it); prebuild: a shader recipe's (counted in bq_low until done) */
+typedef struct BuildJob { struct BuildJob *next; int is_pipe; ShaderJob sj; PipeJob pj; ViewJob vj; int low, prebuild; } BuildJob;   /* is_pipe: 0 a shader, 1 a pipeline, 2 a view variant; low: 1 in bq_head[2] (what registered programs complete), 2 in bq_head[3] (the warm-up and predicted passes) -- bq_promote clears it; prebuild: a shader recipe's (counted in bq_low until done) */
 static uint32_t n_async_skips;   /* draws skipped this frame: a build in flight */
 /* the shader recipes' warm-up builds (below, with the recipes): done ones reported to the render thread, which releases them */
 static pthread_mutex_t warm_m = PTHREAD_MUTEX_INITIALIZER;
 static struct WarmDone { uint64_t key; int kind; } *warm_dones; static int nwarm_dones, warm_dones_cap;
 static struct WarmRel { ShaderEntry *e; SDL_GPUGraphicsPipeline *pipe; } *warm_rels; static int nwarm_rels, warm_rels_cap;
 static int warm_record;   /* warm.txt is open: every build that works goes into it (the OS's shader cache has it from then on) */
+static uint32_t prep_built;   /* the warm-up's builds finished, shaders and pipelines (any thread: the shader prep card's progress, below) */
 static void warm_done(uint64_t key, int kind, int ok) {   /* any thread: a build that worked, for warm.txt */
 	if (!ok || !key || !__atomic_load_n(&warm_record, __ATOMIC_RELAXED)) return;
 	pthread_mutex_lock(&warm_m);
@@ -678,17 +685,20 @@ static void shader_build(ShaderJob *j) {   /* the MSL and the compile, on the re
 	__atomic_store_n(&e->pending, 0, __ATOMIC_RELEASE);
 	bq_release();
 	warm_done(e->wkey, 's', e->ok);
-	if (e->warm) warm_unref(e);
+	if (e->warm) { __atomic_add_fetch(&prep_built, 1, __ATOMIC_RELAXED); warm_unref(e); }
 }
 static void pipeline_build(PipeJob *j);   /* (with the pipelines, below) */
 static void view_variant_build(ViewJob *j);   /* (with the views, below) */
 static pthread_mutex_t bq_m = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t bq_c = PTHREAD_COND_INITIALIZER, bq_idle = PTHREAD_COND_INITIALIZER;
 static int bq_inflight;   /* queued or building (or waiting for their shaders: bq_wait) */
 static BuildJob *bq_wait;   /* pipeline jobs whose shaders are still building (gpu_overlap): queued by bq_release as each shader is done */
-static BuildJob *bq_head[3], *bq_tail[3];   /* [0] pipelines (their shaders are done: nearest to drawing), [1] shaders, [2] the shader recipes' prebuilds (low) */
+static BuildJob *bq_head[4], *bq_tail[4];   /* [0] pipelines (their shaders are done: nearest to drawing), [1] shaders, [2] the prebuilds of programs the game registered (a level's, on its load screen),
+                                              * [3] the bulk prebuilds (the warm-up of every recipe, the predicted pass): low, [3] only when [2] is empty */
 static int bq_low;   /* the recipes' jobs not done yet (BuildJob.prebuild): not the game waiting (gfx_gpu_build_status) */
-static int bq_low_active, bq_low_cap;   /* workers on bq_head[2] jobs now, and at most: RECOMP_SHADER_PREBUILD_RESERVE (default 2) stay free for what a draw
+static int bq_low_active, bq_low_cap;   /* workers on bq_head[2] and [3] jobs now, and at most: RECOMP_SHADER_PREBUILD_RESERVE (default 2) stay free for what a draw
                                          * wants -- with all 8 on prebuilds, a draw's promoted build waited for one of them to finish a cold compile of up to ~2 s */
+static int bq_stopping, bq_running;   /* gfx_gpu_builds_stop: no job starts any more; jobs a worker is running now */
+static int bq_bulk_active, bq_bulk_cap = 1 << 30;   /* workers on bq_head[3] jobs now, and at most (pred_throttle lowers it: not a level's own prebuilds) */
 static int bq_workers;   /* 0 not started, -1 none could start */
 static void *build_worker(void *arg) {
 	(void)arg;
@@ -699,16 +709,27 @@ static void *build_worker(void *arg) {
 #endif
 	for (;;) {
 		pthread_mutex_lock(&bq_m);
-		while (!bq_head[0] && !bq_head[1] && !(bq_head[2] && bq_low_active < bq_low_cap)) pthread_cond_wait(&bq_c, &bq_m);
-		int q = bq_head[0] ? 0 : bq_head[1] ? 1 : 2; BuildJob *j = bq_head[q];
+		#define BQ_LOW_OK (bq_low_active < bq_low_cap)
+		while (bq_stopping || (!bq_head[0] && !bq_head[1] && !(bq_head[2] && BQ_LOW_OK) && !(bq_head[3] && BQ_LOW_OK && bq_bulk_active < bq_bulk_cap))) pthread_cond_wait(&bq_c, &bq_m);
+		int q = bq_head[0] ? 0 : bq_head[1] ? 1 : bq_head[2] && BQ_LOW_OK ? 2 : 3; BuildJob *j = bq_head[q];
+		#undef BQ_LOW_OK
 		if (!(bq_head[q] = j->next)) bq_tail[q] = 0;
-		bq_low_active += q == 2;
+		bq_low_active += q >= 2; bq_bulk_active += q == 3; bq_running++;
 		pthread_mutex_unlock(&bq_m);
 		if (j->is_pipe == 2) view_variant_build(&j->vj); else if (j->is_pipe) pipeline_build(&j->pj); else shader_build(&j->sj);
 		const int pre = j->prebuild; free(j);
-		pthread_mutex_lock(&bq_m); if (pre) bq_low--; if (q == 2) { bq_low_active--; pthread_cond_signal(&bq_c); } if (!--bq_inflight) pthread_cond_broadcast(&bq_idle); pthread_mutex_unlock(&bq_m);
+		pthread_mutex_lock(&bq_m); if (pre) bq_low--; if (q >= 2) { bq_low_active--; bq_bulk_active -= q == 3; pthread_cond_signal(&bq_c); } bq_running--; if (!--bq_inflight || !bq_running) pthread_cond_broadcast(&bq_idle); pthread_mutex_unlock(&bq_m);
 	}
 	return 0;
+}
+/* before exit(): no build starts any more and the running ones end, at most 5 s -- exit() destroys spirv-cross's statics, and a
+ * worker inside it then crashed (a scripted test ending mid warm-up). The window's close is _exit: no destructors run there */
+void gfx_gpu_builds_stop(void) {
+	if (bq_workers <= 0) return;
+	pthread_mutex_lock(&bq_m); bq_stopping = 1;
+	struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 5;
+	while (bq_running) if (pthread_cond_timedwait(&bq_idle, &bq_m, &ts)) break;
+	pthread_mutex_unlock(&bq_m);
 }
 void gfx_gpu_builds_wait(void) {   /* until every queued build is done (a replay's RECOMP_GPU_ASYNC=1 measurement: how long the workers take) */
 	pthread_mutex_lock(&bq_m); while (bq_inflight) pthread_cond_wait(&bq_idle, &bq_m); pthread_mutex_unlock(&bq_m);
@@ -719,7 +740,7 @@ static void bq_release(void) {   /* the waiting pipelines whose shaders are both
 		BuildJob *j = *pj;
 		if ((j->pj.vse && __atomic_load_n(&j->pj.vse->pending, __ATOMIC_ACQUIRE)) || (j->pj.fse && __atomic_load_n(&j->pj.fse->pending, __ATOMIC_ACQUIRE))) { pj = &j->next; continue; }
 		*pj = j->next; j->next = 0;
-		const int q = j->low ? 2 : 0;
+		const int q = j->low == 2 ? 3 : j->low ? 2 : 0;
 		if (bq_tail[q]) bq_tail[q]->next = j; else bq_head[q] = j;
 		bq_tail[q] = j; pthread_cond_signal(&bq_c);
 	}
@@ -738,7 +759,7 @@ static int build_enqueue(BuildJob *src) {   /* 0: no worker -- the caller builds
 	if (bq_workers < 0) return 0;
 	BuildJob *j = malloc(sizeof *j); if (!j) return 0;
 	*j = *src; j->next = 0; j->sj.async = j->pj.async = 1; j->prebuild = j->low;
-	int q = j->low ? 2 : j->is_pipe ? 0 : 1;
+	int q = j->low == 2 ? 3 : j->low ? 2 : j->is_pipe ? 0 : 1;
 	pthread_mutex_lock(&bq_m);
 	if (j->prebuild) bq_low++;
 	if (j->is_pipe == 1 && ((j->pj.vse && __atomic_load_n(&j->pj.vse->pending, __ATOMIC_ACQUIRE)) || (j->pj.fse && __atomic_load_n(&j->pj.fse->pending, __ATOMIC_ACQUIRE)))) {
@@ -755,15 +776,17 @@ static int shader_pending(const ShaderEntry *e) { return e && __atomic_load_n(&e
 /* a draw wants a build a shader recipe queued (low): to the front of its queue -- or, for a pipeline still waiting
  * in bq_wait, its own shaders, and it goes to the pipelines' queue when they're done (render thread) */
 static void bq_promote_locked(ShaderEntry *e, struct PipeEntry *p) {
-	BuildJob *prev = 0;
-	for (BuildJob *j = bq_head[2]; j; prev = j, j = j->next) {
-		if (e ? !(j->is_pipe == 0 && j->sj.e == e) : !(j->is_pipe == 1 && j->pj.p == p)) continue;
-		if (prev) prev->next = j->next; else bq_head[2] = j->next;
-		if (bq_tail[2] == j) bq_tail[2] = prev;
-		const int q = e ? 1 : 0; j->low = 0;
-		j->next = bq_head[q]; bq_head[q] = j; if (!bq_tail[q]) bq_tail[q] = j;
-		pthread_cond_signal(&bq_c);   /* (a worker held back by bq_low_cap takes it) */
-		return;
+	for (int lq = 2; lq <= 3; lq++) {
+		BuildJob *prev = 0;
+		for (BuildJob *j = bq_head[lq]; j; prev = j, j = j->next) {
+			if (e ? !(j->is_pipe == 0 && j->sj.e == e) : !(j->is_pipe == 1 && j->pj.p == p)) continue;
+			if (prev) prev->next = j->next; else bq_head[lq] = j->next;
+			if (bq_tail[lq] == j) bq_tail[lq] = prev;
+			const int q = e ? 1 : 0; j->low = 0;
+			j->next = bq_head[q]; bq_head[q] = j; if (!bq_tail[q]) bq_tail[q] = j;
+			pthread_cond_signal(&bq_c);   /* (a worker held back by bq_low_cap takes it) */
+			return;
+		}
 	}
 	if (p) for (BuildJob *j = bq_wait; j; j = j->next) if (j->is_pipe == 1 && j->pj.p == p) {
 		j->low = 0;
@@ -811,7 +834,8 @@ static struct {
 	RecipeProg *prog; uint32_t prog_cap;
 	int *work; int nwork, work_at, work_cap, work_sorted;   /* recipes to try: their programs were just registered (tried in index order: the order play first used them) */
 	uint32_t *reg; int nreg, reg_at, reg_cap;   /* registered programs not looked at yet (the render thread's copy of reg_q) */
-	uint64_t burst_t0, t_render; int burst, regs, built_sh, built_pp, have, skipped, stale;   /* a burst: the work a level's registrations started */
+	uint32_t (*preg)[2]; int npreg, preg_at, preg_cap;   /* registered programs no recipe names, for predict_registered: address and content hash */
+	uint64_t burst_t0, t_render; int burst, regs, built_sh, built_pp, have, skipped, stale, built_pred;   /* a burst: the work a level's registrations started (built_pred: predict_registered's) */
 	int used_sh, used_pp, verified, differ, recorded, too_many_sa, p_missed;
 	int warm_phase, warm_at, warm_fd, w_keyed, w_missing, w_built, w_fail, w_sh, w_pp, w_need_sh, w_need_pp; uint32_t scratch[2]; uint64_t warm_t0, t_warm;   /* the warm-up (recipes_warm): phase 0 off, 1 waiting for the program index, 2 keys, 3 builds, 4 queued, 6 predicted shaders (predict_warm), 7 their builds queued, 5 done */
 	int pred_at, p_frag, p_sh, p_warm, p_recorded, p_fail; uint64_t pred_t0;   /* the predicted shaders' pass */
@@ -906,7 +930,7 @@ static void recipe_note_pipe(const GfxDraw *d, const ShaderEntry *vs, const Shad
 static uint32_t shader_bucket(uint32_t hash, uint32_t hash2, uint32_t layout_hash) { return (hash ^ hash2 * 0x9E3779B1u ^ layout_hash * 0x85EBCA6Bu) % SHADER_HASH; }
 static ShaderEntry *shader_find(uint32_t hash, uint32_t hash2, int kind, uint32_t cube_mask, uint32_t snap_mask, uint32_t layout_hash, int pcf, int points, int fzero) {   /* pcf -1: the shadow filter setting's */
 	for (int i = shader_head[shader_bucket(hash, hash2, layout_hash)]; i; i = shaders[i - 1].hnext) { ShaderEntry *x = &shaders[i - 1];
-		if (x->hash == hash && x->hash2 == hash2 && x->kind == kind && x->cube_mask == cube_mask && x->snap_mask == snap_mask && x->layout_hash == layout_hash && x->points == points && x->fzero == fzero
+		if (x->hash == hash && x->hash2 == hash2 && x->kind == kind && x->cube_mask == cube_mask && x->snap_mask == snap_mask && x->layout_hash == layout_hash && x->points == points && x->fzero == fzero && x->motion == g_motion_draw
 		    && x->pcf == (pcf >= 0 ? pcf : x->pcf_unit >= 0 && shadow_filter_want() ? 16 : 0)) return x; }
 	return 0;
 }
@@ -915,10 +939,10 @@ static int shader_translate(ShaderEntry *e, const UsseProgram *prog, const UsseV
 	int smp_units[16], nsmp = 0;
 	fetch_mode(); canon_vary_on();   /* (sets the translator's FRAGCOLOR mode and varying layout before its first module) */
 	uint64_t tb0 = us_now();
-	usse_spirv_set_pcf(e->pcf ? e->pcf_unit : -1, e->pcf); usse_spirv_set_points(e->points); usse_spirv_set_fetch_zero(e->fzero >= USSE_FB_LERP_KEEP ? 2 : e->fzero ? 1 : 0);
+	usse_spirv_set_pcf(e->pcf ? e->pcf_unit : -1, e->pcf); usse_spirv_set_points(e->points); usse_spirv_set_fetch_zero(e->fzero >= USSE_FB_LERP_KEEP ? 2 : e->fzero ? 1 : 0); usse_spirv_set_motion(e->motion);
 	{ static long pf = -1; if (pf < 0) { const char *v = getenv("RECOMP_PROBE_FPROG"); pf = v ? (long)strtoul(v, 0, 16) : 0; } usse_spirv_set_probe_off(pf && (uint32_t)pf != e->addr); }   /* RECOMP_PROBE_FPROG=<hex addr>: probe that fragment program only, so the textures and framebuffer it reads stay real */
 	SpirvModule m = usse_spirv_translate(prog, vl, fl, sa_tex_unit, 16, smp_units, &nsmp, e->kind < 0 ? 0 : e->kind, e->cube_mask, e->snap_mask, vf);
-	usse_spirv_set_pcf(-1, 0); usse_spirv_set_points(0); usse_spirv_set_probe_off(0); usse_spirv_set_fetch_zero(0);
+	usse_spirv_set_pcf(-1, 0); usse_spirv_set_points(0); usse_spirv_set_probe_off(0); usse_spirv_set_fetch_zero(0); usse_spirv_set_motion(0);
 	uint64_t tb1 = us_now(); t_shader_xlate += tb1 - tb0;
 	if (!m.ok) { fprintf(stderr, "    gpu: %#x: %s\n", e->addr, m.err); usse_spirv_free(&m); return 0; }
 	int is_frag = usse_is_fragment(prog);
@@ -942,7 +966,7 @@ static ShaderEntry *shader_new(uint32_t addr, const UsseProgram *prog, uint32_t 
 	if (trace_sync()) fprintf(stderr, "gpu trace: shader built for %#x hash %08x/%08x kind %d (%d so far)%s\n", addr, hash, hash2, kind, nshaders + 1, low ? " (recipe)" : "");
 	const uint32_t bucket = shader_bucket(hash, hash2, layout_hash);
 	ShaderEntry *e = &shaders[nshaders++]; memset(e, 0, sizeof *e); e->hnext = shader_head[bucket]; shader_head[bucket] = nshaders; e->addr = addr; e->hash = hash; e->hash2 = hash2; e->kind = kind; e->cube_mask = cube_mask; e->snap_mask = snap_mask; e->layout_hash = layout_hash;
-	e->pcf_unit = pcf_unit; e->pcf = pcf; e->points = points; e->fzero = fzero; e->low = e->prebuilt = low;
+	e->pcf_unit = pcf_unit; e->pcf = pcf; e->points = points; e->fzero = fzero; e->motion = g_motion_draw; e->low = e->prebuilt = low;
 	ShaderJob sj;
 	if (shader_translate(e, prog, vl, fl, sa_tex_unit, vf, &sj)) shader_enqueue(&sj, low);
 	return e;
@@ -972,7 +996,7 @@ static ShaderEntry *get_shader(uint32_t addr, const UsseProgram *prog, const Uss
 		return x;
 	}
 	ShaderEntry *e = shader_new(addr, prog, hash, hash2, vl, fl, sa_tex_unit, kind, cube_mask, snap_mask, vf, layout_hash, pcf_unit, pcf, g_points_draw, g_fzero_draw, 0);
-	if (e && (shader_pending(e) || e->ok)) recipe_note_shader(e, usse_is_fragment(prog), sa_tex_unit, vf);
+	if (e && !e->motion && (shader_pending(e) || e->ok)) recipe_note_shader(e, usse_is_fragment(prog), sa_tex_unit, vf);   /* (motion variants aren't recorded: the motion pass is a setting) */
 	if (e && kind >= 0 && rc.warm_phase == 5 && rc.p_frag && e->wkey && !*rc_slot(e->wkey ^ WTAG_S)) {   /* a fragment shader neither predicted nor built before, after the predicted pass: say how it differs */
 		static uint32_t told[256]; static int ntold; int seen = 0;
 		for (int i = 0; i < ntold; i++) seen |= told[i] == hash;
@@ -1535,6 +1559,8 @@ typedef struct {
 	int kind;        /* target_kind: the GPU texture's format family */
 	uint64_t gen;    /* write_clock when the GPU texture last got new content (a draw, an upload from guest) */
 	uint8_t sx, sy;  /* its texels a guest pixel, across and down: the render scale, or a boosted target's (target_scale) */
+	SDL_GPUTexture *mv; uint64_t mv_frame; uint32_t mv_n;   /* the motion target beside it (RECOMP_MV: mv_target), the frame it was
+	                                                          * last cleared in (mv_qframe + 1) and its motion draws that frame */
 } TargetEntry;
 /* the GPU format a guest colour format renders into, with enough precision that a download encodes
  * the bits gfx_soft.c's target_write would: 8-bit families as RGBA8, the half-float families (F16,
@@ -1726,10 +1752,27 @@ static void target_release(TargetEntry *e) {
 	if (e->lo) SDL_ReleaseGPUTexture(gpu(), e->lo);
 	if (e->snap) SDL_ReleaseGPUTexture(gpu(), e->snap);
 	if (e->own_depth) SDL_ReleaseGPUTexture(gpu(), e->own_depth);
-	e->color = e->fetch_copy = e->lo = e->snap = e->depth = e->own_depth = 0;
+	if (e->mv) SDL_ReleaseGPUTexture(gpu(), e->mv);
+	e->color = e->fetch_copy = e->lo = e->snap = e->depth = e->own_depth = e->mv = 0;
 }
+/* FSR upscaling (M4, RECOMP_FSR_RENDER=<n> below the render scale): the main target -- by its address and size, last
+ * frame's -- is drawn at that internal scale; FSR writes the frame at the render scale into the same address's entry at
+ * that scale, which, the newest over the address, is what everything after it samples (target_view) */
+static struct { uint32_t addr, w, h; } fsr_lo; static int fsr_forward = 1;   /* (fsr_forward: last frame's lit image was the main target -- a deferred renderer doesn't upscale: its G-buffer would shrink under its full-size lighting) */
+static int fsr_render_scale(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_FSR_RENDER"); v = e ? atoi(e) : 0; if (v < 0) v = 0; } return v; }
+static int fsr_on(void);
+static int fsr_upscaling(void) { return fsr_on() && fsr_forward && fsr_render_scale() > 0 && fsr_render_scale() < rscale; }
+static void fsr_lo_scale(uint8_t *sx, uint8_t *sy) {   /* the internal scale, its across in proportion to the render scale's (a widened aspect's rscale_x) */
+	const int i = fsr_render_scale(), x = (rscale_x * i + rscale / 2) / rscale;
+	*sx = (uint8_t)(x < 1 ? 1 : x); *sy = (uint8_t)i;
+}
+static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy);
 static TargetEntry *get_target(const GfxTarget *t) {
 	uint8_t sx, sy; target_scale(t->width, t->height, &sx, &sy);
+	if (fsr_upscaling() && t->data == fsr_lo.addr && t->stride == fsr_lo.w && t->height == fsr_lo.h) fsr_lo_scale(&sx, &sy);
+	return get_target_at(t, sx, sy);
+}
+static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy) {
 	for (int i = 0; i < ntargets; i++) if (targets[i].addr == t->data && targets[i].width == t->stride && targets[i].height == t->height && targets[i].kind == target_kind(t->format) && targets[i].type == t->type && targets[i].sx == sx && targets[i].sy == sy) {
 		TargetEntry *e = &targets[i];
 		e->used = ++target_clock;
@@ -1950,6 +1993,7 @@ typedef struct PipeEntry {
 	int fetch;                         /* the fragment shader samples the framebuffer copy at binding nsmp (fetch mode 1 only: a framebuffer-fetch program needs nothing bound or copied) */
 	uint32_t hkey; int hnext; uint64_t used;   /* the table's hash index (pipe_key_hash, bucket chain: index + 1) and last use (LRU) */
 	uint8_t low, prebuilt;   /* as ShaderEntry's */
+	SDL_GPUGraphicsPipeline *mv_pipe; uint8_t mv_tried; const void *mv_vse;   /* the motion pass's pipeline for this one's draws (mv_pipeline) and its vertex shader (the motion variant) */
 } PipeEntry;
 /* The pipeline table: a hash index, and when full the least recently used pipeline goes (after the batch's draws that
  * use it). It was a fixed 2048 with a linear search per draw and no eviction; a 10-minute Killzone session with
@@ -1984,6 +2028,7 @@ static void pipeline_build(PipeJob *j) {
 	j->p->pipe = pp;
 	__atomic_store_n(&j->p->pending, 0, __ATOMIC_RELEASE);
 	warm_done(j->wkey, 'p', pp != 0);
+	if (j->warm) __atomic_add_fetch(&prep_built, 1, __ATOMIC_RELAXED);
 	if (j->warm) { if (pp) warm_release(0, pp); warm_unref(j->vse); warm_unref(j->fse); free(j->p); }   /* (its shaders' last reference releases them) */
 }
 static int pipeline_pending(const PipeEntry *p) { return p && __atomic_load_n(&p->pending, __ATOMIC_ACQUIRE); }
@@ -2009,6 +2054,7 @@ static PipeEntry *pipe_evict(void) {
 	int idx = (int)(v - pipelines) + 1;
 	for (int *link = &pipe_head[v->hkey % PIPE_HASH]; *link; link = &pipelines[*link - 1].hnext) if (*link == idx) { *link = v->hnext; break; }
 	if (v->pipe) SDL_ReleaseGPUGraphicsPipeline(gpu(), v->pipe);
+	if (v->mv_pipe) SDL_ReleaseGPUGraphicsPipeline(gpu(), v->mv_pipe);
 	if (!n_pipe_evictions++) fprintf(stderr, "    gpu: the pipeline table is full (%d): the least recently used ones are released from now on\n", npipelines);
 	return v;
 }
@@ -2582,6 +2628,410 @@ static const SsaoCamera *ao_camera(void) {   /* the scene's world camera: the mo
 		ao_cand[k].cam.p00, ao_cand[k].cam.p11, ao_cand[k].cam.p22, ao_cand[k].cam.p32, ao_cand[k].cam.zoff, ao_cand[k].cam.zscale);
 	return &ao_cand[best].cam;
 }
+/* ---- motion vectors (RECOMP_MV=1; notes/motion-vectors.md, branch motion-vectors). The main 3D scene's opaque draws
+ * that write depth are drawn a second time after each flush's own passes, into an RG16F target beside the scene's colour
+ * target, depth-tested against the depth the scene left ("or equal", in the scene's own direction; no write): only the
+ * visible surface writes, whatever order the draws came in and whatever an alpha test cut away. M0: the pass writes the
+ * coverage marker (1, 1) (usse_spirv_motion_fragment); M1 writes the vectors. RECOMP_MV_DUMP: the motion target and
+ * its colour target as the game queues a frame (mv_capture). */
+/* M4: FSR 3.1 (fsr/fsr.c). Offered where the game's pack says it's verified (RECOMP_FSR_SUPPORTED, from RUN_ENV: the F10
+ * menu's anti-aliasing choice, settings "fsr"); RECOMP_FSR=1 or =0 forces it either way. Decided once a frame
+ * (fsr_update, at present: a menu change applies from the next frame); F4 flips it live until the setting changes. The
+ * motion vectors run while it's on (or RECOMP_MV) */
+int settings_int(const char *key, int def);
+int gfx_gpu_fsr_supported(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_FSR_SUPPORTED"); v = e && *e && *e != '0'; } return v; }
+static int fsr_wanted(void) {   /* the setting, or the environment's word */
+	static int forced = -2; if (forced == -2) { const char *e = getenv("RECOMP_FSR"); forced = e && *e ? *e != '0' : -1; }
+	return forced >= 0 ? forced : gfx_gpu_fsr_supported() && settings_int("fsr", 0) != 0;
+}
+static uint64_t mv_qframe;   /* frames the game has queued (gfx_gpu_frame_queued): the motion pass's frame count, kept on the thread that draws */
+static int fsr_live, fsr_restart, fsr_wanted_last = -1;   /* (fsr_restart: back on, its history starts over) */
+static int mv_on(void);
+static void fsr_update(void) {
+	const int w = fsr_wanted(), mv_was = fsr_wanted_last >= 0 && mv_on();
+	if (w != fsr_wanted_last) { fsr_wanted_last = w; if (w != fsr_live) { fsr_live = w; if (w) fsr_restart = 1; } }
+	if (!mv_was && mv_on() && mv_qframe < gpu_frame_no) mv_qframe = gpu_frame_no;   /* (the motion vectors start: their frame count from the presented frames', so frame windows mean the same frames) */
+}
+static int fsr_on(void) { if (fsr_wanted_last < 0) fsr_update(); return fsr_live; }
+int gfx_gpu_fsr_active(void) { return fsr_on(); }   /* (post.c: no FXAA over FSR's frame) */
+void gfx_gpu_fsr_toggle(void) {
+	if (!gfx_gpu_fsr_supported() && !fsr_wanted()) return;
+	const int mv_was = mv_on();
+	fsr_live = !fsr_on(); if (fsr_live) fsr_restart = 1;
+	if (!mv_was && mv_on() && mv_qframe < gpu_frame_no) mv_qframe = gpu_frame_no;
+	extern void overlay_toast(const char *msg, double seconds);
+	overlay_toast(fsr_live ? "FSR 3.1 anti-aliasing on" : "FSR 3.1 anti-aliasing off", 2.0);
+	fprintf(stderr, "    fsr: %s (F4)\n", fsr_live ? "on" : "off");
+}
+static int mv_on(void) { static int env = -1; if (env < 0) env = getenv("RECOMP_MV") != 0; return env || fsr_on(); }
+int gfx_gpu_mv_on(void) { return mv_on(); }
+static int mv_scene;                                      /* the open scene gets a motion pass */
+static TargetEntry *mv_best; static uint32_t mv_best_n;  /* this frame's target with the most motion draws (the dump's) */
+/* M3 jitter (RECOMP_MV_JITTER=1, or =<phases>; 8 by default): each frame's main scene drawn a sub-pixel off, a Halton (2, 3)
+ * point in (-0.5, 0.5) render pixels, cycling over the phases, so a temporal pass (FSR) gathers new samples every frame.
+ * It moves the viewport, not the shaders (the shader archive's text stays as it is): every draw of a scene on the main (mv_main_entry)
+ * colour target or on its depth buffer (a depth prepass stays aligned with the scene it feeds), the HUD at its native
+ * shape excepted. The vectors leave it out: they come from clip positions, before the viewport */
+static int mv_jitter_phases(void) {
+	static int v = -2;
+	if (v == -2) { const char *e = getenv("RECOMP_MV_JITTER"); v = e ? atoi(e) : -1; if (v == 1) v = 8; if (v < -1) v = 0; }   /* (-1: not asked for, FSR's) */
+	if (v >= 0) return v;
+	if (!fsr_on()) return 0;   /* (with FSR: on while it is, F4) */
+	const int k = fsr_upscaling() ? rscale / fsr_render_scale() : 1; return 8 * k * k;   /* (FSR's 8 * (display / render)^2) */
+}
+static float halton(uint32_t i, uint32_t b) { float f = 1, r = 0; while (i) { f /= (float)b; r += f * (float)(i % b); i /= b; } return r; }
+static void mv_jitter(uint64_t frame, float *jx, float *jy) {   /* the frame's offset in render pixels (x right, y down) */
+	const int n = mv_jitter_phases(); if (n < 2) { *jx = *jy = 0; return; }
+	const uint32_t i = (uint32_t)(frame % (uint64_t)n) + 1; *jx = halton(i, 2) - 0.5f; *jy = halton(i, 3) - 0.5f;
+}
+static int mv_jit_scene; static float mv_jx, mv_jy;   /* the open scene is jittered, by this much */
+static const void *mv_main_entry, *mv_main_depth;   /* the main target: last frame's with the most motion draws (mv_best), and its depth buffer -- not every
+                                                     * scene mv_is_main takes (Killzone's final composite into the display buffer is 960x544 with a depth flag: its HUD isn't jittered) */
+static const void *mv_best_depth;   /* mv_best's depth buffer (its DepthEntry) */
+/* FSR's colour: the frame's first other target drawn with the main depth buffer, else the main target -- the main target
+ * itself in a forward renderer (Killzone), the lit image of a deferred one (Uncharted: its main target is the G-buffer,
+ * F32, that the lighting reads; FSR over it scrambled the lighting). The first, not the last: Uncharted draws a one-draw
+ * pass on its tone-mapped image with the main depth on some frames only (shooting), and FSR's colour flipped between the
+ * two (a triple image). Last frame's; mv_lit_cur collects this frame's */
+static const void *mv_lit, *mv_lit_cur;
+/* the frame's scenes in order (mv_ord), and where the scenes on FSR's colour were: a deferred renderer draws its
+ * transparent geometry (Uncharted's glass, its particles) in more scenes on the lit image after the composite, with a
+ * scene between that reads the lit image (Uncharted's 360x204 one, for the glass to refract) -- FSR runs once the last
+ * of them is done (a read from a scene past last frame's last lit scene, mv_lit_last_ord), the later ones are jittered
+ * like the G-buffer (their geometry is depth-tested against its jittered depth: unjittered, the glass's edges
+ * flickered), and the lit image is copied as the second of them begins (the reactive mask's opaque-only image) */
+static int mv_ord, mv_lit_ord_cur, mv_lit_last_ord = 1 << 30, mv_lit_seen, mv_lit_index = -1;   /* (mv_lit_index: the open scene's place among this frame's scenes on mv_lit, -1 another) */
+static uint32_t mv_votes_inv, mv_votes_fwd; static int mv_main_inverted;   /* the main scene's motion draws testing GREATER vs LESS this frame; last frame's verdict (FSR's inverted depth) */
+/* RECOMP_MV_SCENES=<from>-<to> (frames queued): each scene's target, and the first draw of each that samples the main
+ * colour target (directly or through a view) -- where in a game's frame a temporal pass (M4) goes */
+static int mv_scene_log(void) {
+	static long from = -2, to; if (from == -2) { const char *e = getenv("RECOMP_MV_SCENES"); from = -1; if (e && sscanf(e, "%ld-%ld", &from, &to) != 2) from = -1; }
+	return from >= 0 && (long)mv_qframe >= from && (long)mv_qframe <= to;
+}
+static int mv_scene_no, mv_scene_said;   /* the open scene's number in the frame; it has said it samples the main target */
+static char mv_scene_draws[4096]; static int mv_scene_nd;   /* (the main scene's draws in order: O opaque with motion, B blended, n neither -- where its transparent part begins) */
+static uint32_t mv_jit_draws, mv_jit_scenes, mv_jit_depth_scenes;
+static uint64_t n_mv_draws; static uint32_t n_mv_pipes;
+static int mv_is_main(const GfxTarget *t, const TargetEntry *e) {   /* a depth buffer and a 16:9-ish colour target at least 640 wide */
+	if (!t->depth || !e || e == &scratch_entry || !e->color) return 0;
+	float a = (float)t->width / (float)(t->height ? t->height : 1);
+	return t->width >= 640 && a > 1.5f && a < 2.0f;
+}
+static SDL_GPUTexture *mv_target(TargetEntry *e) {   /* (a size or render scale change makes a new TargetEntry: its motion target with it) */
+	if (!e->mv) {
+		SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+			.width = TSX(e, e->width), .height = TSY(e, e->height), .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+		e->mv = SDL_CreateGPUTexture(gpu(), &ci);
+		if (!e->mv) { static int said; if (!said++) fprintf(stderr, "    gpu mv: motion target %ux%u: %s\n", ci.width, ci.height, SDL_GetError()); }
+	}
+	return e->mv;
+}
+static SDL_GPUShader *mv_fragment_shader(void) {
+	static SDL_GPUShader *sh; static int tried;
+	if (tried) return sh;
+	tried = 1;
+	SDL_GPUShaderCreateInfo ci = {0}; ci.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+	SpirvModule m; memset(&m, 0, sizeof m);
+	if (SDL_GetGPUShaderFormats(gpu()) & SDL_GPU_SHADERFORMAT_MSL) {
+		static const char *msl = "#include <metal_stdlib>\nusing namespace metal;\nstruct In { float4 cur [[user(locn30)]]; float4 prev [[user(locn31)]]; };\n"
+			"fragment float4 main0(In in [[stage_in]]) { float2 d = in.cur.xy / in.cur.w - in.prev.xy / in.prev.w; return float4(d * 0.5, 0.0, 0.0); }\n";
+		ci.code = (const Uint8 *)msl; ci.code_size = strlen(msl) + 1; ci.format = SDL_GPU_SHADERFORMAT_MSL; ci.entrypoint = "main0";
+	} else {
+		m = usse_spirv_motion_fragment();
+		if (!m.ok) return 0;
+		ci.code = (const Uint8 *)m.words; ci.code_size = 4 * (size_t)m.nwords; ci.format = SDL_GPU_SHADERFORMAT_SPIRV; ci.entrypoint = "main";
+	}
+	sh = SDL_CreateGPUShader(gpu(), &ci);
+	if (!sh) fprintf(stderr, "    gpu mv: motion fragment shader: %s\n", SDL_GetError());
+	usse_spirv_free(&m);
+	return sh;
+}
+/* a draw's pipeline for the motion pass: its own vertex shader, cull mode and depth bias, the motion fragment shader,
+ * the depth test as its own but "or equal", no depth write, the RG16F target */
+static SDL_GPUGraphicsPipeline *mv_pipeline(PipeEntry *pe) {
+	if (pe->mv_pipe || pe->mv_tried) return pe->mv_pipe;
+	pe->mv_tried = 1;
+	const ShaderEntry *vs = pe->mv_vse; SDL_GPUShader *fs = mv_fragment_shader();
+	if (vs && shader_pending(vs)) { pe->mv_tried = 0; return 0; }   /* (its build is still running: a later flush) */
+	if (!vs || !vs->shader || !fs) return 0;
+	SDL_GPUColorTargetDescription ctd = { .format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT };
+	SDL_GPUGraphicsPipelineCreateInfo ci = {0};
+	ci.vertex_shader = vs->shader; ci.fragment_shader = fs; ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)pe->cull_sdl;
+	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE; ci.rasterizer_state.enable_depth_clip = false;
+	if (pe->dbf || pe->dbu) { ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor = (float)pe->dbu; ci.rasterizer_state.depth_bias_slope_factor = (float)(pe->dbf * pe->dbs); }
+	SDL_GPUCompareOp op = conv_cmp(pe->depth_func);
+	op = op == SDL_GPU_COMPAREOP_GREATER || op == SDL_GPU_COMPAREOP_GREATER_OR_EQUAL ? SDL_GPU_COMPAREOP_GREATER_OR_EQUAL
+	   : op == SDL_GPU_COMPAREOP_LESS || op == SDL_GPU_COMPAREOP_LESS_OR_EQUAL ? SDL_GPU_COMPAREOP_LESS_OR_EQUAL : SDL_GPU_COMPAREOP_EQUAL;
+	ci.depth_stencil_state.enable_depth_test = true; ci.depth_stencil_state.enable_depth_write = false; ci.depth_stencil_state.compare_op = op;
+	/* a little toward the camera: the motion variant is another shader, and Metal's fast math can round its depth a step away
+	 * from the draw's own -- enough to fail "or equal" (skinned characters' long programs did) and leave the vectors of what
+	 * the earlier passes drew behind them. RECOMP_MV_DEPTH_BIAS=<steps> (default below) */
+	{ static float steps = -1; if (steps < 0) { const char *e = getenv("RECOMP_MV_DEPTH_BIAS"); steps = e ? (float)atof(e) : 8; }   /* (8: Killzone's soldier came through; 0 off) */
+	  if (steps > 0) { const float toward = op == SDL_GPU_COMPAREOP_GREATER_OR_EQUAL ? steps : -steps;
+	    ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor += toward; } }
+	ci.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+	ci.target_info.color_target_descriptions = &ctd; ci.target_info.num_color_targets = 1;
+	ci.target_info.has_depth_stencil_target = true; ci.target_info.depth_stencil_format = depth_format();
+	pe->mv_pipe = SDL_CreateGPUGraphicsPipeline(gpu(), &ci);
+	if (pe->mv_pipe) n_mv_pipes++; else { static int said; if (!said++) fprintf(stderr, "    gpu mv: motion pipeline: %s\n", SDL_GetError()); }
+	return pe->mv_pipe;
+}
+/* the previous frame's SA of the same draw: draws keyed by their vertex program, streams, indices, count and primitive.
+ * Equal keys (one mesh drawn at many places: Killzone's blossom clusters, Uncharted's temple rocks) pair with the previous
+ * frame's record of that key whose SA is nearest, each taken once, over the whole group: by order alone, one culled or re-sorted copy shifted every later one onto its neighbour's matrices
+ * (RECOMP_MV_MATCH=order: the n'th to the n'th, as before), and a search 32 either side of its own place missed copies
+ * the game had re-sorted further (Uncharted's climbing wall: rocks got another rock's vectors, 300 px, and FSR pulled
+ * their history from there: they flickered). Unmatched (a first frame, a new object): this frame's, no motion. The LDST
+ * pointer words stay this frame's (M2 points them at the previous windows) */
+#define MV_TAB 8192
+typedef struct { uint64_t key; uint32_t sa[256]; int taken, n; } MvRec;   /* n: a key's first record: its draws this frame */
+static MvRec *mv_tab[2]; static int mv_cur; static uint32_t mv_matched, mv_unmatched, mv_windowed, mv_posed, mv_moved;   /* windowed: motion draws whose vertex program reads LDST windows (bones in memory: M2); moved: matched off their own occurrence */
+static uint64_t mv_draw_key(const GfxDraw *d) {
+	uint64_t h = 0xcbf29ce484222325ull;
+	#define MVMIX(x) (h = (h ^ (uint64_t)(x)) * 0x100000001b3ull)
+	MVMIX(d->vprog); MVMIX(d->indices); MVMIX(d->count); MVMIX(d->prim); MVMIX(d->nstream);
+	for (int i = 0; i < d->nstream && i < 16; i++) MVMIX(d->stream[i]);
+	#undef MVMIX
+	return h | 1;
+}
+static uint64_t mv_occ_key(uint64_t k, int occ) { return occ ? (k ^ 0x9E3779B97F4A7C15ull * (uint64_t)occ) | 1 : k; }   /* (the n'th draw of a key in a frame) */
+static MvRec *mv_slot(MvRec *t, uint64_t key, int add) {
+	for (uint32_t i = (uint32_t)(key >> 17) % MV_TAB, n = 0; n < MV_TAB; i = (i + 1) % MV_TAB, n++) {
+		if (t[i].key == key) return &t[i];
+		if (!t[i].key) { if (add) { t[i].key = key; return &t[i]; } return 0; }
+	}
+	return 0;
+}
+static float mv_sa_dist(const uint32_t *a, const uint32_t *b, float stop) {   /* how far apart two SAs are, word by word as floats (early out past stop) */
+	float d = 0;
+	for (int i = 0; i < 256 && d < stop; i++) {
+		if (a[i] == b[i]) continue;
+		float x, y; memcpy(&x, &a[i], 4); memcpy(&y, &b[i], 4);
+		float t = fabsf(x - y); d += t == t && t < 1e3f ? t : 1e3f;   /* (pointer words, NaNs: a large step, not infinity) */
+	}
+	return d;
+}
+static int mv_match_time(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_MV_MATCH_TIME") != 0; return v; }   /* (the matching's CPU time a frame, logged) */
+static double mv_match_ns; static uint32_t mv_match_n;
+/* this frame's SA of the draw recorded, and the previous frame's of the same draw returned (0: unmatched) */
+static const uint32_t *mv_match(const GfxDraw *d, const uint32_t *sa) {
+	static int by_order = -1; if (by_order < 0) { const char *e = getenv("RECOMP_MV_MATCH"); by_order = e && !strcmp(e, "order"); }
+	if (!mv_tab[0]) { mv_tab[0] = calloc(MV_TAB, sizeof(MvRec)); mv_tab[1] = calloc(MV_TAB, sizeof(MvRec)); }
+	if (!mv_tab[0] || !mv_tab[1]) return 0;
+	struct timespec t0; if (mv_match_time()) clock_gettime(CLOCK_MONOTONIC, &t0);
+	MvRec *cur = mv_tab[mv_cur], *prev = mv_tab[mv_cur ^ 1];
+	const uint64_t k = mv_draw_key(d);
+	MvRec *r0 = mv_slot(cur, k, 0); int occ = 0;
+	if (r0) occ = r0->n++; else if ((r0 = mv_slot(cur, k, 1))) r0->n = 1;
+	MvRec *r = occ ? mv_slot(cur, mv_occ_key(k, occ), 1) : r0;
+	if (r) { memcpy(r->sa, sa, sizeof r->sa); r->taken = 0; }
+	const MvRec *p0 = mv_slot(prev, k, 0); const int np = p0 ? p0->n : 0;
+	MvRec *p = 0;
+	if (by_order) p = occ < np ? mv_slot(prev, mv_occ_key(k, occ), 0) : 0;
+	else {
+		MvRec *own = occ < np ? mv_slot(prev, mv_occ_key(k, occ), 0) : 0;
+		float best = own && !own->taken ? mv_sa_dist(sa, own->sa, INFINITY) : INFINITY; p = own && !own->taken ? own : 0;   /* (its own place first: a tight early out) */
+		for (int o = 0; best > 0 && o < np; o++) {
+			MvRec *q = o == occ ? 0 : mv_slot(prev, mv_occ_key(k, o), 0);
+			if (!q || q->taken) continue;
+			const float dd = mv_sa_dist(sa, q->sa, best);
+			if (dd < best) { best = dd; p = q; }
+		}
+		if (p) { p->taken = 1; if (p != own) mv_moved++; }
+	}
+	if (p) mv_matched++; else mv_unmatched++;
+	if (mv_match_time()) { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1); mv_match_ns += (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec); mv_match_n++; }
+	return p ? p->sa : 0;
+}
+/* M2: a motion draw's LDST windows (bone palettes) as they were when it drew, by guest address, once per address a frame:
+ * the next frame's motion pass places the snapshots in the LDST ring beside that frame's windows, and its previous-frame
+ * uniform block points its pointer words at them -- a skinned character's previous pose, not only its previous placement */
+#define MV_WINS 64
+typedef struct { uint32_t base; uint8_t *data; } MvWin;
+static MvWin mv_win[2][MV_WINS]; static int mv_nwin[2];
+static const uint8_t *mv_win_find(int t, uint32_t base) { for (int i = 0; i < mv_nwin[t]; i++) if (mv_win[t][i].base == base) return mv_win[t][i].data; return 0; }
+static void mv_win_snap(uint32_t base) {
+	const int t = mv_cur;
+	if (mv_win_find(t, base) || mv_nwin[t] >= MV_WINS) return;
+	MvWin *w = &mv_win[t][mv_nwin[t]];
+	if (!w->data && !(w->data = malloc(USSE_LDST_WINDOW))) return;
+	w->base = base; memcpy(w->data, G(base), USSE_LDST_WINDOW); mv_nwin[t]++;
+}
+static void mv_frame_end(void) {   /* this frame's records become the previous frame's */
+	if (mv_match_time() && mv_match_n) fprintf(stderr, "    mv match: %u draws, %.3f ms\n", mv_match_n, mv_match_ns / 1e6);
+	mv_match_ns = 0; mv_match_n = 0;
+	if (!mv_tab[0]) return;
+	mv_cur ^= 1; mv_nwin[mv_cur] = 0;   /* (the snapshots' buffers kept for reuse) */
+	for (int i = 0; i < MV_TAB; i++) mv_tab[mv_cur][i].key = 0;
+}
+static float half_to_float(uint16_t h) {
+	uint32_t e = (h >> 10) & 0x1f, m = h & 0x3ff; float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 0x400), (int)e - 25);
+	return h & 0x8000 ? -v : v;
+}
+static void *mv_download(SDL_GPUTexture *t, uint32_t w, uint32_t h, uint32_t bpp) {   /* a texture's texels, malloc'd (0: failed) */
+	SDL_GPUTransferBufferCreateInfo xci = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = bpp * w * h };
+	SDL_GPUTransferBuffer *xb = SDL_CreateGPUTransferBuffer(gpu(), &xci);
+	if (!xb) return 0;
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu()); SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureRegion src = { .texture = t, .w = w, .h = h, .d = 1 };
+	SDL_GPUTextureTransferInfo dst = { .transfer_buffer = xb, .pixels_per_row = w, .rows_per_layer = h };
+	SDL_DownloadFromGPUTexture(cp, &src, &dst); SDL_EndGPUCopyPass(cp);
+	SDL_GPUFence *f = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); SDL_WaitForGPUFences(gpu(), true, &f, 1); SDL_ReleaseGPUFence(gpu(), f);
+	void *out = 0; const void *px = SDL_MapGPUTransferBuffer(gpu(), xb, false);
+	if (px && (out = malloc((size_t)bpp * w * h))) memcpy(out, px, (size_t)bpp * w * h);
+	if (px) SDL_UnmapGPUTransferBuffer(gpu(), xb);
+	SDL_ReleaseGPUTransferBuffer(gpu(), xb);
+	return out;
+}
+/* RECOMP_MV_DUMP=<path with %u>: the frame's motion target and the colour target it belongs to, as the game queued the
+ * frame (both under one frame number, nothing of the next frame drawn yet): <path> (x to red, y to green around grey:
+ * grey = no motion or not covered; RECOMP_MV_DUMP_GAIN), <path>.raw (width, height, then the RG16F pairs) and
+ * <path>.color.ppm (8-bit targets as they are, float ones clamped to 0..1). Every RECOMP_MV_DUMP_EVERY'th frame
+ * (30), RECOMP_MV_DUMP_FROM/_TO a window, all counted in frames queued */
+static void mv_capture(TargetEntry *e, uint64_t f) {
+	static const char *dump = (const char *)1; static int every = 30; static float gain = 8;
+	static long from = 0, to = -1;
+	if (dump == (const char *)1) { dump = getenv("RECOMP_MV_DUMP"); const char *v = getenv("RECOMP_MV_DUMP_EVERY"); if (v && atoi(v) > 0) every = atoi(v); v = getenv("RECOMP_MV_DUMP_GAIN"); if (v && atof(v) > 0) gain = (float)atof(v);
+		if ((v = getenv("RECOMP_MV_DUMP_FROM"))) from = atol(v); if ((v = getenv("RECOMP_MV_DUMP_TO"))) to = atol(v); }
+	if (!dump || !e || !e->mv || !e->color || f % (uint64_t)every || (long)f < from || (to >= 0 && (long)f > to)) return;
+	batch_flush("motion capture");
+	const uint32_t w = TSX(e, e->width), h = TSY(e, e->height);
+	char path[512]; snprintf(path, sizeof path, dump, (unsigned)f);
+	uint16_t *mv = mv_download(e->mv, w, h, 4);
+	if (mv) {
+		FILE *fo = fopen(path, "wb");
+		if (fo) {
+			fprintf(fo, "P6\n%u %u\n255\n", w, h);
+			for (uint32_t i = 0; i < w * h; i++) {
+				float x = half_to_float(mv[2 * i]), y = half_to_float(mv[2 * i + 1]);
+				uint8_t c[3] = { (uint8_t)fminf(255, fmaxf(0, 127.5f + 127.5f * x * gain)), (uint8_t)fminf(255, fmaxf(0, 127.5f + 127.5f * y * gain)), 128 };
+				fwrite(c, 1, 3, fo);
+			}
+			fclose(fo);
+		}
+		char rp[530]; snprintf(rp, sizeof rp, "%s.raw", path); FILE *fr = fopen(rp, "wb");
+		if (fr) { uint32_t wh[2] = { w, h }; fwrite(wh, 4, 2, fr); fwrite(mv, 4, (size_t)w * h, fr); fclose(fr); }
+		free(mv);
+	}
+	if (mv_jitter_phases() >= 2) {   /* <path>.jitter: the frame's offset in render pixels, x right and y down */
+		float jx, jy; mv_jitter(f, &jx, &jy); char jp[530]; snprintf(jp, sizeof jp, "%s.jitter", path); FILE *fj = fopen(jp, "w");
+		if (fj) { fprintf(fj, "%.6f %.6f\n", jx, jy); fclose(fj); }
+	}
+	const uint32_t bpp = kind_bytes(e->kind);   /* (the colour as the GPU holds it: RGBA8, RGBA16F, R11G11B10, R32G32 or RGBA32F) */
+	uint8_t *px = mv_download(e->color, w, h, bpp);
+	char cp[530]; snprintf(cp, sizeof cp, "%s.color.ppm", path); FILE *fc = px ? fopen(cp, "wb") : 0;
+	if (fc) {
+		fprintf(fc, "P6\n%u %u\n255\n", w, h);
+		for (uint32_t i = 0; i < w * h; i++) {
+			const uint8_t *q = px + (size_t)bpp * i; float v[3] = { 0, 0, 0 }; uint8_t c[3];
+			if (e->kind == TK_U8 || e->kind == TK_U8S) { memcpy(c, q, 3); fwrite(c, 1, 3, fc); continue; }
+			if (e->kind == TK_F16) for (int k = 0; k < 3; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); v[k] = half_to_float(hv); }
+			else if (e->kind == TK_HDR10) {   /* R11G11B10_UFLOAT: 6- and 5-bit mantissas over 5-bit exponents */
+				uint32_t x; memcpy(&x, q, 4); const uint32_t f[3] = { x & 0x7ff, (x >> 11) & 0x7ff, x >> 22 }; const int mb[3] = { 6, 6, 5 };
+				for (int k = 0; k < 3; k++) { uint32_t m = f[k] & ((1u << mb[k]) - 1), ex = f[k] >> mb[k]; v[k] = ex ? ldexpf(1.0f + (float)m / (float)(1u << mb[k]), (int)ex - 15) : ldexpf((float)m / (float)(1u << mb[k]), -14); }
+			} else for (int k = 0; k < 3 && 4 * k < (int)bpp; k++) memcpy(&v[k], q + 4 * k, 4);   /* (F32: R32G32's blue reads 0) */
+			for (int k = 0; k < 3; k++) c[k] = (uint8_t)(v[k] != v[k] ? 0 : fminf(255, fmaxf(0, 255 * v[k] + 0.5f)));
+			fwrite(c, 1, 3, fc);
+		}
+		fclose(fc);
+	}
+	free(px);
+}
+/* M4: FSR 3.1 as temporal anti-aliasing (RECOMP_FSR=1, which turns the motion vectors and the jitter on), on the main
+ * target once a frame, when the first draw outside the main scene samples it -- in Killzone the final composite, after
+ * every 3D pass and before the HUD (RECOMP_MV_SCENES): the anti-aliased frame replaces the target's, and its views follow */
+static uint64_t fsr_frame = ~0ull; static uint32_t n_fsr, n_fsr_cuts; static double t_fsr_ms, t_fsr_empty_ms;   /* (t_fsr_empty_ms: an empty command buffer's round trip, the timing's own share) */
+static uint32_t fsr_matched, fsr_unmatched;
+/* FSR's opaque-only image (its reactive mask, fsr.c): the main target's colour copied before the first draw after its
+ * opaque ones -- Killzone's puddles, glows and particles, which blend in the shader (FRAGCOLOR) after its 158 opaque
+ * draws. The mask marks what they changed: FSR leans on the current frame there instead of a history that smeared them */
+static SDL_GPUTexture *fsr_opaque; static uint32_t fsr_opaque_w, fsr_opaque_h; static int fsr_opaque_kind = -1; static uint64_t fsr_opaque_frame;
+static SDL_GPUTexture *fsr_opaque_for(const TargetEntry *e) {
+	const uint32_t w = TSX(e, e->width), h = TSY(e, e->height);
+	if (fsr_opaque && fsr_opaque_w == w && fsr_opaque_h == h && fsr_opaque_kind == e->kind) return fsr_opaque;
+	if (fsr_opaque) SDL_ReleaseGPUTexture(gpu(), fsr_opaque);
+	SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(e->kind), .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+		.width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+	fsr_opaque = SDL_CreateGPUTexture(gpu(), &ci); fsr_opaque_w = w; fsr_opaque_h = h; fsr_opaque_kind = e->kind;
+	return fsr_opaque;
+}
+static int fsr_reactive(float *threshold, float *value) {   /* RECOMP_FSR_REACTIVE=<threshold>,<value> (0.2,0.9: the SDK sample's), =0 no mask */
+	static int on = -1; static float t = 0.2f, v = 0.9f;
+	if (on < 0) { const char *e = getenv("RECOMP_FSR_REACTIVE"); on = !(e && !strcmp(e, "0")); if (e && on) sscanf(e, "%f,%f", &t, &v); }
+	*threshold = t; *value = v; return on;
+}   /* this frame's motion draws in the main target matched to last frame's, and not (a cut: most unmatched) */
+static void fsr_run(TargetEntry *e) {
+	if (fsr_frame == mv_qframe) return;   /* (once a frame) */
+	const DepthEntry *de = mv_main_depth; TargetEntry *mt = (TargetEntry *)mv_main_entry;   /* (e: the colour, mv_lit; mt: the main target, its vectors) */
+	const int lit = e != mt;
+	const char *skip = !mt || mt->mv_frame != mv_qframe + 1 ? "its main scene didn't draw this frame" : !mt->mv || !e->color ? "no motion or colour texture" : !de || !de->tex ? "no depth texture"
+	                 : lit && (TSX(e, e->width) != TSX(mt, mt->width) || TSY(e, e->height) != TSY(mt, mt->height)) ? "the lit image isn't the main target's size"
+	                 : lit && e->drawn_frame != gpu_frame_no + 1 ? "the lit image wasn't drawn this frame" : 0;   /* (a multisampled surface's msx/msy are its layout in guest memory: the texture is the target's size) */
+	if (skip) { static uint64_t said = ~0ull; if (said != mv_qframe && getenv("RECOMP_FSR_DUMP")) { said = mv_qframe; fprintf(stderr, "    fsr: frame %llu: not run: %s\n", (unsigned long long)mv_qframe, skip); } return; }
+	fsr_frame = mv_qframe;
+	batch_flush("fsr");
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu()); if (!cmd) return;
+	static uint64_t last_ns; const uint64_t now = SDL_GetTicksNS(); const float ms = last_ns ? (float)(now - last_ns) / 1e6f : 16.7f; last_ns = now;
+	float jx, jy; mv_jitter(mv_qframe, &jx, &jy);
+	static float sharp = -2; if (sharp == -2) { const char *v = getenv("RECOMP_FSR_SHARPNESS"); sharp = v ? (float)atof(v) : -1.0f; }   /* (RCAS, 0-1; below 0, the default, off: the present's CAS -- the menu's Sharpening -- sharpens the final frame, once) */
+	float rt = 0, rv = 0;
+	static const TargetEntry *fsr_last_color; const int recolor = fsr_last_color && fsr_last_color != e; fsr_last_color = e;   /* (another colour target than last time: its history isn't this one's) */
+	const int cut = recolor || fsr_matched + fsr_unmatched >= 16 && fsr_unmatched * 2 > fsr_matched + fsr_unmatched;   /* (a camera cut or a new place: no history worth blending) */
+	n_fsr_cuts += cut;
+	TargetEntry *dest = e;   /* (anti-aliasing alone: the frame back into the target it was drawn in) */
+	uint8_t dsx, dsy; target_scale(e->width, e->height, &dsx, &dsy);
+	if (!lit && (dsx != e->sx || dsy != e->sy)) {   /* upscaling (a forward renderer's: the lit image of a deferred one isn't drawn at the internal scale): the same address's entry at the render scale */
+		GfxTarget tg = target_entry_as_gfx(e);
+		if (!(dest = get_target_at(&tg, dsx, dsy))) return;
+	}
+	const FsrFrame f = { .color = e->color, .depth = de->tex, .motion = mt->mv, .rw = TSX(e, e->width), .rh = TSY(e, e->height), .dest = dest->color, .dw = TSX(dest, dest->width), .dh = TSY(dest, dest->height),
+		.jitter_x = jx, .jitter_y = jy, .frame_ms = ms, .hdr = e->kind != TK_U8 && e->kind != TK_U8S, .inverted = mv_main_inverted, .reset = cut || fsr_restart, .sharpness = sharp,
+		.opaque = fsr_opaque_frame == mv_qframe + 1 && fsr_reactive(&rt, &rv) ? fsr_opaque : 0,   /* (forward: before the transparent draws; deferred: before the scenes after the composite) */ .reactive_threshold = rt, .reactive_value = rv };
+	fsr_restart = 0;
+	static int timing = -1; if (timing < 0) timing = getenv("RECOMP_FSR_TIME") != 0;   /* (the GPU drained first, then FSR alone timed: a measurement, it stalls the frame) */
+	uint64_t t0 = 0;
+	if (timing) for (int k = 0; k < 2; k++) {   /* (once to drain the GPU, once more to time an empty round trip) */
+		t0 = SDL_GetTicksNS(); SDL_GPUCommandBuffer *c0 = SDL_AcquireGPUCommandBuffer(gpu()); SDL_GPUFence *f0 = c0 ? SDL_SubmitGPUCommandBufferAndAcquireFence(c0) : 0; if (f0) { SDL_WaitForGPUFences(gpu(), true, &f0, 1); SDL_ReleaseGPUFence(gpu(), f0); }
+		if (k) t_fsr_empty_ms += (double)(SDL_GetTicksNS() - t0) / 1e6;
+		t0 = SDL_GetTicksNS();
+	}
+	static const char *dump = (const char *)1; static long from, to;   /* RECOMP_FSR_DUMP=<prefix with %u>, RECOMP_FSR_DUMP_FROM/_TO (frames queued): fsr_dump's files */
+	if (dump == (const char *)1) { dump = getenv("RECOMP_FSR_DUMP"); const char *v; from = (v = getenv("RECOMP_FSR_DUMP_FROM")) ? atol(v) : 0; to = (v = getenv("RECOMP_FSR_DUMP_TO")) ? atol(v) : -1; }
+	const int dumping = dump && (long)mv_qframe >= from && (to < 0 || (long)mv_qframe <= to);
+	fsr_keep_input(dumping);
+	const int ok = fsr_dispatch(gpu(), &cmd, &f);
+	if (dumping) {
+		SDL_GPUFence *fe = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); SDL_WaitForGPUFences(gpu(), true, &fe, 1); SDL_ReleaseGPUFence(gpu(), fe);
+		char prefix[512]; snprintf(prefix, sizeof prefix, dump, (unsigned)mv_qframe); if (ok) fsr_dump(gpu(), prefix);
+		fprintf(stderr, "    fsr: frame %llu: %ux%u -> %ux%u %s, depth %s, jitter %.3f %.3f\n", (unsigned long long)mv_qframe, f.rw, f.rh, f.dw, f.dh, f.hdr ? "HDR" : "LDR", f.inverted ? "inverted" : "forward", jx, jy);
+	} else if (timing) { SDL_GPUFence *fe = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); if (fe) { SDL_WaitForGPUFences(gpu(), true, &fe, 1); SDL_ReleaseGPUFence(gpu(), fe); } t_fsr_ms += (double)(SDL_GetTicksNS() - t0) / 1e6; }
+	else SDL_SubmitGPUCommandBuffer(cmd);
+	if (ok) { dest->gen = ++write_clock; dest->gpu_dirty = 1; dest->cpu_dirty = 0; dest->used = ++target_clock; n_fsr++; }   /* (the newest over the address: what samples it next gets FSR's frame) */
+}
+/* the game queued its frame for display (gxm_sony.c's observer through gfx_frame_queued, on the thread that drew it): the
+ * motion vectors' frame boundary. Not present: the game draws the next frame's first scenes before the display queue's
+ * thread flips the last one, and those draws would match against the wrong frame and clear a motion target mid-frame.
+ * The frame's capture (RECOMP_MV_DUMP), a line of counts every 300 frames, then this frame's records become the previous */
+static const char *fsr_time_str(void) { static char b[800]; b[0] = 0; if (n_fsr && t_fsr_ms > 0) { const char *p = fsr_profile(); snprintf(b, sizeof b, "; %.2f ms each, of which an empty round trip %.2f%s%s", t_fsr_ms / n_fsr, t_fsr_empty_ms / n_fsr, *p ? "; by pass: " : "", p); } return b; }
+void gfx_gpu_frame_queued(void) {
+	if (!mv_on()) return;
+	TargetEntry *e = mv_best;
+	mv_capture(e, mv_qframe);
+	if (mv_qframe % 300 == 0) {
+		fprintf(stderr, "    gpu mv: frame %llu: %llu motion draws so far, %u pipelines, this frame's target %ux%u (%u draws); matched %u (%u to another occurrence of their key), unmatched %u, reading LDST windows %u (%u with their previous pose); jittered %u draws in %u scenes (%u of them on the main depth only); FSR ran %u times (%u of them reset as cuts%s) since the last line\n",
+		        (unsigned long long)mv_qframe, (unsigned long long)n_mv_draws, n_mv_pipes, e ? TSX(e, e->width) : 0, e ? TSY(e, e->height) : 0, mv_best_n, mv_matched, mv_moved, mv_unmatched, mv_windowed, mv_posed, mv_jit_draws, mv_jit_scenes, mv_jit_depth_scenes, n_fsr, n_fsr_cuts, fsr_time_str());
+		mv_matched = mv_moved = mv_unmatched = mv_windowed = mv_posed = 0; mv_jit_draws = mv_jit_scenes = mv_jit_depth_scenes = 0; n_fsr = n_fsr_cuts = 0; t_fsr_ms = t_fsr_empty_ms = 0;
+	}
+	mv_main_entry = mv_best; mv_main_depth = mv_best ? mv_best_depth : 0;   /* (next frame's main target: jitter, the scene log) */
+	mv_lit = mv_lit_cur ? mv_lit_cur : mv_best; mv_lit_cur = 0; fsr_forward = !mv_best || mv_lit == mv_best;   /* (FSR's colour next frame) */
+	mv_lit_last_ord = mv_lit_ord_cur ? mv_lit_ord_cur : 1 << 30; mv_lit_ord_cur = 0; mv_ord = 0; mv_lit_seen = 0;
+	if (mv_best) { fsr_lo.addr = mv_best->addr; fsr_lo.w = mv_best->width; fsr_lo.h = mv_best->height; }   /* (FSR upscaling: drawn at the internal scale from the next frame) */
+	fsr_matched = fsr_unmatched = 0;
+	if (mv_votes_inv + mv_votes_fwd) mv_main_inverted = mv_votes_inv > mv_votes_fwd; mv_votes_inv = mv_votes_fwd = 0;
+	mv_best = 0; mv_best_n = 0;
+	mv_frame_end(); mv_qframe++;
+}
 void gfx_gpu_begin_scene(const GfxTarget *t) {
 	scene_open = 1;
 	gfx_soft_use_interp();   /* the CPU fallback and check reference run the real shaders */
@@ -2635,6 +3085,36 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	if (scene_entry == &scratch_entry && !scene_depth_entry) { scene_entry = 0; scene_soft = 1; gfx_soft_begin_scene(t); }   /* a depth-only scene is its depth texture */
 	ao_draws = ao_ncand = 0;
 	ao_scene = ao_spec_ok() && scene_entry && scene_entry != &scratch_entry && scene_depth_entry && (t->format & ~0x3000u) == ao_spec.fmt && ssao_enabled();   /* (ambient occlusion, above) */
+	mv_scene = mv_on() && scene_depth_entry && mv_is_main(t, scene_entry);   /* (motion vectors, above) */
+	if (mv_scene_log()) {
+		static uint64_t f = ~0ull; if (f != mv_qframe) { f = mv_qframe; mv_scene_no = 0; }
+		mv_scene_said = 0; mv_scene_nd = 0;
+		fprintf(stderr, "    mv scenes: frame %llu scene %d: target %#x %ux%u fmt %#x kind %d, depth %#x%s%s\n", (unsigned long long)mv_qframe, mv_scene_no++, t->data, t->width, t->height, t->format,
+		        scene_entry ? scene_entry->kind : -1, t->depth ? t->ds_data : 0, (const void *)scene_entry == mv_main_entry ? " MAIN" : mv_scene ? " (motion pass)" : "",
+		        (const void *)scene_entry != mv_main_entry && scene_depth_entry && (const void *)scene_depth_entry == mv_main_depth ? " (main depth)" : "");
+	}
+	if (mv_on() && !mv_lit_cur && scene_depth_entry && mv_main_depth && (const void *)scene_depth_entry == mv_main_depth && (const void *)scene_entry != mv_main_entry && scene_entry && scene_entry->color) mv_lit_cur = scene_entry;
+	mv_ord++; mv_lit_index = -1;
+	if (scene_entry && (const void *)scene_entry == mv_lit) { mv_lit_index = mv_lit_seen++; mv_lit_ord_cur = mv_ord; }
+	/* the jitter: the main target's scenes, and those on its depth buffer -- unless that's a deferred renderer's lighting
+	 * (mv_lit isn't the main target): its full-screen passes, moved, would read the G-buffer a sub-pixel off */
+	mv_jit_scene = mv_jitter_phases() >= 2 && mv_on() && scene_depth_entry && ((const void *)scene_entry == mv_main_entry || ((const void *)scene_depth_entry == mv_main_depth && (!mv_lit || mv_lit == mv_main_entry || mv_lit_index >= 1)));   /* (a deferred renderer's lit-image scenes after the composite: its transparent geometry) */
+	if (mv_jit_scene) { mv_jitter(mv_qframe, &mv_jx, &mv_jy); mv_jit_scenes++; if ((const void *)scene_entry != mv_main_entry) mv_jit_depth_scenes++; }
+}
+/* a deferred renderer's composite (mv_lit's first scene, unjittered above) also draws meshes again over the G-buffer's
+ * depth, most tested EQUAL: Uncharted's second pass for foliage, glass, skin. Unmoved over the jittered depth, the test
+ * passed on a different scatter of pixels each frame, so with FSR on those surfaces showed in part and flickered. They
+ * take the frame's jitter: a mesh (more than a quad) tested EQUAL, or tested otherwise without reading the G-buffer.
+ * The light volumes read it at their own pixel and stay put: moved, they lit it a sub-pixel off (foliage flickered 5x) */
+static int composite_mesh(const GfxDraw *d, const PipeEntry *pipe) {
+	static int on = -1; if (on < 0) { const char *e = getenv("RECOMP_MV_COMPOSITE"); on = !(e && *e == '0'); }   /* (=0: not, for an A/B) */
+	if (!(on && mv_lit && mv_lit != mv_main_entry && (const void *)scene_entry == mv_lit && mv_lit_index == 0 && mv_main_entry
+	      && (const void *)scene_depth_entry == mv_main_depth && mv_jitter_phases() >= 2 && mv_on())) return 0;
+	if (!pipe->has_depth || d->count <= 6 || d->depth_func == 0 || d->depth_func == 7) return 0;   /* (NEVER, ALWAYS: no test) */
+	if (d->depth_func == 2) return 1;
+	const TargetEntry *m = (const TargetEntry *)mv_main_entry; const uint32_t lo = m->addr, hi = lo + target_bytes(m);
+	for (int u = 0; u < 16; u++) if (d->tex[u].data >= lo && d->tex[u].data < hi) return 0;
+	return 1;
 }
 /* guest memory [addr, addr+len) was written behind the GPU's back (gfxreplay restoring a capture's
  * memory records at a scene's start; a game writing into a surface with the CPU): the overlapping
@@ -2856,6 +3336,11 @@ void gfx_gpu_sync_all(void) { if (!gpu()) return; batch_flush("sync to guest"); 
 static int vis_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_VIS_SYNC"); v = !(e && *e == '0'); } return v; }
 void gfx_gpu_end_scene(void) {
 	scene_open = 0;
+	if (mv_scene_nd) {   /* (RECOMP_MV_SCENES: the main scene's draws, as runs) */
+		char out[512]; int n = 0; mv_scene_draws[mv_scene_nd] = 0;
+		for (int i = 0; i < mv_scene_nd && n < (int)sizeof out - 16; ) { int j = i; while (j < mv_scene_nd && mv_scene_draws[j] == mv_scene_draws[i]) j++; n += snprintf(out + n, sizeof out - (size_t)n, "%d%c ", j - i, mv_scene_draws[i]); i = j; }
+		fprintf(stderr, "    mv scenes: frame %llu scene %d: draws %s\n", (unsigned long long)mv_qframe, mv_scene_no - 1, out); mv_scene_nd = 0;
+	}
 	if (scene_soft) { gfx_soft_end_scene(); scene_soft = 0; }
 	if (gpu()) {
 		batch_flush("end of scene");
@@ -3449,9 +3934,13 @@ static void bind_unit(const GfxTexture *tex, int unit, SDL_GPUTextureSamplerBind
 	 * declared format, as gfx_soft.c stores it) and the texture decoded from there like
 	 * any other, so every reinterpretation reads the real bytes. */
 	TargetEntry *src_target = 0; uint64_t tb0 = us_now();
+	if (fsr_on() && tex && mv_main_entry && mv_lit && (const void *)scene_entry != mv_lit && (const void *)scene_entry != mv_main_entry && mv_ord > mv_lit_last_ord && tex->data == ((const TargetEntry *)mv_lit)->addr) fsr_run((TargetEntry *)mv_lit);   /* (M4: before the first draw that reads the frame FSR works on, past the scenes that draw it) */
 	TexEntry *te = (tex && tex->data) ? target_view(tex, &src_target) : 0;   /* render-to-texture: a view, the target itself, or guest memory (see target_view) */
 	if (src_target) target_sync_for_gpu(src_target);   /* its newest content may be in guest memory (a software-fallback draw, a replay's restored page): the texture must hold it before being sampled -- sampled stale it was Metal's uninitialised fill, a whole magenta frame */
 	if (!te && !src_target && tex && tex->data) te = get_texture(tex);
+	if (mv_main_entry && !mv_scene_said && mv_scene_log() && ((const void *)src_target == mv_main_entry || (te && te->view_src == mv_main_entry))) {
+		mv_scene_said = 1; fprintf(stderr, "    mv scenes: frame %llu scene %d: draw %u samples the main target (%s, unit %d, %ux%u)\n", (unsigned long long)mv_qframe, mv_scene_no - 1, n_gpu_draws, src_target ? "directly" : "a view", unit, tex->width, tex->height);
+	}
 	t_bind += us_now() - tb0;
 	SDL_GPUTexture *dummy = dummy_texture();
 	b->texture = src_target ? src_target->color : te ? te->tex : dummy ? dummy : (scene_entry ? scene_entry->color : 0);
@@ -3499,6 +3988,8 @@ typedef struct {
 	UsseDrawUniforms vu, fu;
 	int qslot;   /* a visibility query (vis_query_add): its counter in qbuf, -1 for a real draw */
 	int hud; float hud_b[4];   /* a HUD draw (hud_classify) and where it lands (NDC: min x, max x, min y, max y): hud_layout narrows its vp at the flush */
+	uint8_t mv;   /* drawn again in the motion pass (RECOMP_MV: an opaque, depth-writing draw of the main scene) */
+	UsseDrawUniforms pvu;   /* the motion pass's second uniform block: vu with the same draw's SA of the previous frame (mv_prev) */
 } BatchDraw;
 /* between draws pos-1 and pos: the FRAGCOLOR copy of src into dst (view 0; the region (x, y, w, h): the draw's
  * scissor rectangle, all its fragments can read), or a view pass of src into dst (hoisted: a view of another
@@ -3510,6 +4001,7 @@ static struct {
 	SDL_GPUTexture *color, *depth;
 	int clear_ds, debug_clear; float clear_z; uint8_t clear_s;
 	int nq; uint32_t qaddr[256]; uint8_t qset[256];   /* the batch's visibility queries: slot k counts into guest word qaddr[k] */
+	SDL_GPUTexture *mv; int mv_clear;   /* the scene's motion target (RECOMP_MV) and whether its pass clears it first */
 } batch;
 static uint64_t t_flush;   /* every flush's time, counted into t_total by batch_flush itself wherever it happens (gfx_gpu_draw leaves the nested ones out of its own) */
 static uint32_t n_batch_additive;   /* this frame's FRAGCOLOR draws blended ONE/ONE instead of copied (gfx_gpu_draw) */
@@ -3871,6 +4363,36 @@ static void batch_flush_body(const char *why) {
 			SDL_EndGPUCopyPass(fcp);
 		}
 	}
+	if (batch.mv && batch.depth) {   /* the motion pass (mv_on): this batch's motion draws again, into the scene's motion target, against its finished depth */
+		int k = 0; for (int i = 0; i < batch.n; i++) k += batch.d[i].mv;
+		if (k) {
+			SDL_GPUColorTargetInfo mti = { .texture = batch.mv, .load_op = batch.mv_clear ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD, .store_op = SDL_GPU_STOREOP_STORE };
+			SDL_GPUDepthStencilTargetInfo mdt = { .texture = batch.depth, .load_op = SDL_GPU_LOADOP_LOAD, .stencil_load_op = SDL_GPU_LOADOP_LOAD,
+				.store_op = SDL_GPU_STOREOP_STORE, .stencil_store_op = SDL_GPU_STOREOP_STORE };
+			SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &mti, 1, &mdt);
+			batch.mv_clear = 0;
+			SDL_GPUGraphicsPipeline *lp = 0; const BatchDraw *last = 0; int ibound = 0;
+			for (int i = 0; i < batch.n; i++) {
+				BatchDraw *b = &batch.d[i];
+				if (!b->mv || !b->pipe->pipe) continue;
+				SDL_GPUGraphicsPipeline *mp = mv_pipeline(b->pipe);
+				if (!mp) continue;
+				if (mp != lp) { SDL_BindGPUGraphicsPipeline(rp, mp); lp = mp; }
+				if (!last || memcmp(&last->vp, &b->vp, sizeof b->vp)) SDL_SetGPUViewport(rp, &b->vp);
+				if (!last || memcmp(&last->sc, &b->sc, sizeof b->sc)) SDL_SetGPUScissor(rp, &b->sc);
+				if (!last || last->wring != b->wring || last->nsbuf != b->nsbuf) { SDL_GPUBuffer *sbufs[2] = { vring, b->wring ? wring : vring }; SDL_BindGPUVertexStorageBuffers(rp, 0, sbufs, (uint32_t)b->nsbuf); }
+				if (!last || memcmp(&last->vu, &b->vu, sizeof b->vu)) SDL_PushGPUVertexUniformData(cmd, 0, &b->vu, sizeof b->vu);
+				if (!last || memcmp(&last->pvu, &b->pvu, sizeof b->pvu)) SDL_PushGPUVertexUniformData(cmd, 1, &b->pvu, sizeof b->pvu);   /* (the previous frame's: mv_prev) */
+				if (b->nvtsb && (!last || last->nvtsb != b->nvtsb || memcmp(last->vtsb, b->vtsb, (size_t)b->nvtsb * sizeof b->vtsb[0]))) SDL_BindGPUVertexSamplers(rp, 0, b->vtsb, (uint32_t)b->nvtsb);
+				if (b->indexed) {
+					if (ibound != b->isize) { SDL_GPUBufferBinding ib = { .buffer = iring }; SDL_BindGPUIndexBuffer(rp, &ib, b->isize == 2 ? SDL_GPU_INDEXELEMENTSIZE_16BIT : SDL_GPU_INDEXELEMENTSIZE_32BIT); ibound = b->isize; }
+					SDL_DrawGPUIndexedPrimitives(rp, b->nidx, 1, b->iring_off / (uint32_t)b->isize, (int32_t)b->first_vertex, 0);
+				} else SDL_DrawGPUPrimitives(rp, b->nidx, 1, b->first_vertex, 0);
+				last = b; n_mv_draws++;
+			}
+			SDL_EndGPURenderPass(rp);
+		}
+	}
 	t_pass += us_now() - tp0;
 	{ uint64_t ts0 = us_now(); SDL_GPUFence *f = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); t_submit += us_now() - ts0; ring_fence_add(f, vlo / 4, vhi / 4, ilo == ~0u ? 0 : ilo / 4, ilo == ~0u ? 0 : ihi / 4, bwr_lo == ~0u ? 0 : bwr_lo, bwr_hi); }
 	bw_lo = bwr_lo = ~0u; bw_hi = bwr_hi = 0;
@@ -3880,7 +4402,7 @@ static void batch_flush_body(const char *why) {
 		snprintf(fm_tag, sizeof fm_tag, "tgt %#x fmt %#x %ux%u rt %ux%u ms%ux%u ds %#x fmt %#x ld%d st%d: %d draws %u passes %d views %d fetchcopies (%s)%s", scene_target.data, scene_target.format, scene_target.width, scene_target.height, scene_target.rt_width, scene_target.rt_height, scene_target.ms_x, scene_target.ms_y, scene_target.ds_data, scene_target.ds_format, scene_target.ds_force_load, scene_target.ds_force_store, batch.n, n_batch_pass - pass0, nv, nf, why, nh ? " hoisted" : "");
 		fence_mark(0);
 	}
-	batch.n = batch.nev = 0; batch.nq = 0;
+	batch.n = batch.nev = 0; batch.nq = 0; batch.mv = 0; batch.mv_clear = 0;
 	t_flush += us_now() - t0; t_total += us_now() - t0;
 }
 
@@ -4427,8 +4949,14 @@ static void recipes_load(void) {   /* once, on the render thread: the shipped re
 }
 static void rc_registered(uint32_t addr) {   /* a program the game registered: the recipes that name it, to try */
 	if (!addr || memcmp(G(addr), "GXP", 4)) return;
-	uint32_t size; RecipeProg *p = rc_prog(usse_content_hash(addr, &size), 0);
-	if (!p) return;
+	uint32_t size; const uint32_t h = usse_content_hash(addr, &size); RecipeProg *p = rc_prog(h, 0);
+	if (!p) {   /* (no recipe: its predicted shader, after the recipes' work) */
+		static int on = -1; if (on < 0) { const char *e = getenv("RECOMP_SHADER_PREDICT_REGISTERED"); on = !(e && *e == '0'); }   /* (=0: left to the predicted pass) */
+		if (!on || !predict_on()) return;
+		if (rc.npreg == rc.preg_cap) { int c = rc.preg_cap ? rc.preg_cap * 2 : 4096; uint32_t (*q)[2] = realloc(rc.preg, c * sizeof *q); if (!q) return; rc.preg = q; rc.preg_cap = c; }
+		rc.preg[rc.npreg][0] = addr; rc.preg[rc.npreg][1] = h; rc.npreg++;
+		return;
+	}
 	p->addr = addr; rc.regs++;
 	if (rc.nwork + p->nuse > rc.work_cap) { int c = rc.work_cap ? rc.work_cap : 4096; while (c < rc.nwork + p->nuse) c *= 2; int *w = realloc(rc.work, c * sizeof *w); if (!w) return; rc.work = w; rc.work_cap = c; }
 	for (int k = 0; k < p->nuse; k++) rc.work[rc.nwork++] = rc.use[p->use + k];
@@ -4567,7 +5095,7 @@ static void warm_pipe(PipeRecipe *q) {   /* a pipeline of two warm-up shaders, b
 		pipe_create_info(&d, a->we, b->we, q->v[2], q->v[3], q->v[4], q->v[5], q->v[1], &null_fs, &ci, &ctd);
 		p->pending = 1; p->prebuilt = 1;
 		__atomic_add_fetch(&a->we->wrefs, 1, __ATOMIC_ACQ_REL); if (!null_fs) __atomic_add_fetch(&b->we->wrefs, 1, __ATOMIC_ACQ_REL);
-		BuildJob bj = { .is_pipe = 1, .low = 1, .pj = { p, ci, ctd, a->hash, b->hash, us_now(), 0, a->we, null_fs ? 0 : b->we, null_fs, 1, q->wkey } };
+		BuildJob bj = { .is_pipe = 1, .low = 2, .pj = { p, ci, ctd, a->hash, b->hash, us_now(), 0, a->we, null_fs ? 0 : b->we, null_fs, 1, q->wkey } };
 		if (!build_enqueue(&bj)) pipeline_build(&bj.pj);
 		rc.w_pp++;
 	}
@@ -4632,7 +5160,7 @@ static ShaderEntry *stand_in_vs(void) {   /* a vertex shader for predicted pipel
 		usse_program_free(prog);
 		if (!ok || e->nldst) { if (ok) usse_spirv_free(&sj.m); free(e); continue; }   /* (no LDST windows: nothing for them to point at) */
 		e->warm = 1; e->wrefs = 2; e->pred = 1;   /* (its build's reference and the pass's, let go of when the pass is done) */
-		shader_enqueue(&sj, 1);
+		shader_enqueue(&sj, 2);
 		return e;
 	}
 	return 0;
@@ -4646,7 +5174,7 @@ static void predict_pipe(ShaderEntry *vs, ShaderEntry *fs, const int32_t v[NPV])
 	pipe_create_info(&d, vs, fs, v[2], v[3], v[4], v[5], v[1], &null_fs, &ci, &ctd);
 	p->pending = 1; p->prebuilt = 1;
 	__atomic_add_fetch(&vs->wrefs, 1, __ATOMIC_ACQ_REL); __atomic_add_fetch(&fs->wrefs, 1, __ATOMIC_ACQ_REL);
-	BuildJob bj = { .is_pipe = 1, .low = 1, .pj = { p, ci, ctd, vs->hash, fs->hash, us_now(), 0, vs, fs, 0, 1, key } };
+	BuildJob bj = { .is_pipe = 1, .low = 2, .pj = { p, ci, ctd, vs->hash, fs->hash, us_now(), 0, vs, fs, 0, 1, key } };
 	if (!build_enqueue(&bj)) pipeline_build(&bj.pj);
 	rc.p_pp++;
 }
@@ -4676,20 +5204,44 @@ static void predict_warm(uint32_t hash) {   /* a program in the game's files: it
 		if (!need) { usse_spirv_free(&sj.m); free(e); rc.p_warm++; rc.p_pp_warm += rc.stand_vs ? rc.npst : 0; continue; }
 		e->warm = 1; e->wrefs = 2; e->pred = 1;   /* (references: its build's, and this pass's while it queues pipelines; pred: no MSL file) */
 		if (warm) rc.p_warm++; else rc.p_sh++;
-		shader_enqueue(&sj, 1);   /* (warm already but with pipelines to make: the module again -- on Vulkan it costs nothing) */
+		shader_enqueue(&sj, 2);   /* (warm already but with pipelines to make: the module again -- on Vulkan it costs nothing) */
 		for (int st = 0; rc.stand_vs && st < rc.npst; st++) predict_pipe(rc.stand_vs, e, rc.pst[st]);
 		warm_unref(e);
 	}
 	usse_program_free(prog);
 }
-static int pred_low_cap = -1;   /* the low-priority workers' cap before the predicted pass lowered it (-1: not lowered) */
+/* a program the game registered that no recipe names (a level nobody recorded: Killzone's multiplayer maps were 2-50%
+ * covered by the shipped recipes): a fragment program's predicted shader goes into the table now, as a recipe's would, on
+ * the level's load screen -- not when the predicted pass reaches it in the files' order (on a machine that never compiled
+ * them, a quarter of an hour on two workers), and with its MSL kept like any table shader's. Vertex programs wait for
+ * their draws: a vertex shader's fetch plan is the draw's vertex formats */
+static void predict_registered(uint32_t addr, uint32_t h) {
+	uint32_t size;
+	if (nshaders >= MAXSHADER * 3 / 4 || memcmp(G(addr), "GXP", 4) || usse_content_hash(addr, &size) != h) return;   /* (unregistered since, its memory reused) */
+	const UsseProgram *prog = usse_get(addr);
+	if (!prog || !usse_is_fragment(prog)) return;
+	const uint32_t hash = usse_program_hash(prog);
+	const UsseFragLayout *fl = usse_fragment_layout(prog);
+	UsseDraw d; memset(&d, 0, sizeof d); usse_setup_registers(prog, &d, 0, 0);   /* (predict_warm's prediction) */
+	uint32_t sa[256]; for (int i = 0; i < 256; i++) sa[i] = d.sa_unit[i] ? d.sa_unit[i] - 1u : d.sa[i].u;
+	const uint32_t cube = usse_spirv_predict_cube(prog, fl, sa);
+	const int pcf_unit = shadow_unit(addr, hash), pcf = pcf_unit >= 0 && shadow_filter_want() ? 16 : 0;
+	for (int k = 0; k < 3; k++) {
+		int kind = k; uint32_t c = cube; usse_spirv_key(prog, fl, sa, &kind, &c, 0);
+		if (kind != k) break;
+		if (shader_find(hash, 0, kind, c, 0, 0, pcf, 0, 0)) { rc.have++; continue; }
+		if (shader_new(addr, prog, hash, 0, 0, fl, sa, kind, c, 0, 0, 0, pcf_unit, pcf, 0, 0, 1)) rc.built_pred++;
+		if (recipes_verify()) fprintf(stderr, "    gpu: shader recipes: frame %llu: predicted at registration: fragment shader %#x (%08x) kind %d cube %x pcf %d\n", (unsigned long long)gpu_frame_no, addr, hash, kind, c, pcf);
+	}
+}
+static int pred_low_cap = -1;   /* the bulk lane's cap before the predicted pass lowered it (-1: not lowered) */
 static void pred_throttle(int on) {   /* the predicted pass builds on at most RECOMP_SHADER_PREDICT_WORKERS (default 2) workers: a cold first
                                        * session's own builds queue behind whatever the OS's shader compiler already has (Killzone, every
                                        * shader cold: draws waited 9-17 s with the pass on 6 workers against 4.4 s without it) */
 	pthread_mutex_lock(&bq_m);
 	if (on && pred_low_cap < 0) { static int n = -1; if (n < 0) { const char *e = getenv("RECOMP_SHADER_PREDICT_WORKERS"); n = e && atoi(e) > 0 ? atoi(e) : 2; }
-		pred_low_cap = bq_low_cap; if (bq_low_cap > n) bq_low_cap = n; }
-	else if (!on && pred_low_cap >= 0) { bq_low_cap = pred_low_cap; pred_low_cap = -1; pthread_cond_broadcast(&bq_c); }
+		pred_low_cap = bq_bulk_cap; bq_bulk_cap = n; }   /* (the bulk lane only: a level's own prebuilds, bq_head[2], keep every low worker) */
+	else if (!on && pred_low_cap >= 0) { bq_bulk_cap = pred_low_cap; pred_low_cap = -1; pthread_cond_broadcast(&bq_c); }
 	pthread_mutex_unlock(&bq_m);
 }
 static void warm_archive(void) {   /* the recipes' warm-up is done (what follows, the predicted shaders, isn't archived): this machine's archive written (mtl_archive.m) */
@@ -4705,7 +5257,78 @@ void gfx_gpu_quit(void) {   /* the window closes (window.c: _exit, no atexit han
 	if (mtl_archive_on) mtl_archive_flush(2);
 #endif
 }
+/* ---- the shader prep card (overlay.cpp build_prep). A first start's warm-up of every recipe can take minutes (cold,
+ * on an M4 Pro: Killzone's ~5.6k shaders and ~9.6k pipelines in 142 s, Uncharted's 254 builds in 5 s), and a draw whose shader
+ * isn't built yet waits for it or is skipped. Once the warm-up's builds have run 1.5 s from the first one done (8 s at
+ * most), the time left is estimated from their rate: over RECOMP_SHADER_PREP_SECS (15) the overlay pauses the game under a card with
+ * the progress and Skip, and every build worker takes the warm-up (no reserve for draws: the game is paused). The
+ * paused game doesn't present, so the window's loop steps the warm-up instead (gfx_gpu_shader_prep_tick: any pause,
+ * the menu's too). Later starts find the OS's shader cache warm and finish under the limit: no card. An update's new
+ * recipes, or an OS update that cleared the cache, bring it back for what's missing. Settings "shader_prep" 0: never;
+ * RECOMP_SHADER_PREP=0 never, =1 always (the card's own test). The predicted shaders that follow the recipes aren't
+ * waited for: they build behind the game as before. */
+enum { PREP_OFF, PREP_MEASURE, PREP_QUIET, PREP_CARD, PREP_BACKGROUND, PREP_FINISHED };
+static int prep_state;   /* (under the renderer lock; read by the overlay without it) */
+static int prep_total, prep_reserve = -1, prep_said; static uint64_t prep_t0, prep_first, prep_rate_t; static uint32_t prep_rate_n; static double prep_rate;
+static int prep_force(void) { static int v = -2; if (v == -2) { const char *e = getenv("RECOMP_SHADER_PREP"); v = e && *e ? atoi(e) : -1; } return v; }
+static void prep_workers(int all) {   /* the card up: every worker on the warm-up; down: the reserve for draws back */
+	pthread_mutex_lock(&bq_m);
+	if (all && prep_reserve < 0) { prep_reserve = bq_low_cap; bq_low_cap = bq_workers; pthread_cond_broadcast(&bq_c); }
+	else if (!all && prep_reserve >= 0) { bq_low_cap = prep_reserve; prep_reserve = -1; }
+	pthread_mutex_unlock(&bq_m);
+}
+static void prep_start(void) {   /* the warm-up's builds begin: rc.w_need_sh shaders and rc.w_need_pp pipelines */
+	extern int window_active(void); extern int settings_int(const char *, int);
+	prep_total = rc.w_need_sh + rc.w_need_pp; prep_t0 = prep_rate_t = rc_us(); prep_first = 0; prep_rate_n = 0; prep_rate = 0;
+	__atomic_store_n(&prep_built, 0, __ATOMIC_RELAXED);
+	const int f = prep_force();
+	prep_state = f == 0 || !window_active() || bq_workers <= 0 || !gpu_async() || (f < 0 && !settings_int("shader_prep", 1)) ? PREP_OFF : PREP_MEASURE;
+}
+static void prep_finish(void) {   /* the recipes' builds are all done */
+	if (prep_state == PREP_OFF || prep_state == PREP_FINISHED) return;
+	if (prep_state != PREP_QUIET) fprintf(stderr, "    gpu: shader prep: %d builds in %.1f s%s\n", prep_total, (rc_us() - prep_t0) / 1e6, prep_state == PREP_BACKGROUND ? " (skipped: built behind the game)" : "");
+	__atomic_store_n(&prep_state, prep_state == PREP_QUIET ? PREP_OFF : PREP_FINISHED, __ATOMIC_RELEASE);
+	prep_workers(0);
+}
+static void prep_update(void) {   /* each warm-up step: the rate, and whether to ask for the card */
+	if (prep_state != PREP_MEASURE && prep_state != PREP_CARD && prep_state != PREP_BACKGROUND) return;
+	const uint64_t now = rc_us(); const uint32_t b = __atomic_load_n(&prep_built, __ATOMIC_RELAXED);
+	if (now - prep_rate_t >= 1000000) {   /* (the rate over the last second or so, smoothed: the card's speed, not the measuring's) */
+		const double r = (b - prep_rate_n) / ((now - prep_rate_t) / 1e6); prep_rate = prep_rate > 0 ? prep_rate * 0.7 + r * 0.3 : r; prep_rate_t = now; prep_rate_n = b;
+	}
+	if (prep_state != PREP_MEASURE) return;
+	if (b && !prep_first) { prep_first = now; prep_rate_t = now; prep_rate_n = b; }
+	/* the rate from the first build done, not from the start: the first cold compiles take a while to come back (Uncharted's
+	 * cold start: none done at 2 s, all 268 at 5.2 s), and counted from the start they made a 5 s warm-up look endless */
+	const double el = (now - prep_t0) / 1e6, run = prep_first ? (now - prep_first) / 1e6 : 0;
+	if (prep_force() == 1 ? el < 0.5 : (b < 32 || run < 1.5) && el < 8.0) return;   /* (warm builds ramp up: Killzone's second start read 13 s at 0.5 s in and took 5.7 s) */
+	const double secs = getenv("RECOMP_SHADER_PREP_SECS") ? atof(getenv("RECOMP_SHADER_PREP_SECS")) : 15.0, eta = b > 1 && run > 0 ? (prep_total - (int)b) * run / (b - 1) : 1e6;
+	if (prep_force() == 1 || eta > secs) {
+		fprintf(stderr, "    gpu: shader prep: %u of %d builds in %.1f s, about %.0f s left: the card\n", b, prep_total, el, eta);
+		if (prep_rate <= 0 && b > 1 && run > 0) prep_rate = (b - 1) / run;
+		__atomic_store_n(&prep_state, PREP_CARD, __ATOMIC_RELEASE); prep_workers(1);
+	} else { fprintf(stderr, "    gpu: shader prep: %u of %d builds in %.1f s, about %.0f s left: no card\n", b, prep_total, el, eta); __atomic_store_n(&prep_state, PREP_QUIET, __ATOMIC_RELEASE); }
+}
+/* the overlay's view: 0 nothing to show, 1 the card, 2 skipped (building behind the game: the corner line), 3 just
+ * finished after showing either (once); done / total builds, seconds left (< 0: not known yet) */
+int gfx_gpu_shader_prep(int *done, int *total, double *eta_s) {
+	const int st = __atomic_load_n(&prep_state, __ATOMIC_ACQUIRE);
+	const int d = (int)__atomic_load_n(&prep_built, __ATOMIC_RELAXED);
+	*total = prep_total; *done = d < prep_total ? d : prep_total;
+	*eta_s = prep_rate > 0 ? (prep_total - *done) / prep_rate : -1;
+	if (st == PREP_FINISHED) { if (!__atomic_exchange_n(&prep_said, 1, __ATOMIC_ACQ_REL)) return 3; return 0; }
+	return st == PREP_CARD ? 1 : st == PREP_BACKGROUND ? 2 : 0;
+}
+void gfx_gpu_shader_prep_skip(void) {   /* the card's Skip (any thread): the game goes on, the builds behind it */
+	int c = PREP_CARD;
+	if (__atomic_compare_exchange_n(&prep_state, &c, PREP_BACKGROUND, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { fprintf(stderr, "    gpu: shader prep: skipped at %u of %d\n", __atomic_load_n(&prep_built, __ATOMIC_RELAXED), prep_total); prep_workers(0); }
+}
+static void recipes_step(void);   /* (below) */
+void gfx_gpu_shader_prep_tick(void) {   /* the window's loop, while the game is paused (under the lock): the warm-up goes on without presents */
+	if (gpu() && rc.warm_phase && rc.warm_phase != 5) recipes_step();
+}
 static void warm_recipes_done(void) {   /* the recipes' warm-up is queued: the predicted shaders next, or done */
+	prep_finish();
 	warm_archive();
 	if (predict_on() && gxp_index_count()) {
 		rc.warm_phase = 6; rc.pred_at = 0; rc.pred_t0 = rc_us(); pred_throttle(1);
@@ -4725,7 +5348,7 @@ static void recipes_warm_slice(uint64_t t0, uint64_t budget) {
 			for (int i = 0; i < rc.nr; i++) { Recipe *r = &rc.r[i]; r->wneed = r->wstate == 1 && (r->wleft || !*rc_slot(r->wkey ^ WTAG_S)); rc.w_need_sh += r->wneed; }
 			fprintf(stderr, "    gpu: shader recipes: warm-up: %d of %d shaders translated from the game's files (%d built for this session already or not at this render scale, %d not in the files); %d shaders and %d pipelines aren't warm yet (%.0f ms of the render thread over %.1f s)\n",
 			        rc.w_keyed, rc.nr, rc.w_built, rc.w_missing, rc.w_need_sh, rc.w_need_pp, (rc.t_warm + rc_us() - t0) / 1e3, (rc_us() - rc.warm_t0) / 1e6);
-			rc.warm_at = 0; if (rc.w_need_sh) rc.warm_phase = 3; else warm_recipes_done();
+			rc.warm_at = 0; if (rc.w_need_sh) { rc.warm_phase = 3; prep_start(); } else warm_recipes_done();
 			break;
 		}
 		Recipe *r = &rc.r[rc.warm_at++];
@@ -4756,7 +5379,7 @@ static void recipes_warm_slice(uint64_t t0, uint64_t budget) {
 			continue;
 		}
 		e->warm = 1; e->wrefs = 2; e->wkey = r->wkey; r->we = e; r->wheld = 1;   /* (two references: its build's and the warm-up's, until its pipelines are made) */
-		shader_enqueue(&sj, 1); rc.w_sh++;
+		shader_enqueue(&sj, 2); rc.w_sh++;
 		for (int l = r->pipes; l; l = rc.l[l - 1].next) { PipeRecipe *q = &rc.p[rc.l[l - 1].pipe];
 			if (q->wneed && !q->wdone && rc.r[q->vs].we && rc.r[q->fs].we) warm_pipe(q); }
 		if (!r->wleft) warm_hold_done(r);
@@ -4789,26 +5412,27 @@ static void recipes_step(void) {   /* each present: the programs registered sinc
 		fprintf(stderr, "    gpu: recipes: frame %llu: draws waited %.0f ms for builds so far; %d prebuilt shaders and %d pipelines used; %d records new this session; %d fragment shaders the prediction missed\n",
 		        (unsigned long long)gpu_frame_no, __atomic_load_n(&build_wait_total, __ATOMIC_RELAXED) / 1e6, rc.used_sh, rc.used_pp, rc.recorded, rc.p_missed);
 	warm_drain();
+	prep_update();
 	static uint64_t budget; if (!budget) { const char *e = getenv("RECOMP_SHADER_PREBUILD_MS"); budget = (uint64_t)((e && atof(e) > 0 ? atof(e) : 2.0) * 1000); }
 	pthread_mutex_lock(&reg_m);
 	if (reg_qn && rc.nreg + reg_qn > rc.reg_cap) { int c = rc.reg_cap ? rc.reg_cap : 8192; while (c < rc.nreg + reg_qn) c *= 2; uint32_t *g = realloc(rc.reg, c * sizeof *g); if (g) { rc.reg = g; rc.reg_cap = c; } }
 	if (reg_qn && rc.nreg + reg_qn <= rc.reg_cap) { memcpy(rc.reg + rc.nreg, reg_q, reg_qn * sizeof *reg_q); rc.nreg += reg_qn; }
 	reg_qn = 0;
 	pthread_mutex_unlock(&reg_m);
-	if (rc.reg_at == rc.nreg && rc.work_at == rc.nwork) {   /* nothing to do: once its builds are done, the burst's summary */
-		rc.nreg = rc.reg_at = rc.nwork = rc.work_at = 0;
+	if (rc.reg_at == rc.nreg && rc.work_at == rc.nwork && rc.preg_at == rc.npreg) {   /* nothing to do: once its builds are done, the burst's summary */
+		rc.nreg = rc.reg_at = rc.nwork = rc.work_at = rc.npreg = rc.preg_at = 0;
 		if (rc.burst) {
 			pthread_mutex_lock(&bq_m); const int left = bq_low; pthread_mutex_unlock(&bq_m);
 			if (!left) {
 				rc.burst = 0;
-				if (rc.built_sh || rc.built_pp) fprintf(stderr, "    gpu: shader recipes: %d registered programs had recipes: %d shaders and %d pipelines built in %.1f s (%.0f ms of it on the render thread), %d built already, %d passed over, %d stale; draws have used %d prebuilt shaders and %d pipelines so far\n",
-				        rc.regs, rc.built_sh, rc.built_pp, (rc_us() - rc.burst_t0) / 1e6, rc.t_render / 1e3, rc.have, rc.skipped, rc.stale, rc.used_sh, rc.used_pp);
+				if (rc.built_sh || rc.built_pp || rc.built_pred) fprintf(stderr, "    gpu: shader recipes: %d registered programs had recipes: %d shaders and %d pipelines built, and %d predicted shaders for programs without one, in %.1f s (%.0f ms of it on the render thread), %d built already, %d passed over, %d stale; draws have used %d prebuilt shaders and %d pipelines so far\n",
+				        rc.regs, rc.built_sh, rc.built_pp, rc.built_pred, (rc_us() - rc.burst_t0) / 1e6, rc.t_render / 1e3, rc.have, rc.skipped, rc.stale, rc.used_sh, rc.used_pp);
 			}
 		}
 		if (rc.warm_phase && rc.warm_phase != 5) recipes_warm(rc_us(), budget);   /* (between levels' registrations: the warm-up) */
 		return;
 	}
-	if (!rc.burst) { rc.burst_t0 = rc_us(); rc.t_render = 0; rc.regs = rc.built_sh = rc.built_pp = rc.have = rc.skipped = rc.stale = 0; }
+	if (!rc.burst) { rc.burst_t0 = rc_us(); rc.t_render = 0; rc.regs = rc.built_sh = rc.built_pp = rc.have = rc.skipped = rc.stale = rc.built_pred = 0; }
 	rc.burst = 1;
 	const uint64_t t0 = rc_us();
 	while (rc_us() - t0 < budget) {
@@ -4816,7 +5440,8 @@ static void recipes_step(void) {   /* each present: the programs registered sinc
 		else if (rc.work_at < rc.nwork) {
 			if (!rc.work_sorted) { qsort(rc.work + rc.work_at, (size_t)(rc.nwork - rc.work_at), sizeof *rc.work, cmp_int); rc.work_sorted = 1; }   /* (a recipe file is in the order play first used each: the build queue gets them so) */
 			recipe_try(rc.work[rc.work_at++]);
-		} else break;
+		} else if (rc.preg_at < rc.npreg) { predict_registered(rc.preg[rc.preg_at][0], rc.preg[rc.preg_at][1]); rc.preg_at++; }
+		else break;
 	}
 	rc.t_render += rc_us() - t0;
 }
@@ -5066,6 +5691,26 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	uint64_t tvb0 = us_now();
 	uint32_t vbytes = need_words * 4;
 
+	/* the motion pass (mv_on): whether this draw takes part, decided before its windows go into the ring, the previous
+	 * frame's SA of it (mv_match), and its previous windows (M2: mv_win_snap's), placed below beside this frame's */
+	/* a deferred renderer's surfaces drawn after its lighting, on the lit image (Uncharted's windscreens: unblended, depth
+	 * tested, no depth write; the shader writes the glass's whole colour) take part too, into the main target's vectors:
+	 * without them FSR moved the glass with what's behind it, and the reactive mask then left it the raw jittered frame,
+	 * which shimmered. A real depth comparison only (the motion pass tests "or equal"), and no full-screen quad (its zero
+	 * motion would cover the scene's) */
+	const int lit_after = (const void *)scene_entry == mv_lit && mv_lit != mv_main_entry && mv_lit_index >= 1 && mv_main_entry && d->count > 6
+	                      && (d->depth_func == 1 || d->depth_func == 3 || d->depth_func == 4 || d->depth_func == 6);   /* (GXM LESS, LESS_EQUAL, GREATER, GREATER_EQUAL) */
+	const int mv_want = mv_scene && (pipe->depth_write || lit_after) && pipe->has_depth && pipe->depth_ok && !fs->fzero && !g_points_draw && !(d->blend.present && (d->blend.color_func || d->blend.alpha_func));
+	const uint32_t *mv_psa = 0; uint32_t mv_pwin[8][4]; int mv_npwin = 0; const uint8_t *mv_psrc[8];
+	if (mv_want) {
+		uint32_t csa[256]; for (int i = 0; i < 256; i++) csa[i] = vdraw.sa[i].u;
+		mv_psa = mv_match(d, csa);
+		for (int k = 0; mv_psa && k < vs->nldst && k < 8; k++) {   /* every window's snapshot, or none of them */
+			mv_psrc[k] = mv_win_find(mv_cur ^ 1, mv_psa[vs->ldst_sa[k] & 255]);
+			if (!mv_psrc[k]) { mv_npwin = 0; break; }
+			mv_npwin++;
+		}
+	}
 	/* the LDST windows (see usse_spirv.c's emit_ldst): USSE_LDST_WINDOW bytes of guest memory from
 	 * each distinct pointer the vertex program's SA words hold, as storage buffer 1 */
 	uint32_t win[8][4]; int nwin = 0;
@@ -5085,8 +5730,8 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			if (!wring || !wring_xfer) { free(check_pre); soft_fallback(d, "no LDST window ring"); return; }
 		}
 		const uint32_t ww = USSE_LDST_WINDOW / 4;
-		if (wring_pos + (uint32_t)nwin * ww > WRING_WORDS) {   /* (an empty batch doesn't flush: its ranges are of windows no recorded draw uses, and the lap change retires them from the reuse cache) */
-			batch_flush("LDST ring wrap"); wring_pos = 0; wring_lap++; bw_lo = bwr_lo = ~0u; bw_hi = bwr_hi = 0; ring_wait_region(2, 0, (uint32_t)nwin * ww, 1);
+		if (wring_pos + (uint32_t)(nwin + mv_npwin) * ww > WRING_WORDS) {   /* (an empty batch doesn't flush: its ranges are of windows no recorded draw uses, and the lap change retires them from the reuse cache) */
+			batch_flush("LDST ring wrap"); wring_pos = 0; wring_lap++; bw_lo = bwr_lo = ~0u; bw_hi = bwr_hi = 0; ring_wait_region(2, 0, (uint32_t)(nwin + mv_npwin) * ww, 1);
 		}
 		uint32_t *wmap = 0;
 		for (int k = 0; k < nwin; k++) {
@@ -5101,8 +5746,19 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			if (off < bwr_lo) bwr_lo = off; if (off + ww > bwr_hi) bwr_hi = off + ww;
 			win[k][2] = off;   /* the window's word offset in storage buffer 1 */
 		}
+		for (int k = 0; k < mv_npwin; k++) {   /* the previous frame's windows (M2), never through the reuse cache: an address's contents of the previous frame */
+			ring_wait_region(2, wring_pos, ww, 0);
+			if (!wmap) wmap = (uint32_t *)SDL_MapGPUTransferBuffer(gpu(), wring_xfer, false);
+			const uint32_t off = wring_pos; wring_pos += ww;
+			if (wmap) memcpy(wmap + off, mv_psrc[k], USSE_LDST_WINDOW);
+			if (off < bw_lo) bw_lo = off; if (off + ww > bw_hi) bw_hi = off + ww;
+			if (off < bwr_lo) bwr_lo = off; if (off + ww > bwr_hi) bwr_hi = off + ww;
+			mv_pwin[k][0] = mv_psa[vs->ldst_sa[k] & 255]; mv_pwin[k][1] = USSE_LDST_WINDOW; mv_pwin[k][2] = off; mv_pwin[k][3] = 0;
+		}
+		if (mv_want) for (int k = 0; k < nwin; k++) mv_win_snap(win[k][0]);   /* (this frame's, for the next frame's pass) */
 		if (wmap) SDL_UnmapGPUTransferBuffer(gpu(), wring_xfer);
 	}
+	if (!nwin) mv_npwin = 0;   /* (no window placed: none of the previous frame's either) */
 	t_vbuf += us_now() - tvb0;
 
 	int debug_clear = 0; { static int dc = -1; if (dc < 0) dc = getenv("RECOMP_GPU_DEBUG_CLEAR") != 0; debug_clear = dc; }   /* TEMP diagnostic: clear to green, skip the draws */
@@ -5175,6 +5831,12 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			n_batch_fetch++; fetch_ev = batch.nev - 1;
 		}
 	}
+	{ float rt, rv;   /* (FSR's opaque-only image: before the first draw after the main scene's opaque ones, once a frame) */
+	  if (fsr_on() && fsr_reactive(&rt, &rv) && fsr_opaque_frame != mv_qframe + 1 && (((const void *)scene_entry == mv_main_entry && mv_lit == mv_main_entry && !mv_want && scene_entry->mv_frame == mv_qframe + 1 && scene_entry->mv_n)
+	      || ((const void *)scene_entry == mv_lit && mv_lit != mv_main_entry && mv_lit_index >= 1 && !mv_want)) && fsr_opaque_for(scene_entry)) {
+		BatchEvent *ev = batch_event(); ev->src = scene_entry->color; ev->dst = fsr_opaque; ev->w = TSX(scene_entry, scene_entry->width); ev->h = TSY(scene_entry, scene_entry->height);
+		fsr_opaque_frame = mv_qframe + 1;
+	  } }
 	BatchDraw *b = batch_add();
 	if (batch.n == 1) {
 		batch.color = scene_entry->color; batch.depth = scene_target.depth ? scene_entry->depth : 0; batch.debug_clear = debug_clear;
@@ -5184,8 +5846,28 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	b->pipe = pipe; b->stencil_ref = d->stencil_ref; b->indexed = indexed; b->nsbuf = vs->nldst || vs_layout_uniform() ? 2 : 1; b->ntsb = ntsb; b->qslot = -1;
 	b->hud = scene_hud && d->viewport_set && !d->viewport_disabled && vp2.w > 0 && hud_classify(d, b->hud_b);   /* the HUD at its native shape (hud_layout, at the flush) */
 	if (b->hud) disp_note(DISP_HUD);
+	b->mv = 0;
+	TargetEntry *mvt = lit_after ? (TargetEntry *)mv_main_entry : scene_entry;   /* (whose motion target: the main target's for a deferred renderer's later surfaces) */
+	if (mv_want && !b->hud && mv_target(mvt) && TSX(mvt, mvt->width) == TSX(scene_entry, scene_entry->width) && TSY(mvt, mvt->height) == TSY(scene_entry, scene_entry->height)) {
+		b->mv = 1; batch.mv = mvt->mv;   /* drawn again in the motion pass (mv_on) */
+		{ const SDL_GPUCompareOp op = conv_cmp(pipe->depth_func); if (op == SDL_GPU_COMPAREOP_GREATER || op == SDL_GPU_COMPAREOP_GREATER_OR_EQUAL) mv_votes_inv++; else if (op == SDL_GPU_COMPAREOP_LESS || op == SDL_GPU_COMPAREOP_LESS_OR_EQUAL) mv_votes_fwd++; }
+		if ((const void *)scene_entry == mv_main_entry) { if (mv_psa) fsr_matched++; else fsr_unmatched++; }   /* (FSR's cut test) */
+		if (mvt->mv_frame != mv_qframe + 1) { mvt->mv_frame = mv_qframe + 1; mvt->mv_n = 0; batch.mv_clear = 1; }   /* (its first this frame: the pass clears) */
+		if (!lit_after && ++scene_entry->mv_n > mv_best_n) { mv_best_n = scene_entry->mv_n; mv_best = scene_entry; mv_best_depth = scene_depth_entry; }
+	}
+	if (mv_scene_log() && ((const void *)scene_entry == mv_main_entry || (const void *)scene_entry == mv_lit) && mv_scene_nd < (int)sizeof mv_scene_draws - 1) {
+		/* O opaque with motion, A additive (ONE, ONE), T alpha (SRC_ALPHA, 1 - SRC_ALPHA), B other blending, f blends in the shader (FRAGCOLOR), w writes depth, n neither */
+		const int bl = d->blend.present && (d->blend.color_func || d->blend.alpha_func);
+		const char c = b->mv ? 'O' : bl && d->blend.color_src == 1 && d->blend.color_dst == 1 ? 'A' : bl && d->blend.color_src == 4 && d->blend.color_dst == 5 ? 'T' : bl ? 'B' : pipe->fetch ? 'f' : d->depth_write ? 'w' : 'n';
+		if ((const void *)scene_entry == mv_lit && mv_lit != mv_main_entry && mv_scene_nd < 80)
+			fprintf(stderr, "    mv scenes: lit draw %d %c: blend %d/%d,%d depth func %u write %d, %u indices, prim %u, viewport %s\n", mv_scene_nd, c, d->blend.color_func, d->blend.color_src, d->blend.color_dst,
+			        d->depth_func, d->depth_write, d->count, d->prim, d->viewport_disabled ? "off" : "on");
+		mv_scene_draws[mv_scene_nd++] = c;
+	}
 	if (fetch_ev >= 0 && !b->hud) fetch_narrow(d, vs, &batch.ev[fetch_ev], vw, sx0, sy0, sx1, sy1);
 	b->vp = vp2; b->sc = (SDL_Rect){ sx0 * scene_sx, sy0 * scene_sy, (sx1 - sx0) * scene_sx, (sy1 - sy0) * scene_sy };
+	if (mv_jit_scene && !b->hud) { b->vp.x += mv_jx; b->vp.y += mv_jy; mv_jit_draws++; }   /* (M3 jitter: the motion pass draws with the same viewport, its depth test agrees) */
+	else if (!b->hud && composite_mesh(d, pipe)) { float jx, jy; mv_jitter(mv_qframe, &jx, &jy); b->vp.x += jx; b->vp.y += jy; mv_jit_draws++; }
 	b->vring_off = vring_off; b->vbytes = vbytes; b->iring_off = iring_off; b->nidx = nverts; b->first_vertex = first_vertex; b->isize = isize; b->ibytes = 4 * iwords;
 	b->wring = nwin > 0;
 	memcpy(b->tsb, tsb, (size_t)ntsb * sizeof tsb[0]);
@@ -5223,6 +5905,18 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			memcpy(&b->fu.vfetch[0], &su, 4); memcpy(&b->fu.vfetch[1], &sv, 4);
 		}
 		if (plan.gpu) { b->vu.vfetch[0] = lo; b->vu.vfetch[1] = (uint32_t)plan.nst;   /* (point sprites never fetch on the GPU: vf_plan) */ for (int m = 0; m < plan.nst; m++) { b->vu.stream[plan.st[m].s][0] = vf_stream_w[plan.st[m].s]; b->vu.stream[plan.st[m].s][1] = d->stride[plan.st[m].s]; } }
+	}
+	if (b->mv) {   /* the motion pass's vertex shader (the program's motion variant) and the draw's SA of the previous frame */
+		g_motion_draw = 1; ShaderEntry *mvs = g_points_draw ? 0 : get_shader(d->vprog, vp, 0, vl, 0, vsa_for_smp, -1, vcube_mask, 0, plan.gpu ? &plan.vf : 0, plan.hash); g_motion_draw = 0;
+		if (mvs) {
+			pipe->mv_vse = mvs; b->pvu = b->vu;
+			if (mv_psa) memcpy(b->pvu.sa, mv_psa, sizeof b->pvu.sa);
+			if (vs->nldst) {   /* LDST windows: the previous frame's (M2), else this frame's pointers and windows (no pose motion) */
+				mv_windowed++;
+				if (mv_npwin) { memset(b->pvu.win, 0, sizeof b->pvu.win); memcpy(b->pvu.win, mv_pwin, (size_t)mv_npwin * sizeof mv_pwin[0]); mv_posed++; }
+				else for (int i = 0; i < vs->nldst && i < 8; i++) { int w = vs->ldst_sa[i]; if (w >= 0 && w < 256) b->pvu.sa[w] = b->vu.sa[w]; }
+			}
+		} else b->mv = 0;
 	}
 	if (d->vis_addr) vis_query_add(d, vs, scene_target.depth != 0, scene_entry->kind, ds_depth_ok, ds_stencil_ok, cull_sdl);
 	/* what the draw writes, as views and the guest-memory syncs see it: the colour target always;
@@ -5443,6 +6137,7 @@ static void hist_save(int mark) {
 	pthread_detach(t);
 }
 void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format) {
+	fsr_update();   /* (FSR's setting, once a frame) */
 	static int stats = -1; if (stats < 0) stats = getenv("RECOMP_GPU_STATS") != 0;
 	render_scale_init();
 	hud_note_present(base);

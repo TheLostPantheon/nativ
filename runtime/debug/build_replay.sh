@@ -3,7 +3,7 @@
 set -e
 RT=${0:A:h:h}; ROOT=${RT:h}; G=$RT/gfx; D=$RT/debug; C=$RT/core
 OUT=${1:-$ROOT/build/gfxreplay}; mkdir -p ${OUT:h}
-SRCS=($D/gfxreplay.c $RT/platform/platform_posix.c $G/gfx_dispatch.c $G/gfx_soft.c $G/gfx_gpu.c $G/gpulock.c $D/gfx_coverage.c $D/gfx_capture.c $G/guestwatch.c $C/metrics.c $C/settings.c $G/usse.c $G/usse_spirv.c $C/psarc.c $G/gxp_index.c $G/ssao.c)
+SRCS=($D/gfxreplay.c $RT/platform/platform_posix.c $G/gfx_dispatch.c $G/gfx_soft.c $G/gfx_gpu.c $G/gpulock.c $D/gfx_coverage.c $D/gfx_capture.c $G/guestwatch.c $C/metrics.c $C/settings.c $G/usse.c $G/usse_spirv.c $C/psarc.c $G/gxp_index.c $G/ssao.c $G/fsr/fsr.c)
 INC=(); for d in core gfx audio media input net ui platform debug; do INC+=(-I $RT/$d); done; INC+=(-I $ROOT/recompiler -I $ROOT)
 for s in $SRCS $ROOT/recompiler/rt.h $RT/*/*.h; do [[ ! -f $OUT || $s -nt $OUT ]] && { stale=1; break; }; done
 [[ -z $stale ]] && exit 0

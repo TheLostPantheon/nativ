@@ -202,6 +202,8 @@ typedef struct {
 	uint32_t var_win; int nwin; int win_sa[8];   /* vertex LDST: storage buffer 1 holds nwin windows of guest memory, one per SA pointer word (see ldst_pointer_sa) */
 	uint32_t ldst_img[8];                        /* fragment LDST: window w's render target, a sampled image (emit_ldst_target) */
 	uint32_t var_vin, ptr_vin_u, vindex;   /* vertex: PA input SSBO, its element-pointer type, loaded (uint) gl_VertexIndex */
+	int motion, pos_only; uint32_t var_sa_prev, var_mv_cur, var_mv_prev;   /* usse_spirv_set_motion: the previous frame's SA block, the two positions'
+	                                                                        * outputs; pos_only: the epilogue writes only the position, to var_mv_prev */
 	int8_t inc[4][17];   /* RM_SLMSI state (SMLSI/SMBO, §2.12): entirely a function of their own
 	                       * immediate operands, not of any register value, so (with no branches in
 	                       * this pass's coverage -- BR is unsupported) it's fully resolved by
@@ -1610,6 +1612,8 @@ static int pcf_unit_next = -1, pcf_taps_next;   /* usse_spirv_set_pcf: the next 
 static int fetch_zero_next;   /* usse_spirv_set_fetch_zero: the next translation's (1 zeros, 2 zeros then ones) */
 void usse_spirv_set_fetch_zero(int mode) { fetch_zero_next = mode; }
 void usse_spirv_set_pcf(int unit, int taps) { pcf_unit_next = unit; pcf_taps_next = taps; }
+static int motion_next;
+void usse_spirv_set_motion(int on) { motion_next = on; }
 static int points_next;   /* usse_spirv_set_points: the next translation's */
 static int probe_off_next;   /* usse_spirv_set_probe_off: the next translation leaves RECOMP_PROBE out (RECOMP_PROBE_FPROG names another program) */
 void usse_spirv_set_probe_off(int off) { probe_off_next = off != 0; }
@@ -1729,6 +1733,10 @@ static void emit_vert_epilogue(Gen *g, int *ok) {
 	uint32_t vz = load(s, t_vec(s, t_float(s), 4), pz);
 	uint32_t zoff = composite_extract1(s, t_float(s), vz, 0), zscale = composite_extract1(s, t_float(s), vz, 1);
 	pos[2] = fop2(s, SpvOpFAdd, fop2(s, SpvOpFMul, zoff, pos[3]), fop2(s, SpvOpFMul, zscale, pos[2]));
+	if (g->pos_only) {   /* the motion variant's second run: its position, nothing else */
+		uint32_t id = nid(s); INS(&s->func, SpvOpCompositeConstruct, t_vec(s, t_float(s), 4), id, pos[0], pos[1], pos[2], pos[3]);
+		store(s, g->var_mv_prev, id); return;
+	}
 	if (g->points) {   /* point sprites (usse_spirv_set_points): this vertex's corner of its point's square */
 		uint32_t tu = t_uint(s), tf = t_float(s), tb = t_bool(s);
 		uint32_t c6 = uop2(s, SpvOpUMod, g->vindex, c_uint(s, 6));
@@ -2059,6 +2067,12 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	INS(&s->decos, SpvOpDecorate, g.var_sa, SpvDecorationDescriptorSet, (uint32_t)(g.is_fragment ? 3 : 1));
 	INS(&s->decos, SpvOpDecorate, g.var_sa, SpvDecorationBinding, 0);
 	g.ptr_sa_u = t_ptr(s, SpvStorageUniform, t_u);
+	if (!g.is_fragment && motion_next) {   /* the motion variant: the same draw's SA block of the previous frame (usse_spirv_set_motion) */
+		g.motion = 1;
+		g.var_sa_prev = global_var(s, t_ptr(s, SpvStorageUniform, sa_struct), SpvStorageUniform, 0);
+		INS(&s->decos, SpvOpDecorate, g.var_sa_prev, SpvDecorationDescriptorSet, 1);
+		INS(&s->decos, SpvOpDecorate, g.var_sa_prev, SpvDecorationBinding, 1);
+	}
 
 	/* vertex input (vertex stage only): one StorageBuffer of uint words holding, per draw, either the raw vertex
 	 * streams the prologue fetches attributes from itself (vf: emit_vertex_fetch) or one PA record per vertex that
@@ -2135,6 +2149,12 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	if (!g.is_fragment) {
 		g.var_pos = global_var(s, t_ptr(s, SpvStorageOutput, t_v4), SpvStorageOutput, 0);
 		INS(&s->decos, SpvOpDecorate, g.var_pos, SpvDecorationBuiltIn, SpvBuiltInPosition);
+		if (g.motion) {   /* the two clip positions (usse_spirv_set_motion) */
+			g.var_mv_cur = global_var(s, t_ptr(s, SpvStorageOutput, t_v4), SpvStorageOutput, 0);
+			INS(&s->decos, SpvOpDecorate, g.var_mv_cur, SpvDecorationLocation, 30);
+			g.var_mv_prev = global_var(s, t_ptr(s, SpvStorageOutput, t_v4), SpvStorageOutput, 0);
+			INS(&s->decos, SpvOpDecorate, g.var_mv_prev, SpvDecorationLocation, 31);
+		}
 	}
 
 	/* fragment: output colour (+ depth, if DEPTHF is used) and the sampled-image bindings the
@@ -2215,13 +2235,15 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	 * module outputs (X.rgb, 1 - K) for gfx_gpu.c's ONE / ONE_MINUS_SRC_ALPHA blend (usse_fragment_fb_blend) */
 	int lerp = ok && g.is_fragment && g.fetch == 4; uint32_t lerp_col[2] = {0, 0};
 	if (lerp) taps = 2;
+	if (g.motion) taps = 2;   /* the motion variant: the program again from the prologue's registers, with the previous frame's SA */
+	const uint32_t var_sa_now = g.var_sa;
 	uint32_t pcf_vars[6] = {g.var_r, g.var_pa, g.var_o, g.var_i, g.var_idx, g.var_p}, pcf_types[6], pcf_saved[6], pcf_step[2] = {0, 0}, pcf_acc = 0;
 	int8_t pcf_inc0[4][17]; memcpy(pcf_inc0, g.inc, sizeof pcf_inc0);
 	if (taps > 1) {
 		pcf_types[0] = pcf_types[1] = pcf_types[2] = t_array(s, t_u, c_uint(s, 160), 160); pcf_types[3] = t_array(s, t_u, c_uint(s, 16), 16);
 		pcf_types[4] = t_array(s, t_u, c_uint(s, 2), 2); pcf_types[5] = t_array(s, t_bool(s), c_uint(s, 4), 4);
 		for (int k = 0; k < 6; k++) pcf_saved[k] = load(s, pcf_types[k], pcf_vars[k]);
-		for (int k = 0; k < 2 && !lerp; k++) {   /* the grid step in UV, UsseDrawUniforms.vfetch[0..1] */
+		for (int k = 0; k < 2 && !lerp && g.is_fragment; k++) {   /* the grid step in UV, UsseDrawUniforms.vfetch[0..1] */
 			uint32_t pw = nid(s); INS(&s->func, SpvOpAccessChain, g.ptr_sa_u, pw, g.var_sa, c_uint(s, 4), c_uint(s, (uint32_t)k));
 			pcf_step[k] = result1(s, &s->func, SpvOpBitcast, t_float(s), load(s, t_u, pw));
 		}
@@ -2230,7 +2252,8 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 		if (taps > 1) {
 			int side = taps == 16 ? 4 : taps == 9 ? 3 : 2;
 			if (tap) { for (int k = 0; k < 6; k++) store(s, pcf_vars[k], pcf_saved[k]); memcpy(g.inc, pcf_inc0, sizeof pcf_inc0); }
-			if (lerp) { if (tap) emit_frag_color_preload(&g, c_vec4(s, 1.0f), &ok); }
+			if (g.motion) { g.var_sa = tap ? g.var_sa_prev : var_sa_now; g.pos_only = tap; }
+			else if (lerp) { if (tap) emit_frag_color_preload(&g, c_vec4(s, 1.0f), &ok); }
 			else {
 				g.pcf_du = fop2(s, SpvOpFMul, pcf_step[0], c_float(s, (float)(tap % side) - (float)(side - 1) * 0.5f));
 				g.pcf_dv = fop2(s, SpvOpFMul, pcf_step[1], c_float(s, (float)(tap / side) - (float)(side - 1) * 0.5f));
@@ -2311,7 +2334,8 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 		}
 		while (ok && nbr) { INS(&s->func, SpvOpBranch, brstack[nbr - 1].merge); INS(&s->func, SpvOpLabel, brstack[nbr - 1].merge); nbr--; }   /* ranges ending at the program's end */
 		if (ok) { if (g.is_fragment) emit_frag_epilogue(&g, &ok); else emit_vert_epilogue(&g, &ok); }
-		if (taps > 1 && ok) { uint32_t col = load(s, t_v4, g.var_frag_color); if (lerp) lerp_col[tap] = col; else pcf_acc = pcf_acc ? result2(s, &s->func, SpvOpFAdd, t_v4, pcf_acc, col) : col; }
+		if (g.motion && ok && !tap) store(s, g.var_mv_cur, load(s, t_v4, g.var_pos));   /* (this frame's position, as gl_Position got it) */
+		if (taps > 1 && ok && g.is_fragment) { uint32_t col = load(s, t_v4, g.var_frag_color); if (lerp) lerp_col[tap] = col; else pcf_acc = pcf_acc ? result2(s, &s->func, SpvOpFAdd, t_v4, pcf_acc, col) : col; }
 	}
 	if (lerp && ok) {   /* K: red, green and blue's mean (the test made them one K); alpha 1 - K */
 		uint32_t x[3], ksum = 0, tf = t_float(s);
@@ -2323,19 +2347,21 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 		uint32_t a = fop2(s, SpvOpFSub, c_float(s, 1.0f), fop2(s, SpvOpFMul, ksum, c_float(s, 1.0f / 3.0f)));
 		uint32_t id = nid(s); INS(&s->func, SpvOpCompositeConstruct, t_v4, id, x[0], x[1], x[2], a);
 		store(s, g.var_frag_color, id);
-	} else if (taps > 1 && ok) store(s, g.var_frag_color, result2(s, &s->func, 142 /*OpVectorTimesScalar*/, t_v4, pcf_acc, c_float(s, 1.0f / (float)taps)));
+	} else if (taps > 1 && ok && g.is_fragment) store(s, g.var_frag_color, result2(s, &s->func, 142 /*OpVectorTimesScalar*/, t_v4, pcf_acc, c_float(s, 1.0f / (float)taps)));
+	g.var_sa = var_sa_now; g.pos_only = 0;
 	if (!ok && !m.err[0]) snprintf(m.err, sizeof m.err, "I/O setup failed: %s", g.why[0] ? g.why : "layout/colour type outside this pass's coverage");
 
 	if (max_smp >= 0 && smp_units_out) for (int i = 0; i < g.nsmp && i < max_smp; i++) smp_units_out[i] = g.smp_units[i];
 	if (nsmp_out) *nsmp_out = g.nsmp;
-	m.nldst_sa = g.nwin; memcpy(m.ldst_sa, g.win_sa, sizeof m.ldst_sa);
+	m.nldst_sa = g.nwin; memcpy(m.ldst_sa, g.win_sa, sizeof m.ldst_sa); m.motion = g.motion;
 	if (!ok) { free(s->caps.w); free(s->ext.w); free(s->memmodel.w); free(s->entry.w); free(s->execmodes.w); free(s->decos.w); free(s->types.w); free(s->func.w); m.ok = 0; return m; }
 
-	uint32_t iface[2 + 16 + 5]; int niface = 0;
+	uint32_t iface[2 + 16 + 7]; int niface = 0;
 	if (g.var_vprobe) iface[niface++] = g.var_vprobe;
 	if (g.var_point) iface[niface++] = g.var_point;
 	if (g.var_vin) iface[niface++] = var_vidx;
 	if (g.var_pos) iface[niface++] = g.var_pos;
+	if (g.var_mv_cur) { iface[niface++] = g.var_mv_cur; iface[niface++] = g.var_mv_prev; }
 	for (int i = 0; i < nlocs; i++) if (g.var_vary[i]) iface[niface++] = g.var_vary[i];
 	if (g.var_frag_color) iface[niface++] = g.var_frag_color;
 	if (g.var_frag_depth) iface[niface++] = g.var_frag_depth;
@@ -2347,6 +2373,32 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	return m;
 }
 
+SpirvModule usse_spirv_motion_fragment(void) {   /* (cur.xy/cur.w - prev.xy/prev.w) / 2: the pixel's move since the previous frame, in UV units */
+	SpirvModule m; memset(&m, 0, sizeof m);
+	Spv s; memset(&s, 0, sizeof s);
+	s.next_id = 1;
+	s.glsl_ext = nid(&s);
+	uint32_t entry_fn = nid(&s);
+	uint32_t tf = t_float(&s), t_v4 = t_vec(&s, tf, 4);
+	uint32_t in_c = global_var(&s, t_ptr(&s, SpvStorageInput, t_v4), SpvStorageInput, 0), in_p = global_var(&s, t_ptr(&s, SpvStorageInput, t_v4), SpvStorageInput, 0);
+	INS(&s.decos, SpvOpDecorate, in_c, SpvDecorationLocation, 30); INS(&s.decos, SpvOpDecorate, in_p, SpvDecorationLocation, 31);
+	uint32_t out = global_var(&s, t_ptr(&s, SpvStorageOutput, t_v4), SpvStorageOutput, 0);
+	INS(&s.decos, SpvOpDecorate, out, SpvDecorationLocation, 0);
+	uint32_t c = load(&s, t_v4, in_c), pr = load(&s, t_v4, in_p), d[2];
+	uint32_t cw = composite_extract1(&s, tf, c, 3), pw = composite_extract1(&s, tf, pr, 3);
+	for (int k = 0; k < 2; k++) {
+		uint32_t a1 = fop2(&s, SpvOpFDiv, composite_extract1(&s, tf, c, (uint32_t)k), cw), b1 = fop2(&s, SpvOpFDiv, composite_extract1(&s, tf, pr, (uint32_t)k), pw);
+		d[k] = fop2(&s, SpvOpFMul, fop2(&s, SpvOpFSub, a1, b1), c_float(&s, 0.5f));
+	}
+	uint32_t zero = c_float(&s, 0.0f), v = nid(&s);
+	INS(&s.func, SpvOpCompositeConstruct, t_v4, v, d[0], d[1], zero, zero);
+	INS(&s.func, SpvOpStore, out, v);
+	uint32_t iface[3] = { in_c, in_p, out };
+	module_header(&s, 1, entry_fn, iface, 3);
+	finish_module(&m, &s, entry_fn);
+	free(s.caps.w); free(s.ext.w); free(s.memmodel.w); free(s.entry.w); free(s.execmodes.w); free(s.decos.w); free(s.types.w); free(s.func.w);
+	return m;
+}
 /* the empty fragment module (see usse_spirv.h): the same header and function shell as a translated
  * program, with an empty interface -- OriginUpperLeft, "main", OpReturn and nothing in between */
 SpirvModule usse_spirv_null_fragment(void) {

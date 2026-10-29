@@ -904,6 +904,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 				if (window_f9) window_f9(); else fprintf(stderr, "F9: count windows need the verify build (vitarecomp build <title> verify)\n");
 			}
 			if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.key == SDLK_F8) raw_look_toggle();   /* the experimental raw mouse look (hooks.c) */
+			if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.key == SDLK_F4) { extern void gfx_gpu_fsr_toggle(void); gfx_gpu_fsr_toggle(); }   /* FSR 3.1 anti-aliasing off and on, live (RECOMP_FSR: gfx_gpu.c) */
 			if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.key == SDLK_F7) { extern void camera_light_toggle(void); camera_light_toggle(); }   /* the rear camera's lamp (camera.c: Uncharted's hold-it-to-the-light puzzles) */
 			if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.key == SDLK_F2) { extern void gfx_gpu_render_scale_cycle(void); gfx_gpu_render_scale_cycle(); }   /* the GPU backend's internal resolution, 1x -> 2x -> ... -> 6x, from the next frame */
 			if ((e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) || e.type == SDL_EVENT_KEY_UP) {   /* the bound keys (kb_binds) */
@@ -1236,6 +1237,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 
 
 		if (!gpu) { SDL_Delay(1); continue; }
+		if (overlay_game_paused()) { extern void gfx_shader_prep_tick(void); gfx_shader_prep_tick(); }   /* (a paused game doesn't present: the shader warm-up steps on from here, its prep card's too) */
 		uint64_t t_blit0 = now_us();
 		SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
 		if (!cmd) continue;

@@ -156,7 +156,8 @@ static void pass(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *dst, SDL_GPULoadOp l
 int post_present(SDL_GPUDevice *gpu, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t sw, uint32_t sh, uint32_t levels,
                  float px, float py, float pw, float ph, SDL_GPUTexture *swap, SDL_GPUTextureFormat swap_fmt, float dx, float dy, float dw, float dh) {
 	const char *e = getenv("RECOMP_POST_AA"), *k = getenv("RECOMP_SHARPEN");
-	int aa = e ? atoi(e) != 0 : settings_int("post_aa", 1) != 0;
+	extern int gfx_gpu_fsr_active(void);
+	int aa = e ? atoi(e) != 0 : settings_int("post_aa", 1) != 0 && !gfx_gpu_fsr_active();   /* (FSR anti-aliases the 3D frame itself: FXAA over it would only blur) */
 	float sharp = k ? (float)atof(k) : (float)settings_float("sharpen", 0.35);
 	if (sharp < 0) sharp = 0; if (sharp > 1) sharp = 1;
 	if ((!aa && sharp <= 0) || !src || dw < 1 || dh < 1 || !setup(gpu, swap_fmt)) return 0;

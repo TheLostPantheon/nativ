@@ -69,8 +69,10 @@ about two for Shovel Knight, and longer for the bigger games, Killzone the longe
 After you update Nativ, the next Play brings that game's build up to date before it starts. That's usually under a
 minute; when an update changes how games are translated, it's as long as the first build.
 
-The first few minutes of play can stutter while Nativ prepares the game's shaders for your GPU. It keeps them, so
-later sessions run smoothly.
+The first time you start a game, Nativ may pause it on a "Preparing shaders" card while it builds the game's shaders
+for your GPU. Killzone takes a few minutes; the other games take seconds and usually don't show the card. You can skip
+it and play at once: the shaders keep building while you play, with short pauses until they're done. Later starts are
+quick. The card comes back only when there's something new to build, such as after an update.
 
 ## Controls
 

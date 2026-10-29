@@ -33,6 +33,8 @@ typedef struct {
 	int ldst_sa[8], nldst_sa;              /* vertex: the SA words whose values are guest pointers the program's LDSTs load through
 	                                        * (bone matrices: address = index*stride + SA[k]); the host binds a window of guest
 	                                        * memory from each as storage buffer 1 and describes them in UsseDrawUniforms.win */
+	int motion;                            /* vertex: the motion variant (usse_spirv_set_motion): a second uniform block (binding 1, the
+	                                        * previous frame's SA) and the clip position from each at locations 30 and 31 */
 	char err[160];
 } SpirvModule;
 
@@ -89,6 +91,14 @@ void usse_spirv_sa_read(uint32_t out[8]);
 /* a fragment module with no inputs, no outputs and no instructions: the fragment stage of a draw that
  * writes no colour (gfx_gpu.c's colour-masked draws), where the device takes SPIR-V rather than MSL */
 SpirvModule usse_spirv_null_fragment(void);
+/* the motion-vector pass's fragment shader (gfx_gpu.c, RECOMP_MV): from the motion variant's two clip positions (locations
+ * 30, 31) the pixel's move since the previous frame, (cur.xy/cur.w - prev.xy/prev.w) / 2, at location 0 */
+SpirvModule usse_spirv_motion_fragment(void);
+/* the next translation of a vertex program is its motion variant (gfx_gpu.c's motion pass, RECOMP_MV): the program runs
+ * twice, once as always (its outputs) and once from the same inputs with the SA words of a second uniform block (set 1,
+ * binding 1: the same draw's in the previous frame), and the two clip positions, viewport z mapping applied, go out at
+ * locations 30 (this frame) and 31 (the previous). Reset by passing 0 */
+void usse_spirv_set_motion(int on);
 /* how later translations fetch the framebuffer colour for FRAGCOLOR_USED programs: 1 (default) the sampled copy,
  * 2 the input attachment (only where the consumer turns it into a framebuffer fetch: Metal via spirv-cross with
  * MSL_FRAMEBUFFER_FETCH_SUBPASS and MSL >= 2.3; SDL_GPU's Vulkan backend has no input attachments). Decided once

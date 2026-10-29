@@ -755,7 +755,7 @@ def cmd_recipes(g):
 SHIPS = ("vitarecomp", "README.md", "LICENSE", "THIRD_PARTY.md", "requirements.txt", "launcher/", "pipeline/", "recompiler/",
          "decrypt/", "runtime/", "packs/", "third_party/", "assets/brand/png/", "assets/brand/nativ.ico", "assets/brand/nativ.icns",
          "dev/framediff.py")   # (check's comparison: an install can gate itself)
-NOT_SHIPPED = ("decrypt/vitadecrypt/tests/", "runtime/tests/", "runtime/gfx/shaders/", "runtime/debug/gfxreplay.c",
+NOT_SHIPPED = ("decrypt/vitadecrypt/tests/", "runtime/tests/", "runtime/gfx/shaders/", "runtime/gfx/fsr/passes/", "runtime/gfx/fsr/build.sh", "runtime/gfx/fsr/passes.py", "runtime/gfx/fsr/clears.glsl", "runtime/gfx/fsr/ffx_fsr3upscaler_callbacks_nativ.h", "runtime/debug/gfxreplay.c",
                "runtime/debug/build_replay.sh", "third_party/kenney-prompts/make.py")
 BUILT = ("launcher/nativ", "launcher/nativ.exe", "launcher/SDL3.dll", "launcher/libSDL3.so.0")   # (the launcher as built here: untracked, shipped when present)
 DIST_LIST = ".nativ-dist"   # (the files a dist wrote: the next one over it removes those it no longer ships, and only those)
