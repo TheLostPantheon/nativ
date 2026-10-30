@@ -123,6 +123,7 @@ static pthread_mutex_t klock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t kcond = PTHREAD_COND_INITIALIZER;   /* thread ends */
 static __thread uint32_t cur_tid = 0x40010003;              /* the main thread's */
 static __thread Thread *cur_thread;                         /* 0 on the main thread */
+int waitstats_on(void); uint64_t waitstats_now(void); void waitstats_begin(uint64_t t0); void waitstats_wait(uint64_t t0, uint64_t woken_at); void waitstats_sleep(uint64_t t0); void waitstats_name(const char *n);   /* (debug/waitstats.c) */
 #define SELF() (cur_thread ? cur_thread : &main_thread)
 uint32_t recomp_cur_tid(void) { return cur_tid; }           /* the calling host thread's guest uid (verify.c's RECOMP_WATCH_*) */
 const char *recomp_cur_tname(void) { return SELF()->name; }
@@ -508,6 +509,7 @@ static void *thread_main(void *p) {
 #else
 		pthread_setname_np(pthread_self(), nm);
 #endif
+		if (waitstats_on()) waitstats_name(t->name);
 	}
 	recomp_runfast();   /* FPCR is per host thread */
 	cur_tid = t->uid; cur_thread = t;
@@ -646,7 +648,10 @@ static void h_delay(Cpu *c) {
 	struct timespec ts = { us / 1000000, (us % 1000000) * 1000 };
 	thread_waits(2, 0);
 	int b = sched_block_begin();
+	const uint64_t ws_t0 = waitstats_on() ? waitstats_now() : 0;
+	if (ws_t0) waitstats_begin(ws_t0);
 	while (nanosleep(&ts, &ts) && errno == EINTR) ;
+	if (ws_t0) waitstats_sleep(ws_t0);
 	thread_waits(0, 0);
 	if (b) sched_block_end();
 	guest_time_slept(us);
@@ -710,6 +715,7 @@ typedef struct Waiter {
 	int need;                       /* semaphore: the count wanted; mutex: the lock count to take */
 	uint32_t bits, mode, out, udata;/* event flag / simple event: the pattern wanted, the wait mode, where the result pattern and user data go */
 	int woken; uint32_t result;
+	uint64_t wake_ns;               /* when wake() signalled it (RECOMP_WAIT_STATS: the hand-off's latency) */
 	pthread_cond_t *cv;
 	struct Waiter *next, *prev;
 } Waiter;
@@ -796,17 +802,37 @@ static void dequeue(Obj *o, Waiter *w) {
 	if (w->next) w->next->prev = w->prev; else o->tail = w->prev;
 	w->next = w->prev = 0; o->nwait--;
 }
-static void wake(Obj *o, Waiter *w, uint32_t result) { dequeue(o, w); w->result = result; w->woken = 1; pthread_cond_signal(w->cv); }
+static void wake(Obj *o, Waiter *w, uint32_t result) { dequeue(o, w); w->result = result; if (waitstats_on()) w->wake_ns = waitstats_now(); __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE); pthread_cond_signal(w->cv); }
+/* RECOMP_WAIT_SPIN_US=n: a wait spins up to n us for its wake before it sleeps (o->m let go meanwhile). A job system's
+ * hand-offs come within microseconds; a sleep and a wake cost more than that under load (RECOMP_WAIT_STATS: 8-13 us on
+ * average on Windows in Killzone's level, up to 140 us). Off by default (an experiment) */
+static int wait_spin_us(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_WAIT_SPIN_US"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0; } return v; }
+static inline void cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#elif defined(__aarch64__)
+	__asm__ __volatile__("yield");
+#endif
+}
+static uint64_t spin_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 /* block as w on o (o->m held) until woken (-> the waker's result), the deadline (WAIT_TIMEOUT,
  * *timeout = 0) or the object's deletion (the kind's WAIT_DELETE code) */
 static uint32_t wait_on(Obj *o, Waiter *w, uint32_t timeout_p, uint32_t edelete, uint32_t wait_type) {
 	struct timespec ts; int timed = deadline(timeout_p, &ts);
+	const uint64_t ws_t0 = waitstats_on() ? waitstats_now() : 0;
+	if (ws_t0) waitstats_begin(ws_t0);
 	w->tid = cur_tid; w->prio = cur_prio(); w->cv = wait_cv();
 	enqueue(o, w);
 	thread_waits(wait_type, o->uid);
 	Thread *t = cb_thread();
 	if (t) cb_publish(t, &o->m, w->cv);
 	int b = 0;
+	if (wait_spin_us() && !w->woken && !o->deleted && !(t && cb_pending(t))) {   /* (the spin: o->m let go, the wake seen without a sleep) */
+		pthread_mutex_unlock(&o->m);
+		const uint64_t until = spin_now_ns() + (uint64_t)wait_spin_us() * 1000;
+		for (int k = 0; !__atomic_load_n(&w->woken, __ATOMIC_ACQUIRE) && !__atomic_load_n(&o->deleted, __ATOMIC_RELAXED); k++) { cpu_relax(); if ((k & 15) == 15 && spin_now_ns() >= until) break; }
+		pthread_mutex_lock(&o->m);
+	}
 	while (!w->woken && !o->deleted && !(t && cb_pending(t))) {
 		if (!b) b = sched_block_begin();   /* the slot goes before the first sleep (o->m held: giving it up never waits) */
 		if (!timed) pthread_cond_wait(w->cv, &o->m);
@@ -814,6 +840,7 @@ static uint32_t wait_on(Obj *o, Waiter *w, uint32_t timeout_p, uint32_t edelete,
 	}
 	if (t) cb_publish(t, 0, 0);
 	thread_waits(0, 0);
+	if (ws_t0) waitstats_wait(ws_t0, w->woken ? w->wake_ns : 0);
 	if (b) {   /* a slot again, without o->m: a slot holder may need o->m meanwhile (the wake, the result, a deletion are all re-read under it below) */
 		pthread_mutex_unlock(&o->m);
 		sched_block_end();
@@ -1560,6 +1587,7 @@ static void *fiber_main(void *p) {
 #else
 	  pthread_setname_np(pthread_self(), nm);
 #endif
+	  if (waitstats_on()) waitstats_name(f->name);
 	}
 	recomp_runfast();
 	pthread_mutex_lock(&flock);

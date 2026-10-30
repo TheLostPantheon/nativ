@@ -15,6 +15,7 @@
 #include "gfx_coverage.h"
 #include "gfx_capture.h"
 #include "metrics.h"
+#include "platform.h"
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }   /* metrics.c: each entry point's own wall-clock cost */
 
@@ -27,7 +28,19 @@ static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,
 static pthread_mutex_t gfx_lock; static pthread_once_t gfx_lock_once = PTHREAD_ONCE_INIT;
 static void gfx_lock_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&gfx_lock, &a); }
 __thread int gfx_host_depth;   /* inside the lock below: guest memory this thread touches now is the graphics code's own access (gfx_gpu.c's read watch) */
-#define LOCKED(...) do { pthread_once(&gfx_lock_once, gfx_lock_init); pthread_mutex_lock(&gfx_lock); gfx_host_depth++; __VA_ARGS__; gfx_host_depth--; pthread_mutex_unlock(&gfx_lock); } while (0)
+int waitstats_on(void); uint64_t waitstats_now(void); void waitstats_begin(uint64_t t0); void waitstats_lock(uint64_t t0); void waitstats_held(uint64_t t0);
+static __thread uint64_t gfx_hold_t0; static __thread int gfx_hold_depth;   /* (RECOMP_WAIT_STATS: this thread's outermost hold of the lock) */   /* (debug/waitstats.c: RECOMP_WAIT_STATS, the time threads queue for this lock) */
+static void gfx_lock_take(void) {
+	pthread_once(&gfx_lock_once, gfx_lock_init);
+	if (!waitstats_on()) { pthread_mutex_lock(&gfx_lock); return; }
+	if (pthread_mutex_trylock(&gfx_lock)) { const uint64_t t0 = waitstats_now(); waitstats_begin(t0); pthread_mutex_lock(&gfx_lock); waitstats_lock(t0); }
+	if (!gfx_hold_depth++) gfx_hold_t0 = waitstats_now();
+}
+static void gfx_lock_give(void) { if (waitstats_on() && !--gfx_hold_depth) waitstats_held(gfx_hold_t0); pthread_mutex_unlock(&gfx_lock); }
+#define LOCKED(...) do { gfx_lock_take(); gfx_host_depth++; __VA_ARGS__; gfx_host_depth--; gfx_lock_give(); } while (0)
+/* the same lock for the window thread's own SDL_GPU calls (window.c's present loop, RECOMP_WINDOW_LOCK) */
+void gfx_lock_enter(void) { gfx_lock_take(); }
+void gfx_lock_leave(void) { gfx_lock_give(); }
 
 static int gpu_backend(void) {
 	static int b = -1;
@@ -156,6 +169,22 @@ void gfx_vis_write(uint32_t addr, uint32_t count) {   /* (inside a renderer entr
 	gfx_guest_writing(addr, 4); WR32(addr, count); gfx_guest_written(addr, 4);
 }
 void gfx_guest_reading(uint32_t addr, uint32_t len) { LOCKED(if (gpu_backend()) gfx_gpu_guest_reading(addr, len)); }
+/* a scene's notification held back until its visibility counts land (gfx_gpu.c gfx_gpu_vis_defer): the kick hands its
+ * fragment-phase writes here; the poller writes them once the GPU is done even if nothing on the game's side asks, and
+ * gfx_vis_settle (sceGpuSignalWait, gpu.c) waits for them when the game waits for its notification */
+void (*gfx_kick_done_hook)(void);   /* gpu.c's completion counter bump, after held-back writes land */
+int gfx_gpu_vis_defer(const uint32_t *addr, const uint32_t *val, int n); int gfx_gpu_vis_deferred(void); void gfx_gpu_vis_flush(int wait);
+static void *vis_poller(void *arg) {
+	(void)arg;
+	for (;;) { plat_sleep_ns(250000); if (gfx_gpu_vis_deferred()) LOCKED(gfx_gpu_vis_flush(0)); }
+	return 0;
+}
+int gfx_kick_defer(const uint32_t *addr, const uint32_t *val, int n) {
+	int r = 0; LOCKED(if (gpu_backend()) r = gfx_gpu_vis_defer(addr, val, n));
+	static int started; if (r && !started) { started = 1; pthread_t t; if (!pthread_create(&t, 0, vis_poller, 0)) pthread_detach(t); }
+	return r;
+}
+void gfx_vis_settle(void) { if (gfx_gpu_vis_deferred()) LOCKED(gfx_gpu_vis_flush(1)); }
 int gfx_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t sstride, uint32_t dst, uint32_t dstride) { int r = 0; LOCKED(if (gpu_backend()) r = gfx_gpu_transfer_downscale(src, sw, sh, sstride, dst, dstride)); return r; }   /* a CPU read of guest memory a GPU target may hold newer: the download only */
 void gfx_end_scene(void) {
 	int m = metrics_on(); uint64_t t0 = m ? now_us() : 0;

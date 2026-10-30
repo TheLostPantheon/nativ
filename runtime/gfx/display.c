@@ -196,6 +196,7 @@ static void h_set_frame_buf(Cpu *c) {
 	gfx_present(RD32(A0 + 4), RD32(A0 + 16), RD32(A0 + 20), RD32(A0 + 8), RD32(A0 + 12));
 	if (b) sched_block_end();
 	stallprof_present();
+	{ extern void waitstats_present(void); waitstats_present(); }   /* (RECOMP_WAIT_STATS) */
 	if (hitch_ms()) hitch_note(hitch_dur, __atomic_load_n(&frame_edges, __ATOMIC_RELAXED));
 	{	/* RECOMP_TEST_STALL=frame:ms -- a deliberate stall of the flipping thread at that frame (does a
 		 * game's clock carry a long frame through, or drop it?) */
@@ -734,8 +735,28 @@ static void read_wait(uint64_t *last) {
 static void h_ctrl_read(Cpu *c) { read_wait(&ctrl_read_edge[A0 & 3]); h_ctrl_peek(c); }
 static void h_audio_adopt(Cpu *c) { RET(1); }
 #define SCE_CTRL_ERROR_INVALID_ARG 0x80340001u
-static void h_ctrl_read2(Cpu *c) { if (A0) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } h_ctrl_read(c); }
-static void h_ctrl_peek2(Cpu *c) { if (A0) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } h_ctrl_peek(c); }
+/* PS TV mode. A game that reads pad port 1 and gets an answer takes itself for a PS TV with a paired pad: no touch screen
+ * at all, and the touch screen's actions on buttons, its own PS TV layout (Killzone 1.12 looks once at boot; 1.00 never
+ * does). A handheld's port 1 fails. Settings "controller_layout" (the game's own; the menu's Game page offers it once the
+ * game has looked): 0 auto, the default: a PS TV when a gamepad is connected as the game looks, so a controller player
+ * gets buttons and a keyboard-and-mouse player keeps clicking; 1 touch: a handheld, as before; 2 buttons: a PS TV.
+ * Either way keyboard, mouse aim and controller go on feeding the same pad: only the mouse's touches are gone in PS TV
+ * mode (menus by d-pad or keys). Decided at the game's first look: a change applies on its next start. Port 1 reads
+ * the same input as port 0 (h_ctrl_peek reads every port alike); ports 2-4 stay unpaired. */
+static int pstv_looked;
+int display_pstv_looked(void) { return __atomic_load_n(&pstv_looked, __ATOMIC_RELAXED); }
+static int pstv_mode(void) {
+	static int v = -1;
+	if (v < 0) {
+		extern int settings_int(const char *, int); extern int window_gamepad_connected(void);
+		const int s = settings_int("controller_layout", 0); v = s == 2 || (s == 0 && window_gamepad_connected());
+		fprintf(stderr, "    ctrl: the game asks for a PS TV's pad: %s (controller_layout %d)\n", v ? "answered, a PS TV: its button layout, no touch" : "refused, a handheld: touch", s);
+	}
+	return v;
+}
+static int pstv_port_ok(uint32_t port) { if (!port) return 1; __atomic_store_n(&pstv_looked, 1, __ATOMIC_RELAXED); return port == 1 && pstv_mode(); }
+static void h_ctrl_read2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } h_ctrl_read(c); }
+static void h_ctrl_peek2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } h_ctrl_peek(c); }
 /* SceTouchData (0x90 bytes, VitaSDK psp2/touch.h): u64 timestamp, u32 status, u32 report count, 8
  * reports {u8 id, u8 force, s16 x, s16 y, u8 reserved[8], u16 info}. RECOMP_TOUCH="from-to:x,y;..."
  * (frame ranges, front panel coordinates 1920x1088) touches the front panel in scripted runs.

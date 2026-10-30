@@ -233,11 +233,22 @@ static void kick_writes(uint32_t recs, uint32_t n) {
 		else fprintf(stderr, "gpu kick: write record %#x %#x %#x not understood\n", ctl, RD32(r + 4), RD32(r + 8));
 	}
 }
+static void signal_bump(void) { __atomic_add_fetch(&signal_counter, 1, __ATOMIC_SEQ_CST); }
 static void kick(Bridge *b) {
 	uint32_t na = RD32(b->in + 0x104), nb = RD32(b->in + 0x108);
 	kick_writes(b->in + 0x140, na < 32 ? na : 32);
-	kick_writes(b->in + 0x2c0, nb < 4 ? nb : 4);
-	__atomic_add_fetch(&signal_counter, 1, __ATOMIC_SEQ_CST);
+	/* the fragment phase's writes (the scene's notification) wait for its visibility counts when those are still on the
+	 * GPU: the renderer writes them right after the counts land (gfx_dispatch.c gfx_kick_defer) */
+	uint32_t addr[4], val[4]; int n = 0, ok = 1; if (nb > 4) nb = 4;
+	for (uint32_t k = 0; k < nb; k++) {
+		uint32_t r = b->in + 0x2c0 + 12 * k, ctl = RD32(r), cpu = meminfo_cpu(RD32(r + 8));
+		if (!cpu || (ctl & 0xfffff) < 0xf) { ok = 0; break; }
+		addr[n] = cpu + (ctl & 0xfffff) - 0xf; val[n] = RD32(r + 4); n++;
+	}
+	extern int gfx_kick_defer(const uint32_t *addr, const uint32_t *val, int n); extern void (*gfx_kick_done_hook)(void);
+	gfx_kick_done_hook = signal_bump;
+	if (!(ok && n && gfx_kick_defer(addr, val, n))) kick_writes(b->in + 0x2c0, nb);
+	signal_bump();
 }
 
 /* 0x108f SUBMIT_TRANSFER (in 0x94): sceGxmTransferCopy/Downscale/Fill. The blit itself already
@@ -326,8 +337,13 @@ static void h_bridge(Cpu *c) {   /* PVRSRV_BridgeDispatchKM(id, package) */
 static void h_open(Cpu *c) { RET(1); }      /* PVRSRVOpen: the services connection (a descriptor >= 0) */
 static void h_release(Cpu *c) { RET(0); }   /* PVRSRVRelease */
 /* sceGpuSignalWait(uint32 *last seen, timeout): the kernel sleeps while *last seen == its completion counter,
- * then stores the counter. The host's work completes at the kick, so there is never anything to wait for */
-static void h_signal_wait(Cpu *c) { if (A0) WR32(A0, __atomic_load_n(&signal_counter, __ATOMIC_SEQ_CST)); RET(0); }
+ * then stores the counter. The host's work completes at the kick, except a scene's notification held back for its
+ * visibility counts (kick): those the wait completes first, waiting for the GPU as the console's would */
+static void h_signal_wait(Cpu *c) {
+	extern void gfx_vis_settle(void); gfx_vis_settle();
+	if (A0) WR32(A0, __atomic_load_n(&signal_counter, __ATOMIC_SEQ_CST));
+	RET(0);
+}
 
 const HleEntry hle_gpu[] = {
 	{"PVRSRV_BridgeDispatchKM", h_bridge}, {"PVRSRVOpen", h_open}, {"PVRSRVRelease", h_release},

@@ -82,6 +82,7 @@ int gfx_gpu_ssao_supported(void);   /* the game names its main 3D scene (RECOMP_
 int gfx_gpu_fsr_supported(void);   /* the game's pack verified FSR 3.1 (RECOMP_FSR_SUPPORTED): the anti-aliasing row offers it */
 int gfx_gpu_target_scale_supported(void);   /* the game names buffers it draws below the screen's resolution (RECOMP_TARGET_SCALE) */
 int gfx_gpu_shader_prep(int *done, int *total, double *eta_s); void gfx_gpu_shader_prep_skip(void);   /* the shader prep card's state (build_prep) */
+int display_pstv_looked(void);   /* display.c: the game asked for a PS TV's pad (the controller layout row applies) */
 /* window.c: the swapchain's size in pixels (0 x 0 before the first frame); wider aspect support */
 void window_pixel_size(uint32_t *w, uint32_t *h);
 int window_aspect_supported(void);
@@ -366,6 +367,12 @@ static void page_game(void) {
 	if (game_option("character_detail")) {
 		ui::row("Character detail", "How far characters and props keep their full detail. 1.00× is the game's own.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1f×")) set_chr(P.chr);
+	}
+	if (display_pstv_looked()) {   /* (display.c's PS TV mode: a game with a PS TV layout of its own) */
+		ui::row("Controller layout", "How the touch screen's actions are done. Buttons: the game's own PS TV layout, with the touch screen off: menus by d-pad or keys, not by clicking. Auto: buttons when a controller is connected as the game starts. Applies the next time the game starts.");
+		static const char *const names[3] = {"Auto##cl", "Touch screen##cl", "Buttons (PS TV)##cl"};
+		int v = settings_int("controller_layout", 0); if (v < 0 || v > 2) v = 0;
+		if (ui::segmented(names, 3, &v)) { settings_set_int("controller_layout", v); settings_save(); }
 	}
 	if (game_option("online")) {
 		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. Applies the next time the game starts.");
