@@ -83,6 +83,7 @@ int gfx_gpu_fsr_supported(void);   /* the game's pack verified FSR 3.1 (RECOMP_F
 int gfx_gpu_target_scale_supported(void);   /* the game names buffers it draws below the screen's resolution (RECOMP_TARGET_SCALE) */
 int gfx_gpu_shader_prep(int *done, int *total, double *eta_s); void gfx_gpu_shader_prep_skip(void);   /* the shader prep card's state (build_prep) */
 int display_pstv_looked(void);   /* display.c: the game asked for a PS TV's pad (the controller layout row applies) */
+int display_controller_layout_default(void);
 /* window.c: the swapchain's size in pixels (0 x 0 before the first frame); wider aspect support */
 void window_pixel_size(uint32_t *w, uint32_t *h);
 int window_aspect_supported(void);
@@ -369,11 +370,11 @@ static void page_game(void) {
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1f×")) set_chr(P.chr);
 	}
 	if (display_pstv_looked()) {   /* (display.c's PS TV mode: a game with a PS TV layout of its own) */
-		ui::row("Controller layout", "How the touch screen's actions are done. Touch screen: as on a handheld, by mouse clicks or the touch cursor. PS TV buttons: the game's own layout for a PS TV's controller, its touch actions on buttons and sticks. For a controller only: the touch screen is off, and keyboard and mouse don't play the game in it. Applies the next time the game starts.");
-		static const char *const names[2] = {"Touch screen##cl", "PS TV buttons##cl"};
-		int v = settings_int("controller_layout", 1) == 2;   /* (the setting's values: 1 touch, 2 buttons) */
-		if (ui::segmented(names, 2, &v)) { settings_set_int("controller_layout", v ? 2 : 1); settings_save(); }
-		ImGui::SameLine(); ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.85f); ImGui::AlignTextToFramePadding(); ui::muted_wrapped("Controller only"); ImGui::PopFont();
+		ui::row("Controller layout", "How touch-screen actions are done. Automatic uses the game's PS TV buttons and sticks when playing with a controller, and the handheld touch screen for keyboard and mouse. Touch screen can be selected explicitly for the mouse or touch cursor. Applies the next time the game starts.");
+		static const char *const names[3] = {"Automatic##cl", "Touch screen##cl", "PS TV buttons##cl"};
+		int v = settings_int("controller_layout", display_controller_layout_default());
+		if (v < 0 || v > 2) v = display_controller_layout_default();
+		if (ui::segmented(names, 3, &v)) { settings_set_int("controller_layout", v); settings_save(); }
 	}
 	if (game_option("online")) {
 		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. Applies the next time the game starts.");

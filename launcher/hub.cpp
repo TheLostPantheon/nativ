@@ -1239,6 +1239,11 @@ static void game_settings_modal(void) {
 		if (game_option(*g, "view_distance")) { any = true; slider_row(t, "View distance", "How far fading scenery reaches. 1.00× is the game's own.", "view_distance", 1.0, 1.0f, 3.0f, "%.2f×"); }
 		if (game_option(*g, "scenery_detail")) { any = true; slider_row(t, "Scenery detail", "How far small scenery details stay visible. 1.00× is the game's own.", "scenery_detail", 1.0, 1.0f, 8.0f, "%.1f×"); }
 		if (game_option(*g, "character_detail")) { any = true; slider_row(t, "Character detail", "How far characters and props keep their full detail. 1.00× is the game's own.", "character_detail", 1.0, 1.0f, 8.0f, "%.1f×"); }
+		if (game_option(*g, "controller_layout")) {
+			any = true;
+			seg_row(t, "Controller layout", "Killzone 1.12: Automatic uses the game's PS TV buttons and sticks with a controller, and handheld touch with keyboard and mouse. Applies the next time the game starts.", "controller_layout", "0",
+			        {{"0", "Automatic"}, {"1", "Touch screen"}, {"2", "PS TV buttons"}});
+		}
 		if (game_option(*g, "private_server")) {   /* (a game whose online needs its makers' servers: Killzone; Unit 13 needs none) */
 			any = true;
 			ui::row("Private server", "The community server that stands in for the game's own (host, or host:port). Empty: the game's own, long offline.");

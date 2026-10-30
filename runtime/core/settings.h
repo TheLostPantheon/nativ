@@ -5,7 +5,7 @@
  *    The launcher's Settings page edits it, and every game's menu.
  *  - the game's own, in the directory it runs from (vitarecomp run: dump/decrypted/<title>/recomp/settings.ini --
  *    the player's, never committed): its own options (game_key in settings.c: fov, view_distance, scenery_detail,
- *    character_detail, private_server, net_redirect, menu_hint_shown), and any shared key it overrides.
+ *    character_detail, private_server, net_redirect, menu_hint_shown, controller_layout), and any shared key it overrides.
  * A key reads from the game's file first, then the shared one, then its consumer's default. Setting a shared key
  * (any game's menu) writes the shared file and drops the game's override of it; a save merges with the file as it
  * is on disk. A scripted run (RECOMP_HEADLESS: test, capture, verify) or RECOMP_SETTINGS reads no shared file. An
@@ -19,6 +19,7 @@
  *   sharpen       post.c      0..1 (default 0.35)       CAS sharpening at output resolution, 0 off (RECOMP_SHARPEN wins)
  *   anisotropy    gfx_gpu.c   1 | 2 | 4 | 8 | 16 (default 16)   anisotropic texture filtering (RECOMP_ANISO wins)
  *   input_mode    window.c    auto | pad | kbm (default auto)   keyboard+mouse or the pad; auto: the device last used
+ *   controller_layout display.c 0 | 1 | 2 (pack default, normally 1)  game-specific: automatic, handheld touch, or PS TV buttons; restart to apply
  *   mouse_look    window.c    0 | 1 (default 1)          keyboard+mouse: the mouse captured as the look (Alt frees it)
  *   mouse_sens    window.c    0.1..5 (default 1.0)       the look's sensitivity (a raw-look hook's, or the right-stick stand-in's)
  *   mouse_invert  window.c    0 | 1 (default 0)          the look's y inverted

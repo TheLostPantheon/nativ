@@ -94,10 +94,12 @@ Buttons are named as on a PlayStation controller; on an Xbox controller, L1 and 
 **L and R buttons** (Controls, in the menu and the launcher's Settings) swaps the shoulder pairs: L and R on the bumpers
 (L1 and R1), and the touch cursor on the triggers.
 
-**Controller layout** (Killzone, its Game page in the menu): the game's own layout for a PS TV's controller, with its
-touch actions on buttons and sticks. It's for a controller only: the touch screen is off, and keyboard and mouse don't
-play the game in it (the menu still works with them). It's off unless you choose it, and applies the next time the game starts. In it the shoulder
-pair that isn't L and R becomes the game's L2 and R2, and the sticks click as L3 and R3.
+**Controller layout** (Killzone 1.12, under Game settings on its launcher card and its Game page in the menu) defaults
+to **Automatic**. Controller play uses the game's own PS TV layout: D-pad or left-stick menu navigation, Cross/A to
+confirm, and its button-and-stick versions of touch actions such as melee prompts. Keyboard and mouse play keeps the
+handheld touch screen instead. The explicit **Touch screen** choice keeps the touch cursor available with a controller;
+**PS TV buttons** forces the controller layout. The choice is made when the game starts. In PS TV mode the touch screen
+is off, the other shoulder pair becomes the game's L2 and R2, and the sticks click as L3 and R3.
 
 The first time you start a game, a card shows how to touch the screen with a keyboard and mouse, a controller or a
 touch screen, with the one you're using highlighted. Touch once the way it shows to carry on (Esc skips it). It

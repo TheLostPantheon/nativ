@@ -19,8 +19,8 @@ MODULES = "libc libgxm_es4 libgpu_es4 libfios2 libscemp4 libsceavplayer np_match
 # tonemap clipped the lobby to white ("lights way over saturated"); the menus get their teal fill and glow
 MOD_HOOKS = "0x89016ce0:gxm_fp_create 0x8901620c:gxm_vp_create"   # Sony's shader patcher in the recompiled libgxm (runtime/core/hooks.c gxm_*: RECOMP_GXM_PATCHER_LOG); its RegisterProgram hook (the shader recipes) is vitarecomp's for every game
 MOD_IHOOKS = "0x89017034:gxm_fp_made"   # CreateFragmentProgram's tail, just after it hands back the variant (the shader prebuild)
-RUN_ENV = "RECOMP_GAME_OPTIONS=fov,scenery_detail,character_detail,online,private_server RECOMP_NET_SERVERS=kzv.online.scee.com,beta.kzv.online.scee.com RECOMP_SRGB=1 RECOMP_ASPECT_HOOK=1 RECOMP_HUD_DRAWS=scene RECOMP_SSAO=0x1000000:1:24 RECOMP_FSR_SUPPORTED=1 RECOMP_KZ_EVENTS=1 RECOMP_NGS_AT9_LOG=1"   # RECOMP_ASPECT_HOOK: wider aspect ratios on (IHOOKS kz_hfov + kz_aspect_b: Hor+, checked headless at 21:9 2026-10-17)
-TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed RECOMP_SRGB=1"
+RUN_ENV = "RECOMP_GAME_OPTIONS=fov,scenery_detail,character_detail,online,private_server,controller_layout RECOMP_NET_SERVERS=kzv.online.scee.com,beta.kzv.online.scee.com RECOMP_SRGB=1 RECOMP_ASPECT_HOOK=1 RECOMP_HUD_DRAWS=scene RECOMP_SSAO=0x1000000:1:24 RECOMP_FSR_SUPPORTED=1 RECOMP_CONTROLLER_LAYOUT=auto RECOMP_KZ_EVENTS=1 RECOMP_NGS_AT9_LOG=1"   # RECOMP_ASPECT_HOOK: wider aspect ratios on (IHOOKS kz_hfov + kz_aspect_b: Hor+, checked headless at 21:9 2026-10-17); the 1.12 PS TV layout provides controller-native menus and touch actions, while keyboard/mouse keeps handheld touch
+TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed RECOMP_SRGB=1 RECOMP_CONTROLLER_LAYOUT=auto"
 TEST_TOUCH = "950-960:690,916;1300-1310:1564,830"
 TEST_FRAMES = 1500
 TEST_TIMEOUT = 600

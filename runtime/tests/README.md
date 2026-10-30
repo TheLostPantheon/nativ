@@ -68,6 +68,15 @@ cc -O1 -g -Wall -Wno-unused-function $INC gesture_test.c -o /tmp/gesture_test -l
 
 It prints `scripted taps: N checks, 0 failed` and `console trace: 684 records, 0 differ`.
 
+## Controller layout
+
+`controller_layout_test.c` checks the pack-default parser and the Automatic choice for controller, keyboard and mouse,
+headless, and no-gamepad runs:
+
+    cc -O1 -Wall controller_layout_test.c -o /tmp/controller_layout_test && /tmp/controller_layout_test
+
+It prints `controller layout: 15 checks, 0 failed`.
+
 ## JPEG: `jpeg_test.c`
 
 Checks `runtime/media/jpeg.c` (SceJpeg and SceJpegEnc) the way Uncharted's photo minigame uses it: a 960x544 picture

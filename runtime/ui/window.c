@@ -41,6 +41,7 @@
 #include "metrics.h"
 #include "settings.h"
 #include "overlay.h"
+#include "controller_layout.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
        TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
@@ -172,6 +173,11 @@ void window_kb_bind(int i, SDL_Keycode k) {   /* the menu's Rebind: that action 
 }
 void window_kb_reset(void) { for (int i = 0; i < KB_N; i++) settings_set_str(kb_binds[i].key, kb_binds[i].def); settings_save(); kb_reload(); }
 int window_kbm_active(void) { return kbm_on; }
+int window_controller_layout_auto(void) {
+	char b[8]; const char *mode = settings_str("input_mode", "auto", b, sizeof b);
+	const int headless = getenv("RECOMP_HEADLESS") != NULL;
+	return controller_layout_auto_buttons(mode, kbm_on, headless ? 0 : SDL_HasGamepad(), headless);
+}
 /* a game's raw-look hook, once per game frame: the mouse's motion since its last call, in counts (y down),
  * and whether the mouse is looking at all (0: nothing to apply, the deltas are 0) */
 /* RECOMP_INPUT_MOUSE="from-to:dx,dy;...": mouse counts per call over presented-frame ranges -- a headless
