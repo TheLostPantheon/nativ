@@ -17,8 +17,12 @@ game package ──add──> decrypted game ──import──> ELF ──analy
                                                        native program <──build── C + runtime ──┘
 ```
 
-`./vitarecomp <stage> <title>` runs one stage; run it without arguments for the full list. Each stage writes into the
-game's folder in your library (`dump/decrypted/<title>/` in a checkout):
+`./vitarecomp <stage> <title>` runs one stage; run it without arguments for the full list.
+
+From a Windows PowerShell checkout with the dependencies installed in `.venv`, use
+`.\.venv\Scripts\python.exe .\pipeline\vitarecomp.py <stage> <title>` instead of the zsh wrapper.
+
+Each stage writes into the game's folder in your library (`dump/decrypted/<title>/` in a checkout):
 
 | Stage | What it does |
 |---|---|
