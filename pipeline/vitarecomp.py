@@ -96,6 +96,10 @@ from winfs import remove_file, remove_tree  # noqa: E402
 
 WINDOWS = os.name == "nt"
 ENV = os.environ
+# every Python this starts (the decrypter, the recompiler) in UTF-8 mode: its output and its text files UTF-8. Windows'
+# own default is the old code page (cp1252), and a game title outside it (Japanese, say) crashed the decrypter's summary
+# line after the work was done: the add failed (a player's report, 2026-10-29)
+ENV.setdefault("PYTHONUTF8", "1")
 
 
 def _python():   # the repository's virtualenv (.venv), else whichever Python runs this
@@ -141,7 +145,7 @@ def run(argv, env=None, cwd=None, check=True, **kw):
 def run_filtered(argv, pattern, env=None, first=False, check=True):
     """`cmd | grep pattern` (first: `| head -1`): the lines it prints that match, as they come"""
     sys.stdout.flush()
-    p = subprocess.Popen([str(a) for a in argv], env=env, stdout=subprocess.PIPE, text=True, errors="replace")
+    p = subprocess.Popen([str(a) for a in argv], env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     shown = False
     for line in p.stdout:
         if (pattern is None or re.search(pattern, line)) and not (first and shown):
@@ -899,7 +903,9 @@ def cmd_report(T):
 
 
 def main(argv):
-    try: sys.stdout.reconfigure(line_buffering=True)
+    try:   # (this program's own output UTF-8 too, and never an error over a character it can't write)
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     except AttributeError: pass
     cmd = argv[0] if argv else ""; T = argv[1] if len(argv) > 1 else ""
     if cmd == "update-check": cmd_update_check(); return 0

@@ -1857,6 +1857,7 @@ int main(int, char **) {
 	if (!shot_path && !getenv("ATIV_TASK") && !mac_preflight()) return 0;
 #endif
 	if (!getenv("PYTHONPYCACHEPREFIX")) set_env("PYTHONPYCACHEPREFIX", pref_dir() + "pycache");   /* (the stages' compiled Python beside the settings: an install is never written) */
+	if (!getenv("PYTHONUTF8")) set_env("PYTHONUTF8", "1");   /* (the stages' Python in UTF-8 mode: Windows' cp1252 default crashed an add on a game title outside it) */
 #if !defined(_WIN32) && !defined(__APPLE__)
 	if (!getenv("ZIG_GLOBAL_CACHE_DIR")) {   /* (Linux's compiler's own cache, kept per user: an AppImage's install can't be written, and it outlives an update) */
 		const char *x = getenv("XDG_CACHE_HOME"), *h = getenv("HOME");
