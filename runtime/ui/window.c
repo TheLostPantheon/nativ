@@ -43,7 +43,10 @@
 #include "overlay.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
-       TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000 };
+       TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
+       /* a PS TV's pad only (window_input_pad2; the handheld's reads never see them): the stick clicks, and its L2/R2 here
+        * (0x100/0x200 in its reads, where LTRIG/RTRIG become its L1/R1) */
+       L3 = 0x2, R3 = 0x4, L1 = 0x400, R1 = 0x800, PAD_L2 = 0x10000, PAD_R2 = 0x20000 };
 
 void (*window_f9)(void);   /* F9: set by a VERIFY build (verify.c's count window); none otherwise */
 void (*window_f6)(void);   /* F6: set by a VERIFY build (verify.c's 60/30 A/B capture); none otherwise */
@@ -82,7 +85,12 @@ static int cur_used_l, cur_used_r;
 static int cur_cross, cur_trig[2];   /* what holds the cursor touch down: Cross, L2, R2 (cur_down = any of them) */
 static int trig_touch[2];            /* this trigger pressed a cursor touch: no L/R to the game until it is let go */
 static volatile int mouse_rear_down, mouse_rear_x, mouse_rear_y;
-static int lb_held, rb_held, ltrig_on, rtrig_on;
+static int lb_held, rb_held, ltrig_on, rtrig_on;   /* the pair that holds the touch cursor; the pair that is L and R (pad_second, pad_main) */
+static int ptrig[2];                                /* the physical triggers past their press point (hysteresis) */
+/* "shoulder_buttons" (shared): "triggers", the default: the triggers are the game's L and R and the bumpers the other pair
+ * (the touch cursor; a PS TV's L2/R2); "bumpers": the other way round, as a PS TV's own pad has it. Read with the bindings
+ * (kb_reload: at start and as the menu closes, when nothing is held) */
+static int shoulders_swapped;
 static volatile int pad_gyro;               /* the pad has a gyroscope and accelerometer streaming (motion.c) */
 void motion_feed_accel(const float s[3], uint64_t t_ns); void motion_feed_gyro(const float s[3], uint64_t t_ns);
 void motion_recenter(void); void motion_pause(void); void motion_lost(void); void motion_feed_virtual(float angle, uint64_t t_ns); int motion_use_virtual(int on, float *roll);
@@ -152,6 +160,7 @@ static void kb_reload(void) {   /* the bindings from settings (at start, and whe
 		SDL_Keycode k = SDL_GetKeyFromName(name);
 		kb_binds[i].kc = k != SDLK_UNKNOWN ? k : SDL_GetKeyFromName(kb_binds[i].def);
 	}
+	char sb[16]; shoulders_swapped = !strcmp(settings_str("shoulder_buttons", "triggers", sb, sizeof sb), "bumpers");
 }
 int window_kb_count(void) { return KB_N; }
 const char *window_kb_label(int i) { return i >= 0 && i < KB_N ? kb_binds[i].label : ""; }
@@ -163,10 +172,6 @@ void window_kb_bind(int i, SDL_Keycode k) {   /* the menu's Rebind: that action 
 }
 void window_kb_reset(void) { for (int i = 0; i < KB_N; i++) settings_set_str(kb_binds[i].key, kb_binds[i].def); settings_save(); kb_reload(); }
 int window_kbm_active(void) { return kbm_on; }
-static int pad_connected;   /* (the window loop's gamepad, for other threads) */
-int window_gamepad_connected(void) {   /* display.c's PS TV answer at boot: SDL's own list too, before the loop has seen the pad's event */
-	return __atomic_load_n(&pad_connected, __ATOMIC_RELAXED) || (active && SDL_HasGamepad());
-}
 /* a game's raw-look hook, once per game frame: the mouse's motion since its last call, in counts (y down),
  * and whether the mouse is looking at all (0: nothing to apply, the deltas are 0) */
 /* RECOMP_INPUT_MOUSE="from-to:dx,dy;...": mouse counts per call over presented-frame ranges -- a headless
@@ -315,11 +320,21 @@ static const char *const ctrl_rows[][3] = {
 	{"Front touch panel", "Left mouse button (click, drag); hold Alt first while the mouse looks; a swipe prompt: just drag; a two-finger turn: hold and drag down / up; a touchscreen: touch the picture", "Touchpad; or hold L1: a stick + Cross / L2 / R2 (both sticks: two fingers); a two-finger turn: both sticks out, rolled"},
 	{"Rear touch panel", "Right mouse button (click, drag); hold Alt first while the mouse looks; a touchscreen: touch with R1 held", "Touchpad with R1 held; or hold R1: a stick + Cross / L2 / R2 (both sticks: two fingers)"},
 	{"Motion sensor (tilt, aim)", "--", "Gyro (DS4/DualSense); R3 recentres"},
+	{"A PS TV layout's L2 / R2 / L3 / R3 (controller only)", "--", "L1 / R1 / L3 / R3"},
 };
-int window_controls_count(void) { return (int)(sizeof ctrl_rows / sizeof ctrl_rows[0]); }
+/* the pad column with "shoulder_buttons" = bumpers (the bumpers are L and R, the triggers hold the touch cursor) */
+static const char *const ctrl_rows_swapped[][2] = {
+	{"L / R", "L1 / R1 (Xbox: LB / RB)"},
+	{"Front touch panel", "Touchpad; or hold L2: a stick + Cross / L1 / R1 (both sticks: two fingers); a two-finger turn: both sticks out, rolled"},
+	{"Rear touch panel", "Touchpad with R2 held; or hold R2: a stick + Cross / L1 / R1 (both sticks: two fingers)"},
+	{"A PS TV layout's L2 / R2 / L3 / R3 (controller only)", "L2 / R2 / L3 / R3"},
+};
+extern int display_pstv_looked(void);
+int window_controls_count(void) { return (int)(sizeof ctrl_rows / sizeof ctrl_rows[0]) - !display_pstv_looked(); }   /* (the last row: a PS TV layout's, only in a game that has one) */
 void window_controls_row(int i, const char **action, const char **key, const char **pad) {
 	if (i < 0 || i >= window_controls_count()) { *action = *key = *pad = ""; return; }
 	*action = ctrl_rows[i][0]; *key = ctrl_rows[i][1]; *pad = ctrl_rows[i][2];
+	if (shoulders_swapped) for (size_t j = 0; j < sizeof ctrl_rows_swapped / sizeof ctrl_rows_swapped[0]; j++) if (!strcmp(*action, ctrl_rows_swapped[j][0])) *pad = ctrl_rows_swapped[j][1];
 }
 int window_touch(int *x, int *y) { *x = touch_x; *y = touch_y; return touch_down; }
 /* A game hook's word that the game wants a front-panel swipe now (Killzone: a brutal melee / interrogation gesture window):
@@ -328,7 +343,9 @@ int window_touch(int *x, int *y) { *x = touch_x; *y = touch_y; return touch_down
  * cursor, finding the spot, then dragging, and the window was over (found in testing, 2026-10-19). Valid for 200 ms a call. */
 static uint64_t gesture_hint_ns;
 void window_touch_gesture_hint(void) { __atomic_store_n(&gesture_hint_ns, SDL_GetTicksNS(), __ATOMIC_RELAXED); }
-static int gesture_wanted(void) { uint64_t t = __atomic_load_n(&gesture_hint_ns, __ATOMIC_RELAXED); return t && SDL_GetTicksNS() - t < 200000000ull; }
+/* (never in a PS TV layout: no touch screen there, and its prompts want the stick itself, which a swipe would have muted) */
+extern int display_pstv_active(void);
+static int gesture_wanted(void) { uint64_t t = __atomic_load_n(&gesture_hint_ns, __ATOMIC_RELAXED); return t && SDL_GetTicksNS() - t < 200000000ull && !display_pstv_active(); }
 static int gesture_drag;   /* the left button is dragging a touch (gesture_wanted when it went down) */
 /* ... and with a pad: while the window is open a flick of the right stick is a swipe that way -- a touch from the panel's centre
  * 450 points out over 80 ms (the stick muted for the game meanwhile). Pressing a bumper, moving the cursor and dragging with
@@ -344,7 +361,7 @@ static uint64_t gesture_t0;
  * design, 2026-10-20 (two cursors with a press held made rolling them around each other too fiddly). Valid for 200 ms a call. */
 static uint64_t twist_hint_ns;
 void window_touch_twist_hint(void) { __atomic_store_n(&twist_hint_ns, SDL_GetTicksNS(), __ATOMIC_RELAXED); }
-static int twist_wanted(void) { uint64_t t = __atomic_load_n(&twist_hint_ns, __ATOMIC_RELAXED); return t && SDL_GetTicksNS() - t < 200000000ull; }
+static int twist_wanted(void) { uint64_t t = __atomic_load_n(&twist_hint_ns, __ATOMIC_RELAXED); return t && SDL_GetTicksNS() - t < 200000000ull && !display_pstv_active(); }   /* (nor this) */
 static volatile int twist_down, twist_x[2], twist_y[2];
 static int twist_drag, twist_pad;   /* the left button / the sticks hold the twist's fingers down */
 static float twist_ang;             /* the left button's twist: radians, clockwise on the panel */
@@ -378,7 +395,7 @@ static int touchpad_active(void) { for (int i = 0; i < TP_FINGERS; i++) if (tp_d
 static void gamepad_touch_release(void) {
 	motion_pause();   /* (and the gyro: the next sample starts a fresh interval) */
 	for (int i = 0; i < TP_FINGERS; i++) tp_down[i] = 0;
-	cur_down = 0; cur_mode = 0; lb_held = rb_held = 0; ltrig_on = rtrig_on = 0;
+	cur_down = 0; cur_mode = 0; lb_held = rb_held = 0; ltrig_on = rtrig_on = 0; ptrig[0] = ptrig[1] = 0;
 	cur2_on = 0; cur_used_l = cur_used_r = 0; cur_cross = cur_trig[0] = cur_trig[1] = 0; trig_touch[0] = trig_touch[1] = 0;
 	twist_pad = 0; twist_down = twist_drag;
 	mouse_rear_down = 0;
@@ -754,7 +771,7 @@ void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch) {
 }
 
 void window_input(uint32_t *b, uint8_t s[4]) {
-	*b = buttons;
+	*b = buttons & ~(L3 | R3 | PAD_L2 | PAD_R2);
 	for (int i = 0; i < 4; i++) s[i] = sticks[i];
 	/* the sticks are the touch cursor while a bumper is held -- unless the touchpad is doing the touching
 	 * (RB held only to put its fingers on the rear panel: the sticks stay the game's) */
@@ -762,6 +779,13 @@ void window_input(uint32_t *b, uint8_t s[4]) {
 	if (gesture_wanted()) s[2] = s[3] = 128;   /* a gesture window: the right stick flicks a swipe (window_touch_gesture_hint) */
 	if (twist_wanted() && !kbm_on) s[0] = s[1] = s[2] = s[3] = 128;   /* a twist: the sticks are its fingers (window_touch_twist_hint) */
 	if (tilt_section && (kbm_on || !pad_gyro)) s[0] = 128;   /* a tilt section: left/right is the tilt (A / D, a gyro-less pad's stick), not a step or a steer */
+}
+/* a PS TV's pad (display.c: the "2" reads of port 1): the handheld's L and R are its L1 and R1, as a PS TV gives them to a
+ * game that never asks; the other shoulder pair is its L2 and R2, and the stick clicks are there */
+void window_input_pad2(uint32_t *b, uint8_t s[4]) {
+	const uint32_t v = buttons;
+	window_input(b, s);
+	*b = (*b & ~(LTRIG | RTRIG)) | (v & LTRIG ? L1 : 0) | (v & RTRIG ? R1 : 0) | (v & PAD_L2 ? LTRIG : 0) | (v & PAD_R2 ? RTRIG : 0) | (v & (L3 | R3));
 }
 
 static uint32_t pad_bit(int b) {
@@ -771,8 +795,39 @@ static uint32_t pad_bit(int b) {
 	case SDL_GAMEPAD_BUTTON_START: return START; case SDL_GAMEPAD_BUTTON_BACK: return SELECT;
 	case SDL_GAMEPAD_BUTTON_DPAD_UP: return UP; case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return DOWN;
 	case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return LEFT; case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return RIGHT;
+	case SDL_GAMEPAD_BUTTON_LEFT_STICK: return L3; case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return R3;
 	default: return 0;
 	}
+}
+/* The two shoulder pairs, whichever physical pair each is ("shoulder_buttons": the triggers by default are pad_main).
+ * pad_main: the game's L and R; with the touch cursor up (the other pair held) a press is the cursor's touch, like
+ * Cross (two cursors: both go down), and a press that touched sends no L/R until it is let go, whatever the other pair
+ * does meanwhile. pad_second: held, the touch cursor (left: the front panel, right: the rear; right wins when both are
+ * held); a game playing a PS TV has no touch, and there it is the pad's L2 and R2. k: 0 left, 1 right. */
+static void pad_main(SDL_Gamepad *pad, int k, int dn) {
+	(void)pad;
+	int *on = k ? &rtrig_on : &ltrig_on; const uint32_t bit = k ? RTRIG : LTRIG;
+	if (dn && !*on) { *on = 1; if (cur_mode) { cur_trig[k] = trig_touch[k] = 1; } else buttons |= bit; }
+	else if (!dn && *on) { *on = 0; buttons &= ~bit; cur_trig[k] = trig_touch[k] = 0; }
+	cur_down = cur_mode && (cur_cross || cur_trig[0] || cur_trig[1]);
+}
+static void pad_second(SDL_Gamepad *pad, int k, int dn) {
+	if (display_pstv_active()) { const uint32_t bit = k ? PAD_R2 : PAD_L2; if (dn) buttons |= bit; else buttons &= ~bit; return; }
+	if (k) rb_held = dn; else lb_held = dn;
+	int m = rb_held ? 2 : lb_held ? 1 : 0;
+	if (m != cur_mode) { cur_cross = cur_trig[0] = cur_trig[1] = 0; cur2_on = 0; cur_used_l = cur_used_r = 0; }   /* a cursor touch (and the split) ends with its mode */
+	if (m && !cur_mode && pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH)) { cur_cross = 1; buttons &= ~CROSS; }   /* Cross already held: it's the touch now, not Cross */
+	if (m && !cur_mode) for (int j = 0; j < 2; j++) if (j ? rtrig_on : ltrig_on) { cur_trig[j] = trig_touch[j] = 1; buttons &= ~(j ? RTRIG : LTRIG); }   /* L or R already held: the touch too */
+	cur_mode = m;
+	cur_down = m && (cur_cross || cur_trig[0] || cur_trig[1]);
+}
+/* keyboard or mouse tried to play the game (a bound key, the mouse moved or clicked) in a PS TV layout, where they don't:
+ * the notice why, once a run */
+static int kbm_pstv_said;
+static void kbm_used(void) {
+	if (kbm_pstv_said || !display_pstv_active()) return;
+	kbm_pstv_said = 1;
+	overlay_toast_titled("Controller layout", "PS TV buttons are controller only: keyboard and mouse don't play the game in them. To play with keyboard and mouse: [F10] > Game > Controller layout > Touch screen (from the next start)", 10.0);
 }
 
 typedef struct { void *(*fn)(void *); void *arg; } Game;
@@ -939,19 +994,18 @@ void window_run(void *(*fn)(void *), void *arg) {
 				int i = kb_find(e.key.key), dn = e.type == SDL_EVENT_KEY_DOWN;
 				if (i >= 0) {
 					kb_binds[i].held = dn;
-					if (kb_binds[i].bit) { if (dn) buttons |= kb_binds[i].bit; else buttons &= ~kb_binds[i].bit; }
-					if (dn) kbm_auto = 1;
+					if (kb_binds[i].bit && !display_pstv_active()) { if (dn) buttons |= kb_binds[i].bit; else buttons &= ~kb_binds[i].bit; }   /* (a PS TV layout: a controller's only, kbm_used) */
+					if (dn) { kbm_auto = 1; kbm_used(); }
 				}
 			}
 			if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad && (pad = SDL_OpenGamepad(e.gdevice.which)) != 0) {
-				__atomic_store_n(&pad_connected, 1, __ATOMIC_RELAXED);
 				/* a DS4/DualSense's gyroscope and accelerometer stream only once asked for (SDL's HIDAPI driver) */
 				int g = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
 				int a = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
 				pad_gyro = g && a;
 				fprintf(stderr, "gamepad: %s%s%s\n", SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?", SDL_GetNumGamepadTouchpads(pad) > 0 ? ", touchpad" : "", pad_gyro ? ", gyro" : "");
 			}
-			if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) { SDL_CloseGamepad(pad); pad = 0; __atomic_store_n(&pad_connected, 0, __ATOMIC_RELAXED); pad_gyro = 0; motion_lost(); gamepad_touch_release(); buttons = 0; for (int i = 0; i < 4; i++) sticks[i] = 128; }
+			if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) { SDL_CloseGamepad(pad); pad = 0; pad_gyro = 0; motion_lost(); gamepad_touch_release(); buttons = 0; for (int i = 0; i < 4; i++) sticks[i] = 128; }
 			if (e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) {
 				if (e.gsensor.sensor == SDL_SENSOR_ACCEL) motion_feed_accel(e.gsensor.data, e.gsensor.sensor_timestamp);
 				else if (e.gsensor.sensor == SDL_SENSOR_GYRO) motion_feed_gyro(e.gsensor.data, e.gsensor.sensor_timestamp);
@@ -960,15 +1014,9 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) motion_recenter();   /* R3 (the Vita has no stick clicks): the gyro's heading becomes straight ahead */
 			if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
 				int dn = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN, b = e.gbutton.button;
-				if (b == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) lb_held = dn;
-				if (b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) rb_held = dn;
 				if (b == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER || b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) {
-					int m = rb_held ? 2 : lb_held ? 1 : 0;   /* RB wins when both are held */
-					if (m != cur_mode) { cur_cross = cur_trig[0] = cur_trig[1] = 0; cur2_on = 0; cur_used_l = cur_used_r = 0; }   /* a cursor touch (and the split) ends with its mode */
-					if (m && !cur_mode && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH)) { cur_cross = 1; buttons &= ~CROSS; }   /* Cross already held: it's the touch now, not Cross */
-					if (m && !cur_mode) for (int k = 0; k < 2; k++) if (k ? rtrig_on : ltrig_on) { cur_trig[k] = trig_touch[k] = 1; buttons &= ~(k ? RTRIG : LTRIG); }   /* a trigger already held: the touch too */
-					cur_mode = m;
-					cur_down = m && (cur_cross || cur_trig[0] || cur_trig[1]);
+					const int k = b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+					if (shoulders_swapped) pad_main(pad, k, dn); else pad_second(pad, k, dn);
 				} else if (b == SDL_GAMEPAD_BUTTON_SOUTH && (cur_mode || cur_down || cur_cross)) {
 					cur_cross = dn && cur_mode;            /* Cross is the touch while a bumper is held */
 					cur_down = cur_mode && (cur_cross || cur_trig[0] || cur_trig[1]);
@@ -977,15 +1025,11 @@ void window_run(void *(*fn)(void *), void *arg) {
 				else buttons &= ~pad_bit(b);
 			}
 			if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)) {
-				/* the triggers are L and R: pressed past ~37%, released under ~24% (no chatter at the edge) */
-				const int k = e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
-				int *on = k ? &rtrig_on : &ltrig_on;
-				uint32_t bit = k ? RTRIG : LTRIG;
-				/* with a bumper held a trigger is the cursor touch, like Cross (two cursors: both go down); a trigger that
-				 * pressed a touch sends no L/R until it is let go, whatever the bumper does meanwhile */
-				if (!*on && e.gaxis.value > 12000) { *on = 1; if (cur_mode) { cur_trig[k] = trig_touch[k] = 1; } else buttons |= bit; }
-				else if (*on && e.gaxis.value < 8000) { *on = 0; buttons &= ~bit; cur_trig[k] = trig_touch[k] = 0; }
-				cur_down = cur_mode && (cur_cross || cur_trig[0] || cur_trig[1]);
+				/* a trigger is pressed past ~37%, released under ~24% (no chatter at the edge) */
+				const int k = e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, was = ptrig[k];
+				if (!was && e.gaxis.value > 12000) ptrig[k] = 1;
+				else if (was && e.gaxis.value < 8000) ptrig[k] = 0;
+				if (ptrig[k] != was) { if (shoulders_swapped) pad_second(pad, k, ptrig[k]); else pad_main(pad, k, ptrig[k]); }
 			}
 			if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN || e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION || e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
 				int f = e.gtouchpad.finger;
@@ -1060,10 +1104,12 @@ void window_run(void *(*fn)(void *), void *arg) {
 			static int loaded; if (!loaded) { loaded = 1; kb_reload(); }
 			char mb[8]; const char *mode = settings_str("input_mode", "auto", mb, sizeof mb);
 			int on = !strcmp(mode, "kbm") ? 1 : !strcmp(mode, "pad") ? 0 : kbm_auto;
+			const int pstv = display_pstv_active();   /* a PS TV layout is a controller's only: no keyboard-and-mouse scheme, no capture */
+			if (on && pstv) { kbm_used(); on = 0; }
 			static int said;
 			if (on && !kbm_on && !said) { said = 1; overlay_toast_titled("Keyboard & mouse", "The mouse looks and aims -- hold [Alt] for the cursor\nControls: [F10]", 6.0); }
 			kbm_on = on;
-			int want = (on || window_raw_look()) && settings_int("mouse_look", 1) && !overlay_is_open() && !overlay_dialog_active() && win && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) && !(SDL_GetModState() & SDL_KMOD_ALT);
+			int want = (on || (window_raw_look() && !pstv)) && settings_int("mouse_look", 1) && !overlay_is_open() && !overlay_dialog_active() && win && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) && !(SDL_GetModState() & SDL_KMOD_ALT);
 			/* SDL's own state, not just ours: the system can drop the capture behind our back (a focus change as
 			 * the window opens, say) and rel_on then claimed a capture that wasn't there -- the pointer showed,
 			 * left the window and stopped tracking at its edge. Re-applied whenever the two disagree. */
@@ -1254,10 +1300,11 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (was_open && !open) {
 				kb_reload();   /* (the Controls page may have rebound keys) */
 				for (int i = 0; i < 4; i++) sticks[i] = pad ? (uint8_t)((SDL_GetGamepadAxis(pad, (SDL_GamepadAxis)i) + 32768) >> 8) : 128;
-				/* and the triggers (L/R): one held through the menu sends no new axis event */
-				ltrig_on = pad && SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 12000;
-				rtrig_on = pad && SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 12000;
-				buttons = (buttons & ~(LTRIG | RTRIG)) | (ltrig_on && !trig_touch[0] ? LTRIG : 0) | (rtrig_on && !trig_touch[1] ? RTRIG : 0);
+				/* and L and R: one held through the menu sends no new event (the other pair, held through, waits for a new press) */
+				for (int k = 0; k < 2; k++) {
+					ptrig[k] = pad && SDL_GetGamepadAxis(pad, k ? SDL_GAMEPAD_AXIS_RIGHT_TRIGGER : SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 12000;
+					if (pad) pad_main(pad, k, shoulders_swapped ? SDL_GetGamepadButton(pad, k ? SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER : SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) : ptrig[k]);
+				}
 			}
 			was_open = open;
 		}

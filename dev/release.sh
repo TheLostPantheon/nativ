@@ -83,6 +83,17 @@ for os in "$@"; do
       fi;;
     windows)
       bash "$H/windows-install.sh" "$I"
+      # every file with its size: the launcher checks them at start (a zip unpacked part way lost a player Python's modules)
+      python3 - "$I" <<'PY'
+import os, sys
+root, rows = sys.argv[1], []
+for d, _, files in os.walk(root):
+    for f in files:
+        p = os.path.join(d, f); r = os.path.relpath(p, root).replace(os.sep, "/")
+        if r != ".nativ-files" and not os.path.islink(p): rows.append((r, os.path.getsize(p)))
+with open(os.path.join(root, ".nativ-files"), "w", encoding="utf-8", newline="\n") as o:
+    for r, n in sorted(rows): o.write(f"{n} {r}\n")
+PY
       (cd "$W" && zipdir "$Z" ProjectNativ);;
     linux)
       [[ $(uname) == Linux ]] || { echo "release.sh: the Linux install is made on Linux"; exit 1; }

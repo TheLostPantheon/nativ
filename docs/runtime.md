@@ -118,7 +118,11 @@ Linux and Windows rely on the Vulkan drivers' own caches.
 - **Keyboard and mouse.** The mouse looks and aims while captured; hold Alt for a cursor. Left button is the front
   touch panel when the cursor is free; right button is the rear panel.
 - **Gamepads.** The triggers are L and R. The bumpers are touch modifiers: hold LB (front) or RB (rear), and either
-  stick moves a cursor on that panel while Cross touches. A marker shows the cursor.
+  stick moves a cursor on that panel while Cross touches. A marker shows the cursor. The setting `shoulder_buttons`
+  ("bumpers") swaps the two pairs.
+- **PS TV pads.** A game that asks for a PS TV's pad (Killzone 1.12, with `controller_layout` set to buttons) reads it
+  with the "2" calls on port 1 and gets a DualShock's buttons: L and R are its L1 and R1, the other shoulder pair its
+  L2 and R2, and the stick clicks L3 and R3 (`window_input_pad2`).
 - **Touchpads** on DualShock 4 and DualSense pads touch the front panel finger for finger, or the rear with RB held as
   a finger lands.
 - **Touchscreens** touch the front panel where a finger lands on the picture, up to six fingers, or the rear with RB

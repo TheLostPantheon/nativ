@@ -330,6 +330,28 @@ static void update_check_start(void) {
 		}
 	}).detach();
 }
+/* ---- an install with files missing or cut short: the release's own list (.nativ-files, "size path" a line: dev/release.sh
+ * writes it into the Windows zip, the one install a player unpacks), checked in the background at start. A player's Python
+ * once lacked Lib\collections, an unpacking that stopped part way (2026-10-30): the firmware step died on a traceback */
+static struct { std::mutex m; int bad = 0; std::string first; bool dismissed = false; } g_files;
+static void files_check(void) {
+	FILE *f = fopen((g_root + "/.nativ-files").c_str(), "rb"); if (!f) return;
+	char line[2048]; int bad = 0; std::string first;
+	while (fgets(line, sizeof line, f)) {
+		char *sp = strchr(line, ' '); if (!sp) continue;
+		*sp = 0; std::string rel(sp + 1); while (!rel.empty() && (rel.back() == '\n' || rel.back() == '\r')) rel.pop_back();
+		struct stat st; const long long want = atoll(line);
+		if (stat((g_root + "/" + rel).c_str(), &st) != 0 || (long long)st.st_size != want) { if (!bad++) first = rel; }
+	}
+	fclose(f);
+	if (!bad) return;
+	fprintf(stderr, "install: %d of the release's files missing or cut short (the first: %s)\n", bad, first.c_str());
+#ifdef _WIN32
+	std::replace(first.begin(), first.end(), '/', '\\');
+#endif
+	std::lock_guard<std::mutex> l(g_files.m); g_files.bad = bad; g_files.first = first;
+}
+static void files_check_start(void) { std::thread(files_check).detach(); }
 static Step step(const std::string &say, std::vector<std::string> argv = {}, int group = 0) { Step s; s.say = say; s.argv = std::move(argv); s.group = group; return s; }
 struct Task {
 	std::string name, game, kind;
@@ -940,7 +962,7 @@ static void ini_save(const Ini &x, const std::string &path, const char *header) 
 static const char *const SHARED_HEADER = "# Project Nativ's settings for every game (the launcher's Settings, and each game's menu; runtime/core/settings.h)";
 static const char *const GAME_HEADER = "# vitarecomp settings for this game: its own options, and where it differs from the shared settings (runtime/core/settings.h)";
 static bool game_key(const std::string &k) {   /* (settings.c's game_key: kept in the game's own file) */
-	for (const char *g : {"fov", "view_distance", "scenery_detail", "character_detail", "private_server", "net_redirect", "menu_hint_shown"}) if (k == g) return true;
+	for (const char *g : {"fov", "view_distance", "scenery_detail", "character_detail", "private_server", "net_redirect", "menu_hint_shown", "controller_layout"}) if (k == g) return true;
 	return false;
 }
 /* the shared keys' defaults where a game reads no value (runtime/core/settings.h; the consumers' own) */
@@ -948,7 +970,7 @@ static const char *setting_default(const std::string &k) {
 	static const std::pair<const char *, const char *> d[] = {{"render_scale", "1"}, {"fullscreen", "0"}, {"aspect_ratio", "native"}, {"hud_layout", "edges"},
 		{"aspect", "fit"}, {"frame_rate", "30"}, {"post_aa", "1"}, {"sharpen", "0.35"}, {"anisotropy", "16"}, {"shadow_filter", "1"}, {"full_res_world", "1"},
 		{"ssao", "1"}, {"ssao_strength", "1"}, {"osd", "0"}, {"input_mode", "auto"}, {"mouse_look", "1"}, {"raw_look", "1"}, {"mouse_sens", "1"},
-		{"mouse_invert", "0"}, {"touch_cursor_speed", "1"}, {"gyro", "1"}, {"gyro_pose", "upright"}, {"gyro_sens", "1"}, {"volume", "1"}, {"online_id", ""}, {"online", "1"},
+		{"mouse_invert", "0"}, {"shoulder_buttons", "triggers"}, {"touch_cursor_speed", "1"}, {"gyro", "1"}, {"gyro_pose", "upright"}, {"gyro_sens", "1"}, {"volume", "1"}, {"online_id", ""}, {"online", "1"},
 		{"camera", "light"}, {"save_dialog", "ask"}, {"audio_sync_trim_ms", "0"}, {"audio_buffers", "1"}};
 	for (auto &e : d) if (k == e.first) return e.second;
 	return nullptr;
@@ -1149,7 +1171,8 @@ static void settings_modal(void) {
 			seg_row(t, "Mouse aim", "Direct: the game turns exactly as far as the mouse moves (Uncharted, Unit 13, Killzone). Stick: the mouse moves the right stick. F8 switches in a game.", "raw_look", "1", {{"1", "Direct"}, {"0", "Stick"}});
 			slider_row(t, "Mouse sensitivity", nullptr, "mouse_sens", 1.0, 0.1f, 5.0f, "%.2f×", 1, ImGuiSliderFlags_Logarithmic);
 			toggle_row(t, "Invert vertical look", nullptr, "mouse_invert", false);
-			slider_row(t, "Touch cursor speed", "Hold a bumper and move a stick: the cursor is a finger on the touch screen.", "touch_cursor_speed", 1.0, 0.25f, 3.0f, "%.2f×");
+			seg_row(t, "L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter). The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.", "shoulder_buttons", "triggers", {{"triggers", "Triggers (L2 / R2)"}, {"bumpers", "Bumpers (L1 / R1)"}});
+			slider_row(t, "Touch cursor speed", "Hold the shoulder pair that isn't L and R, and move a stick: the cursor is a finger on the touch screen.", "touch_cursor_speed", 1.0, 0.25f, 3.0f, "%.2f×");
 			toggle_row(t, "Gyro", "A controller's gyro as the Vita's motion sensor.", "gyro", true);
 			seg_row(t, "A level controller is a Vita held", "Upright, as in your hands, or flat on a table.", "gyro_pose", "upright", {{"upright", "Upright"}, {"flat", "Flat"}});
 			slider_row(t, "Gyro sensitivity", nullptr, "gyro_sens", 1.0, 0.25f, 3.0f, "%.2f×");
@@ -1192,7 +1215,7 @@ static const char *setting_name(const std::string &k) {
 		{"hud_layout", "HUD"}, {"aspect", "Picture fit"}, {"frame_rate", "Frame rate"}, {"post_aa", "Anti-aliasing"}, {"sharpen", "Sharpening"},
 		{"anisotropy", "Texture filtering"}, {"shadow_filter", "Shadow edges"}, {"full_res_world", "Full-resolution world"}, {"ssao", "Ambient occlusion"},
 		{"ssao_strength", "Occlusion strength"}, {"osd", "On-screen stats"}, {"input_mode", "Play with"}, {"mouse_look", "Mouse look"}, {"raw_look", "Mouse aim"},
-		{"mouse_sens", "Mouse sensitivity"}, {"mouse_invert", "Invert vertical look"}, {"volume", "Volume"}, {"online_id", "Online name"}, {"online", "Play online"}, {"gyro", "Gyro"},
+		{"mouse_sens", "Mouse sensitivity"}, {"mouse_invert", "Invert vertical look"}, {"shoulder_buttons", "L and R buttons"}, {"volume", "Volume"}, {"online_id", "Online name"}, {"online", "Play online"}, {"gyro", "Gyro"},
 		{"gyro_sens", "Gyro sensitivity"}, {"camera", "Rear camera"}};
 	for (auto &n : names) if (k == n.first) return n.second;
 	return nullptr;
@@ -1625,6 +1648,15 @@ static void hub_ui(SDL_Window *win) {
 		if (ui::primary_button("Set up the firmware")) { g_setup_step = 1; g_setup_open = true; }
 		ImGui::EndChild(); ImGui::PopStyleColor();
 	}
+	{	int bad = 0; std::string first; { std::lock_guard<std::mutex> l(g_files.m); if (!g_files.dismissed) { bad = g_files.bad; first = g_files.first; } }
+		if (bad) {   /* the install is missing files (files_check_start) */
+			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(ui::warn.x, ui::warn.y, ui::warn.z, 0.10f));
+			ImGui::BeginChild("filesnote", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+			ui::dot(ui::warn); ImGui::TextWrapped("Project Nativ is missing %d of its files (the first: %s), so adding games and building them will fail. Unpack the whole zip again into an empty folder, and wait until it has finished. If files go missing again, your antivirus may be removing them.", bad, first.c_str());
+			if (ImGui::Button("Not now##files")) { std::lock_guard<std::mutex> l(g_files.m); g_files.dismissed = true; }
+			ImGui::EndChild(); ImGui::PopStyleColor();
+		}
+	}
 	{	std::string tag, page; { std::lock_guard<std::mutex> l(g_update.m); if (!g_update.dismissed) { tag = g_update.tag; page = g_update.page; } }
 		if (!tag.empty()) {   /* a newer release: its page, where the download is */
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(ui::accent.x, ui::accent.y, ui::accent.z, 0.10f));
@@ -1913,6 +1945,7 @@ int main(int, char **) {
 		if (ui_sel.rfind("name:", 0) == 0) g_name_game = ui_sel.substr(5);
 		if (getenv("ATIV_SHOT_NOFW") && *getenv("ATIV_SHOT_NOFW")) { g_firmware = false; g_firmware_version.clear(); }
 		if (const char *u = getenv("ATIV_SHOT_UPDATE")) { g_update.tag = u; g_update.page = "https://example.invalid/"; }   /* (the notice, without asking anyone) */
+		files_check();   /* (an install's own check, as at start: what a damaged copy shows) */
 		int r = shot(win, shot_path, sw, sh);
 		SDL_WaitForGPUIdle(g_gpu);
 		ImGui_ImplSDL3_Shutdown(); ImGui_ImplSDLGPU3_Shutdown(); ImGui::DestroyContext();
@@ -1920,7 +1953,7 @@ int main(int, char **) {
 		return r;
 	}
 
-	update_check_start();
+	update_check_start(); files_check_start();
 	bool quit = false;
 	while (!quit) {
 		SDL_Event e;

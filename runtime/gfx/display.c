@@ -662,16 +662,18 @@ static int play_motion(float a[3], float g[3], float q[4]) {   /* the latest rec
 	while (motion_cur + 1 < n_motion_recs && motion_recs[motion_cur + 1].frame <= pf) motion_cur++;
 	memcpy(a, motion_recs[motion_cur].a, 12); memcpy(g, motion_recs[motion_cur].g, 12); memcpy(q, motion_recs[motion_cur].q, 16); return 1;
 }
-static void h_ctrl_peek(Cpu *c) {   /* (port, SceCtrlData *, count): timestamp, buttons, sticks centred */
+/* pad2: a PS TV's paired pad (the "2" reads of port 1): a DualShock's buttons, L1/R1 and L2/R2 apart and the stick clicks
+ * (window_input_pad2); every other read gets the handheld's (window_input) */
+static void ctrl_peek(Cpu *c, int pad2) {   /* (port, SceCtrlData *, count): timestamp, buttons, sticks centred */
 	input_rec_init();
 	for (uint32_t i = 0; i < A2; i++) {
 		uint32_t p = A1 + 64 * i;
 		memset(G(p), 0, 64);
 		WR64(p, guest_time_us());
-		extern void window_input(uint32_t *b, uint8_t s[4]);
+		extern void window_input(uint32_t *b, uint8_t s[4]); extern void window_input_pad2(uint32_t *b, uint8_t s[4]);
 		uint32_t b; uint8_t st[4];
 		int played = play_loaded && play_ctrl(&b, st);
-		if (!played) window_input(&b, st);
+		if (!played) (pad2 ? window_input_pad2 : window_input)(&b, st);
 		WR32(p + 8, b);
 		WR8(p + 12, st[0]); WR8(p + 13, st[1]); WR8(p + 14, st[2]); WR8(p + 15, st[3]);
 		/* RECOMP_INPUT="from-to:mask,...": buttons held over frame ranges (hex Vita masks: 4000
@@ -710,10 +712,11 @@ static void h_ctrl_peek(Cpu *c) {   /* (port, SceCtrlData *, count): timestamp, 
 		 * vblank it saw, the thread, the caller, the sticks it got (which frames a pad thread gets a sample in) */
 		{ static long lf = -2, lt; if (lf == -2) { const char *e = getenv("RECOMP_LOG_CTRL_FROM"), *t = getenv("RECOMP_LOG_CTRL_TO"); lf = e ? atol(e) : -1; lt = t ? atol(t) : lf + 60; }
 		  if (lf >= 0 && i == 0 && (long)frames >= lf && (long)frames <= lt) { extern const char *recomp_cur_tname(void);
-			fprintf(stderr, "    ctrl read: frame %llu vblank %llu port %u count %u %s lr %#x sticks %u %u %u %u\n", (unsigned long long)frames, (unsigned long long)vb_now(), A0, A2, recomp_cur_tname(), c->r[14], RD8(p + 12), RD8(p + 13), RD8(p + 14), RD8(p + 15)); } }
+			fprintf(stderr, "    ctrl read%s: frame %llu vblank %llu port %u count %u %s lr %#x buttons %#x sticks %u %u %u %u\n", pad2 ? " (PS TV pad)" : "", (unsigned long long)frames, (unsigned long long)vb_now(), A0, A2, recomp_cur_tname(), c->r[14], RD32(p + 8), RD8(p + 12), RD8(p + 13), RD8(p + 14), RD8(p + 15)); } }
 	}
 	RET(A2);
 }
+static void h_ctrl_peek(Cpu *c) { ctrl_peek(c, 0); }
 /* the Read forms block until a sample this thread hasn't seen exists -- the hardware samples the
  * controller and the panels once per vblank edge and Read waits for the next one -- while Peek
  * returns the latest sample at once. A thread that waits for vblank then reads once a frame never
@@ -732,31 +735,36 @@ static void read_wait(uint64_t *last) {
 	if (*last == now) { vb_wait_until(now + 1, 0); now = vb_now(); }   /* count 0: paces the thread, doesn't advance the fixed clock (a polling pad thread made guest time run 8x fast) */
 	*last = now;
 }
-static void h_ctrl_read(Cpu *c) { read_wait(&ctrl_read_edge[A0 & 3]); h_ctrl_peek(c); }
+static void h_ctrl_read(Cpu *c) { read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(c, 0); }
 static void h_audio_adopt(Cpu *c) { RET(1); }
 #define SCE_CTRL_ERROR_INVALID_ARG 0x80340001u
 /* PS TV mode. A game that reads pad port 1 and gets an answer takes itself for a PS TV with a paired pad: no touch screen
  * at all, and the touch screen's actions on buttons, its own PS TV layout (Killzone 1.12 looks once at boot; 1.00 never
  * does). A handheld's port 1 fails. Settings "controller_layout" (the game's own; the menu's Game page offers it once the
- * game has looked): 0 auto, the default: a PS TV when a gamepad is connected as the game looks, so a controller player
- * gets buttons and a keyboard-and-mouse player keeps clicking; 1 touch: a handheld, as before; 2 buttons: a PS TV.
+ * game has looked): 1 touch, the default: a handheld; 2 buttons: a PS TV (0, an automatic choice once, is touch now).
+ * Opt-in and for a controller only: keyboard and mouse couldn't do a PS TV layout's stick prompts, and there are no
+ * clicks as touches, so they don't play the game in it (window.c: a notice says so, once a run).
  * Either way keyboard, mouse aim and controller go on feeding the same pad: only the mouse's touches are gone in PS TV
  * mode (menus by d-pad or keys). Decided at the game's first look: a change applies on its next start. Port 1 reads
- * the same input as port 0 (h_ctrl_peek reads every port alike); ports 2-4 stay unpaired. */
-static int pstv_looked;
+ * the same input as port 0 in a DualShock's layout (window_input_pad2: its L1/R1 are the handheld's L/R, as a PS TV
+ * gives a game that doesn't ask; Killzone aims and fires on them); ports 2-4 stay unpaired. */
+static int pstv_looked, pstv_on;
 int display_pstv_looked(void) { return __atomic_load_n(&pstv_looked, __ATOMIC_RELAXED); }
+int display_pstv_active(void) { return __atomic_load_n(&pstv_on, __ATOMIC_RELAXED); }   /* (window.c: the shoulder pair that isn't L and R is the pad's L2/R2, not the touch cursor) */
 static int pstv_mode(void) {
 	static int v = -1;
 	if (v < 0) {
-		extern int settings_int(const char *, int); extern int window_gamepad_connected(void);
-		const int s = settings_int("controller_layout", 0); v = s == 2 || (s == 0 && window_gamepad_connected());
+		extern int settings_int(const char *, int);
+		const int s = settings_int("controller_layout", 1); v = s == 2;
+		__atomic_store_n(&pstv_on, v, __ATOMIC_RELAXED);
 		fprintf(stderr, "    ctrl: the game asks for a PS TV's pad: %s (controller_layout %d)\n", v ? "answered, a PS TV: its button layout, no touch" : "refused, a handheld: touch", s);
 	}
 	return v;
 }
 static int pstv_port_ok(uint32_t port) { if (!port) return 1; __atomic_store_n(&pstv_looked, 1, __ATOMIC_RELAXED); return port == 1 && pstv_mode(); }
-static void h_ctrl_read2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } h_ctrl_read(c); }
-static void h_ctrl_peek2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } h_ctrl_peek(c); }
+/* port 0 of the "2" reads is the handheld's own buttons, as the other reads have them; port 1 is the PS TV's pad */
+static void h_ctrl_read2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(c, A0 != 0); }
+static void h_ctrl_peek2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } ctrl_peek(c, A0 != 0); }
 /* SceTouchData (0x90 bytes, VitaSDK psp2/touch.h): u64 timestamp, u32 status, u32 report count, 8
  * reports {u8 id, u8 force, s16 x, s16 y, u8 reserved[8], u16 info}. RECOMP_TOUCH="from-to:x,y;..."
  * (frame ranges, front panel coordinates 1920x1088) touches the front panel in scripted runs.

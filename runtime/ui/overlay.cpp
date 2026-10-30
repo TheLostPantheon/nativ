@@ -369,10 +369,11 @@ static void page_game(void) {
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1f×")) set_chr(P.chr);
 	}
 	if (display_pstv_looked()) {   /* (display.c's PS TV mode: a game with a PS TV layout of its own) */
-		ui::row("Controller layout", "How the touch screen's actions are done. Buttons: the game's own PS TV layout, with the touch screen off: menus by d-pad or keys, not by clicking. Auto: buttons when a controller is connected as the game starts. Applies the next time the game starts.");
-		static const char *const names[3] = {"Auto##cl", "Touch screen##cl", "Buttons (PS TV)##cl"};
-		int v = settings_int("controller_layout", 0); if (v < 0 || v > 2) v = 0;
-		if (ui::segmented(names, 3, &v)) { settings_set_int("controller_layout", v); settings_save(); }
+		ui::row("Controller layout", "How the touch screen's actions are done. Touch screen: as on a handheld, by mouse clicks or the touch cursor. PS TV buttons: the game's own layout for a PS TV's controller, its touch actions on buttons and sticks. For a controller only: the touch screen is off, and keyboard and mouse don't play the game in it. Applies the next time the game starts.");
+		static const char *const names[2] = {"Touch screen##cl", "PS TV buttons##cl"};
+		int v = settings_int("controller_layout", 1) == 2;   /* (the setting's values: 1 touch, 2 buttons) */
+		if (ui::segmented(names, 2, &v)) { settings_set_int("controller_layout", v ? 2 : 1); settings_save(); }
+		ImGui::SameLine(); ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.85f); ImGui::AlignTextToFramePadding(); ui::muted_wrapped("Controller only"); ImGui::PopFont();
 	}
 	if (game_option("online")) {
 		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. Applies the next time the game starts.");
@@ -449,7 +450,10 @@ static void page_controls(void) {
 		  if (ImGui::SliderFloat("##ms", &sens, 0.1f, 5.0f, "%.2f×", ImGuiSliderFlags_Logarithmic)) { settings_set_float("mouse_sens", sens); settings_save(); } }
 		ui::row("Invert vertical look");
 		{ bool inv = settings_int("mouse_invert", 0) != 0; if (ui::toggle("mi", &inv)) { settings_set_int("mouse_invert", inv ? 1 : 0); settings_save(); } }
-		ui::row("Touch cursor speed", "Hold a bumper and move a stick: the cursor is a finger on the touch screen (Cross, L2 or R2 presses). Move both sticks for two fingers.");
+		ui::row("L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter). The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.");
+		{ static const char *const names[2] = {"Triggers (L2 / R2)##sb", "Bumpers (L1 / R1)##sb"}; char cur[16]; int v = !strcmp(settings_str("shoulder_buttons", "triggers", cur, sizeof cur), "bumpers");
+		  if (ui::segmented(names, 2, &v)) { settings_set_str("shoulder_buttons", v ? "bumpers" : "triggers"); settings_save(); } }
+		ui::row("Touch cursor speed", "Hold the shoulder pair that isn't L and R, and move a stick: the cursor is a finger on the touch screen (Cross, L or R presses). Move both sticks for two fingers.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##tcs", &P.tcs, 0.25f, 3.0f, "%.2f×")) set_tcs(P.tcs);
 		ui::rows_end();
 	}
