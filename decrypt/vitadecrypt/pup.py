@@ -451,9 +451,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{part}: {r['image_size']} bytes, {r['file_count']} files extracted, "
               f"{r['self_decrypted']} SELF(s) decrypted, {r['self_failed']} failed")
         # os0/sm: the secure processor's own modules -- there are no public keys for them and nothing here runs them
-        sm = [f for f in r["self_failures"] if f.startswith("sm/")]
+        sm_prefix = "sm" + os.sep
+        sm = [f for f in r["self_failures"] if f.startswith(sm_prefix)]
         for f in r["self_failures"]:
-            if not f.startswith("sm/"):
+            if not f.startswith(sm_prefix):
                 print(f"  FAILED {f}")
         if sm:
             print(f"  ({len(sm)} secure-module SELFs under sm/ left encrypted: no keys exist for them, and nothing needs them)")
