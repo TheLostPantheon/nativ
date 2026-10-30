@@ -17,7 +17,7 @@ static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
  * its server; first-launch hints are per game) -- every other key is the player's, the same in every game */
 static int game_key(const char *key) {
 	static const char *const own[] = {"fov", "view_distance", "scenery_detail", "character_detail", "private_server", "net_redirect",
-	                                  "menu_hint_shown", NULL};
+	                                  "menu_hint_shown", "controller_layout", NULL};
 	for (int i = 0; own[i]; i++) if (!strcmp(own[i], key)) return 1;
 	return 0;
 }

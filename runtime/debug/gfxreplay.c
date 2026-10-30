@@ -54,7 +54,7 @@ uint32_t guest_alloc(uint32_t size, uint32_t align) { (void)size; (void)align; r
 uint64_t guest_time_us_peek(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch) { (void)base; (void)w; (void)h; (void)pitch; }
 int window_active(void) { return 0; }   /* no window: gfx_gpu.c presents through guest memory, as the shots need */
-void window_present_gpu(void *tex, uint32_t w, uint32_t h) { (void)tex; (void)w; (void)h; }
+void window_present_gpu(void *tex, uint32_t w, uint32_t h, int raw) { (void)tex; (void)w; (void)h; (void)raw; }
 void *window_gpu_device(void) {
 	static SDL_GPUDevice *dev; static int tried;
 	if (!tried) {

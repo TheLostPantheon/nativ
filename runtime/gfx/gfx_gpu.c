@@ -105,7 +105,7 @@ static uint64_t write_clock;   /* bumps whenever a GPU target or depth surface g
  * reads or rewrites what a recorded draw writes or samples flushes them first */
 static void batch_flush(const char *why);
 static void build_wait(const int *pending);   /* (the build workers, below: batch_flush waits for the pipelines its draws were recorded with) */
-static void vis_complete(int wait); static void vis_download(void); static int vis_pending(void);   /* (the visibility test, with gfx_gpu_draw) */
+static void vis_complete(int wait); static void vis_download(void); static int vis_pending(void); static int vis_pending_set(void);   /* (the visibility test, with gfx_gpu_draw) */
 static SDL_GPUBuffer *qbuf; static SDL_GPUTransferBuffer *qzero;   /* its counters, and zeros to reset them from */
 static int batch_flushing;   /* inside batch_flush: it must not run again from anything it calls (view_pipeline_for's eviction) */
 /* the fences of the scene command buffers still in flight (every flush submits with one): a ring
@@ -376,6 +376,7 @@ void *gfx_gpu_create_device(void) {
 		SDL_SetBooleanProperty(p, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
 		SDL_SetBooleanProperty(p, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, getenv("RECOMP_GPU_DEBUG_SDL") != 0);   /* (off, as SDL_CreateGPUDevice's was; RECOMP_GPU_DEBUG_SDL=1: SDL's checks -- they stop at an integer-format texture made for sampling, the stencil preload's) */
 		SDL_SetStringProperty(p, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, "vulkan");
+		{ const char *lp = getenv("RECOMP_GPU_LOW_POWER"); if (lp && *lp && *lp != '0') SDL_SetBooleanProperty(p, SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN, true); }   /* (RECOMP_GPU_LOW_POWER=1: SDL picks an integrated GPU where there's one beside a discrete one: a laptop's Radeon, for testing) */
 		SDL_SetPointerProperty(p, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER, &vo);
 		d = SDL_CreateGPUDeviceWithProperties(p);
 		SDL_DestroyProperties(p);
@@ -1682,6 +1683,17 @@ static int want_rscale_x(int n) {
  * of 960x544 pixels) is 8-12 ms of renderer time a frame the windowed game never pays -- a headless
  * frame-time measurement with it on isn't the game the player plays. Shot frames still sync (RECOMP_SHOT
  * reads guest memory), as do CPU reads and writes of the frame (gfx_gpu_guest_writing, target_view). */
+/* A FRAGCOLOR draw's framebuffer copy as a blit (a render pass), not vkCmdCopyImage, on Vulkan. With the copy, Killzone
+ * windowed at 3x and 21:9 (3840x1632 targets) lost the device as its level loaded, about one run in two with mailbox
+ * presentation and now and then with vsync: the RTX laptop's driver (617.42) reported an invalid write inside another
+ * 64 MB image while that copy ran (VK_LAYER_LUNARG_crash_diagnostic, 3 of 3 dumps), with validation and sync validation
+ * clean. As a blit: 0 losses in 17 runs, and byte-identical frames (frame_4739 replayed at 3x, 2026-10-26). Metal keeps
+ * the copy. RECOMP_GPU_FETCH_BLIT=0|1 picks. */
+static int fetch_blit(void) {
+	static int v = -1;
+	if (v < 0) { const char *e = getenv("RECOMP_GPU_FETCH_BLIT"), *dv = gpu() ? SDL_GetGPUDeviceDriver(gpu()) : 0; v = e && *e ? *e != '0' : dv && !strcmp(dv, "vulkan"); }
+	return v;
+}
 static int present_nosync(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_PRESENT_NOSYNC"); v = e && *e && *e != '0'; } return v; }
 static void render_scale_init(void) {
 	static int done; if (done) return; done = 1;
@@ -2493,12 +2505,13 @@ static void target_alias_sync(TargetEntry *e) {
  * in the same scene). "The part it is drawing": the texture's rectangle covers at least half of the draw's clip rect. */
 static int scene_snap;                               /* the current scene's starting pixels: 1 in guest memory, 2 in its GPU snapshot (target_snapshot) */
 static int cur_wx0, cur_wy0, cur_wx1, cur_wy1;       /* the draw being recorded: its clip rect, target pixels */
-/* The starting pixels on the GPU instead (RECOMP_GPU_SNAP=1; off by default, with RECOMP_GPU_TRANSFER): a copy of the target taken as
+/* The starting pixels on the GPU instead (RECOMP_GPU_SNAP=0|1; on by default with Vulkan, as RECOMP_GPU_TRANSFER): a copy of the target taken as
  * the scene begins, which those reads sample (target_view: a view or mip_view of the snapshot). The download made Killzone's
  * strip scene a fence wait on the GPU every frame, 4.3 ms on the RTX laptop. Anything that can only read the starting pixels
  * from guest memory gets the snapshot downloaded there once (snap_to_guest). */
 static void target_sync_for_gpu(TargetEntry *e);   /* (below) */
-static int gpu_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_SNAP"); v = e && *e && *e != '0'; } return v; }
+static int gpu_vulkan(void);   /* (below) */
+static int gpu_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_SNAP"); v = e && *e ? *e != '0' : gpu_vulkan(); } return v; }
 static int target_snapshot(TargetEntry *e) {
 	static uint64_t snaps;
 	target_sync_for_gpu(e);   /* (guest memory newer after a CPU write: up first, as a scene starting on it would) */
@@ -3332,8 +3345,13 @@ void gfx_gpu_sync_all(void) { if (!gpu()) return; batch_flush("sync to guest"); 
 /* a scene's visibility results are in guest memory before it ends (RECOMP_VIS_SYNC=0: a frame or so later, as they come
  * back). The game reads them once the scene's notification says it is done, and the host writes notifications at the
  * kick, right after this: read a frame late, Killzone's occlusion culling hid what had just come into view -- objects and
- * NPCs flashing in and out, at every cutscene cut. Waiting costs the scene's GPU time, on scenes with queries only. */
-static int vis_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_VIS_SYNC"); v = !(e && *e == '0'); } return v; }
+ * NPCs flashing in and out, at every cutscene cut. Waiting costs the scene's GPU time, on scenes with queries only.
+ * The default now holds the scene's notification back instead (gfx_gpu_vis_defer): the counts still come before it, and
+ * the render thread goes on. Waiting here held a render thread on the GPU every scene with queries: windowed at 3x and
+ * 21:9 on the RTX laptop, 36 fps waiting against 47 not (2026-10-26). Not waiting at all read Killzone's flares late
+ * (their count is their brightness): a red or blue light shone through whatever had just moved in front of it.
+ * RECOMP_VIS_SYNC=1 waits here as before, =set for SET tests only (flares late), =0 never (counts late). */
+static int vis_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_VIS_SYNC"); v = !e || !*e ? 3 : *e == '0' ? 0 : !strcmp(e, "set") ? 2 : 1; } return v; }   /* 3 defer, 1 all, 2 SET only, 0 none */
 void gfx_gpu_end_scene(void) {
 	scene_open = 0;
 	if (mv_scene_nd) {   /* (RECOMP_MV_SCENES: the main scene's draws, as runs) */
@@ -3348,7 +3366,7 @@ void gfx_gpu_end_scene(void) {
 		if (cam && ssao_apply(gpu(), scene_entry->color, kind_format(scene_entry->kind), scene_depth_entry->tex, TSX(scene_entry, scene_entry->width), TSY(scene_entry, scene_entry->height), cam)) n_ao++;   /* before anything reads the scene */
 		ao_scene = 0;
 		if (scene_entry) readback_enqueue(scene_entry);
-		if (vis_pending() && vis_sync()) vis_complete(1);
+		if (vis_pending() && (vis_sync() == 1 || (vis_sync() == 2 && vis_pending_set()))) vis_complete(1);
 	}
 }
 
@@ -4117,10 +4135,14 @@ static void view_pass(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *dst, SDL_GPUTex
  * over its memory, at the source's render scale: the next level's source, and what later draws sample (target_view).
  * Guest memory under it is behind until something reads it there: readback_enqueue's rule as for a scene's target (a small
  * one read back a frame later, a sampled one watched), a CPU write's download, a capture (which takes the CPU path).
- * Off by default (RECOMP_GPU_TRANSFER=1 on): byte-exact on Metal and Vulkan, but on the RTX laptop the frame rate didn't move
- * (the level is GPU-bound there; the GPU did the extra passes instead, 2026-10-23). Returns 0 for the CPU path to do it. */
+ * Byte-exact on Metal and Vulkan (RECOMP_GPU_TRANSFER_CHECK=1). On by default with Vulkan, with the snapshot (gpu_snap_on):
+ * the two together took the last fence wait out of Killzone's frame, windowed at 3x and 21:9 on the RTX laptop 43 -> 55 fps
+ * (2026-10-26; on 2026-10-23 the frame rate hadn't moved, with vsync's stall and the flare waits still in it). Their extra
+ * resource churn made SDL crash in the window thread's submit until that thread took the renderer's lock too (window.c).
+ * RECOMP_GPU_TRANSFER=0|1 picks. Returns 0 for the CPU path to do it. */
 int gfxcap_active(void);   /* gfx_capture.c */
-static int gpu_transfer_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_TRANSFER"); v = e && *e && *e != '0'; } return v; }
+static int gpu_vulkan(void) { static int v = -1; if (v < 0) { if (!gpu()) return 0; const char *dv = SDL_GetGPUDeviceDriver(gpu()); v = dv && !strcmp(dv, "vulkan"); } return v; }   /* (not cached before the device exists) */
+static int gpu_transfer_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_TRANSFER"); v = e && *e ? *e != '0' : gpu_vulkan(); } return v; }
 int gfx_gpu_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t sstride, uint32_t dst, uint32_t dstride) {
 	if (!gpu() || !gpu_transfer_on() || gfxcap_active()) return 0;
 	static int trace = -1; if (trace < 0) trace = getenv("RECOMP_GPU_TRANSFER_TRACE") != 0;   /* RECOMP_GPU_TRANSFER_TRACE=1: why a transfer stayed on the CPU */
@@ -4356,7 +4378,10 @@ static void batch_flush_body(const char *why) {
 		if (e == batch.nev) break;
 		BatchEvent *ev = &batch.ev[e];
 		if (ev->view) view_pass(cmd, ev->dst, ev->src, ev->from_depth, &ev->u);
-		else {   /* the framebuffer copy the next draw's FRAGCOLOR reads: the colour target as every earlier draw left it */
+		else if (fetch_blit()) {   /* the same copy as a blit (fetch_blit: Vulkan) */
+			SDL_GPUBlitInfo bl = { .source = { .texture = ev->src, .x = ev->x, .y = ev->y, .w = ev->w, .h = ev->h }, .destination = { .texture = ev->dst, .x = ev->x, .y = ev->y, .w = ev->w, .h = ev->h }, .load_op = SDL_GPU_LOADOP_LOAD, .filter = SDL_GPU_FILTER_NEAREST };
+			SDL_BlitGPUTexture(cmd, &bl);
+		} else {   /* the framebuffer copy the next draw's FRAGCOLOR reads: the colour target as every earlier draw left it */
 			SDL_GPUCopyPass *fcp = SDL_BeginGPUCopyPass(cmd);
 			SDL_GPUTextureLocation fsrc = { .texture = ev->src, .x = ev->x, .y = ev->y }, fdst = { .texture = ev->dst, .x = ev->x, .y = ev->y };
 			SDL_CopyGPUTextureToTexture(fcp, &fsrc, &fdst, ev->w, ev->h, 1, false);
@@ -4667,10 +4692,15 @@ static void ldst_window_placed(uint32_t addr, uint32_t off, uint32_t *dst) {
  * it is, Vulkan with fragmentStoresAndAtomics (gfx_gpu_create_device asks for it); without, the counters stay as the
  * game left them. */
 #define QSLOTS 256
-typedef struct { SDL_GPUFence *f; SDL_GPUTransferBuffer *xb; int n; uint32_t addr[QSLOTS]; uint32_t div; } VisPending;
+typedef struct { SDL_GPUFence *f; SDL_GPUTransferBuffer *xb; int n; uint32_t addr[QSLOTS]; uint32_t div; int set;   /* set: a SET test among them (vis_sync) */
+	uint64_t seq; int ndef; uint32_t daddr[4], dval[4]; } VisPending;   /* ndef: the scene's fragment-phase writes, held back until the counts land (gfx_gpu_vis_defer) */
 #define NVISP 8
 static VisPending visp[NVISP]; static int visp_r, visp_n;
+static uint64_t vis_seq, vis_kick_seq;   /* the newest batch of counts, and the one the next kick's notification follows (0: none since the last kick) */
+static int vis_ndeferred;                 /* batches holding back a notification (atomic: gfx_gpu_vis_deferred reads it without the lock) */
+static uint32_t n_def, n_def_wait, n_def_poll;   /* (RECOMP_GPU_STATS) notifications held back, and how many the game's wait / the poller completed */
 static int vis_pending(void) { return visp_n; }
+static int vis_pending_set(void) { for (int i = 0; i < visp_n; i++) if (visp[(visp_r + i) % NVISP].set) return 1; return 0; }
 static SDL_GPUShader *query_fragment_shader(void) {
 	static SDL_GPUShader *sh; static int tried;
 	if (tried) return sh;
@@ -4745,6 +4775,12 @@ static void vis_complete(int wait) {
 			SDL_UnmapGPUTransferBuffer(gpu(), p->xb);
 			for (int j = 0; j < n; j++) gfx_vis_write(addr[j], sum[j] ? (sum[j] + p->div - 1) / p->div : 0);
 		}
+		if (p->ndef) {   /* the scene's notification after its counts, as the GPU writes them: the game reads the counts once it says done */
+			__atomic_thread_fence(__ATOMIC_RELEASE);
+			for (int k = 0; k < p->ndef; k++) __atomic_store_n((uint32_t *)G(p->daddr[k]), p->dval[k], __ATOMIC_RELEASE);
+			p->ndef = 0; __atomic_sub_fetch(&vis_ndeferred, 1, __ATOMIC_ACQ_REL);
+			extern void (*gfx_kick_done_hook)(void); if (gfx_kick_done_hook) gfx_kick_done_hook();
+		}
 		SDL_ReleaseGPUFence(gpu(), p->f); p->f = 0;
 		visp_r = (visp_r + 1) % NVISP; visp_n--;
 	}
@@ -4763,8 +4799,34 @@ static void vis_download(void) {
 	SDL_EndGPUCopyPass(cp);
 	p->f = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
 	p->n = batch.nq; memcpy(p->addr, batch.qaddr, sizeof(uint32_t) * (size_t)batch.nq); p->div = (uint32_t)(scene_sx * scene_sy); if (!p->div) p->div = 1;
-	if (p->f) visp_n++;
+	p->set = 0; for (int k = 0; k < batch.nq; k++) p->set |= batch.qset[k];
+	p->ndef = 0; p->seq = ++vis_seq;
+	if (p->f) { visp_n++; vis_kick_seq = p->seq; }
 	batch.nq = 0;
+}
+/* The scene's notification after its counts, without the render thread waiting for them (RECOMP_VIS_SYNC default, "defer").
+ * The game reads a scene's visibility counts once its fragment notification says the scene is done (Killzone's flares:
+ * the count is their brightness). The kick (gpu.c) writes a scene's notifications at once, the host having drawn it; when
+ * that scene's counts are still on the GPU, its fragment-phase writes are handed here instead and written by vis_complete
+ * right after the counts land. Nothing reads a stale count, and nothing waits unless the game does: its wait for the
+ * notification (sceGpuSignalWait, gpu.c) completes them then, and a poller (gfx_dispatch.c) completes finished ones so
+ * a game polling the word alone sees it too. 1: taken (the kick writes the rest), 0: write them now. */
+int gfx_gpu_vis_defer(const uint32_t *addr, const uint32_t *val, int n) {
+	if (vis_sync() != 3 || !vis_kick_seq || n <= 0 || n > 4) { vis_kick_seq = 0; return 0; }
+	for (int i = 0; i < visp_n; i++) {
+		VisPending *p = &visp[(visp_r + i) % NVISP];
+		if (p->seq != vis_kick_seq) continue;
+		for (int k = 0; k < n; k++) { p->daddr[k] = addr[k]; p->dval[k] = val[k]; }
+		p->ndef = n; __atomic_add_fetch(&vis_ndeferred, 1, __ATOMIC_ACQ_REL); vis_kick_seq = 0; n_def++;
+		return 1;
+	}
+	vis_kick_seq = 0; return 0;   /* (its counts already landed) */
+}
+int gfx_gpu_vis_deferred(void) { return __atomic_load_n(&vis_ndeferred, __ATOMIC_ACQUIRE); }
+void gfx_gpu_vis_flush(int wait) {
+	if (!gpu() || !visp_n) return;
+	const int before = vis_ndeferred; vis_complete(wait); const int done = before - vis_ndeferred;
+	if (wait) n_def_wait += (uint32_t)done; else n_def_poll += (uint32_t)done;
 }
 static uint32_t n_vis_unknown;   /* (RECOMP_GPU_STATS) a frame's visibility queries drawn, and SET tests answered visible unseen */
 static void vis_unknown(const GfxDraw *d) { if (d->vis_addr && d->vis_set) { gfx_vis_write(d->vis_addr, 1); n_vis_unknown++; } }   /* a SET test (occlusion culling) this frame can't count: visible -- a 0 deletes the object (the popping of 2026-10-16) */
@@ -5788,7 +5850,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	cur_wx0 = sx0; cur_wy0 = sy0; cur_wx1 = sx1; cur_wy1 = sy1;   /* (same_region_read, for the binds below) */
 	SDL_GPUTextureSamplerBinding tsb[25]; int ntsb = 0;
 	if (pipe->fetch && !scene_entry->fetch_copy) {   /* the framebuffer copy this draw's FRAGCOLOR reads (taken in its batch's copy pass) */
-		SDL_GPUTextureCreateInfo fci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(scene_entry->kind), .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+		SDL_GPUTextureCreateInfo fci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(scene_entry->kind), .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | (fetch_blit() ? SDL_GPU_TEXTUREUSAGE_COLOR_TARGET : 0),
 			.width = TSX(scene_entry, scene_entry->width), .height = TSY(scene_entry, scene_entry->height), .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
 		scene_entry->fetch_copy = SDL_CreateGPUTexture(gpu(), &fci);
 	}
@@ -6149,7 +6211,8 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 		fprintf(stderr, "\n    gpu time: %.1f ms = setup %.1f + vertex fetch %.1f (%u ring wraps) + shaders %.1f (%u built) + pipelines %.1f + vertex upload %.1f + texture binding %.1f (hash %.1f, upload %.1f [%u textures, %u as BC blocks], target sync %.1f, views %.1f) + scene target upload %.1f + pass %.1f + submit %.1f + other %.1f [map %.1f acquire %.1f]\n",
 		        t_total / 1e3, t_setup / 1e3, t_vfetch / 1e3, n_vring_wraps, t_shader / 1e3, n_shader_builds, t_pipe / 1e3, t_vbuf / 1e3, t_bind / 1e3, t_texhash / 1e3, t_texup / 1e3, n_tex_uploads, n_tex_bc, t_tsync / 1e3, t_view / 1e3, t_scene_sync / 1e3, t_pass / 1e3, t_submit / 1e3, ((double)t_total - (double)(t_setup + t_vfetch + t_shader + t_pipe + t_vbuf + t_bind + t_scene_sync + t_pass + t_submit)) / 1e3, t_map / 1e3, t_acq / 1e3);   /* signed: the syncs at present/guest-write time are outside t_total */
 		{	uint32_t wf = 0, wm = 0, wp = 0; gwatch_stats(&wf, &wm, &wp);   /* change detection (get_texture): its time is the "hash" bucket above */
-			fprintf(stderr, "    gpu visibility: %u queries, %u SET tests answered visible unseen\n", n_vis_queries, n_vis_unknown); n_vis_queries = n_vis_unknown = 0;
+			fprintf(stderr, "    gpu visibility: %u queries, %u SET tests answered visible unseen; %u notifications held for their counts (%u completed by the game's wait, %u by the poller)\n", n_vis_queries, n_vis_unknown, n_def, n_def_wait, n_def_poll);
+			n_vis_queries = n_vis_unknown = 0; n_def = n_def_wait = n_def_poll = 0;
 			if (n_ao) { fprintf(stderr, "    gpu ssao: %u scenes\n", n_ao); n_ao = 0; }
 			if (n_hud_draws || t_hud) { fprintf(stderr, "    gpu hud: %u draws at their native shape (%.2f ms finding them)\n", n_hud_draws, t_hud / 1e3); n_hud_draws = 0; t_hud = 0; }
 			fprintf(stderr, "    gpu uploads: decode %.2f ms, transfer buffers %.2f ms, command buffers %.2f ms\n", t_up_decode / 1e3, t_up_xfer / 1e3, t_up_submit / 1e3); t_up_decode = t_up_xfer = t_up_submit = 0;
@@ -6197,18 +6260,22 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 			if (fo) fclose(fo);
 			SDL_UnmapGPUTransferBuffer(gpu(), xb); SDL_ReleaseGPUTransferBuffer(gpu(), xb);
 		}
-		extern int window_active(void); extern void window_present_gpu(void *tex, uint32_t w, uint32_t h);
+		extern int window_active(void); extern void window_present_gpu(void *tex, uint32_t w, uint32_t h, int raw);
 		static int no_gpu_present = -1; if (no_gpu_present < 0) no_gpu_present = getenv("RECOMP_GPU_NO_PRESENT") != 0;   /* RECOMP_GPU_NO_PRESENT=1: present through guest memory as before */
-		const int via_gpu = e->gpu_dirty && !gfx_soft_shot_due() && format == 0 && window_active() && !no_gpu_present && e->kind != TK_U8S;
+		/* an sRGB frame goes to the window as raw texels (a copy, not a blit) where the backend copies between the sRGB and
+		 * plain forms of a format: Vulkan does. Through guest memory instead, Killzone's windowed frames each cost a download
+		 * and a wait for the whole frame, and the window showed the 1x frame at any render scale (2026-10-26) */
+		static int srgb_copy = -1; if (srgb_copy < 0) { const char *dv = SDL_GetGPUDeviceDriver(gpu()); srgb_copy = dv && !strcmp(dv, "vulkan"); }
+		const int via_gpu = e->gpu_dirty && !gfx_soft_shot_due() && format == 0 && window_active() && !no_gpu_present && (e->kind != TK_U8S || srgb_copy);
 		hist_record(base, e, TSX(e, width), TSY(e, height), via_gpu);
 		{ const int m = __atomic_exchange_n(&hist_save_mark, 0, __ATOMIC_ACQ_REL); if (m) hist_save(m); }
 		{ static long at = -2; if (at == -2) { const char *v = getenv("RECOMP_FRAME_HISTORY_SAVE_AT"); at = v ? atol(v) : -1; }   /* RECOMP_FRAME_HISTORY_SAVE_AT=frame: F5's save without a window (tests) */
 		  extern uint64_t display_frames(void); if (at >= 0 && (long)display_frames() >= at) { at = -1; hist_save(0); } }
-		if (via_gpu) {   /* (an sRGB-format frame would decode in the blit: it presents from its raw bytes below) */
+		if (via_gpu) {   /* (an sRGB-format frame would decode in a blit: copied raw on Vulkan, else it presents from its raw bytes below) */
 			/* the frame goes to the window from the GPU texture: no fence wait, encode and re-upload
 			 * per frame. Guest memory keeps the frame before this one until something reads it (a
 			 * shot, a texture over it, a CPU write: each syncs first) */
-			window_present_gpu(e->color, TSX(e, width), TSY(e, height)); gfx_soft_skip_window = 1;
+			window_present_gpu(e->color, TSX(e, width), TSY(e, height), e->kind == TK_U8S); gfx_soft_skip_window = 1;
 		} else if (!window_active() && !gfx_soft_shot_due() && format == 0 && present_nosync()) { /* RECOMP_GPU_PRESENT_NOSYNC=1, headless: the frame stays on the GPU, as it does with a window (see present_nosync); window_present below is a no-op without a window */ }
 		else { sync_why = "(present)"; target_sync_for_cpu(e); }   /* guest memory must hold what the GPU rendered before anything reads it below */
 	}

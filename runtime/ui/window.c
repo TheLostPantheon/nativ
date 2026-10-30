@@ -55,6 +55,7 @@ static uint32_t fw, fh, new_frame;
 static volatile uint32_t buttons;
 static volatile uint8_t sticks[4] = {128, 128, 128, 128};
 static int active;
+static int self_paced; static uint64_t last_paced_us;   /* a present mode that doesn't wait for vsync: the present loop paces itself */
 static volatile int touch_down, touch_x, touch_y;   /* the mouse as the front touch panel (1920x1088) */
 /* Gamepad touch -- the agreed scheme (memory: input-touch-mapping-design): the triggers are L and R;
  * the bumpers are touch modifiers. A DS4/DualSense touchpad's fingers touch the front panel finger
@@ -162,6 +163,10 @@ void window_kb_bind(int i, SDL_Keycode k) {   /* the menu's Rebind: that action 
 }
 void window_kb_reset(void) { for (int i = 0; i < KB_N; i++) settings_set_str(kb_binds[i].key, kb_binds[i].def); settings_save(); kb_reload(); }
 int window_kbm_active(void) { return kbm_on; }
+static int pad_connected;   /* (the window loop's gamepad, for other threads) */
+int window_gamepad_connected(void) {   /* display.c's PS TV answer at boot: SDL's own list too, before the loop has seen the pad's event */
+	return __atomic_load_n(&pad_connected, __ATOMIC_RELAXED) || (active && SDL_HasGamepad());
+}
 /* a game's raw-look hook, once per game frame: the mouse's motion since its last call, in counts (y down),
  * and whether the mouse is looking at all (0: nothing to apply, the deltas are 0) */
 /* RECOMP_INPUT_MOUSE="from-to:dx,dy;...": mouse counts per call over presented-frame ranges -- a headless
@@ -588,7 +593,7 @@ static int osd_round_trip(SDL_GPUTexture *src, SDL_GPUTexture *dst, uint32_t w, 
 	return 1;
 }
 static int osd_cpu(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_OSD_CPU") != 0; return v; }   /* RECOMP_OSD_CPU=1: the overlay composited into the frame's pixels on the CPU, as before the ImGui HUD */
-void window_present_gpu(void *src, uint32_t w, uint32_t h) {
+void window_present_gpu(void *src, uint32_t w, uint32_t h, int raw) {
 	if (!active || !gpu || !w || !h || w > 16384 || h > 16384) return;
 	pthread_mutex_lock(&lock);
 	int n = (gidx + 1) % 3; if (n == gshow) n = (n + 1) % 3;
@@ -629,9 +634,18 @@ void window_present_gpu(void *src, uint32_t w, uint32_t h) {
 	}
 	if (!osd) {
 		SDL_GPUCommandBuffer *cmd = gtex[n] ? SDL_AcquireGPUCommandBuffer(gpu) : 0;
-		if (cmd) {
+		if (cmd && raw) {
+			/* raw: an sRGB frame (Killzone's). A blit would decode it on the way into this plain texture; a copy moves
+			 * the bytes as they are, which is what the display scans out */
+			SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+			SDL_GPUTextureLocation s = { .texture = src }, d = { .texture = gtex[n] };
+			SDL_CopyGPUTextureToTexture(cp, &s, &d, w, h, 1, false);
+			SDL_EndGPUCopyPass(cp);
+		} else if (cmd) {
 			SDL_GPUBlitInfo blit = { .source = { .texture = src, .w = w, .h = h }, .destination = { .texture = gtex[n], .w = w, .h = h }, .load_op = SDL_GPU_LOADOP_DONT_CARE, .filter = SDL_GPU_FILTER_NEAREST };
 			SDL_BlitGPUTexture(cmd, &blit);
+		}
+		if (cmd) {
 			if (gtl[n] > 1) SDL_GenerateMipmapsForGPUTexture(cmd, gtex[n]);
 			SDL_SubmitGPUCommandBuffer(cmd);
 			gidx = n; gnew = 1; new_frame = 0; gready_us[n] = now_us();
@@ -814,6 +828,20 @@ void window_run(void *(*fn)(void *), void *arg) {
 	SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	{ extern void *gfx_gpu_create_device(void); gpu = gfx_gpu_create_device(); }
 	if (gpu) SDL_ClaimWindowForGPUDevice(gpu, win);
+	if (gpu) {
+		/* the swapchain's present mode. On Vulkan, mailbox where the display has it: with vsync (fifo) this loop's submit
+		 * waits for the swapchain image on the GPU's one queue, and every scene the game submits after it waits out the
+		 * refresh too. Killzone's CPU reads of its exposure target waited ~6 ms each: 40 fps windowed against 66 headless
+		 * (RTX laptop, 2026-10-26), 47 with mailbox. Mailbox doesn't block, so this loop paces itself (self_paced, below).
+		 * Metal blocks the CPU in nextDrawable instead, not the queue: vsync there. RECOMP_PRESENT_MODE=fifo|mailbox|immediate */
+		const char *pe = getenv("RECOMP_PRESENT_MODE"), *dv = SDL_GetGPUDeviceDriver(gpu);
+		/* (with mailbox, Killzone at 3x and 21:9 lost the device in about half its runs: the FRAGCOLOR copy, a blit since,
+		 * gfx_gpu.c fetch_blit) */
+		SDL_GPUPresentMode pm = pe ? (!strcmp(pe, "immediate") ? SDL_GPU_PRESENTMODE_IMMEDIATE : !strcmp(pe, "mailbox") ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC)
+		                           : dv && !strcmp(dv, "vulkan") ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC;
+		if (pm != SDL_GPU_PRESENTMODE_VSYNC && SDL_WindowSupportsGPUPresentMode(gpu, win, pm) && SDL_SetGPUSwapchainParameters(gpu, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pm)) self_paced = 1;
+		fprintf(stderr, "    window: present mode %s\n", !self_paced ? "vsync" : pm == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "immediate");
+	}
 	/* frames the swapchain may have queued for presentation (SDL's default 2): each one is a refresh
 	 * between a game's flip and the screen. 1 here -- with the frame picked after the drawable wait
 	 * (the present loop) -- is the Vita's single flip; games time their audio against that (Uncharted's
@@ -916,13 +944,14 @@ void window_run(void *(*fn)(void *), void *arg) {
 				}
 			}
 			if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad && (pad = SDL_OpenGamepad(e.gdevice.which)) != 0) {
+				__atomic_store_n(&pad_connected, 1, __ATOMIC_RELAXED);
 				/* a DS4/DualSense's gyroscope and accelerometer stream only once asked for (SDL's HIDAPI driver) */
 				int g = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
 				int a = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
 				pad_gyro = g && a;
 				fprintf(stderr, "gamepad: %s%s%s\n", SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?", SDL_GetNumGamepadTouchpads(pad) > 0 ? ", touchpad" : "", pad_gyro ? ", gyro" : "");
 			}
-			if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) { SDL_CloseGamepad(pad); pad = 0; pad_gyro = 0; motion_lost(); gamepad_touch_release(); buttons = 0; for (int i = 0; i < 4; i++) sticks[i] = 128; }
+			if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) { SDL_CloseGamepad(pad); pad = 0; __atomic_store_n(&pad_connected, 0, __ATOMIC_RELAXED); pad_gyro = 0; motion_lost(); gamepad_touch_release(); buttons = 0; for (int i = 0; i < 4; i++) sticks[i] = 128; }
 			if (e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) {
 				if (e.gsensor.sensor == SDL_SENSOR_ACCEL) motion_feed_accel(e.gsensor.data, e.gsensor.sensor_timestamp);
 				else if (e.gsensor.sensor == SDL_SENSOR_GYRO) motion_feed_gyro(e.gsensor.data, e.gsensor.sensor_timestamp);
@@ -1238,6 +1267,12 @@ void window_run(void *(*fn)(void *), void *arg) {
 
 		if (!gpu) { SDL_Delay(1); continue; }
 		if (overlay_game_paused()) { extern void gfx_shader_prep_tick(void); gfx_shader_prep_tick(); }   /* (a paused game doesn't present: the shader warm-up steps on from here, its prep card's too) */
+		if (self_paced) {   /* no vsync wait paces this loop: a present once the game has a new frame, else once a refresh (menus, the overlay); spinning presented ~1200 times a second and slowed the game */
+			const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
+			const uint64_t period = (uint64_t)(1e6 / (dm && dm->refresh_rate > 1 ? dm->refresh_rate : 60.0f));
+			while (!__atomic_load_n(&gnew, __ATOMIC_ACQUIRE) && !__atomic_load_n(&new_frame, __ATOMIC_ACQUIRE) && now_us() - last_paced_us < period) SDL_DelayPrecise(250000);
+			last_paced_us = now_us();
+		}
 		uint64_t t_blit0 = now_us();
 		SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
 		if (!cmd) continue;
@@ -1252,11 +1287,22 @@ void window_run(void *(*fn)(void *), void *arg) {
 		static SDL_GPUFence *frame_fence[3]; static int frame_fi;
 		{ int k = (frame_fi + 3 - frames_in_flight) % 3;   /* the submit SDL's acquire will look at: frames_in_flight back */
 		  if (frame_fence[k]) { SDL_WaitForGPUFences(gpu, true, &frame_fence[k], 1); SDL_ReleaseGPUFence(gpu, frame_fence[k]); frame_fence[k] = 0; } }
+		/* this loop's SDL_GPU calls under the renderer's lock (gfx_dispatch.c), with Vulkan: SDL's Vulkan backend (3.4.16) isn't
+		 * safe against this thread recording and submitting while the renderer creates, records and submits on others. With
+		 * GPU transfers and snapshots on (gfx_gpu.c), which make and copy more each frame, Killzone crashed inside SDL in this
+		 * thread's submit, or jumped into garbage, in 3 of 4 windowed runs; under the lock, none in 7+ (2026-10-26). Mailbox
+		 * doesn't wait in the acquire, so it goes under the lock too; with vsync the acquire waits a refresh, outside it.
+		 * RECOMP_WINDOW_LOCK=0|1 picks */
+		extern void gfx_lock_enter(void), gfx_lock_leave(void);
+		static int wlock = -1; if (wlock < 0) { const char *e = getenv("RECOMP_WINDOW_LOCK"), *dv = SDL_GetGPUDeviceDriver(gpu); wlock = e && *e ? *e != '0' : dv && !strcmp(dv, "vulkan"); }
+		if (wlock) gfx_lock_enter();
 		gpu_sweep(gpu);
+		if (wlock && !self_paced) gfx_lock_leave();   /* (vsync: the acquire waits a refresh, outside the lock) */
 		SDL_GPUTexture *swap = 0;
 		uint32_t ww = 0, wh = 0;
 		int got_swap = SDL_WaitAndAcquireGPUSwapchainTexture(cmd, win, &swap, &ww, &wh);
 		uint64_t t_blit2 = now_us();
+		if (wlock && !self_paced) gfx_lock_enter();
 		if (got_swap && ww && wh) { win_pw = ww; win_ph = wh; }
 		/* the frame to show, picked after the drawable wait: whatever the game flipped while this loop
 		 * waited for vsync goes out now, not a refresh later */
@@ -1336,6 +1382,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			overlay_marks(cmd, swap, ww, wh, dt, mk, nm, rear);
 		}
 		frame_fence[frame_fi] = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); frame_fi = (frame_fi + 1) % 3;   /* vsync via the swapchain paces this loop; the fence is for the poll above, frames_in_flight on */
+		if (wlock) gfx_lock_leave();
 		uint64_t t_blit3 = now_us();
 		{	/* each newly shown GPU frame: the flip -> submit time, plus the compositor and scan-out estimate,
 			 * into the automatic A/V sync's picture term (av_video_ms); RECOMP_LATENCY_LOG=1 prints the
