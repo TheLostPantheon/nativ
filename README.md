@@ -47,7 +47,18 @@ unsupported update, and the game runs without it. Porting a new release starts w
 `launcher/build.sh`; the result is `launcher/nativ`.
 
 **Developers** can run each stage of the pipeline with `./vitarecomp` from the top of the checkout. Run it without
-arguments for the full list. The main stages, in order:
+arguments for the full list.
+
+On Windows, use the Python driver directly from PowerShell instead of the zsh wrapper:
+
+```powershell
+.\.venv\Scripts\python.exe .\pipeline\vitarecomp.py --help
+```
+
+Replace `--help` with a stage and its arguments. The Windows player release includes its own Python and toolchain;
+the [developer guide](docs/developers.md#making-a-release) describes building that distribution on macOS or Linux.
+
+The main stages, in order:
 
 | Command | What it does |
 |---|---|
@@ -60,8 +71,8 @@ arguments for the full list. The main stages, in order:
 | `run <title>` | Plays it. |
 | `check <titles>` | Runs the regression gate. |
 
-The pipeline's Python needs the packages in `requirements.txt`, installed in `.venv` at the top of the checkout
-(`python/` on Windows).
+The pipeline's Python needs the packages in `requirements.txt`, installed in `.venv` at the top of the checkout.
+The Windows player release includes its Python in `python/`.
 
 ### Your library
 
