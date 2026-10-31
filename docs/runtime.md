@@ -92,6 +92,45 @@ A read that reinterprets a target's bytes at another texel size takes its word f
 (`snap_fetch` in `usse_spirv.c`). `RECOMP_RENDER_SCALE_SWITCH=frame:n,...` changes the scale in a headless run, which
 is how to test that path. `RECOMP_GPU_DUMP_PRESENT=path` writes the presented frame at the render scale.
 
+### FSR 3.1
+
+Packs whose depth and motion-vector inputs have been validated (`RECOMP_FSR_SUPPORTED` in the pack's `RUN_ENV`) offer
+**FSR 3.1** in the F10 menu's anti-aliasing row. F4 toggles it while the game is running; `RECOMP_FSR=0|1` overrides the
+saved choice. At native source resolution it is temporal anti-aliasing. The menu's **FSR source resolution** can render
+the main scene at a lower scale and reconstruct it to the selected output resolution; `RECOMP_FSR_RENDER=n` overrides
+that setting. The existing **Sharpening** slider uses FSR's RCAS pass while FSR is active instead of applying a second
+post-process sharpening pass.
+
+With a lower source resolution, reconstruction runs before the first full-resolution post-main scene. Its display-scale
+target is available to later composites but is not synchronized back into Vita guest memory; the original low-resolution
+game target remains authoritative for the next frame.
+
+The integration is the FSR 3.1.4 upscaler from FidelityFX SDK 1.1.4. It supports HDR and inverted depth, low-resolution
+non-jittered motion vectors, SDK jitter, automatic exposure, reactive masks generated from an opaque-only copy of the
+scene, RCAS sharpening, dynamic render sizes within the largest size seen, and the SDK debug view. Frame
+interpolation/frame generation is not part of the vendored component.
+
+The camera comes from the pack's `RECOMP_SSAO` projection, when it names one: the projection of the scene that draws into
+the main depth buffer gives FSR the exact depth conversion and field of view (the game's units are taken as metres).
+Without it FSR keeps the SDK sample camera (near 0.1, far 1000, a 60 degree vertical field of view, units as metres),
+which works but only approximates the game's depth conversion.
+
+`fsr.h`'s `FsrFrame` also accepts a supplied exposure texture, reactive mask, transparency/composition mask and
+pre-exposure. The renderer does not produce those yet (it always passes automatic exposure, a pre-exposure of 1 and no
+supplied masks); a caller that supplies them owns their sizes and formats, which `fsr_dispatch` cannot check.
+
+Developer overrides and diagnostics:
+
+- `RECOMP_FSR_SHARPNESS=0..1` overrides the menu's RCAS strength; leaving it unset uses the Sharpening slider.
+- `RECOMP_FSR_REACTIVE=<threshold>,<value>[,<scale>[,<flags>]]` controls generated reactivity. The default is
+  `0.2,0.9,1,13`; `0` disables it. Flag bits are 1 tonemap, 2 inverse tonemap, 4 threshold and 8 component maximum.
+- `RECOMP_FSR_TUNING=<velocity>,<reactiveness>,<shading-change>,<accumulation>,<min-disocclusion>` sets the SDK's five
+  configurable constants. Their defaults are `1,1,1,0.333333,-0.333333`.
+- `RECOMP_FSR_DEBUG=0|1` overrides the menu's SDK diagnostic view.
+- `RECOMP_FSR_TIME=1` measures the full dispatch; `=2` also reports each pass. `RECOMP_FSR_DUMP=<prefix with %u>` writes
+  the inputs, output and intermediate masks for selected frames (`RECOMP_FSR_DUMP_FROM` and
+  `RECOMP_FSR_DUMP_TO` bound the range).
+
 ### The shader archive (macOS)
 
 `runtime/gfx/mtl_archive.m` keeps this machine's own copy of what Metal compiled for a game, in the game's

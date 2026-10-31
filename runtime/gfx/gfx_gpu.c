@@ -1555,7 +1555,8 @@ typedef struct {
 	uint64_t drawn_frame, prev_drawn_frame;   /* the last two frames (gpu_frame_no) a scene drew into it: drawn every frame, or now and then (skip_lossless) */
 	int alias_in;                 /* this scene began with another target's bytes handed over (target_alias_sync): not its own last frame (skip_lossless) */
 	int cpu_dirty;   /* guest memory was written since the GPU texture was last uploaded (a CPU-fallback draw happened) */
-	int gpu_dirty;   /* the GPU texture has content guest memory doesn't (a GPU draw happened since the last download) */
+	int gpu_dirty;   /* the GPU texture has authoritative content guest memory doesn't (a GPU draw happened since the last download) */
+	int fsr_derived; /* display-scale FSR output: sampleable, but not Vita guest-memory content */
 	uint64_t used;   /* last use, for eviction */
 	int kind;        /* target_kind: the GPU texture's format family */
 	uint64_t gen;    /* write_clock when the GPU texture last got new content (a draw, an upload from guest) */
@@ -1771,7 +1772,12 @@ static void target_release(TargetEntry *e) {
  * frame's -- is drawn at that internal scale; FSR writes the frame at the render scale into the same address's entry at
  * that scale, which, the newest over the address, is what everything after it samples (target_view) */
 static struct { uint32_t addr, w, h; } fsr_lo; static int fsr_forward = 1;   /* (fsr_forward: last frame's lit image was the main target -- a deferred renderer doesn't upscale: its G-buffer would shrink under its full-size lighting) */
-static int fsr_render_scale(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_FSR_RENDER"); v = e ? atoi(e) : 0; if (v < 0) v = 0; } return v; }
+static int fsr_render_scale(void) {
+	static int forced = -2;
+	if (forced == -2) { const char *e = getenv("RECOMP_FSR_RENDER"); forced = e ? atoi(e) : -1; if (e && forced < 0) forced = 0; }
+	const int v = forced >= 0 ? forced : settings_int("fsr_render_scale", 0);
+	return v > 0 ? v : 0;
+}
 static int fsr_on(void);
 static int fsr_upscaling(void) { return fsr_on() && fsr_forward && fsr_render_scale() > 0 && fsr_render_scale() < rscale; }
 static void fsr_lo_scale(uint8_t *sx, uint8_t *sy) {   /* the internal scale, its across in proportion to the render scale's (a widened aspect's rscale_x) */
@@ -1912,7 +1918,7 @@ static void target_upload_from_guest(TargetEntry *e) {
 	}
 	SDL_SubmitGPUCommandBuffer(cmd);
 	SDL_ReleaseGPUTransferBuffer(gpu(), xb);
-	e->cpu_dirty = 0; e->gen = ++write_clock;
+	e->cpu_dirty = 0; e->fsr_derived = 0; e->gen = ++write_clock;
 }
 /* the GPU colour texture -> RGBA floats in a caller-owned buffer (not guest memory: RECOMP_GFX_CHECK
  * compares it against the software path without the two stepping on each other) */
@@ -2483,7 +2489,7 @@ static void target_alias_sync(TargetEntry *e) {
 			SDL_GPUTextureLocation src = { .texture = o->color }, dst = { .texture = e->color };
 			SDL_CopyGPUTextureToTexture(cp, &src, &dst, TSX(e, e->width), TSY(e, e->height), 1, false);
 			SDL_EndGPUCopyPass(cp); SDL_SubmitGPUCommandBuffer(cmd);
-			e->cpu_dirty = 0; e->gpu_dirty = 1; e->gen = ++write_clock; via_guest = 0;
+			e->cpu_dirty = 0; e->gpu_dirty = 1; e->fsr_derived = 0; e->gen = ++write_clock; via_guest = 0;
 		} else { sync_why = "(another target over the same memory begins a scene)"; target_download_to_guest(o); via_guest = 1; }
 	}
 	if (via_guest) e->cpu_dirty = 1;   /* the last hand-over went through guest memory: reload from there before the first draw */
@@ -2641,6 +2647,7 @@ static const SsaoCamera *ao_camera(void) {   /* the scene's world camera: the mo
 		ao_cand[k].cam.p00, ao_cand[k].cam.p11, ao_cand[k].cam.p22, ao_cand[k].cam.p32, ao_cand[k].cam.zoff, ao_cand[k].cam.zscale);
 	return &ao_cand[best].cam;
 }
+static SsaoCamera fsr_camera; static uint64_t fsr_camera_frame = ~0ull;
 /* ---- motion vectors (RECOMP_MV=1; notes/motion-vectors.md, branch motion-vectors). The main 3D scene's opaque draws
  * that write depth are drawn a second time after each flush's own passes, into an RG16F target beside the scene's colour
  * target, depth-tested against the depth the scene left ("or equal", in the scene's own direction; no write): only the
@@ -2690,17 +2697,17 @@ static int mv_jitter_phases(void) {
 	if (v == -2) { const char *e = getenv("RECOMP_MV_JITTER"); v = e ? atoi(e) : -1; if (v == 1) v = 8; if (v < -1) v = 0; }   /* (-1: not asked for, FSR's) */
 	if (v >= 0) return v;
 	if (!fsr_on()) return 0;   /* (with FSR: on while it is, F4) */
-	const int k = fsr_upscaling() ? rscale / fsr_render_scale() : 1; return 8 * k * k;   /* (FSR's 8 * (display / render)^2) */
+	return (int)fsr_jitter_phase_count(fsr_upscaling() ? (uint32_t)fsr_render_scale() : (uint32_t)rscale, (uint32_t)rscale);
 }
-static float halton(uint32_t i, uint32_t b) { float f = 1, r = 0; while (i) { f /= (float)b; r += f * (float)(i % b); i /= b; } return r; }
 static void mv_jitter(uint64_t frame, float *jx, float *jy) {   /* the frame's offset in render pixels (x right, y down) */
 	const int n = mv_jitter_phases(); if (n < 2) { *jx = *jy = 0; return; }
-	const uint32_t i = (uint32_t)(frame % (uint64_t)n) + 1; *jx = halton(i, 2) - 0.5f; *jy = halton(i, 3) - 0.5f;
+	fsr_jitter_offset(frame, (uint32_t)n, jx, jy);
 }
 static int mv_jit_scene; static float mv_jx, mv_jy;   /* the open scene is jittered, by this much */
 static const void *mv_main_entry, *mv_main_depth;   /* the main target: last frame's with the most motion draws (mv_best), and its depth buffer -- not every
                                                      * scene mv_is_main takes (Killzone's final composite into the display buffer is 960x544 with a depth flag: its HUD isn't jittered) */
 static const void *mv_best_depth;   /* mv_best's depth buffer (its DepthEntry) */
+static int fsr_main_camera_scene(void) { return fsr_on() && scene_depth_entry && (const void *)scene_depth_entry == mv_main_depth; }   /* (the open scene draws into the depth buffer FSR is given: the one camera it takes) */
 /* FSR's colour: the frame's first other target drawn with the main depth buffer, else the main target -- the main target
  * itself in a forward renderer (Killzone), the lit image of a deferred one (Uncharted: its main target is the G-buffer,
  * F32, that the lighting reads; FSR over it scrambled the lighting). The first, not the last: Uncharted draws a one-draw
@@ -2969,11 +2976,52 @@ static SDL_GPUTexture *fsr_opaque_for(const TargetEntry *e) {
 	fsr_opaque = SDL_CreateGPUTexture(gpu(), &ci); fsr_opaque_w = w; fsr_opaque_h = h; fsr_opaque_kind = e->kind;
 	return fsr_opaque;
 }
-static int fsr_reactive(float *threshold, float *value) {   /* RECOMP_FSR_REACTIVE=<threshold>,<value> (0.2,0.9: the SDK sample's), =0 no mask */
-	static int on = -1; static float t = 0.2f, v = 0.9f;
-	if (on < 0) { const char *e = getenv("RECOMP_FSR_REACTIVE"); on = !(e && !strcmp(e, "0")); if (e && on) sscanf(e, "%f,%f", &t, &v); }
-	*threshold = t; *value = v; return on;
-}   /* this frame's motion draws in the main target matched to last frame's, and not (a cut: most unmatched) */
+static int fsr_reactive(float *threshold, float *value, float *scale, uint32_t *flags) {   /* RECOMP_FSR_REACTIVE=<threshold>,<value>[,<scale>[,<flags>]], =0 no mask */
+	static int on = -1; static float t = 0.2f, v = 0.9f, s = 1.0f; static uint32_t f = FSR_REACTIVE_APPLY_TONEMAP | FSR_REACTIVE_APPLY_THRESHOLD | FSR_REACTIVE_USE_COMPONENTS_MAX;
+	if (on < 0) {
+		const char *e = getenv("RECOMP_FSR_REACTIVE"); on = !(e && !strcmp(e, "0"));
+		if (e && on) {
+			int fi = (int)f, n = sscanf(e, "%f,%f,%f,%i", &t, &v, &s, &fi);
+			if (n < 2 || !isfinite(t) || !isfinite(v) || !isfinite(s) || fi < 0 || (fi & ~15)) {
+				fprintf(stderr, "    fsr: invalid RECOMP_FSR_REACTIVE, using 0.2,0.9,1,13\n");
+				t = 0.2f; v = 0.9f; s = 1.0f; fi = 13;
+			}
+			f = (uint32_t)fi;
+		}
+	}
+	*threshold = t; *value = v; *scale = s; *flags = f; return on;
+}
+static const FsrTuning *fsr_tuning(void) {   /* the SDK's development constants */
+	static int parsed; static FsrTuning t = { 1.0f, 1.0f, 1.0f, 1.0f / 3.0f, -1.0f / 3.0f };
+	if (!parsed) {
+		parsed = 1; const char *e = getenv("RECOMP_FSR_TUNING");
+		if (e && sscanf(e, "%f,%f,%f,%f,%f", &t.velocity_factor, &t.reactiveness_scale, &t.shading_change_scale, &t.accumulation_added_per_frame, &t.min_disocclusion_accumulation) != 5) {
+			fprintf(stderr, "    fsr: invalid RECOMP_FSR_TUNING, using SDK defaults\n");
+			t = (FsrTuning){ 1.0f, 1.0f, 1.0f, 1.0f / 3.0f, -1.0f / 3.0f };
+		}
+	}
+	return &t;
+}
+static float fsr_sharpness(void) {
+	static int parsed, forced; static float sharp = -1.0f;
+	if (!parsed) {
+		parsed = 1; const char *e = getenv("RECOMP_FSR_SHARPNESS");
+		if (e) {
+			forced = 1;
+			char *end; sharp = strtof(e, &end);
+			if (end == e || *end || !isfinite(sharp)) { fprintf(stderr, "    fsr: invalid RECOMP_FSR_SHARPNESS, disabling RCAS\n"); sharp = -1.0f; }
+		}
+	}
+	if (forced) return sharp;
+	sharp = (float)settings_float("sharpen", 0.35);
+	return sharp > 0.0f ? sharp : -1.0f;
+}
+static int fsr_debug_view(void) {
+	static int forced = -1;
+	if (forced < 0) { const char *e = getenv("RECOMP_FSR_DEBUG"); forced = e ? (*e && *e != '0') : 2; }
+	return forced < 2 ? forced : settings_int("fsr_debug", 0) != 0;
+}
+/* this frame's motion draws in the main target matched to last frame's, and not (a cut: most unmatched) */
 static void fsr_run(TargetEntry *e) {
 	if (fsr_frame == mv_qframe) return;   /* (once a frame) */
 	const DepthEntry *de = mv_main_depth; TargetEntry *mt = (TargetEntry *)mv_main_entry;   /* (e: the colour, mv_lit; mt: the main target, its vectors) */
@@ -2984,11 +3032,10 @@ static void fsr_run(TargetEntry *e) {
 	if (skip) { static uint64_t said = ~0ull; if (said != mv_qframe && getenv("RECOMP_FSR_DUMP")) { said = mv_qframe; fprintf(stderr, "    fsr: frame %llu: not run: %s\n", (unsigned long long)mv_qframe, skip); } return; }
 	fsr_frame = mv_qframe;
 	batch_flush("fsr");
-	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu()); if (!cmd) return;
 	static uint64_t last_ns; const uint64_t now = SDL_GetTicksNS(); const float ms = last_ns ? (float)(now - last_ns) / 1e6f : 16.7f; last_ns = now;
 	float jx, jy; mv_jitter(mv_qframe, &jx, &jy);
-	static float sharp = -2; if (sharp == -2) { const char *v = getenv("RECOMP_FSR_SHARPNESS"); sharp = v ? (float)atof(v) : -1.0f; }   /* (RCAS, 0-1; below 0, the default, off: the present's CAS -- the menu's Sharpening -- sharpens the final frame, once) */
-	float rt = 0, rv = 0;
+	const float sharp = fsr_sharpness();   /* (RCAS, 0-1; below 0 is off: the menu's Sharpening uses RCAS while FSR is active) */
+	float rt = 0, rv = 0, rs = 1; uint32_t rf = 0; const int reactive_on = fsr_reactive(&rt, &rv, &rs, &rf);
 	static const TargetEntry *fsr_last_color; const int recolor = fsr_last_color && fsr_last_color != e; fsr_last_color = e;   /* (another colour target than last time: its history isn't this one's) */
 	const int cut = recolor || fsr_matched + fsr_unmatched >= 16 && fsr_unmatched * 2 > fsr_matched + fsr_unmatched;   /* (a camera cut or a new place: no history worth blending) */
 	n_fsr_cuts += cut;
@@ -2998,10 +3045,20 @@ static void fsr_run(TargetEntry *e) {
 		GfxTarget tg = target_entry_as_gfx(e);
 		if (!(dest = get_target_at(&tg, dsx, dsy))) return;
 	}
+	const int camera = fsr_camera_frame == mv_qframe && isfinite(fsr_camera.p00) && isfinite(fsr_camera.p11) && isfinite(fsr_camera.p22) && isfinite(fsr_camera.p32) &&
+	                   isfinite(fsr_camera.zoff) && isfinite(fsr_camera.zscale) && fsr_camera.p00 > 0.0f && fsr_camera.p11 > 0.0f && fsr_camera.zscale != 0.0f;
 	const FsrFrame f = { .color = e->color, .depth = de->tex, .motion = mt->mv, .rw = TSX(e, e->width), .rh = TSY(e, e->height), .dest = dest->color, .dw = TSX(dest, dest->width), .dh = TSY(dest, dest->height),
 		.jitter_x = jx, .jitter_y = jy, .frame_ms = ms, .hdr = e->kind != TK_U8 && e->kind != TK_U8S, .inverted = mv_main_inverted, .reset = cut || fsr_restart, .sharpness = sharp,
-		.opaque = fsr_opaque_frame == mv_qframe + 1 && fsr_reactive(&rt, &rv) ? fsr_opaque : 0,   /* (forward: before the transparent draws; deferred: before the scenes after the composite) */ .reactive_threshold = rt, .reactive_value = rv };
-	fsr_restart = 0;
+		.pre_exposure = 1.0f,
+		.opaque = fsr_opaque_frame == mv_qframe + 1 && reactive_on ? fsr_opaque : 0,   /* (forward: before the transparent draws; deferred: before the scenes after the composite) */
+		.reactive_scale = rs, .reactive_threshold = rt, .reactive_value = rv, .reactive_flags = rf,
+		.camera_valid = camera,
+		.device_to_view_depth = { camera ? fsr_camera.zoff - fsr_camera.p22 * fsr_camera.zscale : 0.0f, camera ? fsr_camera.p32 * fsr_camera.zscale : 0.0f,
+		                          camera ? 1.0f / fsr_camera.p00 : 0.0f, camera ? 1.0f / fsr_camera.p11 : 0.0f },
+		.tan_half_fov = camera ? 1.0f / fsr_camera.p00 : 0.0f, .view_space_to_meters = 1.0f /* (the game's units taken as metres: the projection can't say) */,
+		.tuning = fsr_tuning(), .debug_view = fsr_debug_view() };
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu());
+	if (!cmd) { fprintf(stderr, "    fsr: command buffer: %s\n", SDL_GetError()); return; }
 	static int timing = -1; if (timing < 0) timing = getenv("RECOMP_FSR_TIME") != 0;   /* (the GPU drained first, then FSR alone timed: a measurement, it stalls the frame) */
 	uint64_t t0 = 0;
 	if (timing) for (int k = 0; k < 2; k++) {   /* (once to drain the GPU, once more to time an empty round trip) */
@@ -3013,14 +3070,28 @@ static void fsr_run(TargetEntry *e) {
 	if (dump == (const char *)1) { dump = getenv("RECOMP_FSR_DUMP"); const char *v; from = (v = getenv("RECOMP_FSR_DUMP_FROM")) ? atol(v) : 0; to = (v = getenv("RECOMP_FSR_DUMP_TO")) ? atol(v) : -1; }
 	const int dumping = dump && (long)mv_qframe >= from && (to < 0 || (long)mv_qframe <= to);
 	fsr_keep_input(dumping);
-	const int ok = fsr_dispatch(gpu(), &cmd, &f);
+	int ok = fsr_dispatch(gpu(), &cmd, &f);
+	if (!ok) {
+		if (cmd) { SDL_CancelGPUCommandBuffer(cmd); cmd = 0; }
+	} else if (dumping || timing) {
+		SDL_GPUFence *fe = cmd ? SDL_SubmitGPUCommandBufferAndAcquireFence(cmd) : 0; cmd = 0;
+		if (!fe) { fprintf(stderr, "    fsr: dispatch submission failed: %s\n", SDL_GetError()); fsr_dispatch_lost(gpu()); ok = 0; }
+		else {
+			if (!SDL_WaitForGPUFences(gpu(), true, &fe, 1)) { fprintf(stderr, "    fsr: dispatch wait failed: %s\n", SDL_GetError()); ok = 0; }
+			SDL_ReleaseGPUFence(gpu(), fe);
+		}
+	} else {
+		if (!cmd || !SDL_SubmitGPUCommandBuffer(cmd)) { fprintf(stderr, "    fsr: dispatch submission failed: %s\n", SDL_GetError()); fsr_dispatch_lost(gpu()); ok = 0; }
+		cmd = 0;
+	}
 	if (dumping) {
-		SDL_GPUFence *fe = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); SDL_WaitForGPUFences(gpu(), true, &fe, 1); SDL_ReleaseGPUFence(gpu(), fe);
 		char prefix[512]; snprintf(prefix, sizeof prefix, dump, (unsigned)mv_qframe); if (ok) fsr_dump(gpu(), prefix);
 		fprintf(stderr, "    fsr: frame %llu: %ux%u -> %ux%u %s, depth %s, jitter %.3f %.3f\n", (unsigned long long)mv_qframe, f.rw, f.rh, f.dw, f.dh, f.hdr ? "HDR" : "LDR", f.inverted ? "inverted" : "forward", jx, jy);
-	} else if (timing) { SDL_GPUFence *fe = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); if (fe) { SDL_WaitForGPUFences(gpu(), true, &fe, 1); SDL_ReleaseGPUFence(gpu(), fe); } t_fsr_ms += (double)(SDL_GetTicksNS() - t0) / 1e6; }
-	else SDL_SubmitGPUCommandBuffer(cmd);
-	if (ok) { dest->gen = ++write_clock; dest->gpu_dirty = 1; dest->cpu_dirty = 0; dest->used = ++target_clock; n_fsr++; }   /* (the newest over the address: what samples it next gets FSR's frame) */
+	} else if (timing && ok) t_fsr_ms += (double)(SDL_GetTicksNS() - t0) / 1e6;
+	if (ok) {
+		const int derived = dest != e;
+		fsr_restart = 0; dest->gen = ++write_clock; dest->gpu_dirty = !derived; dest->cpu_dirty = 0; dest->fsr_derived = derived; dest->used = ++target_clock; n_fsr++;
+	}   /* the newest over the address is what samples get next; an upscaled copy is display-only, not content to feed back through guest memory */
 }
 /* the game queued its frame for display (gxm_sony.c's observer through gfx_frame_queued, on the thread that drew it): the
  * motion vectors' frame boundary. Not present: the game draws the next frame's first scenes before the display queue's
@@ -3074,6 +3145,11 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	scene_depth_entry = 0;
 	scene_sx = scene_entry ? scene_entry->sx : rscale_x; scene_sy = scene_entry ? scene_entry->sy : rscale;   /* (the target's own scale: target_scale) */
 	if (scene_soft) { gfx_soft_begin_scene(t); return; }   /* gfx_gpu_draw hands every draw of this scene to the software path */
+	if (scene_entry->fsr_derived) {   /* this scale is a real game surface now: restore guest-authoritative content instead of carrying FSR's display result into it */
+		scene_entry->fsr_derived = 0;
+		scene_entry->cpu_dirty = 1;
+		scene_entry->gpu_dirty = 0;
+	}
 	scene_entry->alias_in = 0;
 	if (scene_entry != &scratch_entry) target_alias_sync(scene_entry);
 	if (scene_entry->drawn_frame != gpu_frame_no + 1) { scene_entry->prev_drawn_frame = scene_entry->drawn_frame; scene_entry->drawn_frame = gpu_frame_no + 1; }   /* (+1: 0 = never) */
@@ -3097,7 +3173,7 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	}
 	if (scene_entry == &scratch_entry && !scene_depth_entry) { scene_entry = 0; scene_soft = 1; gfx_soft_begin_scene(t); }   /* a depth-only scene is its depth texture */
 	ao_draws = ao_ncand = 0;
-	ao_scene = ao_spec_ok() && scene_entry && scene_entry != &scratch_entry && scene_depth_entry && (t->format & ~0x3000u) == ao_spec.fmt && ssao_enabled();   /* (ambient occlusion, above) */
+	ao_scene = ao_spec_ok() && scene_entry && scene_entry != &scratch_entry && scene_depth_entry && (t->format & ~0x3000u) == ao_spec.fmt && (ssao_enabled() || fsr_main_camera_scene());   /* (ambient occlusion, and FSR's exact camera from its own scene, above) */
 	mv_scene = mv_on() && scene_depth_entry && mv_is_main(t, scene_entry);   /* (motion vectors, above) */
 	if (mv_scene_log()) {
 		static uint64_t f = ~0ull; if (f != mv_qframe) { f = mv_qframe; mv_scene_no = 0; }
@@ -3109,6 +3185,8 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	if (mv_on() && !mv_lit_cur && scene_depth_entry && mv_main_depth && (const void *)scene_depth_entry == mv_main_depth && (const void *)scene_entry != mv_main_entry && scene_entry && scene_entry->color) mv_lit_cur = scene_entry;
 	mv_ord++; mv_lit_index = -1;
 	if (scene_entry && (const void *)scene_entry == mv_lit) { mv_lit_index = mv_lit_seen++; mv_lit_ord_cur = mv_ord; }
+	if (fsr_upscaling() && mv_main_entry && mv_lit && (const void *)scene_entry != mv_lit && (const void *)scene_entry != mv_main_entry && mv_ord > mv_lit_last_ord)
+		fsr_run((TargetEntry *)mv_lit);   /* reconstruct before any full-scale post-main work can consume or copy the low-resolution frame */
 	/* the jitter: the main target's scenes, and those on its depth buffer -- unless that's a deferred renderer's lighting
 	 * (mv_lit isn't the main target): its full-screen passes, moved, would read the G-buffer a sub-pixel off */
 	mv_jit_scene = mv_jitter_phases() >= 2 && mv_on() && scene_depth_entry && ((const void *)scene_entry == mv_main_entry || ((const void *)scene_depth_entry == mv_main_depth && (!mv_lit || mv_lit == mv_main_entry || mv_lit_index >= 1)));   /* (a deferred renderer's lit-image scenes after the composite: its transparent geometry) */
@@ -3332,7 +3410,7 @@ void gfx_gpu_guest_written(uint32_t addr, uint32_t len) {
 	for (int i = 0; i < ntargets; i++) {
 		TargetEntry *e = &targets[i]; if (!e->color) continue;
 		GfxTarget t = target_entry_as_gfx(e); uint32_t hi = e->addr + (uint32_t)gfx_target_bpp(&t) * e->width * e->height;
-		if (addr < hi && addr + len > e->addr) { e->cpu_dirty = 1; e->gpu_dirty = 0; if (trace_sync()) fprintf(stderr, "gpu trace: guest wrote [%#x, +%u) over target %#x: re-upload before its next use\n", addr, len, e->addr); }
+		if (addr < hi && addr + len > e->addr) { e->cpu_dirty = 1; e->gpu_dirty = 0; e->fsr_derived = 0; if (trace_sync()) fprintf(stderr, "gpu trace: guest wrote [%#x, +%u) over target %#x: re-upload before its next use\n", addr, len, e->addr); }
 	}
 	for (int i = 0; i < MAXDEPTHG; i++) {
 		DepthEntry *de = &depthsg[i]; if (!de->tex) continue;
@@ -3363,7 +3441,10 @@ void gfx_gpu_end_scene(void) {
 	if (gpu()) {
 		batch_flush("end of scene");
 		const SsaoCamera *cam = ao_scene && ao_draws >= 30 && scene_entry && scene_depth_entry && scene_depth_entry->tex ? ao_camera() : 0;
-		if (cam && ssao_apply(gpu(), scene_entry->color, kind_format(scene_entry->kind), scene_depth_entry->tex, TSX(scene_entry, scene_entry->width), TSY(scene_entry, scene_entry->height), cam)) n_ao++;   /* before anything reads the scene */
+		if (cam) {
+			if (fsr_main_camera_scene()) { fsr_camera = *cam; fsr_camera_frame = mv_qframe; }   /* (only the scene FSR reads its depth from: a later scene of the same format must not replace its camera) */
+			if (ssao_enabled() && ssao_apply(gpu(), scene_entry->color, kind_format(scene_entry->kind), scene_depth_entry->tex, TSX(scene_entry, scene_entry->width), TSY(scene_entry, scene_entry->height), cam)) n_ao++;   /* before anything reads the scene */
+		}
 		ao_scene = 0;
 		if (scene_entry) readback_enqueue(scene_entry);
 		if (vis_pending() && (vis_sync() == 1 || (vis_sync() == 2 && vis_pending_set()))) vis_complete(1);
@@ -3952,7 +4033,10 @@ static void bind_unit(const GfxTexture *tex, int unit, SDL_GPUTextureSamplerBind
 	 * declared format, as gfx_soft.c stores it) and the texture decoded from there like
 	 * any other, so every reinterpretation reads the real bytes. */
 	TargetEntry *src_target = 0; uint64_t tb0 = us_now();
-	if (fsr_on() && tex && mv_main_entry && mv_lit && (const void *)scene_entry != mv_lit && (const void *)scene_entry != mv_main_entry && mv_ord > mv_lit_last_ord && tex->data == ((const TargetEntry *)mv_lit)->addr) fsr_run((TargetEntry *)mv_lit);   /* (M4: before the first draw that reads the frame FSR works on, past the scenes that draw it) */
+	const TargetEntry *lit = (const TargetEntry *)mv_lit;
+	if (fsr_on() && tex && mv_main_entry && lit && (const void *)scene_entry != mv_lit && (const void *)scene_entry != mv_main_entry && mv_ord > mv_lit_last_ord &&
+	    tex->data >= lit->addr && (uint64_t)tex->data < (uint64_t)lit->addr + target_bytes(lit))
+		fsr_run((TargetEntry *)mv_lit);   /* M4: before the first exact or sub-view read of the completed low-resolution frame */
 	TexEntry *te = (tex && tex->data) ? target_view(tex, &src_target) : 0;   /* render-to-texture: a view, the target itself, or guest memory (see target_view) */
 	if (src_target) target_sync_for_gpu(src_target);   /* its newest content may be in guest memory (a software-fallback draw, a replay's restored page): the texture must hold it before being sampled -- sampled stale it was Metal's uninitialised fill, a whole magenta frame */
 	if (!te && !src_target && tex && tex->data) te = get_texture(tex);
@@ -4183,7 +4267,7 @@ int gfx_gpu_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t 
 	SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
 	SDL_EndGPURenderPass(rp);
 	SDL_SubmitGPUCommandBuffer(cmd);
-	d->cpu_dirty = 0; d->gpu_dirty = 1; d->gen = ++write_clock; d->prev_drawn_frame = d->drawn_frame; d->drawn_frame = gpu_frame_no; d->used = ++target_clock;
+	d->cpu_dirty = 0; d->gpu_dirty = 1; d->fsr_derived = 0; d->gen = ++write_clock; d->prev_drawn_frame = d->drawn_frame; d->drawn_frame = gpu_frame_no; d->used = ++target_clock;
 	readback_enqueue(d);
 	return 1;
 #undef DECLINE
@@ -4837,7 +4921,7 @@ static void async_skip(const GfxDraw *d, const char *why) {   /* gpu_async: the 
 	 * order. Uncharted's tonemap target is the memory of the next frame's other-format pass too; with its draw skipped the
 	 * composite took that one, read as colour -- purple static for a few frames during movement (capture
 	 * frame_3029, 2026-10-22: the live composite sampled the other pass's bytes; the replay, built in advance, was clean). */
-	if (scene_entry && scene_entry != &scratch_entry) { scene_entry->gpu_dirty = 1; scene_entry->gen = ++write_clock; }
+	if (scene_entry && scene_entry != &scratch_entry) { scene_entry->gpu_dirty = 1; scene_entry->fsr_derived = 0; scene_entry->gen = ++write_clock; }
 	if (trace_sync()) fprintf(stderr, "gpu trace: draw %#x/%#x skipped: %s\n", d->vprog, d->fprog, why);
 }
 /* gpu_async skips a draw whose shader or pipeline is still being built only on a target a scene drew into in the frame
@@ -5893,8 +5977,8 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			n_batch_fetch++; fetch_ev = batch.nev - 1;
 		}
 	}
-	{ float rt, rv;   /* (FSR's opaque-only image: before the first draw after the main scene's opaque ones, once a frame) */
-	  if (fsr_on() && fsr_reactive(&rt, &rv) && fsr_opaque_frame != mv_qframe + 1 && (((const void *)scene_entry == mv_main_entry && mv_lit == mv_main_entry && !mv_want && scene_entry->mv_frame == mv_qframe + 1 && scene_entry->mv_n)
+	{ float rt, rv, rs; uint32_t rf;   /* (FSR's opaque-only image: before the first draw after the main scene's opaque ones, once a frame) */
+	  if (fsr_on() && fsr_reactive(&rt, &rv, &rs, &rf) && fsr_opaque_frame != mv_qframe + 1 && (((const void *)scene_entry == mv_main_entry && mv_lit == mv_main_entry && !mv_want && scene_entry->mv_frame == mv_qframe + 1 && scene_entry->mv_n)
 	      || ((const void *)scene_entry == mv_lit && mv_lit != mv_main_entry && mv_lit_index >= 1 && !mv_want)) && fsr_opaque_for(scene_entry)) {
 		BatchEvent *ev = batch_event(); ev->src = scene_entry->color; ev->dst = fsr_opaque; ev->w = TSX(scene_entry, scene_entry->width); ev->h = TSY(scene_entry, scene_entry->height);
 		fsr_opaque_frame = mv_qframe + 1;
@@ -5987,7 +6071,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * a depth write or clear -- a bump per draw made Unit 13's lighting pass, which samples its own
 	 * depth while each light's stencil volume writes stencil with depth writes off, rebuild that view,
 	 * and so flush the batch, before every draw */
-	scene_entry->gpu_dirty = 1; scene_entry->gen = ++write_clock; scene_first_draw = 0;
+	scene_entry->gpu_dirty = 1; scene_entry->fsr_derived = 0; scene_entry->gen = ++write_clock; scene_first_draw = 0;
 	if (scene_depth_entry && scene_target.depth) {
 		int st_on = ds_stencil_ok && (d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass);   /* get_pipeline's enable_stencil_test */
 		int zwrites = ds_clear || (ds_depth_ok && d->depth_write);
