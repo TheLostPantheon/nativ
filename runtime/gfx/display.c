@@ -18,6 +18,7 @@
 #include "gfx.h"
 #include "metrics.h"
 #include "settings.h"
+#include "controller_layout.h"
 
 static uint64_t raw_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 /* the in-game overlay's pause (display_set_paused, called by overlay.cpp as the menu opens and
@@ -741,23 +742,43 @@ static void h_audio_adopt(Cpu *c) { RET(1); }
 /* PS TV mode. A game that reads pad port 1 and gets an answer takes itself for a PS TV with a paired pad: no touch screen
  * at all, and the touch screen's actions on buttons, its own PS TV layout (Killzone 1.12 looks once at boot; 1.00 never
  * does). A handheld's port 1 fails. Settings "controller_layout" (the game's own; the menu's Game page offers it once the
- * game has looked): 1 touch, the default: a handheld; 2 buttons: a PS TV (0, an automatic choice once, is touch now).
- * Opt-in and for a controller only: keyboard and mouse couldn't do a PS TV layout's stick prompts, and there are no
- * clicks as touches, so they don't play the game in it (window.c: a notice says so, once a run).
- * Either way keyboard, mouse aim and controller go on feeding the same pad: only the mouse's touches are gone in PS TV
- * mode (menus by d-pad or keys). Decided at the game's first look: a change applies on its next start. Port 1 reads
+ * game has looked): 0 automatic, 1 touch/handheld, 2 buttons/PS TV. RECOMP_CONTROLLER_LAYOUT supplies the default as one
+ * of those numbers or auto/touch/buttons; packs can choose automatic without overriding the player's explicit setting.
+ * Automatic chooses the PS TV layout for Controller input, touchscreen for Keyboard & mouse, and follows the active
+ * scheme in Automatic input mode. Keyboard and mouse can still feed the PS TV pad: its native stick actions replace
+ * touch, while mouse look, mouse buttons and bound keys keep working and F10's input scheme can change live.
+ * Only the mouse's touches are gone in PS TV mode. Decided at the game's first look: a layout change applies on its
+ * next start. Port 1 reads
  * the same input as port 0 in a DualShock's layout (window_input_pad2: its L1/R1 are the handheld's L/R, as a PS TV
  * gives a game that doesn't ask; Killzone aims and fires on them); ports 2-4 stay unpaired. */
 static int pstv_looked, pstv_on;
 int display_pstv_looked(void) { return __atomic_load_n(&pstv_looked, __ATOMIC_RELAXED); }
 int display_pstv_active(void) { return __atomic_load_n(&pstv_on, __ATOMIC_RELAXED); }   /* (window.c: the shoulder pair that isn't L and R is the pad's L2/R2, not the touch cursor) */
+int display_controller_layout_default(void) {
+	static int layout = -1;
+	if (layout >= 0) return layout;
+	const char *value = getenv("RECOMP_CONTROLLER_LAYOUT");
+	if (!value || !*value) return layout = CONTROLLER_LAYOUT_TOUCH;
+	layout = controller_layout_parse(value);
+	if (layout >= 0) return layout;
+	fprintf(stderr, "RECOMP_CONTROLLER_LAYOUT: expected auto, touch, buttons, 0, 1 or 2; got \"%s\" -- using touch\n", value);
+	return layout = CONTROLLER_LAYOUT_TOUCH;
+}
 static int pstv_mode(void) {
 	static int v = -1;
 	if (v < 0) {
-		extern int settings_int(const char *, int);
-		const int s = settings_int("controller_layout", 1); v = s == 2;
+		int s = settings_int("controller_layout", display_controller_layout_default());
+		if (s < CONTROLLER_LAYOUT_AUTO || s > CONTROLLER_LAYOUT_BUTTONS) {
+			fprintf(stderr, "controller_layout: expected 0, 1 or 2; got %d -- using the pack default\n", s);
+			s = display_controller_layout_default();
+		}
+		extern int window_controller_layout_auto(void);
+		v = s == CONTROLLER_LAYOUT_BUTTONS || (s == CONTROLLER_LAYOUT_AUTO && window_controller_layout_auto());
 		__atomic_store_n(&pstv_on, v, __ATOMIC_RELAXED);
-		fprintf(stderr, "    ctrl: the game asks for a PS TV's pad: %s (controller_layout %d)\n", v ? "answered, a PS TV: its button layout, no touch" : "refused, a handheld: touch", s);
+		fprintf(stderr, "    ctrl: the game asks for a PS TV's pad: %s (controller_layout %s%s)\n",
+		        v ? "answered, a PS TV: its button layout, no touch" : "refused, a handheld: touch",
+		        s == CONTROLLER_LAYOUT_AUTO ? "automatic -> " : "",
+		        s == CONTROLLER_LAYOUT_AUTO ? (v ? "buttons" : "touch") : s == CONTROLLER_LAYOUT_BUTTONS ? "buttons" : "touch");
 	}
 	return v;
 }

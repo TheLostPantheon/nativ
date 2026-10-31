@@ -41,6 +41,7 @@
 #include "metrics.h"
 #include "settings.h"
 #include "overlay.h"
+#include "controller_layout.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
        TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
@@ -172,6 +173,19 @@ void window_kb_bind(int i, SDL_Keycode k) {   /* the menu's Rebind: that action 
 }
 void window_kb_reset(void) { for (int i = 0; i < KB_N; i++) settings_set_str(kb_binds[i].key, kb_binds[i].def); settings_save(); kb_reload(); }
 int window_kbm_active(void) { return kbm_on; }
+int window_controller_layout_auto(void) {
+	char b[8]; const char *mode = settings_str("input_mode", "auto", b, sizeof b);
+	const int headless = getenv("RECOMP_HEADLESS") != NULL;
+	return controller_layout_auto_buttons(mode, kbm_on, headless ? 0 : SDL_HasGamepad(), headless);
+}
+static int controller_input_selected(void) {
+	char b[8];
+	return !strcmp(settings_str("input_mode", "auto", b, sizeof b), "pad");
+}
+static int mouse_input_event(const SDL_Event *e) {
+	return e->type == SDL_EVENT_MOUSE_MOTION || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+	       e->type == SDL_EVENT_MOUSE_BUTTON_UP || e->type == SDL_EVENT_MOUSE_WHEEL;
+}
 /* a game's raw-look hook, once per game frame: the mouse's motion since its last call, in counts (y down),
  * and whether the mouse is looking at all (0: nothing to apply, the deltas are 0) */
 /* RECOMP_INPUT_MOUSE="from-to:dx,dy;...": mouse counts per call over presented-frame ranges -- a headless
@@ -799,6 +813,24 @@ static uint32_t pad_bit(int b) {
 	default: return 0;
 	}
 }
+static void pstv_pad_prompt_notice(SDL_Gamepad *pad) {
+	static int said;
+	if (said || !pad || !display_pstv_active() ||
+	    SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH) != SDL_GAMEPAD_BUTTON_LABEL_A) return;
+	said = 1;
+	overlay_toast_titled("Xbox button prompts", "The game's X-shaped Cross prompt means [A] on this controller.", 8.0);
+}
+static void mouse_game_release(void) {
+	if (gesture_drag) gesture_drag = 0;
+	if (twist_drag) { twist_drag = 0; twist_down = twist_pad; }
+	touch_down = mouse_rear_down = 0;
+	if (kbm_lmb) buttons &= ~RTRIG;
+	if (kbm_rmb) buttons &= ~LTRIG;
+	kbm_lmb = kbm_rmb = 0;
+	__atomic_store_n(&mouse_dx_q8, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&mouse_dy_q8, 0, __ATOMIC_RELAXED);
+	look_dx_q8 = look_dy_q8 = 0;
+}
 /* The two shoulder pairs, whichever physical pair each is ("shoulder_buttons": the triggers by default are pad_main).
  * pad_main: the game's L and R; with the touch cursor up (the other pair held) a press is the cursor's touch, like
  * Cross (two cursors: both go down), and a press that touched sends no L/R until it is let go, whatever the other pair
@@ -821,15 +853,6 @@ static void pad_second(SDL_Gamepad *pad, int k, int dn) {
 	cur_mode = m;
 	cur_down = m && (cur_cross || cur_trig[0] || cur_trig[1]);
 }
-/* keyboard or mouse tried to play the game (a bound key, the mouse moved or clicked) in a PS TV layout, where they don't:
- * the notice why, once a run */
-static int kbm_pstv_said;
-static void kbm_used(void) {
-	if (kbm_pstv_said || !display_pstv_active()) return;
-	kbm_pstv_said = 1;
-	overlay_toast_titled("Controller layout", "PS TV buttons are controller only: keyboard and mouse don't play the game in them. To play with keyboard and mouse: [F10] > Game > Controller layout > Touch screen (from the next start)", 10.0);
-}
-
 typedef struct { void *(*fn)(void *); void *arg; } Game;
 static void *game_main(void *p) { Game *g = p; g->fn(g->arg); return 0; }
 
@@ -956,6 +979,10 @@ void window_run(void *(*fn)(void *), void *arg) {
 			/* the save-data dialog waiting on the player (overlay_dialog_active): it has the keys and the mouse;
 			 * the game is polling the dialog, not the pad */
 			if (overlay_dialog_active()) { overlay_process_event(&e); continue; }
+			/* Explicit Controller mode is controller-only during play. The full menu and dialogs above still get the
+			 * mouse; a paused game below can use the menu bar, but no mouse event falls through into game input. */
+			const int controller_mouse = controller_input_selected() && mouse_input_event(&e);
+			if (controller_mouse && !overlay_game_paused()) continue;
 			/* closed: ImGui still sees the mouse (and the window's focus/enter/leave), so the menu bar can
 			 * show on a hover at the top edge; a press or a move it has claimed (the pointer over the bar,
 			 * a menu or the pull tab, as of the last frame drawn) never becomes a touch below. A release
@@ -967,6 +994,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 				overlay_process_event(&e);
 				if (overlay_mouse_captured() && e.type != SDL_EVENT_MOUSE_BUTTON_UP) continue;
 			}
+			if (controller_mouse) continue;
 			/* a touchscreen's fingers (screen_finger). SDL also makes the first finger the mouse (which == SDL_TOUCH_MOUSEID):
 			 * that stops here, after the menu bar has seen it, so a tap never fires, looks, captures the mouse or switches
 			 * the input to keyboard + mouse */
@@ -994,8 +1022,8 @@ void window_run(void *(*fn)(void *), void *arg) {
 				int i = kb_find(e.key.key), dn = e.type == SDL_EVENT_KEY_DOWN;
 				if (i >= 0) {
 					kb_binds[i].held = dn;
-					if (kb_binds[i].bit && !display_pstv_active()) { if (dn) buttons |= kb_binds[i].bit; else buttons &= ~kb_binds[i].bit; }   /* (a PS TV layout: a controller's only, kbm_used) */
-					if (dn) { kbm_auto = 1; kbm_used(); }
+					if (kb_binds[i].bit) { if (dn) buttons |= kb_binds[i].bit; else buttons &= ~kb_binds[i].bit; }
+					if (dn) kbm_auto = 1;
 				}
 			}
 			if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad && (pad = SDL_OpenGamepad(e.gdevice.which)) != 0) {
@@ -1102,14 +1130,14 @@ void window_run(void *(*fn)(void *), void *arg) {
 			static uint64_t last; uint64_t t = now_us(); double dt = last ? (t - last) / 1e6 : 0; last = t;
 			if (dt > 0.1) dt = 0.1;
 			static int loaded; if (!loaded) { loaded = 1; kb_reload(); }
+			pstv_pad_prompt_notice(pad);
 			char mb[8]; const char *mode = settings_str("input_mode", "auto", mb, sizeof mb);
 			int on = !strcmp(mode, "kbm") ? 1 : !strcmp(mode, "pad") ? 0 : kbm_auto;
-			const int pstv = display_pstv_active();   /* a PS TV layout is a controller's only: no keyboard-and-mouse scheme, no capture */
-			if (on && pstv) { kbm_used(); on = 0; }
 			static int said;
 			if (on && !kbm_on && !said) { said = 1; overlay_toast_titled("Keyboard & mouse", "The mouse looks and aims -- hold [Alt] for the cursor\nControls: [F10]", 6.0); }
+			if (!on && kbm_on) mouse_game_release();
 			kbm_on = on;
-			int want = (on || (window_raw_look() && !pstv)) && settings_int("mouse_look", 1) && !overlay_is_open() && !overlay_dialog_active() && win && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) && !(SDL_GetModState() & SDL_KMOD_ALT);
+			int want = on && settings_int("mouse_look", 1) && !overlay_is_open() && !overlay_dialog_active() && win && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) && !(SDL_GetModState() & SDL_KMOD_ALT);
 			/* SDL's own state, not just ours: the system can drop the capture behind our back (a focus change as
 			 * the window opens, say) and rel_on then claimed a capture that wasn't there -- the pointer showed,
 			 * left the window and stopped tracking at its edge. Re-applied whenever the two disagree. */
@@ -1135,7 +1163,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (want != rel_on && win) {
 				if (!SDL_SetWindowRelativeMouseMode(win, want) && want) fprintf(stderr, "mouse: capture refused: %s\n", SDL_GetError());
 				if (want) rel_since_us = now_us();   /* (the capture's first motion can carry the pointer's jump to the centre: dropped) */
-				if (!want) { if (gesture_drag) { gesture_drag = 0; touch_down = 0; } if (twist_drag) { twist_drag = 0; twist_down = twist_pad; } if (kbm_lmb) buttons &= ~RTRIG; if (kbm_rmb) buttons &= ~LTRIG; kbm_lmb = kbm_rmb = 0; __atomic_store_n(&mouse_dx_q8, 0, __ATOMIC_RELAXED); __atomic_store_n(&mouse_dy_q8, 0, __ATOMIC_RELAXED); }
+				if (!want) mouse_game_release();
 				rel_on = want;
 			}
 			tilt_section_update();
