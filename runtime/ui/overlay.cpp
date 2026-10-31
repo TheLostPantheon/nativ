@@ -80,6 +80,7 @@ int gfx_gpu_render_scale(void); int gfx_gpu_render_scale_wanted(void); void gfx_
 int gfx_gpu_hud_supported(void);   /* the game names its HUD draws (RECOMP_HUD_DRAWS): the HUD row applies */
 int gfx_gpu_ssao_supported(void);   /* the game names its main 3D scene (RECOMP_SSAO): the ambient occlusion rows apply */
 int gfx_gpu_fsr_supported(void);   /* the game's pack verified FSR 3.1 (RECOMP_FSR_SUPPORTED): the anti-aliasing row offers it */
+int gfx_gpu_fsr_active(void);
 int gfx_gpu_target_scale_supported(void);   /* the game names buffers it draws below the screen's resolution (RECOMP_TARGET_SCALE) */
 int gfx_gpu_shader_prep(int *done, int *total, double *eta_s); void gfx_gpu_shader_prep_skip(void);   /* the shader prep card's state (build_prep) */
 int display_pstv_looked(void);   /* display.c: the game asked for a PS TV's pad (the controller layout row applies) */
@@ -319,11 +320,27 @@ static void page_display(void) {
 		static const char *const names[3] = {"Off##aam", "FXAA##aam", "FSR 3.1 (experimental)##aam"};
 		int v = settings_int("fsr", 0) ? 2 : settings_int("post_aa", 1) ? 1 : 0;
 		if (ui::segmented(names, 3, &v)) { settings_set_int("fsr", v == 2); settings_set_int("post_aa", v == 1); settings_save(); }
+		ui::row("FSR source resolution", "Resolution of the 3D world before FSR reconstructs it to the selected output resolution. Native is best quality; a lower scale improves GPU performance.");
+		{	const int rs = gfx_gpu_render_scale_wanted(), count = rs > 1 ? rs : 1;
+			static char names[8][20]; const char *labels[8];
+			std::snprintf(names[0], sizeof names[0], "Native##fsrrs"); labels[0] = names[0];
+			for (int i = 1; i < count && i < 8; i++) { std::snprintf(names[i], sizeof names[i], "%d×##fsrrs", i); labels[i] = names[i]; }
+			int src = settings_int("fsr_render_scale", 0); if (src < 1 || src >= rs) src = 0;
+			ImGui::BeginDisabled(!gfx_gpu_fsr_active() || rs <= 1);
+			if (ui::segmented(labels, count < 8 ? count : 8, &src)) { settings_set_int("fsr_render_scale", src); settings_save(); }
+			ImGui::EndDisabled();
+		}
+		ui::row("FSR diagnostic view", "Shows the SDK's motion, depth, reactivity, history and exposure diagnostics.");
+		{	bool on = settings_int("fsr_debug", 0) != 0;
+			ImGui::BeginDisabled(!gfx_gpu_fsr_active());
+			if (ui::toggle("fsrdbg", &on)) { settings_set_int("fsr_debug", on ? 1 : 0); settings_save(); }
+			ImGui::EndDisabled();
+		}
 	} else {
 		ui::row("Anti-aliasing", "Smooths jagged edges (FXAA).");
 		{ bool aa = settings_int("post_aa", 1) != 0; if (ui::toggle("aa", &aa)) { settings_set_int("post_aa", aa ? 1 : 0); settings_save(); } }
 	}
-	ui::row("Sharpening", "Brings back detail lost to scaling and anti-aliasing.");
+	ui::row("Sharpening", "Brings back detail lost to scaling and anti-aliasing. With FSR, this uses its built-in RCAS pass.");
 	{	float sh = (float)settings_float("sharpen", 0.35) * 100.0f;
 		ImGui::SetNextItemWidth(-FLT_MIN);
 		if (ImGui::SliderFloat("##sharp", &sh, 0.0f, 100.0f, sh <= 0.0f ? "Off" : "%.0f%%")) { settings_set_float("sharpen", sh / 100.0f); settings_save(); }

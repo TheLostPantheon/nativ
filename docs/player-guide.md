@@ -123,6 +123,8 @@ shortcut doesn't lose your progress: **Keep playing** or **Quit**, and closing i
 has a menu with that game's own options. Some worth knowing:
 
 - **Render scale**: draws the game at up to six times the Vita's resolution.
+- **FSR 3.1** (supported games): temporal anti-aliasing at native resolution, or reconstruction from a lower
+  **FSR source resolution** for better GPU performance. The Sharpening slider uses FSR's built-in RCAS pass.
 - **Aspect ratio**: native, 21:9, 32:9 or your window's shape. The HUD keeps its own shape on wide screens.
 - **Frame rate**: 30 or 60. 60 is experimental: parts of a game timed in fixed 1/30 second steps can run fast.
 - **Field of view** (Killzone, Unit 13 and Uncharted).
