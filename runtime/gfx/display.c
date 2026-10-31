@@ -745,10 +745,10 @@ static void h_audio_adopt(Cpu *c) { RET(1); }
  * game has looked): 0 automatic, 1 touch/handheld, 2 buttons/PS TV. RECOMP_CONTROLLER_LAYOUT supplies the default as one
  * of those numbers or auto/touch/buttons; packs can choose automatic without overriding the player's explicit setting.
  * Automatic chooses the PS TV layout for Controller input, touchscreen for Keyboard & mouse, and follows the active
- * scheme in Automatic input mode. The PS TV layout is for a controller only: keyboard and mouse couldn't do its stick
- * prompts, and there are no clicks as touches (window.c shows a notice once a run).
- * Either way keyboard, mouse aim and controller go on feeding the same pad: only the mouse's touches are gone in PS TV
- * mode (menus by d-pad or keys). Decided at the game's first look: a change applies on its next start. Port 1 reads
+ * scheme in Automatic input mode. Keyboard and mouse can still feed the PS TV pad: its native stick actions replace
+ * touch, while mouse look, mouse buttons and bound keys keep working and F10's input scheme can change live.
+ * Only the mouse's touches are gone in PS TV mode. Decided at the game's first look: a layout change applies on its
+ * next start. Port 1 reads
  * the same input as port 0 in a DualShock's layout (window_input_pad2: its L1/R1 are the handheld's L/R, as a PS TV
  * gives a game that doesn't ask; Killzone aims and fires on them); ports 2-4 stay unpaired. */
 static int pstv_looked, pstv_on;

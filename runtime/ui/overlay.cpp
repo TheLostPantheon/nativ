@@ -370,7 +370,7 @@ static void page_game(void) {
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1f×")) set_chr(P.chr);
 	}
 	if (display_pstv_looked()) {   /* (display.c's PS TV mode: a game with a PS TV layout of its own) */
-		ui::row("Controller layout", "How touch-screen actions are done. Automatic uses the game's PS TV buttons and sticks when playing with a controller, and the handheld touch screen for keyboard and mouse. Touch screen can be selected explicitly for the mouse or touch cursor. Applies the next time the game starts.");
+		ui::row("Controller layout", "How touch-screen actions are done. Automatic chooses PS TV buttons for controller play at startup and handheld touch for keyboard and mouse. Controls > Play with can switch input devices immediately in either layout; changing this layout applies next time the game starts.");
 		static const char *const names[3] = {"Automatic##cl", "Touch screen##cl", "PS TV buttons##cl"};
 		int v = settings_int("controller_layout", display_controller_layout_default());
 		if (v < 0 || v > 2) v = display_controller_layout_default();
@@ -435,10 +435,11 @@ static void page_controls(void) {
 	prefs_load();
 	section_label("Input");
 	if (ui::rows_begin("input")) {
-		ui::row("Play with", window_kbm_active() ? "Keyboard and mouse in use. Hold Alt (Option) to free the cursor -- it is then the touch screen."
-		                                          : "Controller in use. Automatic follows the last device you touch.");
 		{	static const char *const ids[3] = {"auto", "pad", "kbm"}, *const names[3] = {"Automatic##in", "Controller##in", "Keyboard & mouse##in"};
 			char cur[8]; settings_str("input_mode", "auto", cur, sizeof cur);
+			ui::row("Play with", window_kbm_active() ? "Keyboard and mouse in use. Hold Alt (Option) to free the cursor -- it is then the touch screen."
+				: !strcmp(cur, "pad") ? "Controller selected. Gameplay ignores the mouse; menus and dialogs still use it."
+				: "Controller in use. Automatic follows the last device you touch.");
 			int v = 0; for (int i = 0; i < 3; i++) if (!strcmp(cur, ids[i])) v = i;
 			if (ui::segmented(names, 3, &v)) { settings_set_str("input_mode", ids[v]); settings_save(); }
 		}

@@ -1166,7 +1166,7 @@ static void settings_modal(void) {
 			slider_row(t, "Occlusion strength", nullptr, "ssao_strength", 1.0, 0.0f, 200.0f, "%.0f%%", 100.0f);
 			seg_row(t, "On-screen stats", "Frame rate and timings over the game. F1 cycles them.", "osd", "0", {{"0", "Off"}, {"1", "FPS"}, {"2", "Full"}});
 		} else if (g_settings_tab == 1) {
-			seg_row(t, "Play with", "Automatic follows the last device you touch.", "input_mode", "auto", {{"auto", "Automatic"}, {"pad", "Controller"}, {"kbm", "Keyboard & mouse"}});
+			seg_row(t, "Play with", "Automatic follows the last device you touch. Controller ignores mouse input during play; menus and dialogs still use it.", "input_mode", "auto", {{"auto", "Automatic"}, {"pad", "Controller"}, {"kbm", "Keyboard & mouse"}});
 			toggle_row(t, "Mouse look", "The mouse turns the camera and aims; left button R, right button L.", "mouse_look", true);
 			seg_row(t, "Mouse aim", "Direct: the game turns exactly as far as the mouse moves (Uncharted, Unit 13, Killzone). Stick: the mouse moves the right stick. F8 switches in a game.", "raw_look", "1", {{"1", "Direct"}, {"0", "Stick"}});
 			slider_row(t, "Mouse sensitivity", nullptr, "mouse_sens", 1.0, 0.1f, 5.0f, "%.2f×", 1, ImGuiSliderFlags_Logarithmic);
@@ -1241,7 +1241,7 @@ static void game_settings_modal(void) {
 		if (game_option(*g, "character_detail")) { any = true; slider_row(t, "Character detail", "How far characters and props keep their full detail. 1.00× is the game's own.", "character_detail", 1.0, 1.0f, 8.0f, "%.1f×"); }
 		if (game_option(*g, "controller_layout")) {
 			any = true;
-			seg_row(t, "Controller layout", "Killzone 1.12: Automatic uses the game's PS TV buttons and sticks with a controller, and handheld touch with keyboard and mouse. Applies the next time the game starts.", "controller_layout", "0",
+			seg_row(t, "Controller layout", "Killzone 1.12: Automatic chooses PS TV buttons for controller play at startup and handheld touch for keyboard and mouse. Either input device remains usable; changing this layout applies next time the game starts.", "controller_layout", "0",
 			        {{"0", "Automatic"}, {"1", "Touch screen"}, {"2", "PS TV buttons"}});
 		}
 		if (game_option(*g, "private_server")) {   /* (a game whose online needs its makers' servers: Killzone; Unit 13 needs none) */

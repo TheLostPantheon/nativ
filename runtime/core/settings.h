@@ -18,7 +18,7 @@
  *   post_aa       post.c      0 | 1 (default 1)         FXAA on the finished frame (RECOMP_POST_AA wins)
  *   sharpen       post.c      0..1 (default 0.35)       CAS sharpening at output resolution, 0 off (RECOMP_SHARPEN wins)
  *   anisotropy    gfx_gpu.c   1 | 2 | 4 | 8 | 16 (default 16)   anisotropic texture filtering (RECOMP_ANISO wins)
- *   input_mode    window.c    auto | pad | kbm (default auto)   keyboard+mouse or the pad; auto: the device last used
+ *   input_mode    window.c    auto | pad | kbm (default auto)   keyboard+mouse or the pad; auto: the device last used; pad ignores gameplay mouse events
  *   controller_layout display.c 0 | 1 | 2 (pack default, normally 1)  game-specific: automatic, handheld touch, or PS TV buttons; restart to apply
  *   mouse_look    window.c    0 | 1 (default 1)          keyboard+mouse: the mouse captured as the look (Alt frees it)
  *   mouse_sens    window.c    0.1..5 (default 1.0)       the look's sensitivity (a raw-look hook's, or the right-stick stand-in's)

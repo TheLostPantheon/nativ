@@ -116,7 +116,8 @@ Linux and Windows rely on the Vulkan drivers' own caches.
 `runtime/ui/window.c` maps the host's input onto the Vita's controls.
 
 - **Keyboard and mouse.** The mouse looks and aims while captured; hold Alt for a cursor. Left button is the front
-  touch panel when the cursor is free; right button is the rear panel.
+  touch panel when the cursor is free; right button is the rear panel. Explicit `input_mode=pad` drops gameplay mouse
+  events and does not capture the mouse; the full menu, dialogs and paused menu bar still receive it.
 - **Gamepads.** The triggers are L and R. The bumpers are touch modifiers: hold LB (front) or RB (rear), and either
   stick moves a cursor on that panel while Cross touches. A marker shows the cursor. The setting `shoulder_buttons`
   ("bumpers") swaps the two pairs.
@@ -124,9 +125,11 @@ Linux and Windows rely on the Vulkan drivers' own caches.
   buttons: L and R are its L1 and R1, the other shoulder pair its L2 and R2, and the stick clicks L3 and R3
   (`window_input_pad2`). Killzone 1.12's pack defaults `controller_layout` to automatic: Controller input, or Automatic
   input with an active gamepad, answers the probe and uses the game's controller-native menus and touch actions;
-  Keyboard & mouse input refuses it and retains handheld touch. An explicit per-game `controller_layout` of 1 (touch)
-  or 2 (buttons) overrides the pack default, and 0 restores automatic selection. Headless scripted runs with Automatic
-  input treat Automatic layout as touch so captures do not depend on controllers connected to the build machine.
+  Keyboard & mouse input at startup refuses it and retains handheld touch. After the probe, `input_mode` can switch live
+  in either layout: bound keys and mouse aim feed the PS TV pad as well as the handheld pad. An explicit per-game
+  `controller_layout` of 1 (touch) or 2 (buttons) overrides the pack default, and 0 restores automatic selection.
+  Headless scripted runs with Automatic input treat Automatic layout as touch so captures do not depend on controllers
+  connected to the build machine.
 - **Touchpads** on DualShock 4 and DualSense pads touch the front panel finger for finger, or the rear with RB held as
   a finger lands.
 - **Touchscreens** touch the front panel where a finger lands on the picture, up to six fingers, or the rear with RB
