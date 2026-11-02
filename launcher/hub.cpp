@@ -962,7 +962,7 @@ static void ini_save(const Ini &x, const std::string &path, const char *header) 
 static const char *const SHARED_HEADER = "# Project Nativ's settings for every game (the launcher's Settings, and each game's menu; runtime/core/settings.h)";
 static const char *const GAME_HEADER = "# vitarecomp settings for this game: its own options, and where it differs from the shared settings (runtime/core/settings.h)";
 static bool game_key(const std::string &k) {   /* (settings.c's game_key: kept in the game's own file) */
-	for (const char *g : {"fov", "view_distance", "scenery_detail", "character_detail", "private_server", "net_redirect", "menu_hint_shown", "controller_layout"}) if (k == g) return true;
+	for (const char *g : {"fov", "view_distance", "scenery_detail", "character_detail", "qte_time", "private_server", "net_redirect", "menu_hint_shown", "controller_layout"}) if (k == g) return true;
 	return false;
 }
 /* the shared keys' defaults where a game reads no value (runtime/core/settings.h; the consumers' own) */
@@ -1239,6 +1239,7 @@ static void game_settings_modal(void) {
 		if (game_option(*g, "view_distance")) { any = true; slider_row(t, "View distance", "How far fading scenery reaches. 1.00× is the game's own.", "view_distance", 1.0, 1.0f, 3.0f, "%.2f×"); }
 		if (game_option(*g, "scenery_detail")) { any = true; slider_row(t, "Scenery detail", "How far small scenery details stay visible. 1.00× is the game's own.", "scenery_detail", 1.0, 1.0f, 8.0f, "%.1f×"); }
 		if (game_option(*g, "character_detail")) { any = true; slider_row(t, "Character detail", "How far characters and props keep their full detail. 1.00× is the game's own.", "character_detail", 1.0, 1.0f, 8.0f, "%.1f×"); }
+		if (game_option(*g, "qte_time")) { any = true; slider_row(t, "QTE time", "How long you get for the swipe in a takedown or an interrogation, the same at 30 and 60 fps. 1 second is what the game's slow motion gives.", "qte_time", 1.0, 1.0f, 3.0f, "%.1f s"); }
 		if (game_option(*g, "private_server")) {   /* (a game whose online needs its makers' servers: Killzone; Unit 13 needs none) */
 			any = true;
 			ui::row("Private server", "The community server that stands in for the game's own (host, or host:port). Empty: the game's own, long offline.");

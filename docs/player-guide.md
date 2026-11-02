@@ -129,6 +129,8 @@ has a menu with that game's own options. Some worth knowing:
 - **Aspect ratio**: native, 21:9, 32:9 or your window's shape. The HUD keeps its own shape on wide screens.
 - **Frame rate**: 30 or 60. 60 is experimental: parts of a game timed in fixed 1/30 second steps can run fast.
 - **Field of view** (Killzone, Unit 13 and Uncharted).
+- **QTE time** (Killzone): how long you get for the swipe in a takedown or an interrogation, from 1 second (what the
+  game's own slow motion gives) to 3. It's the same at 30 and 60 fps.
 
 ## Online play
 
