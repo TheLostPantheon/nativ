@@ -19,9 +19,9 @@ void main()
     if (i >= cl.w2 * cl.h2) return;
     ivec2 p = ivec2(i % cl.w2, i / cl.w2); vec4 z = vec4(0.0);
     imageStore(spd0, p, z);
-    if (p.x < int(cl.w2 >> 1) && p.y < int(cl.h2 >> 1)) imageStore(spd1, p, z);
-    if (p.x < int(cl.w2 >> 2) && p.y < int(cl.h2 >> 2)) imageStore(spd2, p, z);
-    if (p.x < int(cl.w2 >> 3) && p.y < int(cl.h2 >> 3)) imageStore(spd3, p, z);
-    if (p.x < int(cl.w2 >> 4) && p.y < int(cl.h2 >> 4)) imageStore(spd4, p, z);
-    if (p.x < int(cl.w2 >> 5) && p.y < int(cl.h2 >> 5)) imageStore(spd5, p, z);
+    if (p.x < int(max(1u, cl.w2 >> 1)) && p.y < int(max(1u, cl.h2 >> 1))) imageStore(spd1, p, z);
+    if (p.x < int(max(1u, cl.w2 >> 2)) && p.y < int(max(1u, cl.h2 >> 2))) imageStore(spd2, p, z);
+    if (p.x < int(max(1u, cl.w2 >> 3)) && p.y < int(max(1u, cl.h2 >> 3))) imageStore(spd3, p, z);
+    if (p.x < int(max(1u, cl.w2 >> 4)) && p.y < int(max(1u, cl.h2 >> 4))) imageStore(spd4, p, z);
+    if (p.x < int(max(1u, cl.w2 >> 5)) && p.y < int(max(1u, cl.h2 >> 5))) imageStore(spd5, p, z);
 }

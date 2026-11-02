@@ -5,7 +5,8 @@
  * downscale, to give back the crispness a supersampled image loses on the way down.
  *
  *   settings "post_aa"  0 | 1 (default 1)    FXAA          (RECOMP_POST_AA wins)
- *   settings "sharpen"  0..1  (default 0.35) CAS strength  (RECOMP_SHARPEN wins; 0 = off)
+ *   settings "sharpen"  0..1  (default 0.35) CAS strength  (RECOMP_SHARPEN wins; 0 = off);
+ *                                             FSR consumes it as RCAS instead
  *
  * The shaders are Metal Shading Language here, with SPIR-V twins for Vulkan (runtime/gfx/shaders/post.vert,
  * fxaa.frag, cas.frag, compiled into vk_shaders.h by vk/build.sh; a change to one side is made to the
@@ -157,8 +158,9 @@ int post_present(SDL_GPUDevice *gpu, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *
                  float px, float py, float pw, float ph, SDL_GPUTexture *swap, SDL_GPUTextureFormat swap_fmt, float dx, float dy, float dw, float dh) {
 	const char *e = getenv("RECOMP_POST_AA"), *k = getenv("RECOMP_SHARPEN");
 	extern int gfx_gpu_fsr_active(void);
-	int aa = e ? atoi(e) != 0 : settings_int("post_aa", 1) != 0 && !gfx_gpu_fsr_active();   /* (FSR anti-aliases the 3D frame itself: FXAA over it would only blur) */
-	float sharp = k ? (float)atof(k) : (float)settings_float("sharpen", 0.35);
+	const int fsr = gfx_gpu_fsr_active();
+	int aa = e ? atoi(e) != 0 : settings_int("post_aa", 1) != 0 && !fsr;   /* (FSR anti-aliases the 3D frame itself: FXAA over it would only blur) */
+	float sharp = k ? (float)atof(k) : fsr ? 0.0f : (float)settings_float("sharpen", 0.35);   /* (FSR uses its own RCAS for the menu setting; RECOMP_SHARPEN can still force this pass) */
 	if (sharp < 0) sharp = 0; if (sharp > 1) sharp = 1;
 	if ((!aa && sharp <= 0) || !src || dw < 1 || dh < 1 || !setup(gpu, swap_fmt)) return 0;
 	SDL_GPUTexture *cur = src;

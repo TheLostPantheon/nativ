@@ -37,6 +37,9 @@ PASSES = {
         ["INPUT_OPAQUE_ONLY", "INPUT_COLOR"], [], ["AUTOREACTIVE"], [], ["FSR3UPSCALER", "REACTIVE"]),
     "rcas": ("rcas", "RCAS(gl_LocalInvocationID.xyz, gl_WorkGroupID.xyz, gl_GlobalInvocationID.xyz);", (64, 1),
         ["INPUT_EXPOSURE", "RCAS_INPUT", "INPUT_COLOR"], [], ["UPSCALED_OUTPUT"], [], ["FSR3UPSCALER", "RCAS"]),   # (INPUT_COLOR: the game's alpha, see the binding layer)
+    "debug_view": ("debug_view", "DebugView(FfxInt32x2(gl_GlobalInvocationID.xy));", (8, 8),
+        ["DILATED_REACTIVE_MASKS", "DILATED_MOTION_VECTORS", "DILATED_DEPTH", "INTERNAL_UPSCALED", "INPUT_EXPOSURE"], [],
+        ["UPSCALED_OUTPUT"], [], ["FSR3UPSCALER"]),
 }
 EXTRA_INCLUDES = {"accumulate": ["sample", "upsample", "reproject"], "accumulate_sharpen": ["sample", "upsample", "reproject"]}   # (the SDK's accumulate pass includes these before its own)
 SHARPEN = {"accumulate_sharpen": 1}
