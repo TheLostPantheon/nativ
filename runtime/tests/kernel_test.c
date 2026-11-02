@@ -28,6 +28,13 @@ void guest_time_slept(uint32_t us) { (void)us; }
 void display_vblank_callbacks(void) {}   /* display.c's vblank callbacks: none here */
 uint32_t io_guest_fd(int fd) { return (uint32_t)fd + 0x100; }   /* io.c's handle for a host fd (the standard streams) */
 void plat_random(void *buf, size_t n) { for (size_t i = 0; i < n; i++) ((unsigned char *)buf)[i] = (unsigned char)rand(); }
+/* waitstats.c (RECOMP_WAIT_STATS): off here */
+int waitstats_on(void) { return 0; }
+uint64_t waitstats_now(void) { return 0; }
+void waitstats_begin(uint64_t t0) { (void)t0; }
+void waitstats_wait(uint64_t t0, uint64_t woken_at) { (void)t0; (void)woken_at; }
+void waitstats_sleep(uint64_t t0) { (void)t0; }
+void waitstats_name(const char *n) { (void)n; }
 /* "recompiled" guest functions the thread tests start: a table of C functions by fake address */
 static GuestFn guest_fns[32];
 GuestFn guest_lookup(uint32_t a) { return a >= 0x1000 && a < 0x1000 + 32 * 4 ? guest_fns[(a - 0x1000) / 4] : 0; }

@@ -23,11 +23,13 @@
 #import <objc/runtime.h>
 #include <dirent.h>
 #include <errno.h>
+#include <ftw.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
@@ -195,6 +197,41 @@ void mtl_archive_flush(int how) {
 		}
 	}
 }
+/* Metal's scratch folders: the first pipeline added to an archive gives it one, com.apple.gpuarchiver/gpuarchiver-<hex> in the
+ * user's cache folder, which serializeToURL reads and nothing needs once the archive is written (its pipelines are found
+ * without it, in the archive or its file: tested 2026-11-01). Metal never removes them, and every kept library is an archive
+ * of its own: a week of test runs left 97,612 of them, 43 GB. An archive here is written within ten minutes of its first
+ * pipeline (a kept library's within the call), so a folder untouched for SCRATCH_IDLE is a leftover, ours or another
+ * program's: a thread of its own sweeps them at the start and every five minutes, at the disk's background priority. */
+#define SCRATCH_IDLE (20 * 60)
+static char scratch_dir[1024];
+static int rm_entry(const char *p, const struct stat *st, int type, struct FTW *f) {
+	(void)st; (void)f;
+	if (type == FTW_DP) rmdir(p); else unlink(p);
+	return 0;
+}
+static time_t newest_in(const char *path) {   /* the folder's latest change, or its entries' */
+	struct stat st; time_t t = stat(path, &st) ? 0 : st.st_mtime;
+	DIR *d = opendir(path); struct dirent *de; char p[2200];
+	while (d && (de = readdir(d))) if (de->d_name[0] != '.') { snprintf(p, sizeof p, "%s/%s", path, de->d_name); if (!stat(p, &st) && st.st_mtime > t) t = st.st_mtime; }
+	if (d) closedir(d);
+	return t;
+}
+static void scratch_sweep(void) {
+	DIR *d = scratch_dir[0] ? opendir(scratch_dir) : NULL; if (!d) return;
+	setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE);
+	struct dirent *de; char p[2200]; int n = 0; const time_t now = time(0);
+	while ((de = readdir(d))) {
+		if (strncmp(de->d_name, "gpuarchiver-", 12)) continue;
+		snprintf(p, sizeof p, "%s/%s", scratch_dir, de->d_name);
+		if (now - newest_in(p) > SCRATCH_IDLE && !nftw(p, rm_entry, 8, FTW_DEPTH | FTW_PHYS)) n++;
+	}
+	closedir(d);
+	setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_DEFAULT);
+	if (n) fprintf(stderr, "    gpu: shader archive: %d of Metal's leftover scratch folders removed (%s)\n", n, scratch_dir);
+}
+static void *sweeper(void *arg) { (void)arg; for (;;) { scratch_sweep(); sleep(300); } return 0; }
+
 static pthread_mutex_t fl_m = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t fl_c = PTHREAD_COND_INITIALIZER; static int fl_req;   /* 1 flush, 2 the warm-up's */
 void mtl_archive_flush_soon(int warm) {   /* (the render thread: a first session's segment is hundreds of MB) */
 	pthread_mutex_lock(&fl_m); if (fl_req < 1 + !!warm) fl_req = 1 + !!warm; pthread_cond_signal(&fl_c); pthread_mutex_unlock(&fl_m);
@@ -232,6 +269,7 @@ int mtl_archive_open(const char *cache_dir, MtlAirStore store) {
 		for (char *c = fp; *c; c++) if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || *c == '_')) *c = '_';
 		char base[1024]; snprintf(base, sizeof base, "%s/metal", cache_dir); mkdir(base, 0755);
 		snprintf(dir, sizeof dir, "%s/%s", base, fp);
+		char cache[1024]; if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache, sizeof cache)) snprintf(scratch_dir, sizeof scratch_dir, "%s/com.apple.gpuarchiver", cache);
 		if (mkdir(dir, 0755) && access(dir, W_OK)) { fprintf(stderr, "    gpu: shader archive: cannot use %s: off\n", dir); return 0; }
 		DIR *d = opendir(base); struct dirent *de; char p[2200];
 		while (d && (de = readdir(d))) if (de->d_name[0] != '.' && strcmp(de->d_name, fp)) { snprintf(p, sizeof p, "%s/%s", base, de->d_name); remove_dir(p); fprintf(stderr, "    gpu: shader archive: %s is another GPU's or OS build's: removed\n", p); }
@@ -276,6 +314,7 @@ int mtl_archive_open(const char *cache_dir, MtlAirStore store) {
 		orig = method_setImplementation(m, (IMP)new_pipe);
 		on = 1;
 		pthread_t t; if (!pthread_create(&t, 0, flusher, 0)) pthread_detach(t);
+		if (!pthread_create(&t, 0, sweeper, 0)) pthread_detach(t);
 		atexit(at_exit);
 		fprintf(stderr, "    gpu: shader archive: %d segments, %.1f MB (%s)%s%s\n", (int)segs.count, bytes / 1048576.0, dir, compact ? ": compacting this session" : "", start_over ? ": too many segments, started over" : "");
 	}

@@ -88,3 +88,16 @@ format. The behaviour follows Vita3K's SceCamera module; there's no console refe
     cc -O1 -g -Wall -Wno-unused-function $INC $(pkg-config --cflags --libs sdl3) camera_test.c -o /tmp/camera_test && /tmp/camera_test
 
 It prints `all passed`.
+
+## Metal's scratch folders: `mtl_archive_test.m` (macOS)
+
+Checks the sweep in `runtime/gfx/mtl_archive.m`. Metal gives every binary archive a pipeline is added to a scratch
+folder (`com.apple.gpuarchiver/gpuarchiver-<hex>` in the user's cache folder) and never removes it; the archive keeps
+one per shader library, so a week of test runs once left 43 GB of them. The sweep removes the ones untouched for 20
+minutes. The test checks, in a temporary folder, that only idle `gpuarchiver-*` folders go. Then, with Metal itself, it
+checks the two facts the sweep relies on: the folder is where the sweep looks, and a written archive (and its file)
+still finds its pipelines once the folder is gone. A macOS update that changes either fails here.
+
+    clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
+
+It prints `all passed`.
