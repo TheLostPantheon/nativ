@@ -114,6 +114,8 @@ static std::atomic<bool> g_prep_card;             /* the shader prep card is up 
 static int g_prep_demo[3] = {-1, 0, 0};           /* RECOMP_OVERLAY_DUMP_UI=prep: the card with these numbers (done, total, seconds left) */
 static void build_prep(void); static void build_prep_corner(float w, float hgt, int done, int total);
 static std::atomic<bool> g_quit_card;             /* the quit card is (overlay_quit_confirm) */
+static std::atomic<int> g_layout_ask, g_layout_answer;   /* the layout card: asked, and its answer (1 touch, 2 PS TV) */
+static bool g_layout_card, g_layout_remember;
 
 int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt) {
 	if (!device) return 0;
@@ -159,6 +161,7 @@ static void intro_end(void) {   /* the touch card, done or skipped: never again 
 	g_paused = false; apply_pause();
 }
 void overlay_close(void) {   /* closing the menu resumes: a Game > Pause doesn't outlive it */
+	if (g_layout_card) { g_layout_card = false; g_layout_ask = 0; g_layout_answer = 1; }   /* (Escape on the layout card: touch, the default) */
 	intro_end();
 	if (g_prep_card) { g_prep_card = false; gfx_gpu_shader_prep_skip(); }   /* (the card closed before the builds were done: Skip) */
 	g_quit_card = false;
@@ -369,11 +372,10 @@ static void page_game(void) {
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1f×")) set_chr(P.chr);
 	}
 	if (display_pstv_looked()) {   /* (display.c's PS TV mode: a game with a PS TV layout of its own) */
-		ui::row("Controller layout", "How the touch screen's actions are done. Touch screen: as on a handheld, by mouse clicks or the touch cursor. PS TV buttons: the game's own layout for a PS TV's controller, its touch actions on buttons and sticks. For a controller only: the touch screen is off, and keyboard and mouse don't play the game in it. Applies the next time the game starts.");
-		static const char *const names[2] = {"Touch screen##cl", "PS TV buttons##cl"};
-		int v = settings_int("controller_layout", 1) == 2;   /* (the setting's values: 1 touch, 2 buttons) */
-		if (ui::segmented(names, 2, &v)) { settings_set_int("controller_layout", v ? 2 : 1); settings_save(); }
-		ImGui::SameLine(); ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.85f); ImGui::AlignTextToFramePadding(); ui::muted_wrapped("Controller only"); ImGui::PopFont();
+		ui::row("Controller layout", "How the touch screen's actions are done, chosen as the game starts and kept until you quit. Standard: the game as on a handheld, with keyboard, mouse or a controller (its touch cursor). PS TV: the game's own PS TV layout, every action on buttons and sticks, a controller only. Ask: a choice at each start while a controller is connected, Standard otherwise. Applies the next time the game starts.");
+		static const char *const names[3] = {"Ask at start##cl", "Standard##cl", "PS TV##cl"};
+		int v = settings_int("controller_layout", 0); if (v < 0 || v > 2) v = 0;   /* (the setting's values: 0 ask, 1 standard (touch), 2 PS TV) */
+		if (ui::segmented(names, 3, &v)) { settings_set_int("controller_layout", v); settings_save(); }
 	}
 	if (game_option("online")) {
 		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. Applies the next time the game starts.");
@@ -1021,7 +1023,8 @@ static void build_closed(void) {
 	}
 	if (g_has_window) {   /* the shader prep (gfx_gpu.c): the card when it asks (after the touch card), the corner line while skipped, a toast when done */
 		int done, total; double eta; const int ps = gfx_gpu_shader_prep(&done, &total, &eta);
-		if (ps == 1 && !g_intro && !g_open) { g_prep_card = true; g_open = true; apply_pause(); }
+		if (g_layout_ask && !g_layout_card && !g_intro && !g_open) { g_layout_card = true; g_open = true; apply_pause(); }   /* (the game waits for it: before the prep card) */
+		else if (ps == 1 && !g_intro && !g_open && !g_layout_card) { g_prep_card = true; g_open = true; apply_pause(); }
 		else if (ps == 2 && total > 0) build_prep_corner(w, hgt, done, total);
 		else if (ps == 3) overlay_toast_titled("Shaders ready", "Built for this computer: no more pauses to build them.", 4.0);
 	}
@@ -1324,6 +1327,52 @@ static void build_prep(void) {
 	ImGui::End();
 	ImGui::PopStyleVar();
 }
+/* ---- the layout card (overlay_layout_ask): Killzone 1.12 decides at boot whether it plays as a PS TV (every touch action on
+ * buttons and sticks, a controller only) or a handheld (touch, with keyboard, mouse or a controller's touch cursor), and
+ * keeps it. Touch is the default; the PS TV layout is the player's choice, offered before the title */
+static void layout_choose(int v) {
+	if (g_layout_remember) { settings_set_int("controller_layout", v); settings_save(); }
+	g_layout_card = false; g_layout_ask = 0; g_layout_answer = v;
+	g_open = false; g_paused = false; apply_pause();
+}
+static void build_layout(void) {
+	const ImGuiViewport *vp = ImGui::GetMainViewport(); const float em = ImGui::GetFontSize();
+	ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), ui::u32(ui::bg, 0.85f));
+	const float cw = fminf(vp->Size.x - 2 * em, 34 * em);
+	ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSizeConstraints(ImVec2(cw, 0), ImVec2(cw, vp->Size.y - 2 * em));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.4f, em * 1.2f));
+	ImGui::Begin("##layoutcard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+	ui::heading("Controller layout", em * 1.35f);
+	const char *game = std::getenv("RECOMP_GAME_NAME"); char body[320];
+	snprintf(body, sizeof body, "A controller is connected. %s can also play with its own PS TV layout, which puts every touch action on buttons and sticks. It keeps the layout it starts with until you quit.", game && *game ? game : "This game");
+	ImGui::TextWrapped("%s", body);
+	ImGui::Dummy(ImVec2(0, em * 0.4f));
+	const float bw = (ImGui::GetContentRegionAvail().x - em * 0.6f) * 0.5f;
+	int chosen = 0;
+	ImGui::BeginGroup();
+	if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	if (ui::primary_button("Standard##lc", ImVec2(bw, em * 2.4f))) chosen = 1;
+	ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + bw); ui::muted_wrapped("The game as on a handheld. Keyboard, mouse and controller (its touch cursor) all work."); ImGui::PopTextWrapPos();
+	ImGui::EndGroup();
+	ImGui::SameLine(0, em * 0.6f);
+	ImGui::BeginGroup();
+	if (ImGui::Button("PS TV##lc", ImVec2(bw, em * 2.4f))) chosen = 2;
+	ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + bw); ui::muted_wrapped("Controller only: every action on buttons and sticks. Keyboard and mouse don't play the game in it."); ImGui::PopTextWrapPos();
+	ImGui::EndGroup();
+	ImGui::Dummy(ImVec2(0, em * 0.4f));
+	ImGui::Checkbox("Remember my choice##lc", &g_layout_remember);
+	ui::muted_wrapped("Change it later in the menu: Game > Controller layout.");
+	ImGui::End();
+	ImGui::PopStyleVar();
+	if (chosen) layout_choose(chosen);
+}
+extern "C" int overlay_layout_ask(void) {   /* (the game's thread) */
+	if (!g_ctx || !g_has_window) return 1;
+	g_layout_answer = 0; g_layout_ask = 1;
+	int a; while (!(a = g_layout_answer.load())) { struct timespec ts = {0, 10000000}; nanosleep(&ts, nullptr); }
+	return a;
+}
 /* ---- the quit card (this file's header) */
 static void build_quit(void) {
 	const ImGuiViewport *vp = ImGui::GetMainViewport(); const float em = ImGui::GetFontSize();
@@ -1348,7 +1397,7 @@ static void build_quit(void) {
 }
 void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s) {
 	if (!overlay_is_open()) return;
-	render_frame(cmd, target, w, h, dt_s, g_has_window, g_quit_card ? build_quit : g_prep_card ? build_prep : build_ui);
+	render_frame(cmd, target, w, h, dt_s, g_has_window, g_quit_card ? build_quit : g_layout_card ? build_layout : g_prep_card ? build_prep : build_ui);
 }
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
@@ -1393,6 +1442,7 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 		return;
 	}
 	if (!strcmp(ui, "quit")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_quit); return; }   /* (the quit card) */
+	if (!strcmp(ui, "layout")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_layout); return; }   /* (the layout card: RECOMP_GAME_NAME names the game) */
 	if (!strcmp(ui, "prep")) { g_prep_demo[0] = 1240; g_prep_demo[1] = 5837; g_prep_demo[2] = 372; for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_prep); g_prep_demo[0] = -1; return; }   /* (the shader prep card, example numbers) */
 	if (!strncmp(ui, "intro", 5)) {   /* "intro", "intro:pad", "intro:touch": the touch card with that device highlighted; "@<seconds>" after it, that moment of its loop */
 		const char *at = strchr(ui, '@');

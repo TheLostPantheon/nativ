@@ -327,6 +327,9 @@ static void o_depth_bias(Cpu *c) {
 	}
 }
 static int8_t clamp8(int v) { return (int8_t)(v < -128 ? -128 : v > 127 ? 127 : v); }
+/* a diagnostic switch, read once: getenv walks the environment, and the draw observers called it on every draw (1.4% of
+ * Uncharted's main thread, 2026-11-01) */
+static int env_flag(const char *name, int *v) { if (*v < 0) *v = getenv(name) != 0; return *v; }
 static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t index_format, uint32_t indices, uint32_t count) {
 	GfxDraw d;
 	memset(&d, 0, sizeof d);
@@ -383,7 +386,8 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 	/* RECOMP_LOG_DEPTEX=1: a fragment program's dependent sampler (GXP +128/+132 table: SA slot -> unit) whose unit the
 	 * draw has no texture for -- its SMP samples transparent black. Once per program and unit, with the context's
 	 * words for the unit (Killzone's body-shadow decal 0x2a4db910 reads units 1-4, none bound: its whole box went black) */
-	if (getenv("RECOMP_LOG_DEPTEX") && is_gxp(d.fprog)) {
+	static int log_deptex = -1;
+	if (env_flag("RECOMP_LOG_DEPTEX", &log_deptex) && is_gxp(d.fprog)) {
 		uint32_t dc = RD32(d.fprog + 128), dof = RD32(d.fprog + 132), db = dof ? d.fprog + 132 + dof : 0;
 		for (uint32_t i = 0; db && i < dc && i < 32; i++) {
 			uint32_t rilo = RD16(db + 4 * i), u = rilo / 4;
@@ -493,7 +497,8 @@ static void begin_scene(uint32_t rt, uint32_t cs, uint32_t ds_load, uint32_t ds_
 	if (cs && RD32(cs) & 4) {
 		GfxTexture bt = texture(cs + 0x20);
 		t.data = RD32(cs + 8) & ~3u; t.format = (RD32(cs + 4) & 0xf1b00000u) | (srgb_on() ? RD32(cs) & 0x3000u : 0);   /* format + the gamma mode: word 0 bits 12-13, as Sony's sceGxmColorSurfaceGetGammaMode reads it (ldr [r0]; and #0x3000), kept in the format's unused bits 12-13 (gfx.h GFX_TGT_GAMMA) */
-		if ((RD32(cs) & 0x3000u) && getenv("RECOMP_LOG_GAMMA")) {   /* which surfaces are sRGB (once each; logged whether or not RECOMP_SRGB applies them) */
+		static int log_gamma = -1;
+		if ((RD32(cs) & 0x3000u) && env_flag("RECOMP_LOG_GAMMA", &log_gamma)) {   /* which surfaces are sRGB (once each; logged whether or not RECOMP_SRGB applies them) */
 			static uint32_t seen[32]; static int nseen; int k; for (k = 0; k < nseen; k++) if (seen[k] == t.data) break;
 			if (k == nseen && nseen < 32) { seen[nseen++] = t.data; fprintf(stderr, "    gamma: colour surface %#x format %#x mode %u (%ux%u)\n", t.data, t.format, (RD32(cs) >> 12) & 3u, t.width, t.height); }
 		}
@@ -523,7 +528,8 @@ static void begin_scene(uint32_t rt, uint32_t cs, uint32_t ds_load, uint32_t ds_
 		if (t.ms_x * t.ms_y > 1 && t.scale_mode) gfxcov_gap("render_target_msaa", t.ms_y > t.ms_x ? "2x, downscaled" : "4x, downscaled", 1, "drawn single-sampled: no antialiasing");
 		if (t.ms_x * t.ms_y == 1 && t.scale_mode) gfxcov_gap("render_target_msaa", "1x target at 2x the surface, downscaled", 1, "drawn at the surface's size: no supersampling");
 	}
-	if (getenv("RECOMP_LOG_RT")) {   /* each distinct render target / surface pairing, once */
+	static int log_rt = -1;
+	if (env_flag("RECOMP_LOG_RT", &log_rt)) {   /* each distinct render target / surface pairing, once */
 		static uint32_t seen[64][3]; static int nseen; int k;
 		for (k = 0; k < nseen; k++) if (seen[k][0] == rt && seen[k][1] == t.data && seen[k][2] == ms) break;
 		if (k == nseen && nseen < 64) {
@@ -557,8 +563,39 @@ static void o_set_region_clip(Cpu *c) {
  * writes its notifications and status words */
 static void o_end_scene(Cpu *c) { gfx_end_scene(); }
 
-/* sceGxmFinish(context): everything drawn back in guest memory (the game may read its render targets) */
-static void o_finish(Cpu *c) { gfx_sync_to_guest(); }
+/* sceGxmFinish(context): everything drawn back in guest memory (the game may read its render targets). Sony's Finish then
+ * polls four words of the GPU's progress until each equals its value (the context's +0x3fc/+0x420/+0x444/+0x47c: the
+ * word's address, then the value), words the kicks write (gpu.c). The host's work is all done by now (drawn as each scene
+ * ended; the writes held back for visibility counts settled here), so a word short of its value is one no kick wrote:
+ * logged, and written, as the GPU would have by now. Uncharted hung there after a save, the main thread polling for ever
+ * (2026-10-30, Mac and Windows). Each call is logged with its four words (it's rare: saves, level changes). */
+extern uint64_t display_frames(void);
+static uint32_t finish_ctx; static uint64_t finish_scenes; static unsigned finish_n;   /* the Finish under way: its context, until a scene begins */
+static int finish_check(const char *when) {   /* its four words: logged, the short ones written; 1 if any was */
+	static const uint32_t off[4] = {0x3fc, 0x420, 0x444, 0x47c};
+	char line[256]; int len = 0, short_of = 0;
+	for (int i = 0; i < 4; i++) {
+		const uint32_t p = RD32(finish_ctx + off[i]), want = RD32(finish_ctx + off[i] + 4), have = p ? RD32(p) : want;
+		len += snprintf(line + len, sizeof line - (size_t)len, " %#x=%#x/%#x", p, have, want);
+		if (have != want) short_of |= 1 << i;
+	}
+	if (short_of || when[0] == 'a')
+		fprintf(stderr, "    gxm: sceGxmFinish #%u (frame %llu) %s:%s%s\n", finish_n, (unsigned long long)display_frames(), when, line,
+		        short_of ? " -- not all written by the kicks, written now" : "");
+	for (int i = 0; i < 4; i++) if (short_of & (1 << i)) { const uint32_t p = RD32(finish_ctx + off[i]); WR32(p, RD32(finish_ctx + off[i] + 4)); }
+	return short_of != 0;
+}
+static void o_finish(Cpu *c) {
+	gfx_sync_to_guest(); extern void gfx_vis_settle(void); gfx_vis_settle();
+	finish_ctx = A0; finish_scenes = nscenes; finish_n++;
+	if (finish_ctx) finish_check("at its call, waits for");
+}
+/* sceGpuSignalWait (gpu.c), Sony's Finish polling: the same words again, should something have moved one after the call */
+void gxm_finish_poll(void) {
+	if (!finish_ctx) return;
+	if (nscenes != finish_scenes) { finish_ctx = 0; return; }   /* (a scene began: that Finish returned) */
+	finish_check("while it polls");
+}
 
 /* RECOMP_DUMP_GXP=<dir>: every program the game registers, as <dir>/<address>.gxp (GXP header:
  * "GXP\0", version, then the total size at +8), for usse_dis / usse_run offline */

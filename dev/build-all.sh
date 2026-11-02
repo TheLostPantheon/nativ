@@ -7,12 +7,15 @@
 #    launcher's Play does (vitarecomp ready): its code regenerated when recompiler/ or its pack.toml changed since the
 #    last regeneration (uncommitted edits count too), then built when the tools did.
 # Refuses while a game runs (relinking a running binary can take it down), and skips a title whose game started since.
+# NATIV_BUILD_ALL_NOPULL=1: no pull (release.sh: the checkout is the release's tag and stays so).
 # "== " lines are the summary.
 set -u
 ROOT=${0:A:h:h}; cd $ROOT
 if pgrep -x game_host >/dev/null || pgrep -x sk_host >/dev/null; then echo "== a game is running: close it first"; exit 1; fi
 echo "== start $(date +%T) on $(git branch --show-current) at $(git rev-parse --short HEAD)"
-if [[ $(git branch --show-current) == main && -z $(git status --porcelain --untracked-files=no) ]]; then
+if [[ -n ${NATIV_BUILD_ALL_NOPULL:-} ]]; then
+	echo "== no pull (NATIV_BUILD_ALL_NOPULL)"
+elif [[ $(git branch --show-current) == main && -z $(git status --porcelain --untracked-files=no) ]]; then
 	git pull --ff-only -q && echo "== pulled: now at $(git rev-parse --short HEAD)" || echo "== pull failed: building what is here"
 else
 	echo "== not a clean main: no pull"

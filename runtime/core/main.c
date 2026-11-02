@@ -212,13 +212,25 @@ static int host_preferred(const char *n) {
 }
 
 #define RESOLVE_SLOTS 4096
-static struct { uint32_t addr; HleFn fn; uint32_t target; int known; } resolved[RESOLVE_SLOTS];
+static struct { uint32_t addr; HleFn fn; uint32_t target; unsigned flags; int known; } resolved[RESOLVE_SLOTS];
+/* what recomp_call_external asks of an import's name, worked out once with its resolution: it compared the name against
+ * a list of formatting functions (and setjmp, longjmp) on every call, 1.9% of Uncharted's main thread (2026-11-01) */
+enum { RF_FMT = 1, RF_SETJMP = 2, RF_LONGJMP = 4, RF_GXM = 8 };
+static unsigned name_flags(const char *n) {
+	static const char *const fmts[] = {"sprintf", "snprintf", "vsprintf", "vsnprintf", "sceClibSnprintf", "sceClibVsnprintf", 0};
+	unsigned f = 0;
+	for (int i = 0; fmts[i]; i++) if (!strcmp(fmts[i], n)) f |= RF_FMT;   /* (the formatting functions: the buffer is the first argument) */
+	if (!strcmp(n, "setjmp") || !strcmp(n, "_setjmp")) f |= RF_SETJMP;
+	if (!strcmp(n, "longjmp") || !strcmp(n, "_longjmp")) f |= RF_LONGJMP;
+	if (!strncmp(n, "sceGxm", 6)) f |= RF_GXM;
+	return f;
+}
 /* an import: the host's implementation, or (*target) a loaded module's export -- which with a host
- * function as well (the GXM boundary's observers) runs after it */
-static HleFn hle_resolve(uint32_t addr, const char *name, uint32_t *target) {
+ * function as well (the GXM boundary's observers) runs after it; *flags: its name's RF_ bits */
+static HleFn hle_resolve(uint32_t addr, const char *name, uint32_t *target, unsigned *flags) {
 	uint32_t h = (addr >> 4) & (RESOLVE_SLOTS - 1);
 	for (uint32_t k = 0; k < RESOLVE_SLOTS; k++, h = (h + 1) & (RESOLVE_SLOTS - 1)) {
-		if (__atomic_load_n(&resolved[h].known, __ATOMIC_ACQUIRE) && resolved[h].addr == addr) { *target = resolved[h].target; return resolved[h].fn; }   /* acquire: pairs with the release below, so addr/fn/target are seen filled */
+		if (__atomic_load_n(&resolved[h].known, __ATOMIC_ACQUIRE) && resolved[h].addr == addr) { *target = resolved[h].target; *flags = resolved[h].flags; return resolved[h].fn; }   /* acquire: pairs with the release below, so addr/fn/target are seen filled */
 		if (!resolved[h].known) {   /* benign race: two threads may both resolve the same import */
 			HleFn fn = hle_find(name);
 			uint32_t t = fn && host_preferred(name) ? 0 : export_addr(name);
@@ -226,13 +238,13 @@ static HleFn hle_resolve(uint32_t addr, const char *name, uint32_t *target) {
 			else if (!fn && !strncmp(name, "sceGxm", 6)) {   /* no libgxm loaded: the game's GXM calls have nowhere to go */
 				static int said; if (!said) { said = 1; fprintf(stderr, "%s: GXM is Sony's code -- add libgxm_es4 libgpu_es4 to the game's MODULES (packs/<title>/pack.toml)\n", name); }
 			}
-			resolved[h].addr = addr; resolved[h].fn = fn; resolved[h].target = t;
+			resolved[h].addr = addr; resolved[h].fn = fn; resolved[h].target = t; resolved[h].flags = name_flags(name);
 			__atomic_store_n(&resolved[h].known, 1, __ATOMIC_RELEASE);
-			*target = t;
+			*target = t; *flags = resolved[h].flags;
 			return fn;
 		}
 	}
-	*target = 0;
+	*target = 0; *flags = name_flags(name);
 	return hle_find(name);
 }
 
@@ -332,17 +344,15 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 		if (sf) { fprintf(sf, "%#x %s\n", addr & ~1u, (addr & 3) || (c->r[14] & 1) ? "thumb" : "arm"); fclose(sf); }
 		summary("stopped"); exit(2);
 	}
-	if ((name[0] == 'l' || name[0] == '_') && (!strcmp(name, "longjmp") || !strcmp(name, "_longjmp"))) recomp_longjmp(c);   /* (returns only to fall back) */
-	if ((name[0] == 's' || name[0] == '_') && (!strcmp(name, "setjmp") || !strcmp(name, "_setjmp"))) { static int warned; if (!warned++) fprintf(stderr, "setjmp called through a pointer (lr %#x): a longjmp to it can't unwind\n", c->r[14]); }
-	uint32_t target;
-	HleFn fn = hle_resolve(addr, name, &target);
+	uint32_t target; unsigned fl;
+	HleFn fn = hle_resolve(addr, name, &target, &fl);
+	if (fl & RF_LONGJMP) recomp_longjmp(c);   /* (returns only to fall back) */
+	if (fl & RF_SETJMP) { static int warned; if (!warned++) fprintf(stderr, "setjmp called through a pointer (lr %#x): a longjmp to it can't unwind\n", c->r[14]); }
 	if (target) {   /* a loaded module's export: its recompiled code */
 		GuestFn f = guest_lookup(target & ~1u);
 		/* the formatting functions are watched as when the host did them (RECOMP_LOG_FORMAT, the
 		 * last formatted string on a stop): the buffer is the first argument */
-		static const char *const fmts[] = {"sprintf", "snprintf", "vsprintf", "vsnprintf", "sceClibSnprintf", "sceClibVsnprintf", 0};
-		int is_fmt = 0;
-		for (int i = 0; fmts[i]; i++) if (!strcmp(fmts[i], name)) is_fmt = 1;
+		const int is_fmt = (fl & RF_FMT) != 0;
 		uint32_t buf = c->r[0];
 		if (f) {
 			uint32_t a0 = c->r[0], a1 = c->r[1], a2 = c->r[2], a3 = c->r[3];
@@ -359,7 +369,7 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 				c->r[0] = a0; c->r[1] = a1; c->r[2] = a2; c->r[3] = a3;
 			}
 			f(c);
-			if (log_gxm() && !strncmp(name, "sceGxm", 6))
+			if ((fl & RF_GXM) && log_gxm())
 				fprintf(stderr, "gxm %-44s %08x %08x %08x %08x -> %08x (Sony)\n", name, a0, a1, a2, a3, c->r[0]);
 			{   /* RECOMP_TRACE_MODULE=<prefix>[,...]: calls to a loaded module's exports by those names, with the first
 			     * four arguments and the result (RECOMP_LOG_IMPORTS sees only the host's) */

@@ -17,7 +17,7 @@
 #include "metrics.h"
 #include "platform.h"
 
-static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }   /* metrics.c: each entry point's own wall-clock cost */
+static uint64_t now_us(void) { return plat_now_us(); }   /* metrics.c: each entry point's own wall-clock cost */
 
 /* one renderer lock around every entry point: the game's render thread records draws while Sony's
  * display-queue thread presents (its flip callback lands in sceDisplaySetFrameBuf), and since the
@@ -203,7 +203,25 @@ void gfx_shader_prep_tick(void) {   /* (the window's loop while the game is paus
  * the "render" metric counted that time on both threads. The wait is the display thread pacing itself to the GPU, not
  * renderer work, so it stays outside the metric too. RECOMP_GPU_READBACK_PREWAIT=0: wait under the lock, as before. */
 static int readback_prewait(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_READBACK_PREWAIT"); v = !(e && *e) || atoi(e) != 0; } return v; }
+/* a scene into the buffer being shown still being drawn by another thread: present waits for its end, as the console's flip
+ * waits on the buffer's sync object (this host's flips complete at once: gpu.c). Killzone draws a frame's scene on a job
+ * thread, the composite first, then its ~47 HUD draws; at 60 fps the display thread's flip sometimes came after the composite,
+ * and that frame showed without its HUD, the rest of its draws counted into the buffer's next one (F5, 2026-11-01: "1 draws
+ * into it", then 95). Up to RECOMP_PRESENT_SCENE_WAIT_MS (default 50, 0 off) */
+int gfx_gpu_scene_open_on(uint32_t base);
+static void present_scene_wait(uint32_t base) {
+	static int lim = -1; if (lim < 0) { const char *e = getenv("RECOMP_PRESENT_SCENE_WAIT_MS"); lim = e && *e ? atoi(e) : 50; }
+	if (lim <= 0) return;
+	const uint64_t t0 = now_us(); static unsigned waits, timeouts;
+	for (int first = 1;; first = 0) {
+		int open; LOCKED(open = gfx_gpu_scene_open_on(base));
+		if (!open) { if (!first && !waits++) fprintf(stderr, "    present: waited for a scene still drawing into the buffer shown (%#x, %.2f ms): the first such\n", base, (now_us() - t0) / 1e3); return; }
+		if (now_us() - t0 > (uint64_t)lim * 1000) { if (!timeouts++) fprintf(stderr, "    present: a scene into the buffer shown (%#x) still open after %d ms: shown as it is\n", base, lim); return; }
+		plat_sleep_ns(100000);
+	}
+}
 void gfx_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format) {
+	if (gpu_backend()) present_scene_wait(base);
 	if (gpu_backend() && readback_prewait()) {
 		void *due[16]; int n = 0;
 		LOCKED(n = gfx_gpu_readbacks_due(due, 16));

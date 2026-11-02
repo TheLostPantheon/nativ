@@ -63,6 +63,16 @@ double plat_cpu_seconds(void) {
 	struct rusage ru; getrusage(RUSAGE_SELF, &ru);
 	return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
 }
+/* macOS: the uptime counter (a register read). Its clock_gettime(CLOCK_MONOTONIC) also reads the boot time through
+ * gettimeofday on every call: the renderer's per-draw timers were 9% of Uncharted's main thread in Low Power Mode
+ * (2026-11-01). Linux's CLOCK_MONOTONIC is already a vDSO read. */
+uint64_t plat_now_us(void) {
+#ifdef __APPLE__
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000u;
+#else
+	struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+#endif
+}
 void plat_sleep_ns(uint64_t ns) {
 	struct timespec ts = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) };
 	while (nanosleep(&ts, &ts) && errno == EINTR) ;

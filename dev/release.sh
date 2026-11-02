@@ -17,6 +17,7 @@
 #                                   is notarised and its ticket stapled, then the .dmg the same, so a player's Mac
 #                                   opens it with no more than "downloaded from the internet: open?"
 #   NATIV_SIGN_CMD                  Windows: a command signing one program in place (dev/windows-install.sh)
+#   NATIV_RELEASE_SKIP_BUILDS=1     package without first building every game in this machine's library (below)
 # Unsigned without them, as players' guides describe. Publishing is separate and printed at the end.
 # This machine's own values for these (a signing identity, a profile name) go in dev/local.env, which git ignores.
 set -euo pipefail
@@ -28,6 +29,15 @@ if (( $# )); then
   [[ "$(git -C "$ROOT" describe --tags --exact-match 2>/dev/null)" == "$TAG" ]] || { echo "release.sh: check out $TAG first (git tag $TAG; git checkout $TAG)"; exit 1; }
   [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]] || { echo "release.sh: uncommitted changes: a release is built from the tag alone"; exit 1; }
   [[ -n ${NATIV_RELEASES:-} ]] || echo "(no NATIV_RELEASES: these installs won't check for updates)"
+  # every game in this machine's library built with these tools first, as a player's machine will (dev/build-all.sh):
+  # v0.1.3 and v0.1.4 shipped Linux tools that built no game, and nothing here had tried one (2026-10-30)
+  if [[ -z ${NATIV_RELEASE_SKIP_BUILDS:-} ]]; then
+    if ! built=$(NATIV_BUILD_ALL_NOPULL=1 zsh "$H/build-all.sh" 2>&1); then
+      grep '^== ' <<<"$built" || true
+      echo "release.sh: not every game here builds with these tools (above): nothing packaged (NATIV_RELEASE_SKIP_BUILDS=1 packages anyway)"; exit 1
+    fi
+    echo "games built with these tools: $(grep -c '^== .* ok ' <<<"$built" || true)"
+  fi
 fi
 OUT=$ROOT/build/release/$TAG; mkdir -p "$OUT"
 sha() { sha256sum "$@" 2>/dev/null || shasum -a 256 "$@"; }

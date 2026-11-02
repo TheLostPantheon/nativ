@@ -1056,7 +1056,68 @@ static void record_result(uint32_t addr, const char *rep) {
  * call where they part */
 #define SEQ_MAX_DEFAULT 30000   /* RECOMP_SEQ_MAX=n: a longer record */
 static uint32_t (*seq_buf)[2]; static int seq_max; static volatile int seq_n = -1; static const char *seq_tn;
+/* RECOMP_SEQ_WINDOW=<ms>: the arming records, instead, every thread's distinct (function, caller) pairs for that many
+ * milliseconds, each with the order of its first call and its count, into seqw_<frame>.txt -- a moment a hook finds
+ * (Killzone's takedown on the player, stuck at 60 only, 2026-11-01) recorded at 60 and again at 30: the pairs one has
+ * and the other lacks are the calls a branch took in one only (dev/seqdiff.py). Lock-free, so the game keeps its rate. */
+#define SEQW_SLOTS (1u << 19)
+typedef struct { uint64_t key, count; const char *tn; uint32_t first; } SeqwPair;   /* key: function << 32 | caller */
+static SeqwPair *seqw_tab; static int seqw_ms = -1, seqw_state;   /* 0 idle, 1 recording, 2 arming or writing */
+static uint32_t seqw_order, seqw_used; static int seqw_full, seqw_fps; static uint64_t seqw_end, seqw_frame0; static char seqw_why[96];
+static uint64_t seqw_clock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000ull + (uint64_t)t.tv_nsec / 1000000; }
+static void seqw_hit(Cpu *c, uint32_t addr) {
+	const uint64_t key = (uint64_t)addr << 32 | (c->r[14] & ~1u);
+	const uint32_t order = __atomic_fetch_add(&seqw_order, 1, __ATOMIC_RELAXED);
+	uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 45) & (SEQW_SLOTS - 1);
+	for (uint32_t k = 0; k < SEQW_SLOTS; k++, h = (h + 1) & (SEQW_SLOTS - 1)) {
+		SeqwPair *p = &seqw_tab[h];
+		uint64_t cur = __atomic_load_n(&p->key, __ATOMIC_ACQUIRE);
+		if (!cur) {
+			if (__atomic_load_n(&seqw_used, __ATOMIC_RELAXED) >= SEQW_SLOTS / 4 * 3) { seqw_full = 1; return; }
+			if (__atomic_compare_exchange_n(&p->key, &cur, key, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+				p->first = order; p->tn = recomp_cur_tname();
+				__atomic_fetch_add(&p->count, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&seqw_used, 1, __ATOMIC_RELAXED); return;
+			}
+		}
+		if (cur == key) { __atomic_fetch_add(&p->count, 1, __ATOMIC_RELAXED); return; }
+	}
+}
+static int seqw_by_first(const void *a, const void *b) { const SeqwPair *x = a, *y = b; return (x->first > y->first) - (x->first < y->first); }
+static void seqw_close(uint64_t frame) {   /* (a frame hook) the window's time is up: its pairs to the file */
+	int one = 1; if (seqw_clock() < seqw_end || !__atomic_compare_exchange_n(&seqw_state, &one, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+	extern void display_set_frame_hook(void (*)(uint64_t)); display_set_frame_hook(0);
+	usleep(5000);   /* (calls under way land) */
+	SeqwPair *v = malloc(sizeof *v * (seqw_used ? seqw_used : 1)); uint32_t n = 0;
+	for (uint32_t i = 0; i < SEQW_SLOTS && n < seqw_used; i++) if (seqw_tab[i].key) v[n++] = seqw_tab[i];
+	qsort(v, n, sizeof *v, seqw_by_first);
+	char path[64]; snprintf(path, sizeof path, "seqw_%llu.txt", (unsigned long long)seqw_frame0);
+	FILE *f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "# %s at %d fps, frames %llu to %llu, %u calls, %u pairs%s\n# first count function caller thread\n", seqw_why, seqw_fps,
+		        (unsigned long long)seqw_frame0, (unsigned long long)frame, seqw_order, n, seqw_full ? " (TABLE FULL: later pairs missing)" : "");
+		for (uint32_t i = 0; i < n; i++) fprintf(f, "%u %llu %08x %08x %s\n", v[i].first, (unsigned long long)v[i].count, (uint32_t)(v[i].key >> 32), (uint32_t)v[i].key, v[i].tn ? v[i].tn : "?");
+		fclose(f);
+	}
+	fprintf(stderr, "seq: window from frame %llu (%s, %d fps) closed at frame %llu: %u pairs in %s\n", (unsigned long long)seqw_frame0, seqw_why, seqw_fps,
+	        (unsigned long long)frame, n, f ? path : "(file not written)");
+	free(v);
+	__atomic_store_n(&seqw_state, 0, __ATOMIC_RELEASE);
+}
 static void seq_arm(const char *why) {
+	if (seqw_ms < 0) { const char *e = getenv("RECOMP_SEQ_WINDOW"); seqw_ms = e ? atoi(e) : 0; }
+	if (seqw_ms > 0) {
+		int idle = 0; if (!__atomic_compare_exchange_n(&seqw_state, &idle, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;   /* (one window at a time) */
+		extern int display_frame_rate_60(void); extern void display_set_frame_hook(void (*)(uint64_t));
+		if (!seqw_tab) seqw_tab = malloc(sizeof *seqw_tab * SEQW_SLOTS);
+		if (!seqw_tab) { __atomic_store_n(&seqw_state, 0, __ATOMIC_RELEASE); return; }
+		memset(seqw_tab, 0, sizeof *seqw_tab * SEQW_SLOTS); seqw_order = seqw_used = 0; seqw_full = 0;
+		seqw_frame0 = display_frames(); seqw_fps = display_frame_rate_60() ? 60 : 30; snprintf(seqw_why, sizeof seqw_why, "%s", why);
+		seqw_end = seqw_clock() + (uint64_t)seqw_ms;
+		fprintf(stderr, "seq: window armed (%s) at frame %llu, %d fps, for %d ms\n", why, (unsigned long long)seqw_frame0, seqw_fps, seqw_ms);
+		display_set_frame_hook(seqw_close);
+		__atomic_store_n(&seqw_state, 1, __ATOMIC_RELEASE);
+		return;
+	}
 	pthread_mutex_lock(&wlock);
 	if (!seq_buf) { const char *e = getenv("RECOMP_SEQ_MAX"); seq_max = e ? atoi(e) : SEQ_MAX_DEFAULT; if (seq_max < 1000) seq_max = 1000; seq_buf = malloc(sizeof *seq_buf * (size_t)seq_max); }
 	if (seq_n < 0 && seq_buf) { seq_tn = recomp_cur_tname(); seq_n = 0; fprintf(stderr, "seq: armed (%s) at frame %llu, thread %s\n", why, (unsigned long long)display_frames(), seq_tn ? seq_tn : "?"); }
@@ -1074,6 +1135,7 @@ static void seq_hit(Cpu *c, uint32_t addr) {
 
 void recomp_enter(Cpu *c, uint32_t addr) {
 	if (seq_n >= 0) seq_hit(c, addr);
+	if (__atomic_load_n(&seqw_state, __ATOMIC_ACQUIRE) == 1) seqw_hit(c, addr);
 	if (cov_on) coverage(addr);
 	watch_hit(c, addr);
 	datawatch_hit();

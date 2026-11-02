@@ -642,10 +642,12 @@ def cmd_test(g):
     if ENV.get("TEST_SAVES"): shutil.copytree(ENV["TEST_SAVES"], os.path.join(td, "fs", "savedata0"), symlinks=True)   # TEST_SAVES=<a savedata0 folder>: start from those saves instead (the save dialog's list with saves in it)
     if ENV.get("TEST_SETTINGS"): shutil.copyfile(ENV["TEST_SETTINGS"], os.path.join(td, "settings.ini"))   # TEST_SETTINGS=<a settings.ini>: start from a player's settings instead of the defaults (a problem only their setup shows)
     # TEST_TOUCH: scripted front-panel taps; TEST_ENV: the game's own settings (e.g. its real shaders)
-    # the run ends once the test frame's shot is written (RECOMP_SHOT_LAST); SHOT_EVERY=n: a shot every n frames up to it
+    # the run ends once the test frame's shot is written (RECOMP_SHOT_LAST); SHOT_EVERY=n: a shot every n frames up to it;
+    # TEST_COVERAGE=0: no graphics coverage record (a benchmark: its bookkeeping per graphics call took a third of
+    # Uncharted's main thread, string compares under a lock, which no play run pays)
     frames = g.TEST_FRAMES; every = ENV.get("SHOT_EVERY") or ""
     e = game_env(g, g.TEST_ENV.split() + (ENV.get("EXTRA_ENV") or "").split(), [
-        ("RECOMP_GFX_COVERAGE", "gfxcov.json"), ("RECOMP_TITLE", g.TITLE_ID), ("RECOMP_GAME_NAME", g.NAME), ("RECOMP_INPUT", g.TEST_INPUT),
+        ("RECOMP_GFX_COVERAGE", "" if ENV.get("TEST_COVERAGE") == "0" else "gfxcov.json"), ("RECOMP_TITLE", g.TITLE_ID), ("RECOMP_GAME_NAME", g.NAME), ("RECOMP_INPUT", g.TEST_INPUT),
         ("RECOMP_TOUCH", g.TEST_TOUCH), ("RECOMP_HEADLESS", "1"), ("RECOMP_FS", "fs"), ("RECOMP_LOG", "0"), ("RECOMP_SHOT", every or frames),
         ("RECOMP_SHOT_LAST", frames)])   # (a series too ends at the test frame: it ran on to the timeout, 15 minutes for shots it had long since taken)
     with open(os.path.join(td, "test.log"), "wb") as log:

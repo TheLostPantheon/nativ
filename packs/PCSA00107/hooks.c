@@ -141,12 +141,53 @@ void recomp_hook_kz_entity(Cpu *c) {
  * down at +0x348 (set from the difficulty's Easy/Medium/HardGestureWindow at 0x8156b654, decremented by the update's dt at
  * 0x815689b0). While the player's is open, the window lets a captured mouse drag the front panel (window_touch_gesture_hint). */
 void recomp_hook_kz_gesture(Cpu *c) {
-	const uint32_t m = c->r[0]; if (!m || (kz_player && RD32(m + 0x1c) != kz_player)) return;
+	const uint32_t m = c->r[0]; if (!m) return;
+	const uint32_t owner = RD32(m + 0x1c); const int mine = !kz_player || owner == kz_player;
 	uint32_t b = RD32(m + 0x348); float w; memcpy(&w, &b, 4);
-	static float last; if (w > 0 && !(last > 0)) fprintf(stderr, "    kz gesture: window open (%.2f s, frame %llu t %.3f)\n", w, (unsigned long long)display_frames(), guest_time_us_peek() / 1e6);
-	if (!(w > 0) && last > 0) fprintf(stderr, "    kz gesture: window closed (frame %llu t %.3f)\n", (unsigned long long)display_frames(), guest_time_us_peek() / 1e6);
-	last = w;
-	if (w > 0) { extern void window_touch_gesture_hint(void); window_touch_gesture_hint(); }
+	/* every character's windows logged (a takedown an enemy starts on the player froze ~2.5 s with no prompt, 2026-11-01: is
+	 * its window the enemy's, and how does the enemy's component name the player?) */
+	enum { N = 64 }; static uint32_t comp[N]; static float lastw[N]; static int rr;
+	int i; for (i = 0; i < N && comp[i] != m; i++) {}
+	if (i == N) { for (i = 0; i < N && comp[i]; i++) {} if (i == N) i = rr++ % N; comp[i] = m; lastw[i] = 0; }
+	if (w > 0 && !(lastw[i] > 0)) {
+		fprintf(stderr, "    kz gesture: window open (%.2f s, %s melee, owner %#x, frame %llu t %.3f)", w, mine ? "the player's" : "another's", owner, (unsigned long long)display_frames(), guest_time_us_peek() / 1e6);
+		if (!mine && kz_player) for (uint32_t o = 0; o < 0x400; o += 4) if (RD32(m + o) == kz_player) fprintf(stderr, " [the player at +%#x]", o);
+		fprintf(stderr, "\n");
+	}
+	if (!(w > 0) && lastw[i] > 0) fprintf(stderr, "    kz gesture: window closed (%s melee, owner %#x, frame %llu t %.3f)\n", mine ? "the player's" : "another's", owner, (unsigned long long)display_frames(), guest_time_us_peek() / 1e6);
+	lastw[i] = w;
+	if (w > 0 && mine) { extern void window_touch_gesture_hint(void); window_touch_gesture_hint(); }
+}
+/* 1.12's fn_81622b7e (r0 = the other party's component of type 0x81b5889c): half of the takedown's "show the prompt" test in
+ * its per-frame update (fn_815a0688: show = fn_81622b7e(c) && !fn_816231bc(c), then HUD message 0x3b). On a handheld it is
+ * !c[0x24c] && !c[0x22e]; on a PS TV the partner flags +0x24d/+0x22f and the mode +0x1c4 join in. An enemy's takedown on the
+ * player stuck ~2.5 s with no prompt on touch only (2026-11-01): the fields, each time they change, say which flag held it */
+void recomp_hook_kz_prompt(Cpu *c) {
+	const uint32_t k = c->r[0]; if (!k) return;
+	const uint8_t a = RD8(k + 0x24c), b = RD8(k + 0x24d), e = RD8(k + 0x22e), f = RD8(k + 0x22f); const uint32_t mode = RD32(k + 0x1c4);
+	extern int display_pstv_active(void); const int pstv = display_pstv_active();
+	const int A = pstv ? (mode == 1 ? (!a || !b) : (!a && !b)) : !a, B = pstv ? (e || f) : e;
+	static uint32_t lk; static uint64_t last;
+	const uint64_t now = ((uint64_t)k << 32) ^ ((uint64_t)a << 24 | (uint64_t)b << 16 | (uint64_t)e << 8 | f) ^ ((uint64_t)mode << 40) ^ (uint64_t)pstv << 63;
+	if (now == last && k == lk) return;
+	last = now; lk = k;
+	fprintf(stderr, "    kz prompt: component %#x +0x24c %u +0x24d %u +0x22e %u +0x22f %u mode %u (%s): prompt %s (frame %llu)\n", k, a, b, e, f, mode,
+	        pstv ? "PS TV" : "touch", A && !B ? "shown" : "held back", (unsigned long long)display_frames());
+}
+/* 1.12's fn_81623f50 (r0 = a swipe controller, r1 = a gesture resource): a swipe requested -- unless the resource's owner
+ * ([r1+0x1c]) answers 0 to its vtable +0x19c, then it's dropped and the controller stays disabled (fn_8159c14c disables the
+ * human's at a takedown's start: both +0x24c/+0x24d set, the prompt held back; the enemy's takedown stuck with them so,
+ * 2026-11-01). Each request logged, and the answer (kz_swipe_ready at 0x81623f64, just after the call) */
+void recomp_hook_kz_swipe_request(Cpu *c) {
+	const uint32_t k = c->r[0], r = c->r[1], owner = r ? RD32(r + 0x1c) : 0, fn = owner && RD32(owner) ? RD32(RD32(owner) + 0x19c) : 0;
+	static int n; if (n++ >= 200) return;
+	const uint32_t pfn = kz_player && RD32(kz_player) ? RD32(RD32(kz_player) + 0x19c) : 0;
+	fprintf(stderr, "    kz swipe: request on controller %#x, resource %#x, its owner %#x (%s; check %#x, the player's %#x), frame %llu\n", k, r, owner,
+	        !owner ? "none" : owner == kz_player ? "the player" : "not the player", fn, pfn, (unsigned long long)display_frames());
+}
+void recomp_ihook_kz_swipe_ready(Cpu *c, int reg) {
+	(void)reg; static int n; if (n++ >= 200) return;
+	fprintf(stderr, "    kz swipe: the owner's check answered %u: %s (controller %#x, frame %llu)\n", c->r[0], c->r[0] ? "requested" : "DROPPED, the controller stays disabled", c->r[5], (unsigned long long)display_frames());
 }
 /* Two-finger turns: Killzone's valves and explosives (planting a charge). Each has a touch controller (ValveController, vtable
  * 0x81a00cbc; ExplosiveLocationController, 0x819fdf48) whose update (+0x74: FUN_814347e6, FUN_8142d294) reads the first two
@@ -233,8 +274,23 @@ void recomp_ihook_kz_budget_over(Cpu *c, int reg) {
 	fprintf(stderr, "    kz memory: %s in use %#x, past a Vita's %#x: +%#x '%s' (frame %llu)\n", t, total, vita, c->r[9],
 	        c->r[7] ? (const char *)G(c->r[7]) : "?", (unsigned long long)display_frames());
 }
+/* RECOMP_KZ_PSTV_DIAG=1: 1.12's isPSTV (0x810527c4: its word 1 a PS TV, 2 a handheld) -- each caller once, with the frame
+ * and thread of its first call and the answer then; at frame 300, 1000 and 3000 the callers' counts (which ask every frame,
+ * which once: a screen that keeps the answer it got) */
+void recomp_hook_kz_ispstv(Cpu *c) {
+	static int on = -1; if (on < 0) on = getenv("RECOMP_KZ_PSTV_DIAG") != 0;
+	if (!on) return;
+	enum { N = 512 }; static uint32_t lr[N], cnt[N]; static int n; static uint64_t next = 300;
+	const uint32_t a = c->r[14] & ~1u; int i; for (i = 0; i < n && lr[i] != a; i++) {}
+	if (i == n && n < N) { lr[n] = a; cnt[n] = 0; n++; char tn[32] = "?"; plat_thread_name(tn, sizeof tn);
+		fprintf(stderr, "    kz pstv: caller %#x first at frame %llu (%s), answer %u\n", a, (unsigned long long)display_frames(), tn, RD32(0x81aa1740u)); }
+	if (i < N) cnt[i]++;
+	if (display_frames() >= next) { next = next == 300 ? 1000 : next == 1000 ? 3000 : ~0ull;
+		fprintf(stderr, "    kz pstv: frame %llu, calls so far:", (unsigned long long)display_frames());
+		for (int k = 0; k < n; k++) fprintf(stderr, " %#x:%u", lr[k], cnt[k]); fprintf(stderr, "\n"); }
+}
 /* FUN_810044c6 (r0 = a string object, r1 = a C string): the game names its events through it (9122 call sites). With
- * RECOMP_KZ_EVENTS=1 the interrogation / brutal melee / zipline / knockdown ones are logged with the frame and the guest
+ * RECOMP_KZ_EVENTS (on unless =0) the interrogation / brutal melee / zipline / knockdown ones are logged with the frame and the guest
  * time -- the timing of an interrogation's prompt, the player's swipe and the verdict (in testing: the swipe window felt too
  * short) and of dropship deployments (enemies downed at 60) from a real session */
 static const char *const kz_event_names[] = {   /* matched by content: their addresses differ between builds */
@@ -243,10 +299,10 @@ static const char *const kz_event_names[] = {   /* matched by content: their add
 	"Zipline Attach", "Knockdown", "Falling", "Stagger", "KnockedOutTime",
 };
 void recomp_hook_kz_event(Cpu *c) {
-	static int on = -1; if (on < 0) on = getenv("RECOMP_KZ_EVENTS") != 0;
+	static int on = -1; if (on < 0) { const char *e = getenv("RECOMP_KZ_EVENTS"); on = !(e && *e == '0'); }   /* (on by default since 2026-11-01: a handful of lines a match, and a melee freeze's report needs them) */
 	if (!on || !c->r[1]) return;
 	const char *a = (const char *)G(c->r[1]);   /* (the constructor's C string) */
-	if (a[0] < 'B' || a[0] > 'Z') return;
+	if (a[0] < 'A' || a[0] > 'z') return;
 	for (size_t i = 0; i < sizeof kz_event_names / sizeof kz_event_names[0]; i++) if (!strncmp(a, kz_event_names[i], 40)) {
 		char tn[32] = "?"; plat_thread_name(tn, sizeof tn);
 		fprintf(stderr, "    kz event: frame %llu t %.3f %s (%s, lr %#x)\n", (unsigned long long)display_frames(), guest_time_us_peek() / 1e6, kz_event_names[i], tn, c->r[14]);
@@ -294,14 +350,15 @@ void recomp_ihook_kz_drop(Cpu *c, int reg) {
 }
 static void kz_player_mark(void) { if (kz_cur_entity) { kz_player = kz_cur_entity; kz_player_seen = display_frames(); } }
 void recomp_ihook_kz_period(Cpu *c, int reg) {   /* fn_8123a244 (r6 = the entity it files): its period, for the player at 60 */
-	if (reg < 0 || reg > 14 || !kz_60_on() || !kz_player || c->r[6] != kz_player) return;
+	if (reg < 0 || reg > 14 || !kz_60_on() || !c->r[6]) return;
+	if (!kz_player || c->r[6] != kz_player) return;
 	if (c->r[reg] == 33333u) c->r[reg] = 16667u;
 }
 /* the scheduler steps at 60 only while the player is in its 30 Hz (gameplay) mode: in its 15 Hz mode (66666: the game's cinematic
  * mode, the level intro's cutscene) it keeps the game's 30 Hz cadence -- something there steps per world update and the intro
  * played 1.6x fast with the scheduler at 60 (2026-10-18); cutscenes run at 30 then, as in many PC ports */
 static int kz_sched_60;   /* (kz_sched, once a frame) */
-static int kz_no(char k) { static const char *e = (const char *)-1; if (e == (const char *)-1) e = getenv("RECOMP_KZ_60_NO"); return e && strchr(e, k); }   /* (A/B: "w" world dt, "t" tick gate, "s" sub-step 1/60, "p" physics step off) */
+static int kz_no(char k) { static const char *e = (const char *)-1; if (e == (const char *)-1) e = getenv("RECOMP_KZ_60_NO"); return e && strchr(e, k); }   /* (A/B: "w" world dt, "t" tick gate, "s" sub-step 1/60, "p" physics step, "c" takedown clock test off) */
 void recomp_ihook_kz_sched_period(Cpu *c, int reg) { if (reg >= 0 && reg <= 14 && c->r[reg] == 33333u && kz_sched_60) c->r[reg] = 16667u; }
 /* FUN_8112f5a4, the physics world step (the scheduler's sub-step loop at 0x8158c136): it ignores the dt it is passed and loads the
  * world's own fixed step from +0xc8, 1/30 from its constructor (0x8112dc96) -- so at 60 every body (NPCs' character proxies, whose
@@ -491,8 +548,137 @@ void recomp_hook_kz_world(Cpu *c) {
 	if (d_from < 0 || (long)display_frames() < d_from || (long)display_frames() > d_to) return;
 	fprintf(stderr, "    kz world: frame %llu time %u deadline %llu\n", (unsigned long long)display_frames(), RD32(c->r[13]), (unsigned long long)c->r[2] | (unsigned long long)c->r[3] << 32);
 }
+/* Takedowns with the player (2026-11-01). At 60 a bot's takedown on the player stuck ~2.5 s in its opening pose, both
+ * parties frozen until its timeout; the cause was the two parties' clocks (kz_td_clock has the fix). Moving the player
+ * back to 30 for the takedown, from its first update, had left it stuck. 1.12's melee component: fn_8159c214 starts a
+ * takedown (this[0x7b] = 1; this[0x1c] the attacker, [this+0x90] - 0xc the other party), fn_815a0688 is its per-frame
+ * update. Each takedown with the player gets a line and arms the verify build's call-window record (RECOMP_SEQ_WINDOW,
+ * dev/seqdiff.py: how the cause was found); RECOMP_KZ_TAKEDOWN_TRACE=1 also traces the two melee components' words as
+ * they change. */
+static void kz_takedown_mark(uint32_t m, const char *why) {
+	if (!m || !kz_player) return;
+	const uint32_t owner = RD32(m + 0x1c), ref = RD32(m + 0x90), other = ref ? ref - 0xc : 0;
+	if (owner != kz_player && other != kz_player) return;
+	if (!RD8(m + 0x7b) && other != kz_player) return;   /* (the player's own component: only in a takedown; another's: from when it targets the player) */
+	if (RD8(m + 0x7b)) {
+	static uint64_t td_last;   /* (the line once a takedown: none in the 8 frames before) */
+	if (!td_last || display_frames() + 1 - td_last > 8)
+		fprintf(stderr, "    kz takedown: %s, the player %s (frame %llu, attacker's component %#x, the player's %#x)\n", why, owner == kz_player ? "attacking" : "taken",
+		        (unsigned long long)display_frames(), m, RD32(kz_player + 0x4bc));
+	if ((!td_last || display_frames() + 1 - td_last > 8) && hook_seq_arm)   /* (the verify build with RECOMP_SEQ_WINDOW: what this takedown runs, 60 vs 30) */
+		hook_seq_arm(owner == kz_player ? "the player's takedown" : "a takedown on the player");
+	td_last = display_frames() + 1;
+	}
+	/* the trace (RECOMP_KZ_TAKEDOWN_TRACE=1): both components' words that changed since this component's last look, at most once a frame each */
+	static int trace = -1; if (trace < 0) trace = getenv("RECOMP_KZ_TAKEDOWN_TRACE") != 0;
+	if (!trace) return;
+	const uint32_t comps[2] = {m, owner == kz_player ? (other ? RD32(other + 0x4bc) : 0) : RD32(kz_player + 0x4bc)};
+	enum { W = 0x3a0 / 4 }; static uint32_t base[2], snap[2][W]; static uint64_t seen[2];
+	static unsigned lines; if (lines > 40000) return;
+	for (int k = 0; k < 2; k++) {
+		const uint32_t cm = comps[k]; if (!cm) continue;
+		const int slot = k;
+		if (base[slot] != cm) {   /* the first look: every non-zero word, the state the takedown started from */
+			base[slot] = cm; char all[6144]; int al = 0;
+			for (int w = 0; w < W; w++) { snap[slot][w] = RD32(cm + 4 * w); if (snap[slot][w] && al < (int)sizeof all - 32) al += snprintf(all + al, sizeof all - (size_t)al, " +%#x %#x", 4 * w, snap[slot][w]); }
+			fprintf(stderr, "    kz td: frame %llu %s %#x first look:%s\n", (unsigned long long)display_frames(), k ? "other" : "this", cm, all); continue;
+		}
+		if (seen[slot] == display_frames()) continue;
+		seen[slot] = display_frames();
+		char line[4096]; int len = 0, n = 0;
+		for (int w = 0; w < W && len < (int)sizeof line - 40; w++) { const uint32_t v = RD32(cm + 4 * w); if (v != snap[slot][w]) { len += snprintf(line + len, sizeof line - (size_t)len, " +%#x %#x>%#x", 4 * w, snap[slot][w], v); snap[slot][w] = v; n++; } }
+		if (n) { lines++; fprintf(stderr, "    kz td: frame %llu %s%s:%s\n", (unsigned long long)display_frames(), k ? "other" : "this", RD8(m + 0x7b) ? "" : " (approach)", line); }
+	}
+}
+void recomp_hook_kz_takedown(Cpu *c) { kz_takedown_mark(c->r[0], "a takedown"); }
+/* 1.12's fn_815cc042 (1.00's fn_81595466; r0 a character's controller, its entity at +0x14, r1 the mode): 1 the 30 Hz mode
+ * (period 33333, its dt 1/30 at +0x200, the animation rate FUN_81273ab2(entity, 2, 2)), 0 the 15 Hz one (66666, 1/15): the
+ * player's in cutscenes, and the bots' (a bot's melee updated every 4th frame at 60, 2026-11-01: its takedown on the player
+ * stuck, and enemies' animation read as skipping frames). RECOMP_KZ_NPC_30=1: a non-player's 15 Hz mode becomes the 30 Hz
+ * one, through the game's own switch, so period, dt and animation rate move together. Each switch logged (the first 200). */
+void recomp_hook_kz_mode(Cpu *c) {
+	const uint32_t ent = c->r[0] ? RD32(c->r[0] + 0x14) : 0; const int mode = c->r[1] & 0xff;
+	static int raise = -1; if (raise < 0) raise = getenv("RECOMP_KZ_NPC_30") != 0;
+	const int npc = ent && ent != kz_player;
+	const int up = raise && npc && mode == 0;
+	static int n; if (n++ < 200) { char tn[32] = "?"; plat_thread_name(tn, sizeof tn);
+		fprintf(stderr, "    kz mode: entity %#x%s (%s) to the %s Hz mode%s (frame %llu)\n", ent, ent == kz_player ? " (the player)" : "", tn, mode ? "30" : "15", up ? ", raised to 30" : "", (unsigned long long)display_frames()); }
+	if (up) c->r[1] = (c->r[1] & ~0xffu) | 1u;
+}
+/* 0x815a000a, in 1.12's fn_8159ffde (r6 a melee component): r0 = its owner's animation state (the animation component
+ * [owner+0x100]'s vtable +0x78), a handle to a name ("CC Stow", "CC KillMoves", ...: chars at [r0]+0x10) the takedown's
+ * state +0x364 is read from: 1 CC Stow, 2 CC KillMoves / Melee Takedown MP, 5 none. At 60 a bot's takedown on the player
+ * stayed at 5 (its animation never went to CC Stow, 2026-11-01; kz_td_clock): with RECOMP_KZ_TAKEDOWN_TRACE=1, each
+ * component in a takedown with the player logged as its animation state changes */
+void recomp_ihook_kz_cc_state(Cpu *c, int reg) {
+	(void)reg; const uint32_t m = c->r[6], h = c->r[0];
+	static int trace = -1; if (trace < 0) trace = getenv("RECOMP_KZ_TAKEDOWN_TRACE") != 0;
+	if (!trace || !m || !h || !kz_player || !RD8(m + 0x7b)) return;
+	const uint32_t owner = RD32(m + 0x1c), ref = RD32(m + 0x90), other = ref ? ref - 0xc : 0;
+	if (owner != kz_player && other != kz_player) return;
+	const uint32_t so = RD32(h); char name[48] = "?";
+	if (so) { const char *p = (const char *)G(so + 0x10); int i = 0; for (; i < 47 && p[i] >= ' ' && p[i] < 127; i++) name[i] = p[i]; name[i] = 0; }
+	static uint32_t lm[2]; static char ln[2][48];
+	const int k = owner == kz_player ? 1 : 0;
+	if (lm[k] == m && !strcmp(ln[k], name)) return;
+	lm[k] = m; snprintf(ln[k], sizeof ln[k], "%s", name);
+	fprintf(stderr, "    kz cc: %s's animation state \"%s\" (component %#x, frame %llu)\n", k ? "the player" : "the other", name, m, (unsigned long long)display_frames());
+}
+/* 0x8159f1fc, in 1.12's fn_8159f16e (1.00's fn_815692f0; r8 a melee component, r1 its owner, r2 the other party): the
+ * component's queued animation requests (its +0x60 and +0x6c lists, a takedown's "CC Stow" among them) go to the animation
+ * only when the two parties' clocks agree within 10 ms. s2 and s4 are each entity's next update in microseconds (+0x40)
+ * less its step (+0x48), s0 the 0.01 just loaded. The clocks are whole microseconds: a bot steps 66666 (15 Hz) and the
+ * player 33333 at 30, on one grid, so at a bot's update the player's last one is the same moment. The player's 16667 at
+ * 60 isn't a quarter of 66666, and its updates drift 2 us a bot update off that grid. A bot checking then found the
+ * player's last update 14 ms back and kept its requests: its animation never left "Stand Combat" and the takedown on the
+ * player stuck, at 60 and also at 30 after 60, the clock still off the grid (2026-11-01; measured: 2.3-3.0 ms at the
+ * player's checks, 13.7-14.3 at the bots'). With the player at 60, or at 30 after 60 (kz_player_at_60), agreeing in a
+ * takedown with the player means within one of the player's updates: a bot takes the player's latest, the player its
+ * first after the bot's. A game that never ran at 60 keeps the 10 ms. RECOMP_KZ_60_NO=c: the game's test always;
+ * RECOMP_KZ_TD_DIAG=1: the clocks logged. */
+static uint32_t kz_player_at_60;   /* the player entity kz_sched last moved to the 16667 group: its clock off the bots' grid from then on */
+void recomp_ihook_kz_td_clock(Cpu *c, int reg) {
+	(void)reg; const uint32_t owner = c->r[1], other = c->r[2];
+	if (!kz_player || (owner != kz_player && other != kz_player)) return;
+	const uint32_t pp = RD32(kz_player + 0x4c);
+	const int widen = (pp == 16667u || (pp == 33333u && kz_player == kz_player_at_60)) && !kz_no('c');
+	static int diag = -1; if (diag < 0) diag = getenv("RECOMP_KZ_TD_DIAG") != 0;
+	if (diag) {
+		const float d = fabsf(c->vfp.f[2] - c->vfp.f[4]); static unsigned n;
+		if (n++ < 400) fprintf(stderr, "    kz td clock: frame %llu, the %s component %#x: %.4f vs %.4f (periods %u, %u), apart %.1f ms%s\n", (unsigned long long)display_frames(),
+		                       owner == kz_player ? "player's" : "bot's", c->r[8], c->vfp.f[2], c->vfp.f[4], RD32(owner + 0x4c), RD32(other + 0x4c), d * 1000.0f,
+		                       d < 0.01f ? "" : widen && d < pp / 1e6f + 0.001f ? ": one player update apart, through" : ": held");
+	}
+	if (widen) c->vfp.f[0] = pp / 1e6f + 0.001f;
+}
+void recomp_hook_kz_sched_fn(Cpu *c) {   /* 1.12's fn_815c2640 (1.00's scheduler fn_8158bd0a): is it called at all? (RECOMP_KZ_SCHED_DEBUG) */
+	(void)c; static int dbg = -1; static unsigned long n; if (dbg < 0) dbg = getenv("RECOMP_KZ_SCHED_DEBUG") != 0;
+	if (dbg && (n++ % 600) == 0) fprintf(stderr, "    kz sched fn: call %lu (frame %llu)\n", n, (unsigned long long)display_frames());
+}
+/* RECOMP_KZ_ALL_60=1: other characters at 60 too, not the player alone (2026-11-01). 1.12's fn_815c9e16 sets a character's
+ * controller up (r7; its entity at +0x14): it files the entity at the game's 30 Hz period global and stores a fixed 1/30
+ * step at +0x200. At 60, with the scheduler stepping every frame and the bots every other one, a bot's takedown on the
+ * player never took its animation's close-combat transition (it stayed in "Stand Combat"); at 30 it did. Here both change
+ * together for a non-player -- the period (0x815c9f2c, the global just loaded: 33333 -> 16667) and the step (0x815c9f36, the
+ * 1/30 just built: 1/60) -- so its speed is the same and it updates every frame. Logged (the first 40). */
+static int kz_all_60(Cpu *c) {
+	static int all = -1; if (all < 0) all = getenv("RECOMP_KZ_ALL_60") != 0;
+	const uint32_t ent = c->r[7] ? RD32(c->r[7] + 0x14) : 0;
+	return all && kz_60_on() && ent && ent != kz_player;
+}
+void recomp_ihook_kz_npc_period(Cpu *c, int reg) {
+	{ static int dbg = -1, n; if (dbg < 0) dbg = getenv("RECOMP_KZ_SCHED_DEBUG") != 0; if (dbg && n++ < 20) fprintf(stderr, "    kz npc setup: reg %d value %u entity %#x player %#x 60 %d (frame %llu)\n", reg, reg >= 0 && reg <= 14 ? c->r[reg] : 0, c->r[7] ? RD32(c->r[7] + 0x14) : 0, kz_player, kz_60_on(), (unsigned long long)display_frames()); }
+	if (reg < 0 || reg > 14 || c->r[reg] != 33333u || !kz_all_60(c)) return;
+	c->r[reg] = 16667u;
+	static int n; if (n++ < 40) fprintf(stderr, "    kz 60: character %#x set up at 60 (frame %llu)\n", RD32(c->r[7] + 0x14), (unsigned long long)display_frames());
+}
+void recomp_ihook_kz_npc_dt(Cpu *c, int reg) {
+	if (reg < 0 || reg > 14 || c->r[reg] != 0x3d088889u || !kz_all_60(c)) return;
+	const float dt = 1.0f / 60.0f; memcpy(&c->r[reg], &dt, 4);
+}
 uint32_t guest_call(Cpu *parent, uint32_t fn, uint32_t a0, uint32_t a1);
 void recomp_ihook_kz_sched(Cpu *c, int reg) {
+	{ static int dbg = -1, n; if (dbg < 0) dbg = getenv("RECOMP_KZ_SCHED_DEBUG") != 0; if (dbg && n++ < 5) fprintf(stderr, "    kz sched: reg %d value %#x (frame %llu)\n", reg, reg >= 0 && reg <= 14 ? c->r[reg] : 0, (unsigned long long)display_frames()); }
 	if (reg < 0 || reg > 14 || c->r[reg] != 0x3d088889u) return;
 	const int on = kz_60_on();
 	const int live = kz_player && display_frames() - kz_player_seen < 10;
@@ -501,10 +687,14 @@ void recomp_ihook_kz_sched(Cpu *c, int reg) {
 	static uint32_t vflag = 1, setp = 1;   /* the scheduler's frames-by-vblank flag; FUN_81244552(entity, period), Thumb (1.00 addresses) */
 	if (vflag == 1) { vflag = game_addr("kz_vblank_flag"); setp = game_addr("kz_set_period"); }
 	if (on && vflag && RD8(vflag) != 1) WR8(vflag, 1);
+
 	if (kz_sched_60 && !kz_no('s')) { const float dt = 1.0f / 60.0f; memcpy(&c->r[reg], &dt, 4); }
 	if (live) {
 		const uint32_t p = pp, want = on ? 16667u : 33333u;
-		if ((p == 33333u || p == 16667u) && p != want && setp) guest_call(c, setp, kz_player, want);   /* FUN_81244552(entity, period): sets +0x4c and re-files */
+		if ((p == 33333u || p == 16667u) && p != want && setp) {
+			guest_call(c, setp, kz_player, want);   /* FUN_81244552(entity, period): sets +0x4c and re-files */
+			if (want == 16667u) kz_player_at_60 = kz_player;
+		}
 	}
 	static int diag = -1; if (diag < 0) diag = getenv("RECOMP_KZ_60_DIAG") != 0;
 	if (diag) { uint32_t s = c->r[6]; static unsigned n; if (n++ % 30 == 0) fprintf(stderr, "    kz 60: frame %llu on %d flag %u player %#x period %u deadline %llu now %llu\n", (unsigned long long)display_frames(), on, vflag ? RD8(vflag) : 0, kz_player, kz_player ? RD32(kz_player + 0x4c) : 0, (unsigned long long)RD32(s + 0x120) | (unsigned long long)RD32(s + 0x124) << 32, (unsigned long long)guest_time_us_peek()); }

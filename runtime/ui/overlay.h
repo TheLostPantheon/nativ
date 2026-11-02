@@ -43,6 +43,10 @@ void overlay_shutdown(void);
  * overlay_game_paused -- see its own comment), and keep audio silent (window.c's audio_output checks
  * the same). */
 int overlay_is_open(void);
+/* the layout card (display.c, the game's thread, as Killzone 1.12 asks whether it's a PS TV, with a controller connected):
+ * the game's PS TV layout offered, its touch controls the default (Escape, no window), the game waiting behind it. 2 the
+ * PS TV layout, 1 touch. "Remember my choice" stores it as controller_layout. */
+int overlay_layout_ask(void);
 void overlay_open(void);
 void overlay_close(void);
 void overlay_toggle(void);
@@ -108,7 +112,7 @@ int overlay_draws_hud(void);
  * the full menu on that page (Display, Performance, Game, Controls, Help); "bar" the menu bar slid
  * down; "Game", "View", "Controls" or "Help" the bar with that menu open; "toast" the first-launch
  * hint with the pull tab; "intro", "intro:pad" or "intro:touch" the touch card with that device
- * highlighted, and after it "@<seconds>" that moment of its demonstration's loop; "quit" the quit card. */
+ * highlighted, and after it "@<seconds>" that moment of its demonstration's loop; "quit" the quit card; "layout" the layout card. */
 void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t w, uint32_t h, const char *ui);
 
 #ifdef __cplusplus

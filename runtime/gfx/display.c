@@ -739,25 +739,30 @@ static void h_ctrl_read(Cpu *c) { read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(
 static void h_audio_adopt(Cpu *c) { RET(1); }
 #define SCE_CTRL_ERROR_INVALID_ARG 0x80340001u
 /* PS TV mode. A game that reads pad port 1 and gets an answer takes itself for a PS TV with a paired pad: no touch screen
- * at all, and the touch screen's actions on buttons, its own PS TV layout (Killzone 1.12 looks once at boot; 1.00 never
- * does). A handheld's port 1 fails. Settings "controller_layout" (the game's own; the menu's Game page offers it once the
- * game has looked): 1 touch, the default: a handheld; 2 buttons: a PS TV (0, an automatic choice once, is touch now).
- * Opt-in and for a controller only: keyboard and mouse couldn't do a PS TV layout's stick prompts, and there are no
- * clicks as touches, so they don't play the game in it (window.c: a notice says so, once a run).
- * Either way keyboard, mouse aim and controller go on feeding the same pad: only the mouse's touches are gone in PS TV
- * mode (menus by d-pad or keys). Decided at the game's first look: a change applies on its next start. Port 1 reads
- * the same input as port 0 in a DualShock's layout (window_input_pad2: its L1/R1 are the handheld's L/R, as a PS TV
- * gives a game that doesn't ask; Killzone aims and fires on them); ports 2-4 stay unpaired. */
+ * at all, and the touch screen's actions on buttons and the sticks, its own PS TV layout (Killzone 1.12 looks once at
+ * boot; 1.00 never does). A handheld's port 1 fails. The game decides there and keeps it: ~20 of its setups ask once,
+ * right after the look (the controls' table, the touch panel and its gestures, the button prompts), so a later change
+ * changed its input but not its screens (tried 2026-11-01: RECOMP_KZ_PSTV_DIAG in its hooks lists who asks when).
+ * Settings "controller_layout" (the game's own; the menu's Game page offers it once the game has looked): 0 ask, the
+ * default: with a controller connected, a card offers the PS TV layout before the title (overlay_layout_ask; touch is
+ * its default), without one touch; 1 touch screen, which keyboard, mouse and a controller's touch cursor all play;
+ * 2 PS TV buttons, a controller's only (window.c keeps keyboard and mouse out of the game in it). Port 1 reads the same
+ * input as port 0 in a DualShock's layout (window_input_pad2: its L1/R1 are the handheld's L/R, as a PS TV gives a game
+ * that doesn't ask; Killzone aims and fires on them); ports 2-4 stay unpaired. */
 static int pstv_looked, pstv_on;
 int display_pstv_looked(void) { return __atomic_load_n(&pstv_looked, __ATOMIC_RELAXED); }
 int display_pstv_active(void) { return __atomic_load_n(&pstv_on, __ATOMIC_RELAXED); }   /* (window.c: the shoulder pair that isn't L and R is the pad's L2/R2, not the touch cursor) */
-static int pstv_mode(void) {
+static int pstv_mode(void) {   /* the game's look at boot, answered once */
 	static int v = -1;
 	if (v < 0) {
-		extern int settings_int(const char *, int);
-		const int s = settings_int("controller_layout", 1); v = s == 2;
+		extern int settings_int(const char *, int); extern int window_gamepad_connected(void); extern int window_active(void);
+		extern int overlay_layout_ask(void);
+		int s = settings_int("controller_layout", 0); if (s < 0 || s > 2) s = 0;
+		const int asked = s == 0 && window_active() && window_gamepad_connected();
+		v = s == 2 || (asked && overlay_layout_ask() == 2);
 		__atomic_store_n(&pstv_on, v, __ATOMIC_RELAXED);
-		fprintf(stderr, "    ctrl: the game asks for a PS TV's pad: %s (controller_layout %d)\n", v ? "answered, a PS TV: its button layout, no touch" : "refused, a handheld: touch", s);
+		fprintf(stderr, "    ctrl: the game asks for a PS TV's pad: %s (controller_layout %d%s)\n", v ? "answered, a PS TV: its button layout, no touch" : "refused, a handheld: touch",
+		        s, asked ? ", the player's choice at the card" : "");
 	}
 	return v;
 }
@@ -861,7 +866,10 @@ static void h_refresh_rate(Cpu *c) { if (!A0) { RET(0x80290002u); return; } floa
 static uint32_t ctrl_mode;
 static void h_ctrl_mode(Cpu *c) { if (A0 > 2) { RET(0x80340001u); return; } RET(__atomic_exchange_n(&ctrl_mode, A0, __ATOMIC_RELAXED)); }   /* SCE_CTRL_ERROR_INVALID_ARG */
 /* sceTouchSetSamplingState(port, state): the host samples the panels whenever asked */
-static void h_touch_sampling(Cpu *c) { RET(A0 > 1 ? 0x80350001u : 0); }   /* SCE_TOUCH_ERROR_INVALID_ARG */
+static void h_touch_sampling(Cpu *c) {   /* (port, state): logged (rare; a game booted as a PS TV never starts it: Killzone 1.12) */
+	fprintf(stderr, "    touch: panel %u sampling %s (frame %llu, from %#x)\n", A0, A1 ? "on" : "off", (unsigned long long)frames, c->r[14]);
+	RET(A0 > 1 ? 0x80350001u : 0);   /* SCE_TOUCH_ERROR_INVALID_ARG */
+}
 
 /* ---- SceMotion. With a gamepad's gyro live (motion.c: a DS4/DualSense's gyroscope and accelerometer,
  * fused), its state; else -- no pad, no gyro, headless runs, the gate -- a console held still, lying

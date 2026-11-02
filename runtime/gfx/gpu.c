@@ -341,6 +341,7 @@ static void h_release(Cpu *c) { RET(0); }   /* PVRSRVRelease */
  * visibility counts (kick): those the wait completes first, waiting for the GPU as the console's would */
 static void h_signal_wait(Cpu *c) {
 	extern void gfx_vis_settle(void); gfx_vis_settle();
+	extern void gxm_finish_poll(void); gxm_finish_poll();   /* (a Finish under way: its words checked again, gxm_sony.c) */
 	if (A0) WR32(A0, __atomic_load_n(&signal_counter, __ATOMIC_SEQ_CST));
 	RET(0);
 }

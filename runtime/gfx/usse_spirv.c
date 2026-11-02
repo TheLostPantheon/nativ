@@ -1295,9 +1295,14 @@ static uint32_t snap_fetch(Gen *g, int slot, int unit, uint32_t u, uint32_t v) {
 	uint32_t su[2] = { result3(s, &s->func, SpvOpSelect, tf, scaled, Sk[0], c_float(s, 1.0f)), result3(s, &s->func, SpvOpSelect, tf, scaled, Sk[1], c_float(s, 1.0f)) };
 	uint32_t fc = load(s, t_vec(s, tf, 4), g->var_frag_coord), zero = c_float(s, 0), half = c_float(s, 0.5f);
 	uint32_t f[2], o[2];
+	/* (X + 0.5) / n and size / n + 0.5, floored: a GPU may divide approximately (Vulkan allows 2.5 ulp; AMD's is a
+	 * reciprocal times), and at a scale that isn't a power of two the exact quotients came out just under the whole
+	 * number they are -- 2160 / 3 as 719.99994 -- and floored to the block or texel before. Uncharted at 3x on Radeons
+	 * (issue 20, 2026-11-01): every pixel but each 3x3 block's centre read its neighbour's texel, near geometry turned
+	 * to coloured stripes. */
 	for (int k = 0; k < 2; k++) {   /* this fragment's place in its n x n block, and the offset to the block's centre (scaled pixels) */
 		uint32_t X = glsl1(s, GLSLFloor, composite_extract1(s, tf, fc, (uint32_t)k));
-		f[k] = fop2(s, SpvOpFSub, X, fop2(s, SpvOpFMul, Sk[k], glsl1(s, GLSLFloor, fop2(s, SpvOpFDiv, X, Sk[k]))));
+		f[k] = fop2(s, SpvOpFSub, X, fop2(s, SpvOpFMul, Sk[k], glsl1(s, GLSLFloor, fop2(s, SpvOpFDiv, fop2(s, SpvOpFAdd, X, half), Sk[k]))));
 		o[k] = fop2(s, SpvOpFSub, fop2(s, SpvOpFMul, Sk[k], half), fop2(s, SpvOpFAdd, f[k], half));
 	}
 	uint32_t c[2] = { u, v }, img = result1(s, &s->func, SpvOpImage, g->t_img2d, load_sampler(g, slot));
@@ -1306,7 +1311,7 @@ static uint32_t snap_fetch(Gen *g, int slot, int unit, uint32_t u, uint32_t v) {
 	for (int k = 0; k < 2; k++) {
 		uint32_t dx = result1(s, &s->func, SpvOpDPdx, tf, c[k]), dy = result1(s, &s->func, SpvOpDPdy, tf, c[k]);
 		uint32_t c1 = fop2(s, SpvOpFAdd, c[k], fop2(s, SpvOpFAdd, fop2(s, SpvOpFMul, dx, o[0]), fop2(s, SpvOpFMul, dy, o[1])));   /* the coordinate at the 1x centre */
-		uint32_t n1 = fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertSToF, tf, composite_extract1(s, ti, isz, (uint32_t)k)), su[k]);   /* the texture's 1x size */
+		uint32_t n1 = glsl1(s, GLSLFloor, fop2(s, SpvOpFAdd, fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertSToF, tf, composite_extract1(s, ti, isz, (uint32_t)k)), su[k]), half));   /* the texture's 1x size */
 		uint32_t t1 = glsl2(s, GLSLFMin, glsl2(s, GLSLFMax, glsl1(s, GLSLFloor, fop2(s, SpvOpFMul, c1, n1)), zero), fop2(s, SpvOpFSub, n1, c_float(s, 1.0f)));
 		uint32_t Tk = fop2(s, SpvOpFAdd, fop2(s, SpvOpFMul, t1, su[k]), result3(s, &s->func, SpvOpSelect, tf, scaled, f[k], zero));
 		T[k] = result1(s, &s->func, SpvOpConvertFToS, ti, Tk);

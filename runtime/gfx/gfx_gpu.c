@@ -70,7 +70,7 @@ static int timing_on(void) {
 	}
 	return v;
 }
-static uint64_t us_now(void) { if (!timing_on()) return 0; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
+static uint64_t us_now(void) { return timing_on() ? plat_now_us() : 0; }
 static uint32_t n_shader_builds, n_vring_wraps;
 /* RECOMP_HITCH_LOG=ms (display.c): a presented frame longer than that logs what the renderer did in it.
  * These count this frame's first-use work (a shader translated, cross-compiled and compiled; a pipeline
@@ -1878,6 +1878,7 @@ static void texels_to_floats(int kind, const uint8_t *in, float *out, uint32_t n
  * new and starts as whatever an earlier frame or the CPU left there) */
 static TargetEntry *scene_entry;   /* the current scene's colour target (see gfx_gpu_begin_scene) */
 static int scene_open;             /* between gfx_gpu_begin_scene and gfx_gpu_end_scene (scene_entry stays set after: the last scene's) */
+static pthread_t scene_thread;      /* the thread that began it */
 static SDL_GPUTexture *target_lo(TargetEntry *e) {   /* render scale > 1: the 1x copy of e's texture guest-memory syncs go through */
 	if (!e->lo) {
 		SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(e->kind), .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
@@ -2576,8 +2577,15 @@ static int hud_scene(uint32_t addr) { for (int i = 0; i < 4; i++) if (addr && pr
  * HUD layout took, those skipped while their pipeline built, those on the software path */
 enum { DISP_DRAWS, DISP_HUD, DISP_SKIPPED, DISP_SOFT };
 static struct { uint32_t base, n[4]; } disp_count[4];
+/* and each scene into a displayed buffer, as it ends (F5's line: which thread drew how much into which buffer, in order --
+ * Killzone's HUD flicker: at 60 fps its HUD scene went into the other frame's buffer, that buffer shown with the world
+ * alone, 2026-11-01) */
+typedef struct { uint32_t base; uint16_t draws; char th[14]; } SceneRec;
+#define SCENE_RECS 8
+static SceneRec scene_recs[SCENE_RECS]; static int scene_nrecs; static uint32_t scene_disp_draws;
 static void disp_note(int what) {
 	if (!scene_hud) return;
+	if (what == DISP_DRAWS) scene_disp_draws++;
 	const uint32_t a = scene_target.data; int k = 0;
 	for (int i = 0; i < 4; i++) { if (disp_count[i].base == a) { k = i; goto hit; } if (!disp_count[i].base) k = i; }
 	memset(&disp_count[k], 0, sizeof disp_count[k]); disp_count[k].base = a;
@@ -3046,7 +3054,7 @@ void gfx_gpu_frame_queued(void) {
 	mv_frame_end(); mv_qframe++;
 }
 void gfx_gpu_begin_scene(const GfxTarget *t) {
-	scene_open = 1;
+	scene_open = 1; scene_thread = pthread_self();
 	gfx_soft_use_interp();   /* the CPU fallback and check reference run the real shaders */
 	render_scale_init();
 	/* a requested render scale (F2) applies here, between scenes: present comes from the display
@@ -3066,7 +3074,7 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	batch_flush("scene begun without an end");   /* normally empty: gfx_gpu_end_scene flushed (targets and depth surfaces may be evicted below) */
 	vis_complete(0);   /* visibility counters the GPU has finished: into guest memory */
 	scene_target = *t;
-	scene_hud = hud_scene(t->data);
+	scene_hud = hud_scene(t->data); scene_disp_draws = 0;
 	static int no_depth_only = -1; if (no_depth_only < 0) no_depth_only = getenv("RECOMP_GPU_NO_DEPTH_ONLY") != 0;   /* RECOMP_GPU_NO_DEPTH_ONLY=1: depth-only scenes on the software path, as before */
 	scene_entry = t->data ? get_target(t) : t->depth && t->ds_data && t->width && !no_depth_only ? scratch_target(t) : 0;
 	scene_first_draw = 1;
@@ -3352,8 +3360,17 @@ void gfx_gpu_sync_all(void) { if (!gpu()) return; batch_flush("sync to guest"); 
  * (their count is their brightness): a red or blue light shone through whatever had just moved in front of it.
  * RECOMP_VIS_SYNC=1 waits here as before, =set for SET tests only (flares late), =0 never (counts late). */
 static int vis_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_VIS_SYNC"); v = !e || !*e ? 3 : *e == '0' ? 0 : !strcmp(e, "set") ? 2 : 1; } return v; }   /* 3 defer, 1 all, 2 SET only, 0 none */
+int gfx_gpu_scene_open_on(uint32_t base) {   /* (under the lock) a scene into base being drawn by another thread: gfx_present waits for it */
+	return scene_open && base && scene_target.data == base && !pthread_equal(scene_thread, pthread_self());
+}
 void gfx_gpu_end_scene(void) {
 	scene_open = 0;
+	if (scene_hud && scene_nrecs < SCENE_RECS) {   /* (disp_note's scene record) */
+		extern void plat_thread_name(char *buf, size_t n); SceneRec *r = &scene_recs[scene_nrecs++];   /* (a guest thread's host thread carries its name) */
+		r->base = scene_target.data; r->draws = (uint16_t)(scene_disp_draws > 65535 ? 65535 : scene_disp_draws);
+		plat_thread_name(r->th, sizeof r->th); if (!r->th[0]) snprintf(r->th, sizeof r->th, "?");
+	}
+	scene_disp_draws = 0;
 	if (mv_scene_nd) {   /* (RECOMP_MV_SCENES: the main scene's draws, as runs) */
 		char out[512]; int n = 0; mv_scene_draws[mv_scene_nd] = 0;
 		for (int i = 0; i < mv_scene_nd && n < (int)sizeof out - 16; ) { int j = i; while (j < mv_scene_nd && mv_scene_draws[j] == mv_scene_draws[i]) j++; n += snprintf(out + n, sizeof out - (size_t)n, "%d%c ", j - i, mv_scene_draws[i]); i = j; }
@@ -6110,7 +6127,7 @@ static void apply_render_scale(int n) {
  * a flickered frame = the game didn't draw it; the same count = this renderer lost it. */
 #define HIST_MAX 256
 #define HIST_W 480u
-typedef struct { uint64_t frame; uint32_t base, n[4]; uint8_t from_gpu, img; } HistRec;
+typedef struct { uint64_t frame; uint32_t base, n[4]; uint8_t from_gpu, img, nsc; SceneRec sc[SCENE_RECS]; } HistRec;
 static HistRec hist[HIST_MAX]; static uint32_t hist_head;   /* presents recorded; the newest in slot (hist_head - 1) % hist_len() */
 static SDL_GPUTexture *hist_tex[HIST_MAX]; static uint32_t hist_w, hist_h;
 static int hist_save_mark;   /* an F5 waiting for the next present (its mark number) */
@@ -6131,6 +6148,7 @@ static void hist_record(uint32_t base, TargetEntry *e, uint32_t w, uint32_t h, i
 	const uint32_t len = hist_len(); if (!len) return;
 	const uint32_t slot = hist_head++ % len; HistRec *r = &hist[slot];
 	memset(r, 0, sizeof *r); r->frame = display_frames(); r->base = base; r->from_gpu = (uint8_t)from_gpu; memcpy(r->n, n, sizeof r->n);
+	r->nsc = (uint8_t)scene_nrecs; memcpy(r->sc, scene_recs, sizeof r->sc); scene_nrecs = 0;
 	if (!e || !e->color || e->cpu_dirty || !w || !h) return;   /* (guest memory newer than the texture: no picture) */
 	const uint32_t hw = HIST_W, hh = (uint32_t)((uint64_t)HIST_W * h / w) ? (uint32_t)((uint64_t)HIST_W * h / w) : 1u;
 	if (hw != hist_w || hh != hist_h) {   /* the frame's shape changed (aspect ratio, render scale): a new ring */
@@ -6157,6 +6175,14 @@ static void *hist_write(void *arg) {   /* (a thread of its own: 180 PNGs, the si
 		SDL_Surface *s = SDL_CreateSurfaceFrom((int)j->w, (int)j->h, SDL_PIXELFORMAT_XBGR8888, j->px + one * k, (int)(4 * j->w));
 		if (s) { SDL_SavePNG(s, path); SDL_DestroySurface(s); }
 	}
+	{	/* and the session's log as it stands (vitarecomp's tee of stderr, beside the game): only the last two are kept, and the
+		 * moment's context went with the next runs (Killzone's Botzone melee freeze, 2026-11-01) */
+		char to[160]; snprintf(to, sizeof to, "%s/session.log", j->dir);
+		FILE *in = fopen("session.log", "rb"), *out = in ? fopen(to, "wb") : 0;
+		if (in && out) { char b[65536]; size_t n; while ((n = fread(b, 1, sizeof b, in)) > 0) fwrite(b, 1, n, out); }
+		if (out) fclose(out);
+		if (in) fclose(in);
+	}
 	free(j->px); free(j);
 	return 0;
 }
@@ -6167,11 +6193,13 @@ static void hist_save(int mark) {
 	HistWrite *j = calloc(1, sizeof *j); if (!j) return;
 	snprintf(j->dir, sizeof j->dir, "captures/f5_%llu", (unsigned long long)display_frames());
 	mkdir("captures", 0755); mkdir(j->dir, 0755);
-	fprintf(stderr, "frame history at F5 mark %d: the last %u presents (pictures in %s/):\n", mark, n, j->dir);
+	fprintf(stderr, "frame history at F5 mark %d: the last %u presents (pictures and this log in %s/):\n", mark, n, j->dir);
 	for (uint32_t k = first; k < hist_head; k++) {
 		const HistRec *r = &hist[k % len];
-		fprintf(stderr, "  frame %llu: buffer %#x, %u draws into it (%u HUD, %u skipped while building, %u on the software path), shown from %s%s\n", (unsigned long long)r->frame, r->base,
-		        r->n[DISP_DRAWS], r->n[DISP_HUD], r->n[DISP_SKIPPED], r->n[DISP_SOFT], r->from_gpu ? "the GPU" : "guest memory", r->img ? "" : ", no picture");
+		char sc[256]; int sl = 0; sc[0] = 0;
+		for (int q = 0; q < r->nsc && sl < (int)sizeof sc - 40; q++) sl += snprintf(sc + sl, sizeof sc - (size_t)sl, "%s%#x %u by %s", q ? ", " : "; scenes since the last present: ", r->sc[q].base, r->sc[q].draws, r->sc[q].th);
+		fprintf(stderr, "  frame %llu: buffer %#x, %u draws into it (%u HUD, %u skipped while building, %u on the software path), shown from %s%s%s\n", (unsigned long long)r->frame, r->base,
+		        r->n[DISP_DRAWS], r->n[DISP_HUD], r->n[DISP_SKIPPED], r->n[DISP_SOFT], r->from_gpu ? "the GPU" : "guest memory", r->img ? "" : ", no picture", sc);
 	}
 	for (uint32_t k = first; k < hist_head; k++) if (hist[k % len].img && hist_tex[k % len]) j->n++;
 	const size_t one = 4u * hist_w * hist_h;

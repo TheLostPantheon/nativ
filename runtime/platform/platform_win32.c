@@ -95,6 +95,12 @@ double plat_cpu_seconds(void) {
 	uint64_t kt = ((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime, ut = ((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime;
 	return (kt + ut) / 1e7;   /* 100 ns units */
 }
+uint64_t plat_now_us(void) {   /* (QueryPerformanceCounter: what winpthreads' clock_gettime reads, without its conversions) */
+	static LARGE_INTEGER f; LARGE_INTEGER c;
+	if (!f.QuadPart) QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000u + (uint64_t)(c.QuadPart % f.QuadPart) * 1000000u / (uint64_t)f.QuadPart;
+}
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif

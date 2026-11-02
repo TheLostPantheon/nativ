@@ -34,6 +34,8 @@ void plat_backtrace(FILE *f);                            /* this thread's native
 /* time and processors */
 int plat_cpu_count(void);                                /* online logical processors */
 double plat_cpu_seconds(void);                           /* this process's CPU time so far, user + system */
+uint64_t plat_now_us(void);                              /* a monotonic microsecond clock for intervals, the platform's cheapest (not one to
+                                                          * compare with another module's clock: macOS counts uptime, without sleep) */
 void plat_random(void *buf, size_t n);                   /* n unpredictable bytes (an install's own ids: apputil.c's console id) */
 void plat_sleep_ns(uint64_t ns);                         /* as precise as the platform allows (Windows: a high-resolution waitable timer, not Sleep's 1-16 ms) */
 

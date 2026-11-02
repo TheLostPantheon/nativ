@@ -7,6 +7,9 @@
  * Busy is the thread's own CPU time from the OS (a fiber parked in its switch, a vblank wait: whatever the blocking,
  * it isn't CPU); the waits and their latency are the kernel's alone. Two clock reads a wait, and only with it set.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* (glibc declares pthread_getname_np only then: without it every game's build failed on Linux) */
+#endif
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>

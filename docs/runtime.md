@@ -120,9 +120,12 @@ Linux and Windows rely on the Vulkan drivers' own caches.
 - **Gamepads.** The triggers are L and R. The bumpers are touch modifiers: hold LB (front) or RB (rear), and either
   stick moves a cursor on that panel while Cross touches. A marker shows the cursor. The setting `shoulder_buttons`
   ("bumpers") swaps the two pairs.
-- **PS TV pads.** A game that asks for a PS TV's pad (Killzone 1.12, with `controller_layout` set to buttons) reads it
-  with the "2" calls on port 1 and gets a DualShock's buttons: L and R are its L1 and R1, the other shoulder pair its
-  L2 and R2, and the stick clicks L3 and R3 (`window_input_pad2`).
+- **PS TV pads.** A game that asks for a PS TV's pad (Killzone 1.12) reads it with the "2" calls on port 1 and gets a
+  DualShock's buttons: L and R are its L1 and R1, the other shoulder pair its L2 and R2, and the stick clicks L3 and R3
+  (`window_input_pad2`). The game decides once, at its look, and keeps it (its setups ask once, right after): with
+  `controller_layout` 0 (ask, the default) and a controller connected, the overlay's layout card offers the PS TV layout
+  first (`overlay_layout_ask`, Standard its default); 1 Standard (touch), 2 PS TV. In the PS TV layout keyboard and mouse
+  don't play the game.
 - **Touchpads** on DualShock 4 and DualSense pads touch the front panel finger for finger, or the rear with RB held as
   a finger lands.
 - **Touchscreens** touch the front panel where a finger lands on the picture, up to six fingers, or the rear with RB

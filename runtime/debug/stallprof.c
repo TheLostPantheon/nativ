@@ -59,9 +59,18 @@ static void sample_all(thread_t self) {
 	}
 	vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(thread_t));
 }
+/* an address's symbol, remembered: a stall's thousands of samples repeat a few hundred addresses, and each dladdr walks
+ * the image's symbol table -- in Low Power Mode the naming took 80% of a core through Uncharted's longer stalls
+ * (2026-11-01). Only this thread calls it; the names are the images' own strings, there for the process's life. */
 static const char *sym(uint64_t pc) {
-	Dl_info di; static char buf[64];
-	if (dladdr((void *)pc, &di) && di.dli_sname) return di.dli_sname;
+	enum { NC = 16384 }; static struct { uint64_t pc; const char *name; } cache[NC];
+	static char buf[64]; Dl_info di;
+	uint32_t h = (uint32_t)((pc >> 1) * 2654435761u) & (NC - 1);
+	for (int k = 0; k < 32; k++, h = (h + 1) & (NC - 1)) {
+		if (cache[h].pc == pc) { if (cache[h].name) return cache[h].name; break; }
+		if (!cache[h].pc) { cache[h].pc = pc; cache[h].name = dladdr((void *)pc, &di) && di.dli_sname ? di.dli_sname : 0; if (cache[h].name) return cache[h].name; break; }
+		if (k == 31 && dladdr((void *)pc, &di) && di.dli_sname) return di.dli_sname;   /* (a full run of the table: looked up, not kept) */
+	}
 	snprintf(buf, sizeof buf, "%#llx", (unsigned long long)pc); return buf;
 }
 typedef struct { char key[512]; int count; } Stack;
