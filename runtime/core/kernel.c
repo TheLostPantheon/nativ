@@ -98,6 +98,7 @@ typedef struct Thread {
 	int init_prio, prio;         /* 64 (highest) .. 191 for user threads; the default 160 */
 	char name[32];
 	Cpu *cpu;
+	const char *in_hle;         /* the HLE handler it is inside right now (kernel_hle_in; 0 = in guest code) */
 	pthread_t th;
 	int started, done, deleted;
 	uint32_t status;
@@ -241,7 +242,10 @@ static void sched_hand(int slot, Thread *from, int why) {
 	pthread_cond_signal(&n->s_cv);
 }
 static void sched_release(Thread *t, int why) { int slot = t->s_slot; sched_slot[slot] = 0; sched_hand(slot, t, why); }   /* sched_m held, t in S_RUN */
-static void sched_wait_turn(Thread *t) { while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m); }   /* sched_m held */
+static void sched_wait_turn(Thread *t) {   /* sched_m held */
+	recomp_excl_valid = 0;   /* the thread is about to yield the CPU: the firmware's scheduler clears the exclusive monitor on a context switch, so a strex after this point must fail and its loop retry (a stale ldrex value must never publish) */
+	while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m);
+}
 static void sched_get_slot(Thread *t, int front) {   /* sched_m held: a free slot it may use (nobody waiting can use it), else the list */
 	int slot = sched_free_slot(t);
 	if (slot >= 0) sched_take(t, slot);
@@ -1572,7 +1576,9 @@ static void fiber_identity(Fiber *f) {   /* the fiber's host thread is the threa
 	Thread *t = f->thread;
 	cur_tid = t->uid; cur_thread = t == &main_thread ? 0 : t; recomp_tpidruro = t->tls; cur_fiber = f;
 }
+void kernel_hle_in(const char *name) { Thread *t = SELF(); if (t) t->in_hle = name; }   /* the HLE handler the guest code entered (0 when it returns) */
 static void fiber_park(Fiber *f) {   /* flock held: until a Run/Switch resumes it; a finalize ends the host thread (its guest stack is abandoned) */
+	recomp_excl_valid = 0;   /* the firmware's exclusive monitor does not survive a context switch: a strex after this park must fail and its loop retry with fresh data (monitor_test case 3) */
 	while (!f->go && !f->finalize) pthread_cond_wait(&f->cv, &flock);
 	f->go = 0;
 	if (f->finalize) { pthread_mutex_unlock(&flock); pthread_cond_destroy(&f->cv); free(f); pthread_exit(0); }

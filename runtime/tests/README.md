@@ -43,10 +43,33 @@ A hang in that section fails after 30 seconds with every thread's scheduler stat
 supplies the pieces it needs from `main.c` and `display.c`: a 4 GiB guest memory block, the allocator and the
 function lookup.
 
-    cc -O1 -g -Wall -Wno-unused-function $INC kernel_test.c -o /tmp/kernel_test -lpthread && /tmp/kernel_test
+    cc -O1 -g -Wall -Wno-unused-function -D_GNU_SOURCE $INC kernel_test.c -o /tmp/kernel_test -lpthread && /tmp/kernel_test
 
 It prints `scheduler (RECOMP_SCHED=vita): N checks, 0 failed`, then `N checks, 0 failed`, and exits 0. A failed check
 names its line. Waiter tests use short sleeps to order threads, so a run takes about three seconds.
+
+## The exclusive monitor: `monitor_test.c`
+
+Checks `recompiler/rt.h`'s LDREX/STREX exclusive monitor against the firmware's context-switch
+semantics:
+
+1. a plain ldrex/strex pair lands when nothing intervenes, and the monitor is one-shot (a second
+   strex fails), for the 32- and 64-bit forms;
+2. an HLE import boundary with **no** context switch inside keeps the monitor (clearing it
+   unconditionally at the import dispatch would break a lock-free sequence spanning a
+   non-switching import);
+3. the fail-before / pass-after case: after a fiber context switch (a `sceFiberSwitch` that parks
+   the running fiber), a strex must **fail** and its loop retry with fresh data — the firmware's
+   monitor does not survive the switch. Without the park-time clear the stale monitor publishes
+   a value loaded before the switch while sibling fields changed underneath (3 checks fail).
+
+`kernel.c` is included directly like `kernel_test.c`; the link also needs `../debug/waitstats.c`
+(the wait bookkeeping), and `-D_GNU_SOURCE` (`kernel.c` names threads with the GNU
+`pthread_setname_np`):
+
+    cc -O1 -g -Wall -Wno-unused-function -D_GNU_SOURCE $INC monitor_test.c ../debug/waitstats.c -o /tmp/monitor_test -lpthread && /tmp/monitor_test
+
+It prints `16 checks, 0 failed` and exits 0.
 
 ## Touch gestures: `gesture_test.c`
 
