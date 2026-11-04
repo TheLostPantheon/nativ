@@ -78,6 +78,24 @@ pitches and the colours that come back. There's no console reference yet; the la
 
 It prints `all passed`.
 
+## Context-less fiber stacks: `fiber_stack_test.c`
+
+A context-less fiber (`addrContext` 0) gets its **own private guest stack** (`fiber_stack_private` in
+`kernel.c`), not a 512-byte carve below the caller's sp. The carve put the fiber's frames inside a
+neighbouring strand's live stack region: two such fibers can be live at once (a fiber is a host
+thread parked on a handoff when not running), and the upper strand's deep call chain grew down into
+the lower strand's live frames and overwrote its saved registers. The game cannot observe a
+context-less fiber's stack location (`sceFiberInfo` reports `addrContext`/`sizeContext` 0).
+
+The fail-before / pass-after case: strand A holds a canary in its frames; strand B runs from another
+thread with its stack carved 568 bytes above A's (the failure geometry) and uses 0x400 bytes of
+stack. While A is alive its frames must survive. Without the fix B smashes the canary (1 check
+fails); with it, intact. Needs `../debug/waitstats.c` linked like `kernel_test`:
+
+    cc -O1 -g -Wall -Wno-unused-function -D_GNU_SOURCE $INC fiber_stack_test.c ../debug/waitstats.c -o /tmp/fiber_stack_test -lpthread && /tmp/fiber_stack_test
+
+It prints `9 checks, 0 failed` and exits 0.
+
 ## The camera: `camera_test.c`
 
 Checks `runtime/media/camera.c` (SceCamera) the way Uncharted's hold-it-to-the-light parchment puzzles use it: the
