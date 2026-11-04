@@ -706,7 +706,7 @@ static void h_abort_handler(Cpu *c) {   /* libc's abort() ends here; a stub that
 }
 
 /* ---- sync objects */
-enum { SEMA = 1, MUTEX, LWMUTEX, LWCOND, EVF, KCOND, SEVENT, RWLOCK, MSGPIPE, CALLBACK };
+enum { SEMA = 1, MUTEX, LWMUTEX, LWCOND, EVF, KCOND, SEVENT, RWLOCK, MSGPIPE, CALLBACK, TIMER };
 /* a thread blocked on an object: what it waits for and the condition variable it sleeps on (one
  * per host thread: a thread waits on one object at a time, and a pthread condition may serve
  * different mutexes over time), so a wake is one signal to one thread */
@@ -735,6 +735,7 @@ typedef struct {
 	struct { uint32_t tid; int n; } *readers; int nreaders, readers_cap;   /* a reader-writer lock's readers and their counts (owner/count: the writer) */
 	uint8_t *ring; int cap, used, rpos;   /* a message pipe's bytes: a ring of the created size */
 	uint32_t func, common, notify_arg, notifier; int ncount;   /* a callback: its function and common argument; the notifications not yet delivered */
+	uint64_t t_start, t_stop; int t_running;   /* a timer: the monotonic start, the stop stamp, and whether it runs */
 } Obj;
 static __thread pthread_cond_t *my_cv;
 static pthread_cond_t *wait_cv(void) { if (!my_cv) { my_cv = malloc(sizeof *my_cv); pthread_cond_init(my_cv, 0); } return my_cv; }
@@ -1762,6 +1763,35 @@ static void h_tls_addr(Cpu *c) {   /* the guest thread's, not the host thread's:
 	RET(A0 < 256 ? t->tls_keys + 4 * A0 : 0);
 }
 static void h_system_time_wide(Cpu *c) { uint64_t t = guest_time_us(); c->r[0] = (uint32_t)t; c->r[1] = (uint32_t)(t >> 32); }
+/* the kernel timers (CreateTimer/StartTimer/GetTimerTimeWide): the game's task subsystem keeps its
+ * deadlines on one of these -- with a stub that always read 0 its poll conditions could never fire.
+ * Reference semantics (Vita3K Timer, kernel/src/sync_primitives.cpp + SceThreadmgr.cpp): a restart
+ * continues the count from where it stopped, start() on a running timer returns 1, stop() returns 1
+ * when it froze and 0 when it was already stopped, an unknown timer id is SCE_KERNEL_ERROR_UNKNOWN_
+ * TIMER_ID (0x80028241) and the Wide query gives all ones for one (an error code could be taken
+ * for a time). */
+#define E_UNKNOWN_TIMER 0x80028241u
+static void h_create_timer(Cpu *c) { Obj *o = new_obj(TIMER, A0, A1); RET(o->uid); }   /* (name, attr, opt) */
+static void h_start_timer(Cpu *c) {
+	Obj *o = by_uid(A0, TIMER); if (!o) { RET(E_UNKNOWN_TIMER); return; }
+	if (o->t_running) { RET(1); return; }   /* already running: 1 (Timer::start) */
+	o->t_start = mono_us() - (o->t_stop - o->t_start); o->t_running = 1; RET(0);   /* continues where it stopped */
+}
+static void h_stop_timer(Cpu *c) {
+	Obj *o = by_uid(A0, TIMER); if (!o) { RET(E_UNKNOWN_TIMER); return; }
+	if (!o->t_running) { RET(0); return; }   /* already stopped: 0 (Timer::stop) */
+	o->t_stop = mono_us(); o->t_running = 0; RET(1);
+}
+static uint64_t timer_us(Obj *o) { return (o->t_running ? mono_us() : o->t_stop) - o->t_start; }
+static void h_get_timer_time_wide(Cpu *c) {
+	Obj *o = by_uid(A0, TIMER);
+	uint64_t t = o ? timer_us(o) : ~0ull;   /* unknown timer: all ones, not an error code */
+	c->r[0] = (uint32_t)t; c->r[1] = (uint32_t)(t >> 32);
+}
+static void h_get_timer_time(Cpu *c) {
+	Obj *o = by_uid(A0, TIMER); if (!o) { RET(E_UNKNOWN_TIMER); return; }
+	WR64(A1, timer_us(o)); RET(0);   /* (uid, SceKernelTimerTime *t) */
+}
 
 /* the program's process parameters (mkimage.py's PPRM): older C libraries read their heap size
  * there; the standard streams are the console's TTYs, i.e. the host's */
@@ -1786,6 +1816,8 @@ static void h_stderr(Cpu *c) { h_std_stream(c, 2); }
 static void h_random_number(Cpu *c) { if (!A0) { RET(0x80020001u); return; } plat_random(G(A0), A1); RET(0); }   /* sceKernelGetRandomNumber(buf, size): libssl seeds its RNG with it */
 const HleEntry hle_kernel[] = {
 	{"sceKernelGetRandomNumber", h_random_number},
+	{"sceKernelCreateTimer", h_create_timer}, {"sceKernelStartTimer", h_start_timer}, {"sceKernelStopTimer", h_stop_timer},
+	{"sceKernelGetTimerTimeWide", h_get_timer_time_wide}, {"sceKernelGetTimerTime", h_get_timer_time},
 	{"sceUltWaitingQueueResourcePoolGetWorkAreaSize", h_ult_pool_size}, {"_sceUltWaitingQueueResourcePoolCreate", h_zero_ok},
 	{"sceUltWaitingQueueResourcePoolDestroy", h_zero_ok},
 	{"_sceUltSemaphoreCreate", h_ult_sema_create}, {"sceUltSemaphoreAcquire", h_ult_sema_acquire},
