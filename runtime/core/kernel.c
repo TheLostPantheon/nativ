@@ -1546,8 +1546,12 @@ static void h_msgpipe_info(Cpu *c) {   /* (uid, *SceKernelMppInfo 0x3c) */
  * of a function, which the recompiled C cannot do -- so a fiber here is a host thread of its own,
  * over its own Cpu and the guest stack the game supplied, parked on a handoff while it isn't the
  * one running: the same way the host runs ULT ulthreads. A fiber with no context (addrContext 0)
- * runs on its thread's stack below the caller and starts from its entry at every Run, as the
- * SDK's does. The game's SceFiber (128 bytes it owns) holds a tag and the host object's address. */
+ * runs on its own private guest stack and starts from its entry at every Run, as the
+ * SDK's does. The runtime's old placement -- a 512-byte carve below the caller's sp -- put the
+ * fiber's frames inside a neighbouring strand's live stack region, where a concurrent chain
+ * clobbered its saved registers. The game cannot observe a context-less fiber's stack location
+ * (sceFiberInfo reports addrContext/sizeContext 0). The game's SceFiber (128 bytes it owns)
+ * holds a tag and the host object's address. */
 typedef struct Fiber {
 	uint32_t addr;                    /* the guest SceFiber */
 	uint32_t entry, arg_init, ctx, ctx_size;
@@ -1639,6 +1643,10 @@ static uint32_t fiber_init(Cpu *c, uint32_t fiber, uint32_t name, uint32_t entry
 }
 static void h_fiber_init(Cpu *c) { RET(fiber_init(c, A0, A1, A2, A3, STK(0), STK(1))); }   /* (fiber, name, entry, argOnInitialize, addrContext, sizeContext, params[, sdk version]) */
 static void h_fiber_opt_param_init(Cpu *c) { if (!A0) { RET(E_FIBER_NULL); return; } memset(G(A0), 0, 128); RET(0); }
+static void fiber_stack_private(Fiber *f) {   /* a context-less fiber's stack is its own guest memory, not a carve below the caller */
+	if (f->sp0) return;                     /* the restart copies the struct: the incarnation stack is reused */
+	f->sp0 = (guest_alloc(0x10000, 16) + 0x10000) & ~7u;
+}
 static void h_fiber_run(Cpu *c) {   /* (fiber, argOnRunTo, *argOnReturn): from a thread */
 	Fiber *f = fiber_of(A0);
 	if (!A0) { RET(E_FIBER_NULL); return; }
@@ -1654,7 +1662,7 @@ static void h_fiber_run(Cpu *c) {   /* (fiber, argOnRunTo, *argOnReturn): from a
 			WR64(f->addr + 8, (uint64_t)(uintptr_t)f);
 			old->finalize = 1; pthread_cond_broadcast(&old->cv);
 		}
-		f->sp0 = (c->r[13] - 512) & ~7u;
+		fiber_stack_private(f);   /* context-less: a fresh start every run, on its own private stack */
 	}
 	fiber_resume(f, t, A1);
 	while (!t->fgo) pthread_cond_wait(thread_fcv(t), &flock);
@@ -1684,7 +1692,7 @@ static void h_fiber_switch(Cpu *c) {   /* (fiber, argOnRunTo, *argOnRun): from a
 	if (g->state == F_RUNNING) { pthread_mutex_unlock(&flock); RET(E_FIBER_STATE); return; }
 	if (!g->ctx) {
 		if (g->started) { Fiber *old = g; g = calloc(1, sizeof *g); *g = *old; g->started = g->go = 0; pthread_cond_init(&g->cv, 0); WR64(g->addr + 8, (uint64_t)(uintptr_t)g); old->finalize = 1; pthread_cond_broadcast(&old->cv); }
-		g->sp0 = (c->r[13] - 512) & ~7u;   /* below this fiber's own stack (the thread's, if this one is context-less too) */
+		fiber_stack_private(g);   /* its own guest stack, not a carve below this fiber's sp */
 	}
 	f->state = F_SUSPENDED; f->run_arg_p = A2;
 	fiber_resume(g, f->thread, A1);
