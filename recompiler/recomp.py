@@ -21,7 +21,7 @@ has none) -- for a constant a function builds mid-body (a pack's IHOOKS).
 --unordered-loads: plain loads everywhere (A/B only). By default a function that uses exclusives or
 barriers (lock-free code) gets ordered loads (rt.h RD32A...); see SYNC_MN.
 """
-import bisect, json, os, re, sys
+import bisect, json, os, re, struct, sys
 from capstone import Cs, CS_ARCH_ARM, CS_MODE_THUMB, CS_MODE_ARM
 from capstone.arm import (ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM, ARM_OP_FP, ARM_SFT_INVALID)
 
@@ -1260,12 +1260,22 @@ def main():
     # function only reached through pointers is ARM when its Thumb decode holds instructions no Vita
     # code has (coprocessors other than VFP/NEON/system) and its ARM decode doesn't
     by_entry = {f.entry: f for f in fns}
+    # the image's own function pointers carry the mode: a word entry|1 in an image block is the
+    # linker saying Thumb. A blx #imm to such an entry contradicts that (a blx immediate only ever
+    # lands in ARM state), and the pointer is what the code that actually runs -- a table walk over
+    # those words -- uses. The pointer bit wins: those entries stay Thumb.
+    thumb_refs = set()
+    for start, bb in blocks.items():
+        for o in range((-start) % 4, len(bb) - 3, 4):
+            v, = struct.unpack_from("<I", bb, o)
+            if v & 1 and (v & ~1) in by_entry:
+                thumb_refs.add(v & ~1)
     arm = set()
     def calls(f, mnem):
         for i in f.insns:
             if i.mnemonic == mnem and i.operands and i.operands[0].type == ARM_OP_IMM:
                 yield i.operands[0].imm & 0xffffffff
-    todo = [t for f in fns for t in calls(f, "blx") if t in by_entry]
+    todo = [t for f in fns for t in calls(f, "blx") if t in by_entry and t not in thumb_refs]
     todo += [a for a in d.get("arm", []) if a in by_entry]   # the analysis decoded these as ARM (its exports and calls say so)
     for f in fns:
         if junk(f.insns) and not junk(decode(fspans[f.entry], True)):
