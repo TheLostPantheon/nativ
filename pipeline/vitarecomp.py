@@ -102,10 +102,18 @@ ENV = os.environ
 ENV.setdefault("PYTHONUTF8", "1")
 
 
-def _python():   # the repository's virtualenv (.venv), else whichever Python runs this
-    for p in (os.path.join(ROOT, ".venv", "bin", "python"), os.path.join(ROOT, ".venv", "Scripts", "python.exe")):
+def _venv_python(root, is_nt):
+    # one venv per host platform: a Windows .venv's Scripts/python.exe is visible under WSL
+    # (and a POSIX .venv's bin/python on Windows), where it cannot run the other host's paths --
+    # so only the hosted platform's venv layout qualifies
+    for c in (("Scripts/python.exe",) if is_nt else ("bin/python",)):
+        p = os.path.join(root, ".venv", *c.split("/"))
         if os.path.exists(p): return p
-    return sys.executable
+    return None
+
+
+def _python():   # the repository's virtualenv (.venv), else whichever Python runs this
+    return _venv_python(ROOT, WINDOWS) or sys.executable
 
 
 PY = _python()
