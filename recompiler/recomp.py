@@ -389,13 +389,14 @@ class Fn:
             out.append("return;")
         return ["".join(out)]
 
-    def call(self, target, nxt):
+    def call(self, target, nxt, link=True):
         t = target & ~1
+        lr = f"c->r[14] = 0x{nxt | self.tbit:x}u; " if link else ""
         if t in self.entries:
-            return [f"c->r[14] = 0x{nxt | self.tbit:x}u; fn_{t:08x}(c); if (c->stop) return;"]
+            return [f"{lr}fn_{t:08x}(c); if (c->stop) return;"]
         if t in SETJMP_STUBS:   # 0 now; a guest longjmp to this buffer comes back here with its value
-            return [f"c->r[14] = 0x{nxt | self.tbit:x}u; {{ RecompJmp *rj = recomp_setjmp_begin(c); if (!_setjmp(rj->host)) c->r[0] = 0; }} if (c->stop) return;"]
-        return [f"c->r[14] = 0x{nxt | self.tbit:x}u; recomp_call_external(c, 0x{target:x}u); if (c->stop) return;"]
+            return [f"{lr}{{ RecompJmp *rj = recomp_setjmp_begin(c); if (!_setjmp(rj->host)) c->r[0] = 0; }} if (c->stop) return;"]
+        return [f"{lr}recomp_call_external(c, 0x{target:x}u); if (c->stop) return;"]
 
     def branch(self, i, mn, ops):
         nxt = i.address + i.size
@@ -405,14 +406,14 @@ class Fn:
             if t in self.addrs:
                 body = [f"goto L_{t:08x};"]
             else:   # a tail call into another function
-                body = self.call(t, nxt) + ["return;"]
+                body = self.call(t, nxt, link=False) + ["return;"]
             return body if cc == 15 else [f"if (COND(c, {cc})) {{"] + body + ["}"]
         if mn in ("cbz", "cbnz"):
             r, t = self.r(ops[0].reg, i), ops[1].imm & 0xffffffff
             test = f"{r} {'==' if mn == 'cbz' else '!='} 0"
             if t in self.addrs:
                 return [f"if ({test}) goto L_{t:08x};"]
-            return [f"if ({test}) {{"] + self.call(t, nxt) + ["return; }"]
+            return [f"if ({test}) {{"] + self.call(t, nxt, link=False) + ["return; }"]
         if mn == "bl" or (mn == "blx" and ops[0].type == ARM_OP_IMM):
             body = self.call(ops[0].imm & 0xffffffff, nxt)
             return body if cc == 15 else [f"if (COND(c, {cc})) {{"] + body + ["}"]
