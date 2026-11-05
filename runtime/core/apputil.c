@@ -475,7 +475,16 @@ static void h_avplayer_frame(Cpu *c) { if (A1) memset(G(A1), 0, 0x20); RET(0); }
 static void h_avplayer_no_stream(Cpu *c) { RET(0x806a0001u); }   /* GetStreamInfo / EnableStream / JumpToTime / Start with no source */
 static void h_avplayer_time(Cpu *c) { c->r[0] = 0; c->r[1] = 0; }   /* CurrentTime: a 64-bit 0 ms */
 static void h_app_state(Cpu *c) { memset(G(A0), 0, A1); RET(0); }   /* (SceAppMgrAppState *, size, version): nothing pending */
-static void h_zero_ok(Cpu *c) { RET(0); }
+/* SceSysmodule: the host has every library built in, so loading is bookkeeping -- but IsLoaded answers only for the
+ * modules the game loaded (SCE_SYSMODULE_ERROR_UNLOADED 0x805a1001 otherwise), as the system does. A game asking
+ * whether the IME module (0x11) it never loads is loaded before calling sceImeUpdate read "loaded" plus the update
+ * stub's 0 as "an on-screen keyboard is open", and so never opened its save-data dialog */
+static uint8_t sysmodule_loaded[0x200];
+static void h_sysmodule_load(Cpu *c) { if (A0 < sizeof sysmodule_loaded) __atomic_store_n(&sysmodule_loaded[A0], 1, __ATOMIC_RELAXED); RET(0); }
+static void h_sysmodule_unload(Cpu *c) { if (A0 < sizeof sysmodule_loaded) __atomic_store_n(&sysmodule_loaded[A0], 0, __ATOMIC_RELAXED); RET(0); }
+static void h_sysmodule_is_loaded(Cpu *c) {
+	RET(A0 < sizeof sysmodule_loaded && __atomic_load_n(&sysmodule_loaded[A0], __ATOMIC_RELAXED) ? 0 : 0x805a1001u);
+}
 /* sceAppMgrAppParamGetString(pid, param, buf, size): param 12 is the title id (np_matching2 asks for it); the others unknown */
 static void h_app_param_string(Cpu *c) {
 	if (!A2 || !A3) { RET(0x80800001u); return; }
@@ -486,7 +495,8 @@ static void h_app_param_string(Cpu *c) {
 const HleEntry hle_apputil[] = {
 	{"sceAppMgrAppParamGetString", h_app_param_string},
 	{"sceAppMgrReceiveSystemEvent", h_receive_system_event},
-	{"sceAppUtilSystemParamGetInt", h_system_param_int}, {"_sceAppMgrGetAppState", h_app_state}, {"sceSysmoduleIsLoaded", h_zero_ok},
+	{"sceAppUtilSystemParamGetInt", h_system_param_int}, {"_sceAppMgrGetAppState", h_app_state}, {"sceSysmoduleIsLoaded", h_sysmodule_is_loaded},
+	{"sceSysmoduleLoadModule", h_sysmodule_load}, {"sceSysmoduleUnloadModule", h_sysmodule_unload},
 	{"sceAppUtilSystemParamGetString", h_system_param_string},
 	{"sceAppUtilInit", h_zero}, {"sceAppUtilShutdown", h_zero}, {"sceAppUtilDrmOpen", h_drm_open}, {"sceAppUtilDrmClose", h_zero},   /* (SceAppUtilDrmAddcontId *, mount point): the additional content's licence -- the host has no DRM, every add-on is licensed */   /* (SceAppUtilInitParam *, SceAppUtilBootParam *): nothing to set up */
 	{"sceAppUtilReceiveAppEvent", h_receive_app_event},
