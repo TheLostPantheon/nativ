@@ -12,6 +12,7 @@
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
+#include "stubret.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -396,25 +397,11 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 	if (k >= budget) { summary("budget reached"); exit(0); }
 	pthread_mutex_unlock(&host_lock);
 	uint32_t a0 = c->r[0], a1 = c->r[1], a2 = c->r[2], a3 = c->r[3];
-	/* no implementation and no module export: the call returns 0 -- or, for the device/network
-	 * families the host doesn't emulate (NP, networking, HTTP/SSL, voice chat, Near), that family's
-	 * "not initialised" error: a success that did nothing left games polling forever (Uncharted's
-	 * MP4 intro), an error lets them take their offline path. RECOMP_STUB_ZERO=1: 0 for all. */
-	static const struct { const char *prefix; uint32_t err; } stub_errs[] = {
-		{"sceNetCtl", 0x80412101u}, {"sceNet", 0x80410101u}, {"sceNp", 0x80550002u}, {"sceHttp", 0x80431001u}, {"sceSsl", 0x80435001u}, {"sceVoice", 0x80451001u}, {"SceNearUtil", 0x80820001u},
-		{"sceRudp", 0x80770001u},   /* SCE_RUDP_ERROR_NOT_INITIALIZED: the reliable-UDP transport of online play, which never connects */
-		{0, 0} };
+	/* no implementation and no module export: 0, or the family's "not initialised" error (stubret.h) */
 	uint32_t stub_ret = 0;
 	if (!fn) {
 		static int zero = -1; if (zero < 0) zero = getenv("RECOMP_STUB_ZERO") != 0;
-		/* the families' set-up and tear-down calls still succeed: Shovel Knight asserts on sceNpInit's
-		 * result ("if(!(ret == 0))") and stops at boot; it is the operational calls (state queries,
-		 * requests, matching, scores) whose fake success left games waiting */
-		size_t nl = strlen(name);
-		int setup = (nl >= 4 && !strcmp(name + nl - 4, "Init")) || (nl >= 10 && !strcmp(name + nl - 10, "Initialize")) || (nl >= 4 && !strcmp(name + nl - 4, "Term"))
-		         || (nl >= 9 && !strcmp(name + nl - 9, "Terminate")) || (nl >= 8 && !strcmp(name + nl - 8, "Shutdown")) || (nl >= 8 && !strcmp(name + nl - 8, "Finalize"))
-		         || strstr(name, "Callback") || strstr(name, "RegisterHandler") || strstr(name, "InitWithParam") || strstr(name, "SetParam") || strstr(name, "Create") || strstr(name, "Delete") || strstr(name, "Destroy") || strstr(name, "Abort");
-		if (!zero && !setup) for (int i = 0; stub_errs[i].prefix; i++) if (!strncmp(name, stub_errs[i].prefix, strlen(stub_errs[i].prefix))) { stub_ret = stub_errs[i].err; break; }
+		stub_ret = stub_family_result(name, zero);
 		/* said once per import, because a game feature that quietly does nothing (a ragdoll that freezes, a door that never opens, a silent gun) is usually one of these */
 		static const char *said[512]; static int nsaid; int seen = 0;
 		pthread_mutex_lock(&host_lock);
