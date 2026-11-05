@@ -59,6 +59,13 @@ static void h_ce_alloc(Cpu *c) {
 	if (id < 8 && blocks[id].open) {
 		UnmapBlock *b = &blocks[id];
 		uint32_t at = (b->base + b->used + align - 1) & ~(align - 1);
+		/* the block isn't the CPU's on the console (the codec engine maps it in its own space, where the
+		 * caller's size budget holds); the host decoder never touches it: a range the alignment pushes
+		 * past the end still goes at the next free offset while the sizes fit -- distinct, inside the block */
+		if (at + size > b->base + b->size && b->used + size <= b->size) {
+			static int said; if (!said++) fprintf(stderr, "    codec engine: %#x bytes aligned %#x past block %u's end -- placed unaligned (the size budget fits)\n", size, align, id + 1);
+			at = b->base + b->used;
+		}
 		if (at + size <= b->base + b->size) { a = at; b->used = at + size - b->base; }
 	}
 	pthread_mutex_unlock(&blocks_mx);
