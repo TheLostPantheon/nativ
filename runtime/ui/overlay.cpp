@@ -91,6 +91,7 @@ float window_aspect_widen(void);
 int metrics_osd_level(void); void metrics_osd_set(int level); void metrics_osd_cycle(void);
 double metrics_fps(void);
 int metrics_osd_lines(char (*out)[40], int max);   /* the F1 overlay's text, drawn here as the HUD (overlay_marks) */
+int metrics_frame_times(float *ms, int max);       /* the full level's frame-time graph: recent game-frame durations, oldest first */
 /* settings.c */
 int settings_has(const char *key);
 int settings_int(const char *key, int def);
@@ -859,6 +860,7 @@ static void build_pause_banner(float w, float hgt) {
 static const OverlayMark *g_marks; static int g_nmarks;
 static float g_rear[4];   /* the rear panel's rows on the picture, in window points (x, y, w, h); w 0: none */
 static char g_osd[6][40]; static int g_nosd;   /* the overlay's lines this frame (metrics_osd_lines) */
+static float g_ft[240]; static int g_nft;      /* the full level's frame-time graph this frame (metrics_frame_times); 0: none */
 int overlay_draws_hud(void) { return g_ctx && g_has_window; }
 static void build_marks(void) {
 	ImDrawList *dl = g_intro ? ImGui::GetForegroundDrawList() : ImGui::GetBackgroundDrawList();   /* over the game's frame (LOAD), under the bar and its menus; over the touch card */
@@ -866,8 +868,23 @@ static void build_marks(void) {
 		ImFont *font = ImGui::GetFont(); float fs = ImGui::GetFontSize() * 2.0f;   /* the embedded bitmap font at an integer multiple: crisp */
 		const float x = 8, y = 8 + g_bar_h * g_bar_vis, pad = 6, lh = fs + 2; float wmax = 0;
 		for (int i = 0; i < g_nosd; i++) { ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, g_osd[i]); if (sz.x > wmax) wmax = sz.x; }
-		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + wmax + 2 * pad, y + g_nosd * lh + 2 * pad), IM_COL32(0, 0, 0, 170));
+		/* the full level adds the frame-time graph under the lines: the last ~1.5 s of game frames, one point per
+		 * frame, newest at the right; dim guides at 16.7 ms (60 fps) and 33.3 ms (30 fps); the scale is 50 ms, or
+		 * the worst frame shown when that is longer, so a stutter stays inside the panel */
+		const float gh = g_nft >= 2 ? fs * 3.0f : 0.0f, gw = wmax;
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + wmax + 2 * pad, y + g_nosd * lh + 2 * pad + (gh > 0 ? gh + pad : 0)), IM_COL32(0, 0, 0, 170));
 		for (int i = 0; i < g_nosd; i++) dl->AddText(font, fs, ImVec2(x + pad, y + pad + i * lh), IM_COL32(255, 255, 255, 255), g_osd[i]);
+		if (gh > 0) {
+			const float gx = x + pad, gy = y + pad + g_nosd * lh + pad;
+			float top = 50.0f; for (int i = 0; i < g_nft; i++) if (g_ft[i] > top) top = g_ft[i];
+			for (float guide : {1000.0f / 60.0f, 1000.0f / 30.0f}) {
+				const float ly = gy + gh - gh * guide / top;
+				dl->AddLine(ImVec2(gx, ly), ImVec2(gx + gw, ly), IM_COL32(255, 255, 255, 60), 1.0f);
+			}
+			ImVec2 pts[240];
+			for (int i = 0; i < g_nft; i++) pts[i] = ImVec2(gx + gw * i / (float)(g_nft - 1), gy + gh - gh * g_ft[i] / top);
+			dl->AddPolyline(pts, g_nft, IM_COL32(120, 230, 120, 255), ImDrawFlags_None, 1.5f);
+		}
 	}
 	if (g_rear[2] > 0) dl->AddRect(ImVec2(g_rear[0], g_rear[1]), ImVec2(g_rear[0] + g_rear[2], g_rear[1] + g_rear[3]), IM_COL32(255, 170, 60, 140), 0.0f, 2.0f);   /* (rounding 0, thickness 2: ImGui 1.92.8+ argument order -- the old (0, 0, 2.0f) put 2 in `flags`, an ImGui user-error assert) */
 	for (int i = 0; i < g_nmarks; i++) {
@@ -1402,6 +1419,7 @@ void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
 	g_nosd = metrics_osd_lines(g_osd, 6);
+	g_nft = g_nosd > 1 ? metrics_frame_times(g_ft, 240) : 0;   /* more than one line: the full level */
 	/* headless (the dump's HUD check): only with something to show. Windowed: every present -- the bar's
 	 * hover and timers, the cursor and the capture flag live in this frame (a frame that draws nothing is
 	 * a few microseconds of CPU and no render pass: render_frame) */
@@ -1428,7 +1446,7 @@ static void forced_frame(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t
 }
 void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t w, uint32_t h, const char *ui) {
 	if (!g_ctx || !device) return;
-	g_nmarks = 0; g_rear[2] = 0; g_nosd = 0;
+	g_nmarks = 0; g_rear[2] = 0; g_nosd = 0; g_nft = 0;
 	if (!ui || !*ui || !strncmp(ui, "menu", 4)) {
 		/* "menu:<tab>" opens the full menu on that page (the tab bar applies a selection on its next layout) */
 		if (ui && ui[4] == ':') for (int i = 0; i < TAB_N; i++) if (!strcmp(ui + 5, g_tab_names[i])) g_select_tab = i;
@@ -1454,10 +1472,11 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 	if (!strcmp(ui, "toast")) g_force_toast = true;
 	else { g_force_bar = true; if (strcmp(ui, "bar")) g_force_menu = ui; }
 	g_nosd = metrics_osd_lines(g_osd, 6);   /* the HUD too (RECOMP_OSD), in the same frame as the bar so it layers as it does live: under it */
+	g_nft = g_nosd > 1 ? metrics_frame_times(g_ft, 240) : 0;
 	/* three frames: the bar's first, its menu popup's auto-fit on the second, and only the settled third
 	 * drawn (the texture is LOADed into, so drawing all three would stack the bar's translucency) */
 	for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_closed);
-	g_nosd = 0;
+	g_nosd = 0; g_nft = 0;
 	/* then put the closed state back the way a run finds it, inside one more (undrawn) frame so an open
 	 * menu popup is closed through ImGui itself, not left in its popup stack */
 	g_force_bar = false; g_force_menu = nullptr; g_bar_vis = 0; g_bar_want = false; g_toast_until = -1e9; g_tab_a = 0; g_dismiss_req = true;

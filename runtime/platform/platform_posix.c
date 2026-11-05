@@ -15,6 +15,10 @@
 #if !defined(__ANDROID__)
 #include <execinfo.h>
 #endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+#include <stdio.h>
 
 void *plat_reserve(size_t bytes) {
 	void *p = mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -63,6 +67,31 @@ double plat_cpu_seconds(void) {
 	struct rusage ru; getrusage(RUSAGE_SELF, &ru);
 	return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
 }
+#ifdef __APPLE__
+int plat_thread_count(void) {
+	thread_array_t threads; mach_msg_type_number_t n;
+	if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) return 0;
+	for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), threads[i]);
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, (vm_size_t)n * sizeof(thread_t));
+	return (int)n;
+}
+uint64_t plat_rss_bytes(void) {
+	mach_task_basic_info_data_t info; mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
+	return task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &n) == KERN_SUCCESS ? (uint64_t)info.resident_size : 0;
+}
+#else   /* Linux and Android: procfs */
+int plat_thread_count(void) {
+	FILE *f = fopen("/proc/self/status", "r"); if (!f) return 0;
+	char line[64]; int n = 0;
+	while (fgets(line, sizeof line, f)) if (!strncmp(line, "Threads:", 8)) { n = atoi(line + 8); break; }
+	fclose(f); return n;
+}
+uint64_t plat_rss_bytes(void) {   /* statm's second field: resident pages */
+	FILE *f = fopen("/proc/self/statm", "r"); if (!f) return 0;
+	unsigned long long size = 0, resident = 0; int ok = fscanf(f, "%llu %llu", &size, &resident) == 2;
+	fclose(f); return ok ? (uint64_t)resident * plat_page_size() : 0;
+}
+#endif
 /* macOS: the uptime counter (a register read). Its clock_gettime(CLOCK_MONOTONIC) also reads the boot time through
  * gettimeofday on every call: the renderer's per-draw timers were 9% of Uncharted's main thread in Low Power Mode
  * (2026-11-01). Linux's CLOCK_MONOTONIC is already a vDSO read. */

@@ -5,6 +5,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <timeapi.h>
+#define PSAPI_VERSION 2   /* K32GetProcessMemoryInfo: in kernel32, no psapi.lib */
+#include <psapi.h>
 #include <string.h>
 #include "platform.h"
 #include <pthread.h>   /* (winpthreads: kernel.c names threads through it, so it has the names) */
@@ -94,6 +96,13 @@ double plat_cpu_seconds(void) {
 	if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
 	uint64_t kt = ((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime, ut = ((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime;
 	return (kt + ut) / 1e7;   /* 100 ns units */
+}
+/* unknown: Windows has no cheap per-process count. A Toolhelp snapshot walks every thread on the system and took
+ * 39-47 ms per call on a desktop with ~480 processes -- a stutter if the overlay asked twice a second. */
+int plat_thread_count(void) { return 0; }
+uint64_t plat_rss_bytes(void) {
+	PROCESS_MEMORY_COUNTERS pmc; pmc.cb = sizeof pmc;
+	return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? (uint64_t)pmc.WorkingSetSize : 0;
 }
 uint64_t plat_now_us(void) {   /* (QueryPerformanceCounter: what winpthreads' clock_gettime reads, without its conversions) */
 	static LARGE_INTEGER f; LARGE_INTEGER c;

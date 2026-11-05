@@ -52,4 +52,8 @@ int metrics_osd_lines(char (*out)[40], int max);   /* the same overlay as text l
  * Performance page ("show fps"), which wants the figure as a plain double, not drawn into a bitmap */
 double metrics_fps(void);
 
+/* the full overlay's frame-time graph: the last ~1.5 s of game-frame durations in ms, oldest first, at most
+ * `max`; returns how many were written */
+int metrics_frame_times(float *ms, int max);
+
 #endif

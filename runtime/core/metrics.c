@@ -40,9 +40,6 @@
 #include <time.h>
 #include "metrics.h"
 #include "platform.h"
-#ifdef __APPLE__
-#include <mach/mach.h>
-#endif
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 
@@ -120,8 +117,8 @@ static double window_fps_stats(uint64_t now) {
 	return n >= 2 && span > 0 ? (n - 1) / span : 0;
 }
 
-/* process CPU% (one core = 100%) between two getrusage samples, and the host's own thread count --
- * both "if cheap": one syscall and a fixed-size subtraction, called at most twice a second */
+/* process CPU% (one core = 100%) between two getrusage samples; the thread count and resident memory come
+ * from platform.h (plat_thread_count, plat_rss_bytes) -- all "if cheap", called at most twice a second */
 static double cpu_percent(void) {
 	static struct timespec pwall; static double pcpu; static int have;
 	double cpu = plat_cpu_seconds();
@@ -134,21 +131,6 @@ static double cpu_percent(void) {
 	pcpu = cpu; pwall = wall; have = 1;
 	return pct;
 }
-#ifdef __APPLE__
-static int host_thread_count(void) {
-	thread_array_t threads; mach_msg_type_number_t n;
-	if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) return 0;
-	vm_deallocate(mach_task_self(), (vm_address_t)threads, (vm_size_t)n * sizeof(thread_t));
-	return (int)n;
-}
-#else
-static int host_thread_count(void) {
-	FILE *f = fopen("/proc/self/status", "r"); if (!f) return 0;
-	char line[64]; int n = 0;
-	while (fgets(line, sizeof line, f)) if (!strncmp(line, "Threads:", 8)) { n = atoi(line + 8); break; }
-	fclose(f); return n;
-}
-#endif
 
 /* guest time advanced per real second, sampled here (at most twice a second: nowhere near
  * guest_time_us's own "17 reads in a row with no vblank wait" polling threshold) -- 1.0 under
@@ -182,6 +164,23 @@ double metrics_fps(void) {
 	double fps, avg_ms, max_ms, low1_ms;
 	pthread_mutex_lock(&mx); game_frame_stats(now_us(), &fps, &avg_ms, &max_ms, &low1_ms); pthread_mutex_unlock(&mx);
 	return fps;
+}
+
+/* the frame-time graph's data (overlay.cpp draws it under the full overlay's lines): the newest game-frame
+ * durations in milliseconds, oldest first, at most `max` of them and none older than the stats' own window
+ * (FRAME_WINDOW_US) -- the same samples game_frame_stats summarises, so the graph and the numbers agree */
+int metrics_frame_times(float *ms, int max) {
+	if (!ms || max <= 0) return 0;
+	pthread_mutex_lock(&mx);
+	uint64_t now = now_us(); int n = 0;
+	while (n < gring_n && n < max) {
+		const FrameSample *s = &gring[(gring_head - 1 - n + RING_CAP) % RING_CAP];
+		if (now - s->t_us > FRAME_WINDOW_US) break;
+		n++;
+	}
+	for (int i = 0; i < n; i++) ms[i] = gring[(gring_head - n + i + RING_CAP) % RING_CAP].dur_us / 1000.0f;
+	pthread_mutex_unlock(&mx);
+	return n;
 }
 
 /* ---- the on-screen overlay: a 5x7-dot font, hand-drawn below (upper-case letters, digits, space,
@@ -388,7 +387,8 @@ static void maybe_tick(uint64_t now) {
 	double wfps = window_fps_stats(now);
 	double speed = guest_speed(now);
 	double cpu = cpu_percent();
-	int threads = host_thread_count();
+	int threads = plat_thread_count();
+	unsigned mem_mb = (unsigned)(plat_rss_bytes() >> 20);
 	int gpu = __atomic_load_n(&backend_gpu, __ATOMIC_RELAXED);
 	int rs = __atomic_load_n(&render_scale, __ATOMIC_RELAXED);
 	char backend[16]; if (gpu && rs > 1) snprintf(backend, sizeof backend, "gpu %dx", rs); else snprintf(backend, sizeof backend, "%s", gpu ? "gpu" : "soft");
@@ -405,7 +405,8 @@ static void maybe_tick(uint64_t now) {
 	snprintf(line_full[1], sizeof line_full[1], "SPEED %.2fX WINDOW %.1f FPS", speed, wfps);
 	snprintf(line_full[2], sizeof line_full[2], "%s%s %uSCN %uDR %uSW", gpu ? "GPU" : "SOFT", gpu && rs == 2 ? " 2X" : gpu && rs == 3 ? " 3X" : gpu && rs == 4 ? " 4X" : "", scenes, draws, fd);
 	snprintf(line_full[3], sizeof line_full[3], "RENDER %.1fMS PRESENT %.1fMS", render_ms, present_ms);
-	snprintf(line_full[4], sizeof line_full[4], "CPU %.0f%% THREADS %d", cpu, threads);
+	if (threads > 0) snprintf(line_full[4], sizeof line_full[4], "CPU %.0f%% THREADS %d MEM %uMB", cpu, threads, mem_mb);
+	else snprintf(line_full[4], sizeof line_full[4], "CPU %.0f%% MEM %uMB", cpu, mem_mb);   /* (no cheap count: Windows) */
 	snprintf(line_full[5], sizeof line_full[5], "AUDIO %uMS Q %u UNDERRUN", am, au);
 	n_full = 6;
 
@@ -415,8 +416,8 @@ static void maybe_tick(uint64_t now) {
 	static int metrics_env = -1; if (metrics_env < 0) { const char *e = getenv("RECOMP_METRICS"); metrics_env = e && *e && *e != '0'; }
 	if (metrics_env && (!last_report_us || now - last_report_us >= REPORT_US)) {
 		last_report_us = now;
-		fprintf(stderr, "    metrics: %.1f fps (frame %.1f/%.1f/%.1f ms avg/max/1%%low)  speed %.2fx  window %.1f fps  %s: %u scenes %u draws (%u gpu %u sw)  render %.1f ms present %.1f ms  cpu %.0f%% (%d threads)  audio %u ms queued (%u ports), %u underruns\n",
-		        fps, avg_ms, max_ms, low1_ms, speed, wfps, backend, scenes, draws, gd, fd, render_ms, present_ms, cpu, threads, am, ap, au);
+		fprintf(stderr, "    metrics: %.1f fps (frame %.1f/%.1f/%.1f ms avg/max/1%%low)  speed %.2fx  window %.1f fps  %s: %u scenes %u draws (%u gpu %u sw)  render %.1f ms present %.1f ms  cpu %.0f%% (%d threads)  mem %u MB  audio %u ms queued (%u ports), %u underruns\n",
+		        fps, avg_ms, max_ms, low1_ms, speed, wfps, backend, scenes, draws, gd, fd, render_ms, present_ms, cpu, threads, mem_mb, am, ap, au);
 	}
 	pthread_mutex_unlock(&mx);
 }
