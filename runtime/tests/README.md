@@ -101,3 +101,13 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## Output pacing against the device's buffer: `audio_pace_test.c`
+
+Checks `runtime/ui/audio_pace.h` (window.c audio_output's pacing margin) in a simulation: a 48 kHz stereo port
+with a 65 ms A/V delay kept queued, a device taking its whole buffer each period, the game's thread polling every
+1 ms and topping the queue up with silence below the delay. 256-sample buffers against a 480-frame device (Windows
+shared mode) insert no silence after the start; nor do 1024-sample buffers or a 256-frame device. `-DOLD_RULE` (the
+previous margin, depth x buffer) inserts ~50 a second in the 256/480 case -- the crackle measured live. Header-only:
+
+    cc -O1 -g -Wall audio_pace_test.c -o /tmp/audio_pace_test && /tmp/audio_pace_test
