@@ -101,3 +101,16 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## SceSysmodule's IsLoaded contract: `sysmodule_test.c`
+
+Checks `sceSysmoduleIsLoaded` / `LoadModule` / `UnloadModule` in `runtime/core/apputil.c`: a module is loaded (0)
+only after the game loaded it, and `SCE_SYSMODULE_ERROR_UNLOADED` (0x805a1001) before that and after an unload.
+IsLoaded used to answer 0 for every module. The fixture includes `apputil.c` and supplies its external pieces
+(settings, overlay, guest memory); calls go through the `hle_apputil` table by name, so
+`-DAPPUTIL_UNDER_TEST='"<file>"'` compiles it against an older `apputil.c` for a fail-before run:
+
+    cc -O1 -g -Wall -D_GNU_SOURCE $INC -I $SDL3_INC sysmodule_test.c -o /tmp/sysmodule_test -lpthread && /tmp/sysmodule_test
+
+`$SDL3_INC` is SDL3's include directory; only the headers are touched.
+
