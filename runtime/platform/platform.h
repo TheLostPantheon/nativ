@@ -34,6 +34,21 @@ void plat_backtrace(FILE *f);                            /* this thread's native
 /* time and processors */
 int plat_cpu_count(void);                                /* online logical processors */
 double plat_cpu_seconds(void);                           /* this process's CPU time so far, user + system */
+int plat_thread_count(void);                             /* this process's threads right now; 0 when unknown */
+uint64_t plat_rss_bytes(void);                           /* this process's resident memory (Windows: its working set); 0 when unknown */
+
+/* the machine, for the full performance overlay's sampler thread (metrics.c, twice a second while it shows): each
+ * of these may take milliseconds, so nothing on the game's or the window's thread calls them */
+int plat_system_cpu(uint64_t *busy, uint64_t *total);   /* all processors' busy and total time so far, one unit (ratios only); 0 unknown */
+int plat_mem_info(uint64_t *used_bytes, uint64_t *total_bytes);   /* physical memory in use and installed; 0 unknown */
+void plat_cpu_name(char *out, size_t n);                 /* the CPU's brand string ("AMD Ryzen 7 7800X3D 8-Core Processor"); "" unknown */
+typedef struct { float load_pct, vram_used_mb, vram_total_mb, temp_c, power_w, clock_mhz; } PlatGpuSample;   /* -1: unknown */
+typedef struct PlatGpuMon PlatGpuMon;
+PlatGpuMon *plat_gpu_open(const char *device_name);      /* the GPU the game renders on, by the renderer's device name ("" or NULL: a guess) */
+void plat_gpu_sample(PlatGpuMon *m, PlatGpuSample *s);   /* every field -1 that this machine does not give; m may be NULL */
+void plat_gpu_close(PlatGpuMon *m);
+void *plat_lib_open(const char *name);                   /* a shared library by file name (dlopen / LoadLibrary); NULL if absent */
+void *plat_lib_sym(void *lib, const char *sym);
 uint64_t plat_now_us(void);                              /* a monotonic microsecond clock for intervals, the platform's cheapest (not one to
                                                           * compare with another module's clock: macOS counts uptime, without sleep) */
 void plat_random(void *buf, size_t n);                   /* n unpredictable bytes (an install's own ids: apputil.c's console id) */

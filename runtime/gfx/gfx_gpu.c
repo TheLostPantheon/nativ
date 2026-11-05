@@ -63,12 +63,13 @@ static int trace_sync(void);
  * accumulator or a threshold test, so zeros are harmless; the metrics line's render time is gfx_dispatch.c's
  * own clock. */
 static int timing_on(void) {
-	static int v = -1;
+	static int v = -1, off;   /* off: RECOMP_GPU_TIMERS=0, which also keeps the full overlay's timers off */
 	if (v < 0) {
 		const char *e = getenv("RECOMP_GPU_TIMERS"), *h = getenv("RECOMP_HITCH_LOG");
 		v = e && *e ? atoi(e) != 0 : getenv("RECOMP_GPU_STATS") != 0 || (h && *h && atoi(h) > 0) || getenv("RECOMP_GPU_FENCE_STATS") != 0;
+		off = e && *e && atoi(e) == 0;
 	}
-	return v;
+	return v || (!off && metrics_osd_level() == 2);   /* (the full overlay shows the build and wait times: on while it does) */
 }
 static uint64_t us_now(void) { return timing_on() ? plat_now_us() : 0; }
 static uint32_t n_shader_builds, n_vring_wraps;
@@ -82,6 +83,17 @@ static uint64_t t_pipe_build, t_tgt_download, t_readback_wait, t_ring_wait, t_sh
 static uint32_t n_shader_cached;   /* shaders whose MSL came from the cache this frame (msl_cache_get) */
 static GfxGpuFrameCosts last_costs;
 void gfx_gpu_last_frame_costs(GfxGpuFrameCosts *out) { *out = last_costs; }
+/* the full performance overlay (metrics.c, once a game frame while it shows): the frame just presented's shader and
+ * pipeline builds and their time, texture uploads, waits (target downloads, readbacks, ring wraps) and draws skipped
+ * for an unfinished build; 0 on the software backend */
+static SDL_GPUDevice *gpu(void);
+int gfx_gpu_overlay_costs(uint32_t *builds, uint32_t *uploads, uint32_t *skipped, uint64_t *build_us, uint64_t *wait_us) {
+	if (!gpu()) return 0;
+	const GfxGpuFrameCosts *c = &last_costs;
+	*builds = c->shaders + c->pipes; *uploads = c->tex_uploads; *skipped = c->skipped;
+	*build_us = c->t_shader + c->t_pipe; *wait_us = c->t_tgt_download + c->t_readback_wait + c->t_ring_wait;
+	return 1;
+}
 #define VRING_WORDS (16u << 20)   /* the vertex ring: 64 MB of PA records, several frames' worth */
 static SDL_GPUBuffer *vring; static SDL_GPUTransferBuffer *vring_xfer; static uint32_t vring_pos;   /* in words */
 #define IRING_WORDS (4u << 20)    /* the index ring: 16 MB of 32-bit indices */
@@ -392,6 +404,7 @@ void *gfx_gpu_create_device(void) {
 	if (d && (SDL_GetGPUShaderFormats(d) & SDL_GPU_SHADERFORMAT_METALLIB) && msl_cache_dir() && !msl_salt()) mtl_archive_on = mtl_archive_open(msl_cache_dir(), msl_lib_store);
 #endif
 	if (d) fprintf(stderr, "    gpu: %s device %s%s\n", SDL_GetGPUDeviceDriver(d), SDL_GetStringProperty(SDL_GetGPUDeviceProperties(d), SDL_PROP_GPU_DEVICE_NAME_STRING, "?"), vk_fragment_stores ? " (robustBufferAccess, fragmentStoresAndAtomics on)" : "");
+	if (d) metrics_set_gpu_name(SDL_GetStringProperty(SDL_GetGPUDeviceProperties(d), SDL_PROP_GPU_DEVICE_NAME_STRING, ""));   /* (the overlay's GPU monitor finds this device by name) */
 	return d;
 }
 /* D24_UNORM_S8_UINT isn't supported on Metal/Apple Silicon (no 24-bit depth format at all there);
@@ -6307,7 +6320,7 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 		} else if (!window_active() && !gfx_soft_shot_due() && format == 0 && present_nosync()) { /* RECOMP_GPU_PRESENT_NOSYNC=1, headless: the frame stays on the GPU, as it does with a window (see present_nosync); window_present below is a no-op without a window */ }
 		else { sync_why = "(present)"; target_sync_for_cpu(e); }   /* guest memory must hold what the GPU rendered before anything reads it below */
 	}
-	if (hitch_log()) {   /* this frame's first-use work and waits, for display.c's hitch line; then the counters start the next frame (RECOMP_GPU_STATS, if also on, zeroed them above already: run one or the other) */
+	if (hitch_log() || metrics_osd_level() == 2) {   /* this frame's first-use work and waits, for display.c's hitch line and the full overlay; then the counters start the next frame (RECOMP_GPU_STATS, if also on, zeroed them above already: run one or the other) */
 		GfxGpuFrameCosts c = { .draws = __atomic_load_n(&n_gpu_draws, __ATOMIC_RELAXED), .fallback = __atomic_load_n(&n_fallback, __ATOMIC_RELAXED), .shaders = n_shader_builds, .pipes = n_pipe_builds, .tex_uploads = n_tex_uploads, .tex_new = n_tex_new,
 			.tgt_downloads = n_tgt_downloads, .readback_waits = n_readback_waits, .ring_waits = n_ring_waits, .flushes = n_batch_cmd,
 			.t_total = t_total, .t_shader = t_shader, .t_xlate = t_shader_xlate, .t_msl = t_shader_msl, .t_compile = t_shader_compile, .t_pipe = t_pipe_build, .t_texup = t_texup, .t_tgt_download = t_tgt_download,

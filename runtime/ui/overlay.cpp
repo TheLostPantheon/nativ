@@ -91,6 +91,13 @@ float window_aspect_widen(void);
 int metrics_osd_level(void); void metrics_osd_set(int level); void metrics_osd_cycle(void);
 double metrics_fps(void);
 int metrics_osd_lines(char (*out)[40], int max);   /* the F1 overlay's text, drawn here as the HUD (overlay_marks) */
+int metrics_frame_times(float *ms, int max);       /* the full level's frame-time graph: recent game-frame durations, oldest first */
+}
+#include "metrics.h"   /* (MetricsSnapshot: the full level's HUD) */
+extern "C" {
+const char *window_present_mode(void);   /* window.c: vsync, mailbox or immediate */
+int display_frame_rate_60(void);         /* display.c: the frame-rate setting */
+int gfx_gpu_fsr_active(void);            /* gfx_gpu.c: FSR upscales the frame */
 /* settings.c */
 int settings_has(const char *key);
 int settings_int(const char *key, int def);
@@ -859,15 +866,118 @@ static void build_pause_banner(float w, float hgt) {
 static const OverlayMark *g_marks; static int g_nmarks;
 static float g_rear[4];   /* the rear panel's rows on the picture, in window points (x, y, w, h); w 0: none */
 static char g_osd[6][40]; static int g_nosd;   /* the overlay's lines this frame (metrics_osd_lines) */
+static float g_ft[240]; static int g_nft;      /* the full level's frame-time graph this frame (metrics_frame_times); 0: none */
+static MetricsSnapshot g_snap; static bool g_full;   /* the full level's numbers this frame (metrics_snapshot) */
 int overlay_draws_hud(void) { return g_ctx && g_has_window; }
+/* ---- the full performance overlay (F1's level 2): the machine, the game's frames, the renderer and the picture, in
+ * coloured groups and three columns. A number this machine or backend does not give is drawn as "-". Sized from the
+ * window's height (a vector font: any size is sharp). */
+static void perf_fmt(char *b, size_t n, float v, const char *fmt) { if (v < 0) std::snprintf(b, n, "-"); else std::snprintf(b, n, fmt, v); }
+static void build_perf_full(ImDrawList *dl) {
+	const MetricsSnapshot &m = g_snap;
+	ImFont *font = ImGui::GetFont();
+	const float H = ImGui::GetIO().DisplaySize.y, fs = H / 46.0f < 13.0f ? 13.0f : H / 46.0f > 30.0f ? 30.0f : H / 46.0f;
+	const float pad = fs * 0.6f, lh = fs * 1.25f, W = fs * 21.0f;
+	const float x0 = 8, y0 = 8 + g_bar_h * g_bar_vis;
+	const ImU32 c_gpu = IM_COL32(140, 225, 120, 255), c_cpu = IM_COL32(110, 175, 255, 255), c_ram = IM_COL32(205, 145, 235, 255),
+	            c_txt = IM_COL32(245, 245, 245, 255), c_mut = IM_COL32(170, 170, 180, 255), c_ren = IM_COL32(240, 200, 90, 255), c_dsp = IM_COL32(150, 195, 245, 255);
+	const float cx1 = x0 + pad + fs * 9.0f, cx2 = x0 + pad + fs * 14.5f, cx3 = x0 + W - pad;   /* right edges of the three value columns */
+	struct Row { const char *label; ImU32 col; char v[3][48]; };
+	auto text_r = [&](float xr, float y, ImU32 col, const char *t) { const float w = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, t).x; dl->AddText(font, fs, ImVec2(xr - w, y), col, t); };
+	auto gb = [](char *b, size_t n, float mb, const char *pre) { if (mb < 0) std::snprintf(b, n, "%s-", pre); else std::snprintf(b, n, "%s%.1f GB", pre, mb / 1024.0f); };
+	const bool mach = m.machine != 0;
+
+	Row top[6] = {};
+	top[0].label = "GPU"; top[0].col = c_gpu;
+	perf_fmt(top[0].v[0], 48, mach ? m.gpu_pct : -1, "%.0f%%"); perf_fmt(top[0].v[1], 48, mach ? m.gpu_temp_c : -1, "%.0f \xc2\xb0""C");
+	if (mach && m.gpu_power_w >= 0 && m.gpu_clock_mhz >= 0) std::snprintf(top[0].v[2], 48, "%.0f W  %.0f MHz", m.gpu_power_w, m.gpu_clock_mhz); else perf_fmt(top[0].v[2], 48, mach ? m.gpu_power_w : -1, "%.0f W");
+	top[1].label = "VRAM"; top[1].col = c_gpu; gb(top[1].v[0], 48, mach ? m.vram_used_mb : -1, ""); gb(top[1].v[1], 48, mach ? m.vram_total_mb : -1, "/ ");
+	top[2].label = "CPU"; top[2].col = c_cpu; perf_fmt(top[2].v[0], 48, mach ? m.cpu_total_pct : -1, "%.0f%%"); std::snprintf(top[2].v[1], 48, "-");
+	if (mach && m.cpu_game_pct >= 0) std::snprintf(top[2].v[2], 48, "game %.0f%%", m.cpu_game_pct); else std::snprintf(top[2].v[2], 48, "game -");
+	top[3].label = "RAM"; top[3].col = c_ram; gb(top[3].v[0], 48, mach ? m.ram_used_mb : -1, ""); gb(top[3].v[1], 48, mach ? m.ram_total_mb : -1, "/ "); gb(top[3].v[2], 48, mach ? m.ram_game_mb : -1, "game ");
+	top[4].label = "FPS"; top[4].col = c_txt; std::snprintf(top[4].v[0], 48, "%.0f", m.fps);
+	if (m.low1_fps >= 0) std::snprintf(top[4].v[1], 48, "1%% low %.0f", m.low1_fps); else std::snprintf(top[4].v[1], 48, "1%% low -");
+	if (m.low01_fps >= 0) std::snprintf(top[4].v[2], 48, "0.1%% low %.0f", m.low01_fps); else std::snprintf(top[4].v[2], 48, "0.1%% low -");
+	top[5].label = "Frame"; top[5].col = c_txt; std::snprintf(top[5].v[0], 48, "%.1f ms", m.frame_ms_avg); std::snprintf(top[5].v[1], 48, "max %.1f ms", m.frame_ms_max);
+
+	/* the renderer's and the picture's rows: a label and one value at the right edge */
+	char rv[8][48]; const char *rl[8]; ImU32 rc[8]; int nr = 0;
+	auto row2 = [&](const char *l, ImU32 c) -> char * { rl[nr] = l; rc[nr] = c; return rv[nr++]; };
+	perf_fmt(row2("Render (CPU) per frame", c_ren), 48, m.render_ms, "%.2f ms");
+	std::snprintf(row2("GPU busy per frame", c_ren), 48, "-");   /* (SDL's GPU API has no timestamp queries) */
+	if (m.builds >= 0) std::snprintf(row2("Shader + pipeline builds", c_ren), 48, "%.1f (%.2f ms)", m.builds, m.build_ms); else std::snprintf(row2("Shader + pipeline builds", c_ren), 48, "-");
+	perf_fmt(row2("Waits (downloads, readbacks)", c_ren), 48, m.waits_ms, "%.2f ms");
+	perf_fmt(row2("Texture uploads", c_ren), 48, m.tex_uploads, "%.1f per frame");
+	perf_fmt(row2("Draws waiting for a build", c_ren), 48, m.skipped, "%.1f per frame");
+	std::snprintf(row2("Scenes / draws", c_ren), 48, m.fallback ? "%u / %u (%u software)" : "%u / %u", m.scenes, m.draws, m.fallback);
+	std::snprintf(row2("Audio queued", c_ren), 48, m.audio_underruns ? "%u ms, %u underruns" : "%u ms", m.audio_ms, m.audio_underruns);
+	char dv[6][64]; const char *dl_[6]; int nd = 0;
+	uint32_t ww = 0, wh = 0; window_pixel_size(&ww, &wh);
+	const int rs = m.render_scale > 0 ? m.render_scale : 1;
+	dl_[nd] = "Window"; if (ww && wh) std::snprintf(dv[nd++], 64, "%ux%u", ww, wh); else std::snprintf(dv[nd++], 64, "-");
+	dl_[nd] = "Game image"; std::snprintf(dv[nd++], 64, "%dx%d (%dx)", 960 * rs, 544 * rs, rs);
+	dl_[nd] = "Upscaling"; std::snprintf(dv[nd++], 64, "%s", gfx_gpu_fsr_active() ? "FSR" : "bilinear");
+	dl_[nd] = "Frame limit"; std::snprintf(dv[nd++], 64, "%d FPS", display_frame_rate_60() ? 60 : 30);
+	dl_[nd] = "Presentation"; std::snprintf(dv[nd++], 64, "%s", window_present_mode());
+	dl_[nd] = "Renderer"; std::snprintf(dv[nd++], 64, "%s", m.gpu_backend ? "GPU" : "software");
+
+	const char *title = std::getenv("RECOMP_GAME_NAME"); if (!title || !*title) title = std::getenv("RECOMP_TITLE"); if (!title || !*title) title = "Project Nativ";
+	const float gh = fs * 2.6f;
+	const float h = pad * 2 + lh * (1 + 6) + pad + gh + pad + lh * nr + pad * 0.5f + lh * nd + pad * 0.5f + lh * 2;
+	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + W, y0 + h), IM_COL32(0, 0, 0, 175), fs * 0.4f);
+	float y = y0 + pad; const float xl = x0 + pad;
+	dl->AddText(font, fs, ImVec2(xl, y), c_mut, title); y += lh;
+	for (const Row &r : top) {
+		dl->AddText(font, fs, ImVec2(xl, y), r.col, r.label);
+		if (r.v[0][0]) text_r(cx1, y, c_txt, r.v[0]);
+		if (r.v[1][0]) text_r(cx2, y, c_txt, r.v[1]);
+		if (r.v[2][0]) text_r(cx3, y, c_txt, r.v[2]);
+		y += lh;
+	}
+	/* the graph: the newest frames, newest at the right; guides at 16.7 ms (60 fps) and 33.3 ms (30 fps); the scale is
+	 * 50 ms, or the worst frame shown when that is longer */
+	y += pad * 0.5f;
+	const float gx = xl, gw = W - 2 * pad, gy = y;
+	dl->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh), IM_COL32(40, 70, 130, 150), fs * 0.25f);
+	if (m.nframes >= 2) {
+		float top_ms = 50.0f; for (int i = 0; i < m.nframes; i++) if (m.frame_ms[i] > top_ms) top_ms = m.frame_ms[i];
+		for (float guide : {1000.0f / 60.0f, 1000.0f / 30.0f}) { const float ly = gy + gh - gh * guide / top_ms; dl->AddLine(ImVec2(gx, ly), ImVec2(gx + gw, ly), IM_COL32(255, 255, 255, 55), 1.0f); }
+		ImVec2 pts[METRICS_GRAPH];
+		for (int i = 0; i < m.nframes; i++) pts[i] = ImVec2(gx + gw * i / (float)(m.nframes - 1), gy + gh - gh * m.frame_ms[i] / top_ms);
+		dl->AddPolyline(pts, m.nframes, IM_COL32(225, 235, 255, 230), ImDrawFlags_None, fs * 0.08f > 1.0f ? fs * 0.08f : 1.0f);
+	}
+	y = gy + gh + pad;
+	for (int i = 0; i < nr; i++) { dl->AddText(font, fs, ImVec2(xl, y), rc[i], rl[i]); text_r(cx3, y, c_txt, rv[i]); y += lh; }
+	y += pad * 0.5f;
+	for (int i = 0; i < nd; i++) { dl->AddText(font, fs, ImVec2(xl, y), c_dsp, dl_[i]); text_r(cx3, y, c_txt, dv[i]); y += lh; }
+	y += pad * 0.5f;
+	dl->AddText(font, fs, ImVec2(xl, y), c_mut, m.gpu_name[0] ? m.gpu_name : "GPU: -"); y += lh;
+	dl->AddText(font, fs, ImVec2(xl, y), c_mut, m.cpu_name[0] ? m.cpu_name : "CPU: -");
+}
 static void build_marks(void) {
 	ImDrawList *dl = g_intro ? ImGui::GetForegroundDrawList() : ImGui::GetBackgroundDrawList();   /* over the game's frame (LOAD), under the bar and its menus; over the touch card */
-	if (g_nosd) {   /* the overlay: a translucent dark panel at the top-left corner with the lines, as the bitmap version drew it (metrics.c); below the bar while that's down */
+	if (g_full) build_perf_full(dl);
+	else if (g_nosd) {   /* the overlay: a translucent dark panel at the top-left corner with the lines, as the bitmap version drew it (metrics.c); below the bar while that's down */
 		ImFont *font = ImGui::GetFont(); float fs = ImGui::GetFontSize() * 2.0f;   /* the embedded bitmap font at an integer multiple: crisp */
 		const float x = 8, y = 8 + g_bar_h * g_bar_vis, pad = 6, lh = fs + 2; float wmax = 0;
 		for (int i = 0; i < g_nosd; i++) { ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, g_osd[i]); if (sz.x > wmax) wmax = sz.x; }
-		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + wmax + 2 * pad, y + g_nosd * lh + 2 * pad), IM_COL32(0, 0, 0, 170));
+		/* the full level adds the frame-time graph under the lines: the last ~1.5 s of game frames, one point per
+		 * frame, newest at the right; dim guides at 16.7 ms (60 fps) and 33.3 ms (30 fps); the scale is 50 ms, or
+		 * the worst frame shown when that is longer, so a stutter stays inside the panel */
+		const float gh = g_nft >= 2 ? fs * 3.0f : 0.0f, gw = wmax;
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + wmax + 2 * pad, y + g_nosd * lh + 2 * pad + (gh > 0 ? gh + pad : 0)), IM_COL32(0, 0, 0, 170));
 		for (int i = 0; i < g_nosd; i++) dl->AddText(font, fs, ImVec2(x + pad, y + pad + i * lh), IM_COL32(255, 255, 255, 255), g_osd[i]);
+		if (gh > 0) {
+			const float gx = x + pad, gy = y + pad + g_nosd * lh + pad;
+			float top = 50.0f; for (int i = 0; i < g_nft; i++) if (g_ft[i] > top) top = g_ft[i];
+			for (float guide : {1000.0f / 60.0f, 1000.0f / 30.0f}) {
+				const float ly = gy + gh - gh * guide / top;
+				dl->AddLine(ImVec2(gx, ly), ImVec2(gx + gw, ly), IM_COL32(255, 255, 255, 60), 1.0f);
+			}
+			ImVec2 pts[240];
+			for (int i = 0; i < g_nft; i++) pts[i] = ImVec2(gx + gw * i / (float)(g_nft - 1), gy + gh - gh * g_ft[i] / top);
+			dl->AddPolyline(pts, g_nft, IM_COL32(120, 230, 120, 255), ImDrawFlags_None, 1.5f);
+		}
 	}
 	if (g_rear[2] > 0) dl->AddRect(ImVec2(g_rear[0], g_rear[1]), ImVec2(g_rear[0] + g_rear[2], g_rear[1] + g_rear[3]), IM_COL32(255, 170, 60, 140), 0.0f, 2.0f);   /* (rounding 0, thickness 2: ImGui 1.92.8+ argument order -- the old (0, 0, 2.0f) put 2 in `flags`, an ImGui user-error assert) */
 	for (int i = 0; i < g_nmarks; i++) {
@@ -1402,6 +1512,8 @@ void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
 	g_nosd = metrics_osd_lines(g_osd, 6);
+	g_nft = g_nosd > 1 ? metrics_frame_times(g_ft, 240) : 0;   /* more than one line: the full level */
+	g_full = metrics_osd_level() == 2; if (g_full) metrics_snapshot(&g_snap);
 	/* headless (the dump's HUD check): only with something to show. Windowed: every present -- the bar's
 	 * hover and timers, the cursor and the capture flag live in this frame (a frame that draws nothing is
 	 * a few microseconds of CPU and no render pass: render_frame) */
@@ -1428,7 +1540,7 @@ static void forced_frame(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t
 }
 void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t w, uint32_t h, const char *ui) {
 	if (!g_ctx || !device) return;
-	g_nmarks = 0; g_rear[2] = 0; g_nosd = 0;
+	g_nmarks = 0; g_rear[2] = 0; g_nosd = 0; g_nft = 0; g_full = false;
 	if (!ui || !*ui || !strncmp(ui, "menu", 4)) {
 		/* "menu:<tab>" opens the full menu on that page (the tab bar applies a selection on its next layout) */
 		if (ui && ui[4] == ':') for (int i = 0; i < TAB_N; i++) if (!strcmp(ui + 5, g_tab_names[i])) g_select_tab = i;
@@ -1454,10 +1566,12 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 	if (!strcmp(ui, "toast")) g_force_toast = true;
 	else { g_force_bar = true; if (strcmp(ui, "bar")) g_force_menu = ui; }
 	g_nosd = metrics_osd_lines(g_osd, 6);   /* the HUD too (RECOMP_OSD), in the same frame as the bar so it layers as it does live: under it */
+	g_nft = g_nosd > 1 ? metrics_frame_times(g_ft, 240) : 0;
+	g_full = metrics_osd_level() == 2; if (g_full) metrics_snapshot(&g_snap);
 	/* three frames: the bar's first, its menu popup's auto-fit on the second, and only the settled third
 	 * drawn (the texture is LOADed into, so drawing all three would stack the bar's translucency) */
 	for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_closed);
-	g_nosd = 0;
+	g_nosd = 0; g_nft = 0; g_full = false;
 	/* then put the closed state back the way a run finds it, inside one more (undrawn) frame so an open
 	 * menu popup is closed through ImGui itself, not left in its popup stack */
 	g_force_bar = false; g_force_menu = nullptr; g_bar_vis = 0; g_bar_want = false; g_toast_until = -1e9; g_tab_a = 0; g_dismiss_req = true;

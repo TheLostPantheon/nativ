@@ -89,6 +89,26 @@ format. The behaviour follows Vita3K's SceCamera module; there's no console refe
 
 It prints `all passed`.
 
+## The performance overlay: `metrics_test.c`
+
+Checks `runtime/core/metrics.c`, the numbers behind F1's overlay, with no game and no window. Game frames are fed at
+known intervals, then the full overlay is read back:
+
+- **Frame-time history** (`metrics_frame_times`, the full overlay's graph): one sample per frame, oldest first, and
+  the long frame where it was fed; a smaller `max` keeps the newest frames.
+- **The CPU line:** the process's resident memory, and a thread count where it is cheap to get. On Windows a
+  thread count would need a snapshot of every thread on the system, about 40 ms, so the line leaves it out.
+- **Refresh cost:** one stats refresh stays under 5 ms. It runs on the game or window thread twice a second.
+- **The full overlay's snapshot** (`metrics_snapshot`): the 1% and 0.1% lows from known frame times, the
+  renderer's per-frame costs averaged over half a second, and the machine sampler. The full level starts the sampler;
+  its numbers must be sane (CPU within 0..100%, RAM used within installed, each GPU value a number or -1 for unknown);
+  leaving the level stops it.
+
+    cc -O1 -g -Wall -Wno-unused-function -I ../core -I ../platform metrics_test.c ../platform/platform_posix.c -o /tmp/metrics_test -lpthread -ldl && /tmp/metrics_test
+
+On Windows (llvm-mingw), use `../platform/platform_win32.c` and add `-static -lpthread -lwinmm`. It prints
+`all passed`.
+
 ## Metal's scratch folders: `mtl_archive_test.m` (macOS)
 
 Checks the sweep in `runtime/gfx/mtl_archive.m`. Metal gives every binary archive a pipeline is added to a scratch
