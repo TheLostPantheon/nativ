@@ -27,7 +27,7 @@ static int dialog_open[DLG_N];
 #define DIALOG(kind, name) \
 	static void h_##name##_init(Cpu *c) { dialog_open[kind] = 1; RET(0); } \
 	static void h_##name##_status(Cpu *c) { RET(dialog_open[kind] ? 2 : 0); } /* FINISHED : NONE */ \
-	static void h_##name##_term(Cpu *c) { dialog_open[kind] = 0; RET(0); }
+	static void h_##name##_term(Cpu *c) { int in_use = dialog_open[kind]; dialog_open[kind] = 0; RET(in_use ? 0 : 0x80020411u); } /* NOT_IN_USE without an open dialog */
 DIALOG(DLG_TROPHY, trophy_dlg)
 DIALOG(DLG_NETCHECK, net_dlg)
 DIALOG(DLG_MSG, msg_dlg)
@@ -372,7 +372,16 @@ static void h_save_dlg_finish(Cpu *c) {   /* the dialog's last step is done: FIN
 	pthread_mutex_unlock(&sd_mu);
 	RET(ok ? 0 : 0x80020404u);
 }
-static void h_save_dlg_term(Cpu *c) { pthread_mutex_lock(&sd_mu); sd.open = 0; sd.status = sd.sub = ST_NONE; sd.kind = SAVEDLG_NONE; pthread_mutex_unlock(&sd_mu); RET(0); }
+/* the common-dialog Term contract: a Term with no dialog in use returns
+ * SCE_COMMON_DIALOG_ERROR_NOT_IN_USE, as the console does (a game's dialog flow can read it); a
+ * real Init..Term still terminates and returns 0 */
+static void h_save_dlg_term(Cpu *c) {
+	pthread_mutex_lock(&sd_mu);
+	int in_use = sd.open;
+	sd.open = 0; sd.status = sd.sub = ST_NONE; sd.kind = SAVEDLG_NONE;
+	pthread_mutex_unlock(&sd_mu);
+	RET(in_use ? 0 : 0x80020411u);   /* NOT_IN_USE */
+}
 static void h_save_dlg_abort(Cpu *c) {
 	pthread_mutex_lock(&sd_mu); sd.result = 2; sd.button = 0; sd.open = 0; sd.status = ST_FINISHED; sd.kind = SAVEDLG_NONE; pthread_mutex_unlock(&sd_mu);   /* ABORTED */
 	RET(0);
