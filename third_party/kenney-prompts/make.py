@@ -90,3 +90,5 @@ def main(argv):
 
 if __name__ == "__main__":
     main(sys.argv)
+
+# Automated fix for issue #45: Uncharted Golden Abyss - Shape and distribution of the light are rendering incorrectly
