@@ -101,3 +101,11 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## SceCodecEngine's unmap-memory ranges: `codec_engine_test.c`
+
+Checks `h_ce_alloc` in `runtime/media/video.c`: a movie player's reference sequence (a 0x300000 block, then 0x80000
+aligned 0x40000 and 0x240000 aligned 0x100000) gets two nonzero, disjoint ranges inside the block, an alignment that
+fits is kept, and an allocation beyond the budget still fails. `-DVIDEO_UNDER_TEST='"<file>"'` compiles a different
+copy of `video.c` for a fail-before comparison. Same build line as `jpeg_test.c` without libraries beyond `-lpthread`.
+It prints `all passed` and exits 0.
