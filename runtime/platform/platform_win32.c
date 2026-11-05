@@ -8,6 +8,10 @@
 #define PSAPI_VERSION 2   /* K32GetProcessMemoryInfo: in kernel32, no psapi.lib */
 #include <psapi.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include <cpuid.h>
 #include "platform.h"
 #include <pthread.h>   /* (winpthreads: kernel.c names threads through it, so it has the names) */
 
@@ -131,3 +135,137 @@ void plat_random(void *buf, size_t n) {   /* the system's own generator (bcrypt.
 	LARGE_INTEGER t; QueryPerformanceCounter(&t);
 	for (size_t i = 0; i < n; i++) ((unsigned char *)buf)[i] = (unsigned char)(t.QuadPart >> (i % 56)) ^ (unsigned char)(GetTickCount() >> (i % 24));
 }
+
+/* ---- the machine, for the performance overlay's sampler thread (platform.h) */
+void *plat_lib_open(const char *name) { return (void *)LoadLibraryA(name); }
+void *plat_lib_sym(void *lib, const char *sym) { return lib ? (void *)GetProcAddress((HMODULE)lib, sym) : 0; }
+
+static uint64_t ft64(FILETIME f) { return ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime; }
+int plat_system_cpu(uint64_t *busy, uint64_t *total) {   /* 100 ns units; kernel time includes idle time */
+	FILETIME idle, kern, user;
+	if (!GetSystemTimes(&idle, &kern, &user)) return 0;
+	uint64_t i = ft64(idle), k = ft64(kern), u = ft64(user);
+	*total = k + u; *busy = k + u - i; return 1;
+}
+int plat_mem_info(uint64_t *used, uint64_t *total) {
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+	if (!GlobalMemoryStatusEx(&ms) || !ms.ullTotalPhys) return 0;
+	*total = ms.ullTotalPhys; *used = ms.ullTotalPhys - ms.ullAvailPhys; return 1;
+}
+void plat_cpu_name(char *out, size_t n) {
+	if (!n) return;
+	out[0] = 0;
+	unsigned int r[12], a, b, c, d;
+	if (!__get_cpuid(0x80000000u, &a, &b, &c, &d) || a < 0x80000004u) return;
+	for (unsigned int i = 0; i < 3; i++) __get_cpuid(0x80000002u + i, &r[i * 4], &r[i * 4 + 1], &r[i * 4 + 2], &r[i * 4 + 3]);
+	char s[49]; memcpy(s, r, 48); s[48] = 0;
+	const char *p = s; while (*p == ' ') p++;
+	snprintf(out, n, "%s", p);
+}
+
+/* the GPU. DXGI (dxgi.dll, loaded here) names the adapters: the one whose description matches the renderer's device
+ * name -- else the one with the most dedicated memory -- gives the LUID the performance counters are keyed by, and
+ * the VRAM size. The counters (pdh.dll) are the ones Task Manager shows: "GPU Engine" utilization per engine and
+ * process, summed per engine type, the busiest type being the GPU's load; and "GPU Adapter Memory" dedicated usage.
+ * NVML (gpumon_nvml.h) adds temperature, power and clock on NVIDIA. AMD's and Intel's equivalents are not read: -1. */
+#include "gpumon_nvml.h"
+typedef LONG (WINAPI *PdhOpenQueryW_t)(LPCWSTR, DWORD_PTR, HANDLE *);
+typedef LONG (WINAPI *PdhAddEnglishCounterW_t)(HANDLE, LPCWSTR, DWORD_PTR, HANDLE *);
+typedef LONG (WINAPI *PdhCollectQueryData_t)(HANDLE);
+typedef LONG (WINAPI *PdhGetFormattedCounterArrayW_t)(HANDLE, DWORD, DWORD *, DWORD *, void *);
+typedef LONG (WINAPI *PdhCloseQuery_t)(HANDLE);
+typedef struct { LPWSTR name; struct { DWORD status; DWORD pad; union { LONG l; double d; LONGLONG ll; } v; } value; } PdhItem;   /* PDH_FMT_COUNTERVALUE_ITEM_W */
+#define PDH_FMT_DOUBLE_ 0x00000200
+#define PDH_FMT_LARGE_ 0x00000400
+#define PDH_FMT_NOCAP100_ 0x00008000
+#define PDH_MORE_DATA_ ((LONG)0x800007D2)
+struct PlatGpuMon {
+	Nvml nv; char name[96];
+	wchar_t luid[40]; float vram_total_mb;   /* L"luid_0x%08X_0x%08X"; from DXGI */
+	HANDLE q, c_util, c_mem; int samples;
+	PdhCollectQueryData_t collect; PdhGetFormattedCounterArrayW_t array; PdhCloseQuery_t close;
+};
+/* DXGI's IDXGIFactory1 / IDXGIAdapter1, called through their vtables (only the slots used; the layout is the COM
+ * interface's): EnumAdapters1 is the factory's 13th method, GetDesc1 the adapter's 11th, Release the 3rd */
+typedef struct { WCHAR Description[128]; UINT VendorId, DeviceId, SubSysId, Revision; SIZE_T DedicatedVideoMemory, DedicatedSystemMemory, SharedSystemMemory; LUID AdapterLuid; UINT Flags; } DxgiDesc1;
+typedef struct { void **vt; } ComObj;
+static void dxgi_pick(PlatGpuMon *m) {
+	HMODULE lib = LoadLibraryA("dxgi.dll"); if (!lib) return;
+	HRESULT (WINAPI *create)(const GUID *, void **) = (HRESULT (WINAPI *)(const GUID *, void **))(void *)GetProcAddress(lib, "CreateDXGIFactory1");
+	static const GUID iid_factory1 = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};   /* IID_IDXGIFactory1 */
+	ComObj *f = 0;
+	if (!create || create(&iid_factory1, (void **)&f) < 0 || !f) return;
+	HRESULT (WINAPI *enum1)(ComObj *, UINT, ComObj **) = (HRESULT (WINAPI *)(ComObj *, UINT, ComObj **))f->vt[12];
+	LUID best = {0, 0}; SIZE_T best_mem = 0; int matched = 0;
+	for (UINT i = 0; i < 16 && !matched; i++) {
+		ComObj *a = 0;
+		if (enum1(f, i, &a) < 0 || !a) break;
+		DxgiDesc1 d; memset(&d, 0, sizeof d);
+		if (((HRESULT (WINAPI *)(ComObj *, DxgiDesc1 *))a->vt[10])(a, &d) >= 0 && !(d.Flags & 2 /* software */)) {
+			char desc[128]; WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, desc, sizeof desc, 0, 0);
+			if (m->name[0] && desc[0] && (nvml_icontains(m->name, desc) || nvml_icontains(desc, m->name))) { best = d.AdapterLuid; best_mem = d.DedicatedVideoMemory; matched = 1; }
+			else if (d.DedicatedVideoMemory > best_mem) { best = d.AdapterLuid; best_mem = d.DedicatedVideoMemory; }
+		}
+		((ULONG (WINAPI *)(ComObj *))a->vt[2])(a);
+	}
+	((ULONG (WINAPI *)(ComObj *))f->vt[2])(f);
+	if (!best_mem) return;
+	swprintf(m->luid, 40, L"luid_0x%08lX_0x%08lX", (unsigned long)best.HighPart, (unsigned long)best.LowPart);
+	m->vram_total_mb = (float)(best_mem / 1048576.0);
+}
+PlatGpuMon *plat_gpu_open(const char *device_name) {
+	PlatGpuMon *m = calloc(1, sizeof *m); if (!m) return 0;
+	snprintf(m->name, sizeof m->name, "%s", device_name ? device_name : "");
+	m->vram_total_mb = -1;
+	dxgi_pick(m);
+	HMODULE pdh = m->luid[0] ? LoadLibraryA("pdh.dll") : 0;
+	PdhOpenQueryW_t open = pdh ? (PdhOpenQueryW_t)(void *)GetProcAddress(pdh, "PdhOpenQueryW") : 0;
+	PdhAddEnglishCounterW_t add = pdh ? (PdhAddEnglishCounterW_t)(void *)GetProcAddress(pdh, "PdhAddEnglishCounterW") : 0;
+	m->collect = pdh ? (PdhCollectQueryData_t)(void *)GetProcAddress(pdh, "PdhCollectQueryData") : 0;
+	m->array = pdh ? (PdhGetFormattedCounterArrayW_t)(void *)GetProcAddress(pdh, "PdhGetFormattedCounterArrayW") : 0;
+	m->close = pdh ? (PdhCloseQuery_t)(void *)GetProcAddress(pdh, "PdhCloseQuery") : 0;
+	if (open && add && m->collect && m->array && m->close && open(0, 0, &m->q) == 0) {
+		if (add(m->q, L"\\GPU Engine(*)\\Utilization Percentage", 0, &m->c_util)) m->c_util = 0;
+		if (add(m->q, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &m->c_mem)) m->c_mem = 0;
+		m->collect(m->q);   /* (a rate counter needs two collections: the first sample reads -1) */
+	}
+	return m;
+}
+/* the counter's instances as an array (PdhItem), or NULL; the caller frees it */
+static PdhItem *pdh_items(PlatGpuMon *m, HANDLE c, DWORD fmt, DWORD *count) {
+	DWORD size = 0; *count = 0;
+	if (m->array(c, fmt, &size, count, 0) != PDH_MORE_DATA_ || !size) return 0;
+	PdhItem *it = malloc(size);
+	if (it && m->array(c, fmt, &size, count, it) != 0) { free(it); it = 0; }
+	return it;
+}
+void plat_gpu_sample(PlatGpuMon *m, PlatGpuSample *s) {
+	s->load_pct = s->vram_used_mb = s->vram_total_mb = s->temp_c = s->power_w = s->clock_mhz = -1;
+	if (!m) return;
+	nvml_open(&m->nv, m->name); nvml_sample(&m->nv, s);   /* (the counters below win where both give a number) */
+	if (m->vram_total_mb > 0) s->vram_total_mb = m->vram_total_mb;
+	if (!m->q || m->collect(m->q) != 0) return;
+	if (++m->samples < 2) return;
+	DWORD n; PdhItem *it;
+	if (m->c_util && (it = pdh_items(m, m->c_util, PDH_FMT_DOUBLE_ | PDH_FMT_NOCAP100_, &n))) {
+		/* instances: pid_<p>_luid_<hi>_<lo>_phys_<k>_eng_<e>_engtype_<type>; summed per type on our adapter */
+		struct { wchar_t type[32]; double sum; } t[16]; int nt = 0;
+		for (DWORD i = 0; i < n; i++) {
+			if (it[i].value.status > 1 || !wcsstr(it[i].name, m->luid)) continue;   /* (PDH_CSTATUS_VALID_DATA 0, NEW_DATA 1) */
+			const wchar_t *ty = wcsstr(it[i].name, L"engtype_"); ty = ty ? ty + 8 : L"";
+			int k = 0; while (k < nt && wcscmp(t[k].type, ty)) k++;
+			if (k == nt) { if (nt == 16) continue; wcsncpy(t[nt].type, ty, 31); t[nt].type[31] = 0; t[nt].sum = 0; nt++; }
+			t[k].sum += it[i].value.v.d;
+		}
+		double busiest = 0; for (int k = 0; k < nt; k++) if (t[k].sum > busiest) busiest = t[k].sum;
+		if (nt) s->load_pct = (float)(busiest > 100 ? 100 : busiest);
+		free(it);
+	}
+	if (m->c_mem && (it = pdh_items(m, m->c_mem, PDH_FMT_LARGE_, &n))) {
+		double used = -1;
+		for (DWORD i = 0; i < n; i++) if (it[i].value.status <= 1 && wcsstr(it[i].name, m->luid)) used = (used < 0 ? 0 : used) + (double)it[i].value.v.ll;
+		if (used >= 0) s->vram_used_mb = (float)(used / 1048576.0);
+		free(it);
+	}
+}
+void plat_gpu_close(PlatGpuMon *m) { if (!m) return; if (m->q) m->close(m->q); free(m); }

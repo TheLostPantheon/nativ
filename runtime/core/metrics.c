@@ -72,9 +72,10 @@ static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
 
 /* frame-time ring: the last RING_CAP real game frames' own timestamp and the gap since the one
  * before it; "last second or two" of stats scan back from `now` until a sample falls outside
- * FRAME_WINDOW_US. 512 covers a couple of seconds even at a few hundred fps. */
-#define RING_CAP 512
+ * FRAME_WINDOW_US. 4096 covers the full overlay's 10-second lows (LOWS_WINDOW_US) up to ~400 fps. */
+#define RING_CAP 4096
 #define FRAME_WINDOW_US 1500000ull
+#define LOWS_WINDOW_US 10000000ull
 typedef struct { uint64_t t_us; uint32_t dur_us; } FrameSample;
 static FrameSample gring[RING_CAP]; static int gring_n, gring_head; static uint64_t last_game_t;
 static uint64_t wring[RING_CAP]; static int wring_n, wring_head;   /* window-loop timestamps only: no "duration" stat asked for there, just its own fps */
@@ -181,6 +182,91 @@ int metrics_frame_times(float *ms, int max) {
 	for (int i = 0; i < n; i++) ms[i] = gring[(gring_head - n + i + RING_CAP) % RING_CAP].dur_us / 1000.0f;
 	pthread_mutex_unlock(&mx);
 	return n;
+}
+
+/* ---- the full overlay's snapshot (metrics.h's MetricsSnapshot) */
+static int fl_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
+void metrics_lows(float *ms, int n, float *low1_fps, float *low01_fps) {
+	*low1_fps = *low01_fps = -1;
+	if (!ms || n < 100) return;
+	qsort(ms, (size_t)n, sizeof ms[0], fl_cmp);
+	int k1 = (n + 99) / 100, k01 = (n + 999) / 1000;   /* how many frames are the slowest 1% / 0.1% (at least one) */
+	float a = ms[n - k1], b = ms[n - k01];              /* the fastest of them */
+	*low1_fps = a > 0 ? 1000.0f / a : -1; *low01_fps = b > 0 ? 1000.0f / b : -1;
+}
+
+static MetricsSnapshot snap;   /* guarded by mx: maybe_tick writes the frame and renderer parts, the sampler the machine's */
+static char gpu_name_v[96];
+void metrics_set_gpu_name(const char *name) { pthread_mutex_lock(&mx); snprintf(gpu_name_v, sizeof gpu_name_v, "%s", name ? name : ""); pthread_mutex_unlock(&mx); }
+
+/* the renderer's per-frame work while the full level shows (gfx_gpu.c's frame costs), summed until the next tick */
+static uint64_t rc_frames, rc_builds, rc_uploads, rc_skipped, rc_build_us, rc_wait_us; static int rc_have;
+
+/* the sampler thread: the machine's numbers twice a second while the full level shows, then it ends (the next full
+ * level starts another). The lows are sorted here too: up to 4096 frame times, off the game's thread. */
+static int sampler_running;   /* guarded by mx */
+static void *sampler(void *arg) {
+	(void)arg;
+	static float lows_buf[RING_CAP];
+	char cpu_name[64]; plat_cpu_name(cpu_name, sizeof cpu_name);
+	pthread_mutex_lock(&mx); char want[96]; snprintf(want, sizeof want, "%s", gpu_name_v); pthread_mutex_unlock(&mx);
+	PlatGpuMon *gm = plat_gpu_open(want);
+	uint64_t pb = 0, pt = 0, pwall = 0; double pgame = 0; int have = 0, ncpu = plat_cpu_count();
+	while (metrics_osd_level() == 2) {
+		uint64_t busy = 0, total = 0, used = 0, tot = 0; int sys = plat_system_cpu(&busy, &total), mem = plat_mem_info(&used, &tot);
+		double game = plat_cpu_seconds(); uint64_t wall = now_us();
+		PlatGpuSample g; plat_gpu_sample(gm, &g);
+		int threads = plat_thread_count(); uint64_t rss = plat_rss_bytes();
+		/* the lows: this window's frame times, copied under the lock, sorted outside it */
+		pthread_mutex_lock(&mx);
+		int n = 0;
+		for (int i = 0; i < gring_n; i++) {
+			const FrameSample *f = &gring[(gring_head - 1 - i + RING_CAP) % RING_CAP];
+			if (wall - f->t_us > LOWS_WINDOW_US) break;
+			lows_buf[n++] = f->dur_us / 1000.0f;
+		}
+		pthread_mutex_unlock(&mx);
+		float l1, l01; metrics_lows(lows_buf, n, &l1, &l01);
+		pthread_mutex_lock(&mx);
+		snap.low1_fps = l1; snap.low01_fps = l01;
+		snap.cpu_total_pct = sys && have && total > pt ? (float)(100.0 * (busy - pb) / (double)(total - pt)) : -1;
+		snap.cpu_game_pct = have && wall > pwall ? (float)(100.0 * (game - pgame) / ((wall - pwall) / 1e6) / (ncpu > 0 ? ncpu : 1)) : -1;
+		if (snap.cpu_game_pct > 100) snap.cpu_game_pct = 100;
+		snap.ram_used_mb = mem ? (float)(used / 1048576.0) : -1; snap.ram_total_mb = mem ? (float)(tot / 1048576.0) : -1;
+		snap.ram_game_mb = rss ? (float)(rss / 1048576.0) : -1;
+		snap.threads = threads;
+		snap.gpu_pct = g.load_pct; snap.vram_used_mb = g.vram_used_mb; snap.vram_total_mb = g.vram_total_mb;
+		snap.gpu_temp_c = g.temp_c; snap.gpu_power_w = g.power_w; snap.gpu_clock_mhz = g.clock_mhz;
+		snprintf(snap.cpu_name, sizeof snap.cpu_name, "%s", cpu_name);
+		snap.machine = 1;
+		pthread_mutex_unlock(&mx);
+		pb = busy; pt = total; pgame = game; pwall = wall; have = 1;
+		plat_sleep_ns(500000000ull);
+	}
+	plat_gpu_close(gm);
+	pthread_mutex_lock(&mx); sampler_running = 0; snap.machine = 0; pthread_mutex_unlock(&mx);
+	return 0;
+}
+static void sampler_start(void) {   /* caller holds mx */
+	if (sampler_running) return;
+	pthread_t t;
+	if (pthread_create(&t, 0, sampler, 0) == 0) { pthread_detach(t); sampler_running = 1; }
+}
+int metrics_sampler_running(void) { pthread_mutex_lock(&mx); int r = sampler_running; pthread_mutex_unlock(&mx); return r; }
+
+void metrics_snapshot(MetricsSnapshot *out) {
+	pthread_mutex_lock(&mx);
+	*out = snap;
+	snprintf(out->gpu_name, sizeof out->gpu_name, "%s", gpu_name_v);
+	uint64_t now = now_us(); int n = 0;
+	while (n < gring_n && n < METRICS_GRAPH) {
+		const FrameSample *f = &gring[(gring_head - 1 - n + RING_CAP) % RING_CAP];
+		if (now - f->t_us > LOWS_WINDOW_US) break;
+		n++;
+	}
+	for (int i = 0; i < n; i++) out->frame_ms[i] = gring[(gring_head - n + i + RING_CAP) % RING_CAP].dur_us / 1000.0f;
+	out->nframes = n;
+	pthread_mutex_unlock(&mx);
 }
 
 /* ---- the on-screen overlay: a 5x7-dot font, hand-drawn below (upper-case letters, digits, space,
@@ -410,6 +496,16 @@ static void maybe_tick(uint64_t now) {
 	snprintf(line_full[5], sizeof line_full[5], "AUDIO %uMS Q %u UNDERRUN", am, au);
 	n_full = 6;
 
+	snap.fps = (float)fps; snap.frame_ms_avg = (float)avg_ms; snap.frame_ms_max = (float)max_ms;
+	snap.speed = (float)speed; snap.window_fps = (float)wfps; snap.render_ms = (float)render_ms; snap.present_ms = (float)present_ms;
+	snap.gpu_backend = gpu; snap.render_scale = rs; snap.scenes = scenes; snap.draws = draws; snap.fallback = fd;
+	snap.audio_ms = am; snap.audio_underruns = au;
+	if (rc_have && rc_frames) {
+		snap.builds = (float)rc_builds / rc_frames; snap.build_ms = (float)(rc_build_us / 1000.0 / rc_frames);
+		snap.tex_uploads = (float)rc_uploads / rc_frames; snap.waits_ms = (float)(rc_wait_us / 1000.0 / rc_frames); snap.skipped = (float)rc_skipped / rc_frames;
+	} else snap.builds = snap.build_ms = snap.tex_uploads = snap.waits_ms = snap.skipped = -1;
+	rc_frames = rc_builds = rc_uploads = rc_skipped = rc_build_us = rc_wait_us = 0;
+	if (metrics_osd_level() == 2) sampler_start();
 	rebuild_osd(metrics_osd_level());
 	maybe_dump_osd();
 
@@ -431,6 +527,11 @@ void metrics_game_frame(void) {
 	uint32_t cum_gpu = 0, cum_fb = 0;
 	extern void gfx_gpu_get_counts(uint32_t *gpu_draws, uint32_t *fallback_draws);
 	gfx_gpu_get_counts(&cum_gpu, &cum_fb);
+	/* the full level: what the renderer did in this frame (gfx_gpu.c collects it while the level shows; it returns
+	 * 0 on the software backend) */
+	extern int gfx_gpu_overlay_costs(uint32_t *builds, uint32_t *uploads, uint32_t *skipped, uint64_t *build_us, uint64_t *wait_us);
+	uint32_t c_b = 0, c_u = 0, c_s = 0; uint64_t c_bu = 0, c_w = 0;
+	int c_have = metrics_osd_level() == 2 && gfx_gpu_overlay_costs(&c_b, &c_u, &c_s, &c_bu, &c_w);
 
 	pthread_mutex_lock(&mx);
 	lf_render_us = render_us; lf_scenes = scenes; lf_draws = draws;
@@ -439,6 +540,7 @@ void metrics_game_frame(void) {
 	cum_gpu_seen = cum_gpu; cum_fb_seen = cum_fb;
 	if (last_game_t) gring_push(now, (uint32_t)(now - last_game_t));
 	last_game_t = now;
+	if (c_have) { rc_have = 1; rc_frames++; rc_builds += c_b; rc_uploads += c_u; rc_skipped += c_s; rc_build_us += c_bu; rc_wait_us += c_w; }
 	pthread_mutex_unlock(&mx);
 
 	maybe_tick(now);

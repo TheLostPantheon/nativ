@@ -7,9 +7,12 @@
  *   - the full level's CPU line: the process's resident memory (plat_rss_bytes) on every platform, and a real
  *     thread count where it is cheap (this test holds a second thread), else no thread count at all (Windows);
  *   - one stats refresh stays cheap: it runs on the game or window thread twice a second.
+ *   - the full overlay's snapshot (metrics_snapshot): 1%/0.1% lows from known frame times (metrics_lows), the
+ *     renderer's per-frame costs averaged, and the machine sampler -- started by the full level, its numbers sane
+ *     (CPU within 0..100%, RAM used within installed, GPU values a number or -1), stopped when the level drops.
  *
  * Linux / macOS, from this folder:
- *     cc -O1 -g -Wall -Wno-unused-function -I ../core -I ../platform metrics_test.c ../platform/platform_posix.c -o /tmp/metrics_test -lpthread && /tmp/metrics_test
+ *     cc -O1 -g -Wall -Wno-unused-function -I ../core -I ../platform metrics_test.c ../platform/platform_posix.c -o /tmp/metrics_test -lpthread -ldl && /tmp/metrics_test
  * Windows (llvm-mingw):
  *     clang -O1 -g -Wall -Wno-unused-function -I ../core -I ../platform metrics_test.c ../platform/platform_win32.c -o metrics_test.exe -static -lpthread -lwinmm && ./metrics_test.exe
  * -DFAIL_BEFORE builds only the checks that also compile against a runtime without these additions.
@@ -20,9 +23,14 @@
 #include <string.h>
 #include "../core/metrics.c"
 
-/* the four symbols metrics.c takes from the rest of the runtime */
+/* the symbols metrics.c takes from the rest of the runtime */
 uint64_t guest_time_us_peek(void) { return now_us(); }
 void gfx_gpu_get_counts(uint32_t *gpu_draws, uint32_t *fallback_draws) { *gpu_draws = 0; *fallback_draws = 0; }
+static int costs_on;   /* 0: the software backend (no costs); 1: fixed costs every frame */
+int gfx_gpu_overlay_costs(uint32_t *builds, uint32_t *uploads, uint32_t *skipped, uint64_t *build_us, uint64_t *wait_us) {
+	if (!costs_on) return 0;
+	*builds = 2; *uploads = 3; *skipped = 1; *build_us = 500; *wait_us = 250; return 1;
+}
 int settings_has(const char *key) { (void)key; return 0; }
 int settings_int(const char *key, int def) { (void)key; return def; }
 
@@ -82,6 +90,61 @@ int main(void) {
 	if (known) check(got && threads >= 2, "the CPU line counts this process's threads (main + holder)");
 	else check(got, "no cheap thread count here: the CPU line leaves it out instead of showing 0");
 	check(got && mem > 0, "the CPU line shows the process's resident memory in MB");
+
+#ifndef FAIL_BEFORE
+	/* ---- the full overlay's snapshot (metrics_snapshot) */
+	{	/* 1% and 0.1% lows from known frame times, given out of order: 979 at 10 ms, 20 at 40 ms, one at 100 ms */
+		static float ft[1000]; float l1, l01;
+		for (int i = 0; i < 1000; i++) ft[i] = i == 0 ? 100.0f : i <= 20 ? 40.0f : 10.0f;
+		metrics_lows(ft, 1000, &l1, &l01);
+		printf("     lows of 1000 frames: 1%% %.2f fps, 0.1%% %.2f fps\n", l1, l01);
+		check(l1 > 24.99f && l1 < 25.01f, "1% low: the slowest 10 frames are 40 ms ones -> 25 fps");
+		check(l01 > 9.99f && l01 < 10.01f, "0.1% low: the slowest frame is the 100 ms one -> 10 fps");
+		for (int i = 0; i < 200; i++) ft[i] = i < 2 ? 50.0f : 10.0f;
+		metrics_lows(ft, 200, &l1, &l01);
+		check(l1 > 19.99f && l1 < 20.01f, "200 frames, exactly 1% at 50 ms: 1% low 20 fps");
+		metrics_lows(ft, 99, &l1, &l01);
+		check(l1 < 0 && l01 < 0, "under 100 frames: no lows (-1)");
+	}
+	MetricsSnapshot sn; metrics_snapshot(&sn);
+	check(sn.builds < 0 && sn.tex_uploads < 0, "no renderer costs given (software backend): -1, drawn as -");
+
+	/* the renderer's costs: 2 builds, 3 uploads, 1 skipped draw, 0.5 ms building, 0.25 ms waiting, every frame */
+	costs_on = 1;
+	for (int i = 0; i < 20; i++) { sleep_ms(5); metrics_game_frame(); }
+	sleep_ms(550); metrics_game_frame(); metrics_snapshot(&sn);
+	printf("     renderer per frame: %.2f builds %.3f ms, %.2f uploads, %.3f ms waits, %.2f skipped\n", sn.builds, sn.build_ms, sn.tex_uploads, sn.waits_ms, sn.skipped);
+	check(sn.builds > 1.99f && sn.builds < 2.01f && sn.tex_uploads > 2.99f && sn.tex_uploads < 3.01f && sn.skipped > 0.99f && sn.skipped < 1.01f, "renderer counts averaged per frame");
+	check(sn.build_ms > 0.499f && sn.build_ms < 0.501f && sn.waits_ms > 0.249f && sn.waits_ms < 0.251f, "renderer times averaged per frame, in ms");
+
+	/* the machine sampler: started by the full level, delivers within a couple of seconds (the GPU monitor's first
+	 * open can take hundreds of ms); two samples make the CPU percentages */
+	metrics_set_gpu_name("no such test GPU"); metrics_snapshot(&sn);
+	for (int i = 0; i < 60 && !(sn.machine && sn.cpu_total_pct >= 0); i++) { sleep_ms(50); metrics_game_frame(); metrics_snapshot(&sn); }
+	printf("     machine: cpu '%s' %.1f%% (game %.1f%%), ram %.0f/%.0f MB (game %.0f), threads %d\n", sn.cpu_name, sn.cpu_total_pct, sn.cpu_game_pct, sn.ram_used_mb, sn.ram_total_mb, sn.ram_game_mb, sn.threads);
+	printf("     gpu '%s': %.1f%%, vram %.0f/%.0f MB, %.1f C, %.1f W, %.0f MHz\n", sn.gpu_name, sn.gpu_pct, sn.vram_used_mb, sn.vram_total_mb, sn.gpu_temp_c, sn.gpu_power_w, sn.gpu_clock_mhz);
+	check(sn.machine == 1 && metrics_sampler_running(), "the full level runs the machine sampler");
+	check(sn.cpu_total_pct >= 0 && sn.cpu_total_pct <= 100.5f, "system CPU in 0..100%");
+	check(sn.cpu_game_pct >= 0 && sn.cpu_game_pct <= 100.5f, "this game's CPU in 0..100% of all processors");
+	check(sn.ram_total_mb > 0 && sn.ram_used_mb > 0 && sn.ram_used_mb <= sn.ram_total_mb, "system RAM: used within installed");
+	check(sn.ram_game_mb > 0 && sn.ram_game_mb <= sn.ram_total_mb, "this game's RAM within installed");
+#if defined(__x86_64__) || defined(__i386__)
+	check(sn.cpu_name[0] != 0, "the CPU names itself (x86 brand string)");
+#endif
+	int gpu_sane = 1; const float gv[6] = {sn.gpu_pct, sn.vram_used_mb, sn.vram_total_mb, sn.gpu_temp_c, sn.gpu_power_w, sn.gpu_clock_mhz};
+	for (int i = 0; i < 6; i++) if (!(gv[i] == -1.0f || gv[i] >= 0)) gpu_sane = 0;
+	if (sn.gpu_pct > 100.5f || (sn.vram_used_mb >= 0 && sn.vram_total_mb > 0 && sn.vram_used_mb > sn.vram_total_mb)) gpu_sane = 0;
+	check(gpu_sane, "GPU numbers are each a value or -1 (unknown), load within 100%, VRAM used within total");
+	check(!strcmp(sn.gpu_name, "no such test GPU"), "the snapshot carries the renderer's GPU name");
+	check(sn.nframes > 0 && sn.nframes <= METRICS_GRAPH, "the graph holds the newest frames");
+
+	/* leaving the full level ends the sampler at its next wake-up (twice a second) */
+	metrics_osd_set(1);
+	for (int i = 0; i < 30 && metrics_sampler_running(); i++) sleep_ms(50);
+	check(!metrics_sampler_running(), "leaving the full level stops the machine sampler");
+	metrics_snapshot(&sn);
+	check(sn.machine == 0, "...and the snapshot says its machine numbers are stale");
+#endif
 
 	pthread_mutex_lock(&hold_mx); hold_done = 1; pthread_cond_signal(&hold_cv); pthread_mutex_unlock(&hold_mx);
 	pthread_join(t, 0);

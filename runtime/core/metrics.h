@@ -3,6 +3,9 @@
 #ifndef RECOMP_METRICS_H
 #define RECOMP_METRICS_H
 #include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* gfx_dispatch.c: each gfx_begin_scene/draw/end_scene/present call's own wall-clock cost (its
  * LOCKED section) -- folded into the render-time total metrics_game_frame() harvests at the next
@@ -56,4 +59,36 @@ double metrics_fps(void);
  * `max`; returns how many were written */
 int metrics_frame_times(float *ms, int max);
 
+/* the full overlay's numbers in one copy, for overlay.cpp's HUD (read every present while the full level shows;
+ * recomputed at most twice a second). A value this machine or backend does not give is negative: drawn as "-".
+ * The machine's numbers (CPU, RAM, GPU) come from a sampler thread that runs only while the full level shows, at
+ * 2 Hz: their OS calls take milliseconds (a GPU monitor's first open hundreds), so they never run on the game's or
+ * the window's thread. */
+#define METRICS_GRAPH 240
+typedef struct {
+	float fps, frame_ms_avg, frame_ms_max;   /* the game's frames over the last ~1.5 s */
+	float low1_fps, low01_fps;               /* the fps of the slowest 1% / 0.1% of frames over the last 10 s; -1: under 100 frames */
+	int nframes; float frame_ms[METRICS_GRAPH];   /* the graph: the newest game frames' durations, oldest first */
+	float speed, window_fps;
+	float render_ms, present_ms;             /* the renderer's CPU time in the last frame; the window's blit */
+	float builds, build_ms, tex_uploads, waits_ms, skipped;   /* per frame over the last 0.5 s: shader + pipeline builds and their time, texture uploads, waits (target downloads, readbacks, ring wraps), draws skipped for an unfinished build; -1 on the software backend */
+	int gpu_backend, render_scale; unsigned scenes, draws, fallback;
+	int machine;                             /* 1 once the sampler has delivered */
+	float cpu_total_pct, cpu_game_pct;       /* the whole machine and this game, percent of all logical processors */
+	int threads;                             /* this process's threads; 0 unknown (Windows) */
+	float ram_used_mb, ram_total_mb, ram_game_mb;
+	float gpu_pct, vram_used_mb, vram_total_mb, gpu_temp_c, gpu_power_w, gpu_clock_mhz;
+	char cpu_name[64], gpu_name[96];
+	unsigned audio_ms, audio_underruns;
+} MetricsSnapshot;
+void metrics_snapshot(MetricsSnapshot *out);
+int metrics_sampler_running(void);   /* (tests) the machine sampler is alive */
+void metrics_set_gpu_name(const char *name);   /* gfx_gpu.c, when it creates its device: the name the GPU monitor matches */
+/* the 1% and 0.1% lows of n frame times (ms, any order; sorted in place) as fps: the fps of the fastest frame among
+ * the slowest 1% (0.1%); -1 both under 100 frames */
+void metrics_lows(float *ms, int n, float *low1_fps, float *low01_fps);
+
+#ifdef __cplusplus
+}
+#endif
 #endif

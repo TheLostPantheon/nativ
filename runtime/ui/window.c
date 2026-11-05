@@ -58,7 +58,9 @@ static uint32_t fw, fh, new_frame;
 static volatile uint32_t buttons;
 static volatile uint8_t sticks[4] = {128, 128, 128, 128};
 static int active;
-static int self_paced; static uint64_t last_paced_us;   /* a present mode that doesn't wait for vsync: the present loop paces itself */
+static int self_paced; static uint64_t last_paced_us;
+static const char *present_mode_v = "-";   /* the swapchain's present mode, for the full performance overlay (window_present_mode) */
+const char *window_present_mode(void) { return present_mode_v; }   /* a present mode that doesn't wait for vsync: the present loop paces itself */
 static volatile int touch_down, touch_x, touch_y;   /* the mouse as the front touch panel (1920x1088) */
 /* Gamepad touch -- the agreed scheme (memory: input-touch-mapping-design): the triggers are L and R;
  * the bumpers are touch modifiers. A DS4/DualSense touchpad's fingers touch the front panel finger
@@ -905,7 +907,8 @@ void window_run(void *(*fn)(void *), void *arg) {
 		SDL_GPUPresentMode pm = pe ? (!strcmp(pe, "immediate") ? SDL_GPU_PRESENTMODE_IMMEDIATE : !strcmp(pe, "mailbox") ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC)
 		                           : dv && !strcmp(dv, "vulkan") ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC;
 		if (pm != SDL_GPU_PRESENTMODE_VSYNC && SDL_WindowSupportsGPUPresentMode(gpu, win, pm) && SDL_SetGPUSwapchainParameters(gpu, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pm)) self_paced = 1;
-		fprintf(stderr, "    window: present mode %s\n", !self_paced ? "vsync" : pm == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "immediate");
+		present_mode_v = !self_paced ? "vsync" : pm == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "immediate";
+		fprintf(stderr, "    window: present mode %s\n", present_mode_v);
 	}
 	/* frames the swapchain may have queued for presentation (SDL's default 2): each one is a refresh
 	 * between a game's flip and the screen. 1 here -- with the frame picked after the drawable wait
