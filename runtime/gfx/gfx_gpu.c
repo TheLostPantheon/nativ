@@ -20,6 +20,7 @@
 #include <SDL3/SDL.h>
 #include "gpulock.h"   /* every SDL submit/fence call below is the locked one: Homebrew SDL 3.4.16's Metal fence race, see that header */
 #include "fsr/fsr.h"
+#include "view_swz.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3713,7 +3714,10 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	case 0x21000000u: return xb == 0x1a000000u ? 1 : -1;                                        /* F11F11F10 as F11F11F10 */
 	case 0x41000000u: return xb == 0x9a000000u ? 2 : -1;                                        /* U2F10F10F10 as U2F10F10F10 */
 	case 0x11000000u: return xb == 0x0c000000u ? 3 : xb == 0x0d000000u ? 4 : -1;                /* F32F32 as U8U8U8U8 / S8S8S8S8 bytes */
-	case 0x00000000u: return (tgt_fmt & 0x00300000u) == 0 && xb == 0x0c000000u ? 0 : -1;      /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
+	case 0x00000000u: return xb == 0x0c000000u && view_swz_u8x4(tgt_fmt, swz) ? 0 : -1;       /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target
+	                                                                                               * itself), any target swizzle: the selectors composed with the bytes it
+	                                                                                               * stores (view_swz.h). ABGR only before: an A8R8G8B8 atlas read as
+	                                                                                               * U8U8U8U8_ARGB tiles came down to guest memory on every read */
 	}
 	return -1;
 }
