@@ -101,3 +101,26 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## SceAudiodec's ATRAC9 decoder: `audiodec_test.c`
+
+Checks `runtime/audio/audiodec.c` (ATRAC9 through the vendored LibAtrac9): InitLibrary/CreateDecoder fill the info
+(channels, rate, superframe, bit rate) and the ctrl's handle and maximum sizes from a synthetic configuration word;
+Decode of four hand-built minimal (silent) mono frames, written back to back, reports each frame's own bytes, the
+superframe's padding with the last frame, exactly one 1024-byte superframe and 512 bytes of PCM per frame; a corrupt
+frame is `API_FAIL`; other codec types are `INVALID_TYPE`; Delete of a deleted handle is `NOT_HANDLE_IN_USE`.
+
+    cc -O1 -g -Wall -D_GNU_SOURCE $INC audiodec_test.c ../../third_party/libatrac9/*.c -o /tmp/audiodec_test -lpthread -lm && /tmp/audiodec_test
+
+`-DFAIL_BEFORE` runs the checks against the behaviour without the file (every import unresolved: 0, nothing written).
+It prints `all passed` and exits 0.
+
+With the AAC decoder (`RECOMP_RAWDEC`: the Windows toolchain's FFmpeg with `--enable-decoder=aac` and
+`libnativ_rawdec.a`) the fixture also runs an AAC case: a movie player's GetContextSize (0x18000) and
+CreateDecoderExternal without InitLibrary, two hand-built 4-byte silent raw AAC-LC mono frames back to back (each
+reports its own 4 bytes, 2048 bytes of silent PCM), ClearContext, DeleteDecoderExternal. Built for Windows with the
+toolchain's clang (`$W` = `~/toolchains/ativ-win`):
+
+    $W/llvm-mingw/bin/x86_64-w64-mingw32-clang -O1 -g -Wall -D_GNU_SOURCE -DRECOMP_RAWDEC $INC -I $W/ffmpeg/include audiodec_test.c ../../third_party/libatrac9/*.c $W/ffmpeg/lib/libnativ_rawdec.a $W/ffmpeg/lib/libavcodec.a $W/ffmpeg/lib/libavutil.a -lbcrypt -lole32 -luser32 -lpthread -o audiodec_test.exe
+
+`-DFAIL_BEFORE -DAAC_EXPECTED` runs the AAC checks against the unresolved-import behaviour too.
