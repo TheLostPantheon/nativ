@@ -82,6 +82,17 @@ def load(path, version="", env=None):
     return v
 
 
+def pack_for(packs, title):
+    """The pack a copy of this title id plays with: its own (packs/<title>/pack.toml), else the one that lists it among
+    its OTHER_TITLES -- another release of the same game, played with that pack when its main program is one of the
+    pack's versions (vitarecomp import checks the hash) -- else "" (none)."""
+    if os.path.isfile(os.path.join(packs, title, "pack.toml")): return title
+    for fn in sorted(os.listdir(packs)) if os.path.isdir(packs) else []:
+        p = os.path.join(packs, fn, "pack.toml")
+        if fn != title and os.path.isfile(p) and title in read(p)[0].get("OTHER_TITLES", "").split(): return fn
+    return ""
+
+
 def _check():
     """every pack: its shape, then every version it lists (and none), with and without each switch it has"""
     import glob

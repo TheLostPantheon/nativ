@@ -107,6 +107,12 @@ def other_release(title: str, name: str, index: list[dict]) -> dict | None:
 def release_note(title: str, content_id: str, name: str, version: str, status: str, packs: str, index=None) -> str:
     """What to tell a player of a copy Nativ can't play as it is: which release and version it does play."""
     index = index if index is not None else pack_index(packs)
+    if status == "check" and packconf.pack_for(packs, title) not in ("", title):
+        p = next(p for p in index if p["id"] == packconf.pack_for(packs, title))
+        mine = region_of(content_id, title) or title
+        theirs = p["region"] or region_of("", p["id"]) or p["id"]
+        vs = f", {', '.join(p['versions'])}" if p["versions"] else ""
+        return f"{mine} release: plays with the {theirs} release's pack ({p['id']}{vs}) if its program is that build"
     if status == "unsupported":
         p = next((p for p in index if p["id"] == title), None)
         return f"Nativ plays {', '.join(p['versions'])}" if p and p["versions"] else ""
@@ -249,7 +255,9 @@ def scan(root: str, packs: str, dumps: str, firmware: str, import_licences: bool
             licence = "yes"
         else:
             status = _status(kind, title, version, packs, dumps)
-            if status == "nopack" and kind != "addon" and other_release(title, name, index):
+            if status == "nopack" and kind != "addon" and packconf.pack_for(packs, title):
+                status = "check"   # (another release's pack lists it: its hash decides when added)
+            elif status == "nopack" and kind != "addon" and other_release(title, name, index):
                 status = "otherregion"
             has_lib_licence = os.path.isfile(os.path.join(dumps, title, "license.rif"))
             if own_licence(kind, form, path):
@@ -328,7 +336,13 @@ def selftest() -> None:
         eu = scan(os.path.join(tmp, "eu"), os.path.join(tmp, "packs"), os.path.join(tmp, "dumps"), os.path.join(tmp, "firmware"))
         assert [(r[2], r[4], r[10]) for r in eu] == [
             ("PCSG00099", "otherregion", "JP release: Nativ plays the EU release (PCSB00013, 1.00, 1.01)"),
-            ("PCSF00001", "otherregion", "EU release: Nativ plays the US release (PCSA00029, 1.00)")], eu
+            ("PCSF00001", "check", "EU release: plays with the US release's pack (PCSA00029, 1.00) if its program is that build")], eu
+        # a release a pack lists among its OTHER_TITLES is played with that pack (its hash decides when added);
+        # its own pack wins, and one that's only a name match isn't taken
+        assert packconf.pack_for(os.path.join(tmp, "packs"), "PCSF00001") == "PCSA00029"
+        assert packconf.pack_for(os.path.join(tmp, "packs"), "PCSA00029") == "PCSA00029"
+        assert packconf.pack_for(os.path.join(tmp, "packs"), "PCSG00099") == ""
+        assert packconf.pack_for(os.path.join(tmp, "packs"), "PCSX00000") == ""
         shutil.rmtree(os.path.join(tmp, "eu"))
         os.makedirs(os.path.join(tmp, "firmware", "3.74"))
         rows = scan(os.path.join(tmp, "ux0"), os.path.join(tmp, "packs"), os.path.join(tmp, "dumps"), os.path.join(tmp, "firmware"))
