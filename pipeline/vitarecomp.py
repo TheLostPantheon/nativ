@@ -284,7 +284,7 @@ def cmd_add(T, rest):
     # (--no-build: kept, not imported -- the game alone may be a version the pack refuses that its update makes one it plays)
     if nobuild: die(f"{tid}: kept; the next add (its update) or vitarecomp import {tid} imports it", 0)
     run(SELF + ["import", tid])
-    if not os.path.isfile(os.path.join(PACKS, tid, "pack.toml")): die(f"{tid}: imported; there's no game pack for it yet (packs/{tid}/pack.toml)", 0)
+    if not packconf.pack_for(PACKS, tid): die(f"{tid}: imported; there's no game pack for it yet (packs/{tid}/pack.toml)", 0)
     for c in ("analyze", "recompile", "build"): run(SELF + [c, tid])
 
 
@@ -300,7 +300,12 @@ class Game:
     def __init__(self, T, cmd):
         self.T = T
         self.W = os.path.join(DUMP, "decrypted", T)
-        self.PACK = T.split("_")[0] if re.match(r"[A-Z]{4}[0-9]{5}_", T) else T
+        own = T.split("_")[0] if re.match(r"[A-Z]{4}[0-9]{5}_", T) else T
+        # PACK: its own, else the pack of another release of the game that lists this title id among its OTHER_TITLES
+        # (an EU copy of a game with a US pack: played with it when its main program is one of the pack's versions --
+        # import refuses it otherwise, by hash); OTHER: such a copy, which still runs as its own title id
+        self.PACK = packconf.pack_for(PACKS, own) or own
+        self.OTHER = self.PACK != own
         self.CONF = os.path.join(PACKS, self.PACK, "pack.toml")
         # VERSION: which of the pack's builds this copy is (import records it from the main program's hash): the pack's
         # per-version settings (HOOKS, GAME_ADDRS, FUNCTION_SEEDS...) branch on it
@@ -323,7 +328,7 @@ class Game:
         if ov and version not in ov: c["RUN_ENV"] = ((c.get("RUN_ENV") or "") + " RECOMP_ONLINE_NEEDS=" + ",".join(ov)).strip()
         self.c = c; self.VERSION = version
         # TITLE_ID: the title id the game is told it runs as (sceAppMgr's, RECOMP_TITLE) -- the pack's unless the pack says otherwise
-        self.TITLE_ID = c.get("TITLE_ID") or self.PACK
+        self.TITLE_ID = own if self.OTHER else (c.get("TITLE_ID") or self.PACK)
         self.OUT = os.path.join(self.W, "recomp")
         self.SEEDS = os.path.join(DUMP, "decrypted", "seeds")   # firmware modules' missed functions (offsets), shared by every game
         # RECOMP_BIN=<name>: build/test a second host binary (<base>_<name>, test_<name>/) alongside the
