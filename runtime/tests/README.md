@@ -101,3 +101,19 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## The common dialogs' Term contract: `dlg_term_test.c`
+
+Checks the `Term` handlers in `runtime/core/apputil.c` against the common-dialog contract: a `Term` with no
+dialog in use returns `SCE_COMMON_DIALOG_ERROR_NOT_IN_USE` (0x80020411), as the console does, instead of a
+bare 0, while a real Init..Term still terminates and returns 0. Covered: the save-data dialog and the simple
+dialogs (trophy, network check, message, EULA), which share one generated `Term`. The fixture includes
+`apputil.c` and supplies its external pieces (settings, overlay, guest memory).
+
+    cc -O1 -g -Wall -D_GNU_SOURCE $INC -I $SDL3_INC dlg_term_test.c -o /tmp/dlg_term_test -lpthread && /tmp/dlg_term_test
+
+`$SDL3_INC` is SDL3's include directory (e.g. `$HOME/toolchains/ativ-win/SDL3/x86_64-w64-mingw32/include`, from
+`runtime/platform/win/setup-toolchain.sh`); only the headers are touched. `-DAPPUTIL_UNDER_TEST='"<file>"'`
+compiles the fixture against a different copy of `apputil.c` for a fail-before comparison.
+
+It prints `all passed` and exits 0. A failed check is named in the output.
