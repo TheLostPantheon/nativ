@@ -101,3 +101,14 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## What an unimplemented import returns: `stubret_test.c`
+
+Checks `runtime/core/stubret.h`: the device/network families' "not initialised" errors for operational calls, 0 for
+their set-up/tear-down calls, and 0 (`SCE_COMMON_DIALOG_STATUS_NONE`) for any common dialog's `GetStatus`.
+Header-only, no shims:
+
+    cc -O1 -g -Wall $INC stubret_test.c -o /tmp/stubret_test && /tmp/stubret_test
+
+`-DSTUBRET_UNDER_TEST='"<file>"'` compiles it against another copy of the policy for a fail-before run.
+
