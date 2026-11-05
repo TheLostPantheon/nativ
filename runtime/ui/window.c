@@ -41,6 +41,7 @@
 #include "metrics.h"
 #include "settings.h"
 #include "overlay.h"
+#include "audio_pace.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
        TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
@@ -455,6 +456,7 @@ void *window_handle(void) { return win; }
  * by the sound card as on the hardware */
 static SDL_AudioStream *streams[8];
 static uint32_t afreq[8], achan[8];
+static int adev_frames[8];   /* each port's device buffer, in the port's sample frames (0: unknown -- the pacing keeps its old margin) */
 static int nstreams;
 int audio_open(uint32_t freq, uint32_t channels, uint32_t samples) {
 	(void)samples;
@@ -467,6 +469,14 @@ int audio_open(uint32_t freq, uint32_t channels, uint32_t samples) {
 	SDL_AudioStream *s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, 0, 0);
 	if (!s) return 0;
 	SDL_ResumeAudioStreamDevice(s);
+	{	/* the device the stream landed on: its real buffer (the hint is a request) -- the pacing keeps one ahead (audio_pace.h) */
+		SDL_AudioSpec ds; int frames = 0;
+		if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s), &ds, &frames)) {
+			/* in the stream's own format: the device's frames at the device's rate, as many at the port's rate */
+			adev_frames[nstreams] = ds.freq > 0 ? (int)((int64_t)frames * (int64_t)freq / ds.freq) : frames;
+			if (getenv("RECOMP_AUDIO_PAD_LOG")) fprintf(stderr, "    audio device for port %d: %d Hz, %d ch, %d sample frames per buffer\n", nstreams + 1, ds.freq, ds.channels, frames);
+		}
+	}
 	streams[nstreams] = s; afreq[nstreams] = freq; achan[nstreams] = channels;
 	return ++nstreams;   /* 1-based handle; 0 means "failed to open" to callers */
 }
@@ -542,7 +552,24 @@ void audio_output(int dev, const void *buf, uint32_t bytes) {
 		}
 		int dms = av_auto_delay(dev - 1);
 		extra = (int)((uint64_t)dms * afreq[dev - 1] / 1000) * frame;
-		if (extra && q < extra) { static uint8_t zero[8192]; for (int pad = (extra - q) / frame * frame; pad > 0;) { int n = pad < (int)sizeof zero ? pad : (int)sizeof zero; SDL_PutAudioStreamData(s, zero, n); pad -= n; } }
+		if (extra && q < extra) {
+			static uint8_t zero[8192];
+			int padded = (extra - q) / frame * frame;
+			for (int pad = padded; pad > 0;) { int n = pad < (int)sizeof zero ? pad : (int)sizeof zero; SDL_PutAudioStreamData(s, zero, n); pad -= n; }
+			/* RECOMP_AUDIO_PAD_LOG=1: how often silence goes in between a port's buffers, and how much (each one is an audible gap) */
+			static int padlog = -1; if (padlog < 0) padlog = getenv("RECOMP_AUDIO_PAD_LOG") != 0;
+			if (padlog && padded > 0) {
+				static uint32_t pads[8]; static uint64_t pad_bytes[8], buffers[8]; static uint64_t last_us;
+				pads[dev - 1]++; pad_bytes[dev - 1] += (uint64_t)padded;
+				uint64_t t = SDL_GetTicksNS() / 1000;
+				if (t - last_us > 2000000) {
+					last_us = t;
+					for (int i = 0; i < nstreams; i++) if (pads[i]) fprintf(stderr, "    audio pad: port %d %u silence inserts, %.1f ms total (delay %d ms, buffer %u bytes, queue %d before)\n",
+						i + 1, pads[i], (double)pad_bytes[i] / ((double)achan[i] * 2 * afreq[i] / 1000.0), av_applied[i], bytes, q);
+				}
+				(void)buffers;
+			}
+		}
 	}
 	SDL_PutAudioStreamData(s, buf, (int)bytes);
 	{	uint32_t ms = 0;
@@ -556,9 +583,11 @@ void audio_output(int dev, const void *buf, uint32_t bytes) {
 	 * a slow machine crackles. The pacing sleep gives the guest thread's run slot up (RECOMP_SCHED). */
 	static int depth = -1;
 	if (depth < 0) { depth = getenv("RECOMP_AUDIO_QUEUE") ? atoi(getenv("RECOMP_AUDIO_QUEUE")) : settings_int("audio_buffers", 1); if (depth < 1) depth = 1; if (depth > 4) depth = 4; }
-	if (SDL_GetAudioStreamQueued(s) > depth * (int)bytes + extra) {
+	/* and at least one device buffer (its real size) plus one of these ahead: audio_pace.h */
+	int margin = audio_pace_margin(depth, (int)bytes, adev_frames[dev - 1] * (int)achan[dev - 1] * 2);
+	if (SDL_GetAudioStreamQueued(s) > margin + extra) {
 		int b = sched_block_begin();
-		while (SDL_GetAudioStreamQueued(s) > depth * (int)bytes + extra) SDL_Delay(1);
+		while (SDL_GetAudioStreamQueued(s) > margin + extra) SDL_Delay(1);
 		if (b) sched_block_end();
 	}
 }
