@@ -101,3 +101,23 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## The save dialog answers the controller: `savedlg_pad_test.cpp`
+
+Save dialog + gamepad (SAVE-DLG-01): the dialog's keys (Cross = choose, Circle = back, dpad/left stick =
+move) must work with a controller. The fixture drives the real dialog (`savedlg_ui.cpp`, included; the game's
+dialog state machine `apputil.c`, included as in `dlg_term_test.c`) with a headless ImGui context and feeds
+gamepad keys two ways: raw `io.AddKeyEvent` and the host's feed seam `savedlg_ui_gamepad_button/axis` (what
+`overlay_process_event` calls for the pad events routed to the overlay). Case 2 is the fail-before condition:
+a gamepad key fed without `ImGuiBackendFlags_HasGamepad` is cleared again every frame (imgui.cpp
+`UpdateKeyboardInputs`: "Clear gamepad data if disabled") and the step stays unanswered -- the bug behind a
+save dialog that ignored a controller whose pad connected after the overlay's first frame. Cases 3-6 are the
+pass-after contract: the feed marks the flag and the dialog answers the selected row, moves the selection,
+cancels on Circle, and keeps its arm rule (a key already held when the step appeared answers nothing).
+
+    c++ -O1 -g -w -D_GNU_SOURCE -std=c++17 $INC -I ../../third_party/imgui -I $SDL3_INC savedlg_pad_test.cpp \
+        ../../third_party/imgui/imgui.cpp ../../third_party/imgui/imgui_draw.cpp ../../third_party/imgui/imgui_tables.cpp \
+        ../../third_party/imgui/imgui_widgets.cpp -o /tmp/savedlg_pad_test -lpthread && /tmp/savedlg_pad_test
+
+It prints `all passed (7 ok)` and exits 0. `-DAPPUTIL_UNDER_TEST='\"<file>\"'` / `-DSAVEDLG_UI_UNDER_TEST='\"<file>\"'`
+compile against different copies for fail-before comparisons.
