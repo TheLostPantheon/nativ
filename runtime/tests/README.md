@@ -101,3 +101,17 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## sceDisplayGetVcount advances: `vcount_test.c`
+
+`DISP-01`: `sceDisplayGetVcount` was unimplemented (the generic stub returned 0 forever), so a game polling
+the count for change hung at its first frame. The handler (display.c, `hle_display[]`) reports the vblanks
+since the display started, 60 a second on the host's monotonic clock, anchored at the first read. The fixture
+checks the import is registered under its name, the first read is the anchor, two reads at least 1/60 s apart
+differ while the count only moves forward, and 500 ms read as >= 25 vblanks (lower bound only).
+
+    cc -O1 -g -w -D_GNU_SOURCE $INC -I $SDL3_INC -c ../gfx/display.c -o /tmp/disp.o && \
+        cc -O1 -g -w -D_GNU_SOURCE $INC -I $SDL3_INC vcount_test.c /tmp/disp.o -o /tmp/vcount_test -lpthread -lm && /tmp/vcount_test
+
+A fail-before run compiles an older copy of `display.c` in place of `../gfx/display.c` (the first check fails:
+the import is not registered). It prints `all passed (4 ok)` and exits 0.
