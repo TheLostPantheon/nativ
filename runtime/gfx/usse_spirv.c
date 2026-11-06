@@ -175,7 +175,7 @@ typedef struct {
 	uint32_t ptr_priv_u, ptr_sa_u;             /* Private uint*, Uniform-block uint* (SA) */
 	uint32_t var_r, var_pa, var_o, var_i;        /* Private arrays */
 	uint32_t var_sa;                               /* Uniform block instance (SA) */
-	uint32_t var_p;                                 /* Private bool[4] predicates (always false: VTST/VTSTMSK unsupported here) */
+	uint32_t var_p;                                 /* Private bool[4] predicates (written by VTST, read by predication and BR) */
 	uint32_t var_idx;                                /* Private uint[2] index registers idx1/idx2 (UsseInst.idx), zero-initialised */
 	uint32_t smp_sampler[16];                          /* UniformConstant sampled-image vars actually used, 0 if unused */
 	uint32_t t_simg, t_simg_cube;                        /* their OpTypeSampledImage (2D, and a 6-layer 2D array for cube units), to OpLoad through */

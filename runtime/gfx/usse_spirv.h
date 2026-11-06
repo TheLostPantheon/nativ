@@ -11,10 +11,11 @@
  * Coverage (checked by usse_spirv_translate, same philosophy as usse_supported()): VMOV, VPCK,
  * VMAD2, VNMAD, VMAD, VDP, VDUAL, VCOMP, SMP, KILL, DEPTHF, LIMM, SMLSI/SMBO, simple (pN / !pN)
  * predication, INDEXED1/2 operands and the INDEX bank (a runtime OpAccessChain index computed from
- * the idx1/idx2 registers, see usse_spirv.c's idx_ptr). NOT yet covered: VTST/VTSTMSK, VBW,
- * SOP2/SOP2M/SOP3, I8/16/32MAD/I32MAD2, LDST, BR -- a program using any of these fails translation
- * (ok=0) and the caller should fall back to the software path for that draw, same as
- * render_interp() already does for usse_supported().
+ * the idx1/idx2 registers, see usse_spirv.c's idx_ptr), VTST/VTSTMSK, VBW, I8/16/32MAD/I32MAD2,
+  * LDST and BR's structured predicated forward forms. NOT yet covered: SOP2/SOP2M/SOP3, and BR
+  * outside those forms -- a program using any of these fails translation (ok=0) and the caller
+  * should fall back to the software path for that draw, same as render_interp() already does for
+  * usse_supported().
  */
 #ifndef RECOMP_USSE_SPIRV_H
 #define RECOMP_USSE_SPIRV_H
