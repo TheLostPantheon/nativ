@@ -18,6 +18,7 @@
 #include "gfx.h"
 #include "metrics.h"
 #include "settings.h"
+#include "input_rec.h"
 
 static uint64_t raw_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 /* the in-game overlay's pause (display_set_paused, called by overlay.cpp as the menu opens and
@@ -536,15 +537,26 @@ static void h_audio_output(Cpu *c) {   /* (port, buffer) */
 }
 
 /* ---- input: nothing pressed yet */
-/* ---- input recording and replay. RECOMP_INPUT_RECORD=path writes every controller and touch
- * sample the game reads, with the presented-frame number it was read at ("C frame buttons lx ly
- * rx ry", "T frame port down id x y slot" -- one line per contact on the panel, slot its place in
- * the report list; a recording from before multi-touch has no slot: 0); RECOMP_INPUT_PLAY=path serves those samples back by frame
- * instead of the window, the scripts and the mouse (the latest record at or before the frame).
+/* ---- input recording and replay. RECOMP_INPUT_RECORD=path records the pad state DELIVERED to
+ * guest code -- after the window mapping, the RECOMP_INPUT script and replay -- as `# nativ-input
+ * v2` (runtime/gfx/input_rec.h): a version/origin header and one "C frame buttons lx ly rx ry
+ * poll ms" row per delivered-state CHANGE. Held input adds no row (the run-length encoding: the
+ * span row -> next row is the hold); poll and ms keep the read timing (frames are 0 before the
+ * first present and freeze while nothing renders, polls never do); a quick tap's down and up are
+ * exactly the two rows that carry them, and mask edges are computable row to row. Legacy rows
+ * still round-trip: "T frame port down id x y slot" -- one line per contact on the panel, slot its
+ * place in the report list; a recording from before multi-touch has no slot: 0); "M frame ax ay az
+ * gx gy gz qx qy qz qw": a live gyro's state as the game read it; "L frame": the recorded session's
+ * load ends (load_mark).
+ * RECOMP_INPUT_REPLAY=path serves those rows back by frame instead of the window, the scripts and
+ * the mouse (the latest row at or before the frame; the last row is held after the recording
+ * ends), validates the trace (version, row ordering, field ranges -- a corrupt or newer trace
+ * refuses to play loudly) and refuses to run together with RECOMP_INPUT_RECORD. A replay is
+ * input-identical, not necessarily run-deterministic (thread scheduling can still take it elsewhere).
  * Why: Unit 13's enemy that turns but never walks is a room into the first mission -- a path no
  * scripted tap sequence reaches -- so we play there once with recording on and the
  * headless replay (deterministic under RECOMP_CLOCK=fixed) puts the probes on it. */
-typedef struct { uint64_t frame; uint32_t buttons; uint8_t st[4]; } CtrlRec;
+typedef InputRecRow CtrlRec;
 typedef struct { uint64_t frame; uint8_t port, down, id, slot; uint16_t x, y; } TouchRec;
 typedef struct { uint64_t frame; float a[3], g[3], q[4]; } MotionRec;   /* "M frame ax ay az gx gy gz qx qy qz qw": a live gyro's state as the game read it */
 enum { TOUCH_SLOTS = 6 };   /* contacts a panel reports at once here (the front panel's own limit is 6, the rear's 4) */
@@ -553,20 +565,66 @@ static CtrlRec *ctrl_recs; static size_t n_ctrl_recs, ctrl_cur;
 static TouchRec *touch_recs; static size_t n_touch_recs, touch_cur[2][TOUCH_SLOTS];
 static uint64_t *load_recs; static size_t n_load_recs, load_cur;   /* "L frame": the recorded session's load ends (load_mark) */
 static MotionRec *motion_recs; static size_t n_motion_recs, motion_cur;
+static InputRecWriter rec_w;
+static InputRecFp play_fp;
+static int play_key;              /* INPUT_REC_KEY_FRAME / _MS (RECOMP_INPUT_REPLAY_KEY) */
+static uint64_t play_ms0; static int play_ms0_set;   /* ms key: guest time at the replay's first pad read (the recorder's ms origin) */
+static void input_rec_shutdown(void) {   /* graceful exit: bound the last hold, close the trace */
+	if (!rec_file) return;
+	input_rec_close_row(&rec_w);
+	fclose(rec_file); rec_file = NULL;
+}
+static void input_rec_checkpoint(void) {   /* the replay's stable identity at exit */
+	if (!play_loaded) return;
+	play_fp.reached = frames;
+	play_fp.state = INPUT_REC_FP_REACHED;
+	input_rec_fp_print(&play_fp);
+}
 static void input_rec_init(void) {
 	if (rec_init) return; rec_init = 1;
-	const char *r = getenv("RECOMP_INPUT_RECORD");
-	if (r) { rec_file = fopen(r, "w"); if (!rec_file) fprintf(stderr, "RECOMP_INPUT_RECORD: cannot write %s\n", r); else fprintf(stderr, "recording input to %s\n", r); }
-	const char *pl = getenv("RECOMP_INPUT_PLAY");
+	const char *r = getenv("RECOMP_INPUT_RECORD"), *pl = getenv("RECOMP_INPUT_REPLAY");
+	if (!pl) pl = getenv("RECOMP_INPUT_PLAY");   /* the earlier name, kept as an alias */
+	char ferr[160];
+	if (input_rec_flags_ok(r && *r, pl && *pl, ferr, sizeof ferr) < 0) { fprintf(stderr, "%s\n", ferr); exit(1); }
+	if (r) {
+		rec_file = fopen(r, "w");
+		if (!rec_file) fprintf(stderr, "RECOMP_INPUT_RECORD: cannot write %s\n", r);
+		else if (input_rec_header_write(rec_file) || ferror(rec_file)) {
+			fprintf(stderr, "RECOMP_INPUT_RECORD: cannot write the header of %s\n", r);
+			fclose(rec_file); rec_file = NULL;
+		} else {
+			input_rec_writer_init(&rec_w, rec_file);
+			atexit(input_rec_shutdown);
+			fprintf(stderr, "recording input to %s (v%d, change-only rows)\n", r, INPUT_REC_VERSION);
+		}
+	}
 	if (!pl) return;
 	FILE *f = fopen(pl, "r");
-	if (!f) { fprintf(stderr, "RECOMP_INPUT_PLAY: cannot open %s\n", pl); return; }
+	if (!f) { fprintf(stderr, "RECOMP_INPUT_REPLAY: cannot open %s\n", pl); return; }
 	char line[256]; size_t cc = 0, tc = 0, mc = 0;
+	int ln = 0, first = 1;
+	InputRecLoader loader;
+	input_rec_loader_init(&loader, 0);
 	while (fgets(line, sizeof line, f)) {
+		ln++;
+		if (first) {
+			int hc;
+			first = 0;
+			hc = input_rec_header_check(line, &loader.version);
+			if (hc < 0) {
+				fprintf(stderr, "RECOMP_INPUT_REPLAY: %s: unsupported trace header (newer than this build reads)\n", pl);
+				fclose(f); exit(1);
+			}
+			if (hc > 0) continue;
+		}
 		if (line[0] == 'C') {
-			CtrlRec r2 = {0}; unsigned s0, s1, s2, s3;
-			if (sscanf(line + 1, "%llu %x %u %u %u %u", (unsigned long long *)&r2.frame, &r2.buttons, &s0, &s1, &s2, &s3) == 6) {
-				r2.st[0] = (uint8_t)s0; r2.st[1] = (uint8_t)s1; r2.st[2] = (uint8_t)s2; r2.st[3] = (uint8_t)s3;
+			CtrlRec r2 = {0}; char err[160];
+			int rc = input_rec_loader_add(&loader, line, &r2, err, sizeof err);
+			if (rc < 0) {
+				fprintf(stderr, "RECOMP_INPUT_REPLAY: %s: line %d: %s\n", pl, ln, err);
+				fclose(f); exit(1);
+			}
+			if (rc > 0) {
 				if (n_ctrl_recs == cc) { cc = cc ? cc * 2 : 4096; ctrl_recs = realloc(ctrl_recs, cc * sizeof *ctrl_recs); }
 				ctrl_recs[n_ctrl_recs++] = r2;
 			}
@@ -589,7 +647,19 @@ static void input_rec_init(void) {
 		}
 	}
 	fclose(f); play_loaded = 1;
+	{	/* RECOMP_INPUT_REPLAY_KEY (input_rec.h): frame (default) or ms */
+		const char *k = getenv("RECOMP_INPUT_REPLAY_KEY");
+		play_key = input_rec_replay_key_parse(k);
+		if (play_key < 0) { fprintf(stderr, "RECOMP_INPUT_REPLAY_KEY: unknown key '%s' (frame | ms)\n", k); exit(1); }
+		if (play_key == INPUT_REC_KEY_MS && loader.version < 2) { fprintf(stderr, "RECOMP_INPUT_REPLAY_KEY=ms: %s is a v1 trace without ms columns\n", pl); exit(1); }
+		if (play_key == INPUT_REC_KEY_MS) fprintf(stderr, "[input-play] controller rows keyed by recorded ms against elapsed guest time (touch/motion rows at the recorded frame for that time; load anchors and RECOMP_INPUT_SHIFT unused)\n");
+	}
+	play_fp.version = loader.version;
+	play_fp.rows = n_ctrl_recs;
+	play_fp.trace_hash = loader.hash;
+	atexit(input_rec_checkpoint);
 	fprintf(stderr, "replaying input from %s: %zu controller, %zu touch and %zu motion samples, %zu load ends\n", pl, n_ctrl_recs, n_touch_recs, n_motion_recs, n_load_recs);
+	fprintf(stderr, "[input-play] input-identical replay only -- not necessarily run-deterministic; the last row is held after the recording ends\n");
 }
 /* the replay's position in the recording: the presented frame plus an offset that verify.c's Lua
  * tracer re-anchors at every mission-script call it finds in the recorded session's log
@@ -610,7 +680,9 @@ static uint64_t vidle_seen, load_idle, load_clean;
 static void load_mark(void) {
 	uint64_t vi = __atomic_load_n(&vidle, __ATOMIC_RELAXED), d = vi - vidle_seen; vidle_seen = vi;
 	if (d && getenv("RECOMP_LOAD_TRACE")) fprintf(stderr, "    idle clock: +%llu vblanks before frame %llu\n", (unsigned long long)d, (unsigned long long)frames);
-	if (d) { load_idle += d; load_clean = 0; return; }
+	if (d) {
+		load_idle += d; load_clean = 0; return;
+	}
 	if (!load_idle || ++load_clean < 10) return;
 	uint64_t was = load_idle; load_idle = 0;
 	if (was < 30) return;
@@ -634,14 +706,28 @@ static int64_t input_shift(uint64_t at) {
 	int64_t d = 0; for (int i = 0; i < n; i++) if (at >= from[i]) d += delta[i];
 	return d;
 }
-static uint64_t play_frame(void) { int64_t f = (int64_t)frames + play_offset + input_shift(frames); return f < 0 ? 0 : (uint64_t)f; }
+/* the ms key's elapsed guest time since the replay's first pad read, in ms (side-effect-free clock
+ * read: serving input must not move the fixed clock) */
+static uint64_t play_elapsed_ms(void) {
+	uint64_t now = guest_time_us_peek();
+	if (!play_ms0_set) { play_ms0 = now; play_ms0_set = 1; }
+	return (now - play_ms0) / 1000;
+}
+static uint64_t play_frame(void) {
+	/* ms key: the recorded frame at this elapsed time, so the frame-only touch/motion rows stay in step */
+	if (play_key == INPUT_REC_KEY_MS) return input_rec_frame_at_ms(ctrl_recs, (int)n_ctrl_recs, play_elapsed_ms());
+	int64_t f = (int64_t)frames + play_offset + input_shift(frames); return f < 0 ? 0 : (uint64_t)f;
+}
 /* the latest recorded sample at or before the replay frame (records are in frame order) */
 static int play_ctrl(uint32_t *b, uint8_t st[4]) {
-	uint64_t pf = play_frame();
-	if (!n_ctrl_recs || ctrl_recs[0].frame > pf) return 0;
-	if (ctrl_recs[ctrl_cur].frame > pf) ctrl_cur = 0;   /* the anchor moved the replay back */
-	while (ctrl_cur + 1 < n_ctrl_recs && ctrl_recs[ctrl_cur + 1].frame <= pf) ctrl_cur++;
-	*b = ctrl_recs[ctrl_cur].buttons; memcpy(st, ctrl_recs[ctrl_cur].st, 4); return 1;
+	int at;
+	if (play_key == INPUT_REC_KEY_MS)
+		at = input_rec_latest_ms_at_or_before(ctrl_recs, (int)n_ctrl_recs, play_elapsed_ms());
+	else
+		at = input_rec_latest_at_or_before(ctrl_recs, (int)n_ctrl_recs, play_frame());
+	if (at < 0) return 0;
+	ctrl_cur = (size_t)at;
+	*b = ctrl_recs[at].buttons; memcpy(st, ctrl_recs[at].st, 4); return 1;
 }
 static int play_touch(uint32_t port, uint32_t slot, int *down, uint8_t *id, int *x, int *y) {   /* one slot of a panel */
 	uint64_t pf = play_frame();
@@ -707,7 +793,17 @@ static void ctrl_peek(Cpu *c, int pad2) {   /* (port, SceCtrlData *, count): tim
 			if (frames >= a && frames <= z) for (int k = 0; k < 4; k++) WR8(p + 12 + k, (uint8_t)v[k]);
 			if (*q == ';') q++; else break;
 		}
-		if (rec_file && i == 0) fprintf(rec_file, "C %llu %x %u %u %u %u\n", (unsigned long long)frames, RD32(p + 8), RD8(p + 12), RD8(p + 13), RD8(p + 14), RD8(p + 15));
+		if (i == 0) {
+			uint32_t db = RD32(p + 8);
+			uint8_t dst[4] = { RD8(p + 12), RD8(p + 13), RD8(p + 14), RD8(p + 15) };
+			if (rec_file) {
+				int wrote = input_rec_observe(&rec_w, frames, now_us(), &db, dst);
+				if (wrote < 0) {
+					fprintf(stderr, "RECOMP_INPUT_RECORD: write failed, recording off\n");
+					input_rec_shutdown();
+				}
+			}
+		}
 		/* RECOMP_LOG_CTRL_FROM=n (RECOMP_LOG_CTRL_TO, default n+60): every read over those presented frames -- the
 		 * vblank it saw, the thread, the caller, the sticks it got (which frames a pad thread gets a sample in) */
 		{ static long lf = -2, lt; if (lf == -2) { const char *e = getenv("RECOMP_LOG_CTRL_FROM"), *t = getenv("RECOMP_LOG_CTRL_TO"); lf = e ? atol(e) : -1; lt = t ? atol(t) : lf + 60; }

@@ -101,3 +101,24 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## Input recording/replay: `input_rec_test.c`
+
+Checks `runtime/gfx/input_rec.c` -- the `# nativ-input v2` trace format behind
+`RECOMP_INPUT_RECORD`/`RECOMP_INPUT_REPLAY` (runtime/gfx/input_rec.h) -- as pure logic with no game
+and no SDL: the header/version check, encode/decode round trip, change-only rows (neutral spans and
+quick taps resolving to exact down/up edges, a hold spanning frames as one row with the poll
+counter moving on), malformed traces (short rows, missing v2 columns, out-of-range analog, trailing
+"unsupported" columns, bad hex, masks over 32 bits, frame/poll/ms going backwards), the replay's
+EOF lookup (hold the last state past the end), record+replay exclusivity, the checkpoint
+fingerprint (repeatable state matches, a deliberately changed stable field is detected, an
+unreached checkpoint reports unknown rather than a mismatch), and `RECOMP_INPUT_REPLAY_KEY=ms`:
+the key parse (`NULL`/`""`/`"frame"` -> frame, `"ms"` -> ms, anything else refused), the
+time-keyed row lookup, and `input_rec_frame_at_ms`'s interpolation (a frame-only touch/motion row
+is served at the recorded frame its time reached, between controller rows, past EOF and before
+the first row included).
+
+    cc -O1 -g -Wall -Wno-unused-function $INC input_rec_test.c ../gfx/input_rec.c -o /tmp/input_rec_test && /tmp/input_rec_test
+
+It prints `N checks, 0 failed`, then the `  checkpoint:` line the fingerprint test renders, and
+exits 0. A failed check names its line.
