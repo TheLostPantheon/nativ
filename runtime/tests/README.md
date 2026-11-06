@@ -101,3 +101,16 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## Volatile guest-memory accessors: `volatile_access_test.c`
+
+Checks `recompiler/rt.h`'s RD32/WR32-family: guest memory is shared between host threads and fibers, so a load must
+not be cached out of a spin-wait and a store must not be dropped or merged. The case is a second host thread
+spinning on `RD32(flag)` while this thread stores to it (the spin is bounded — no hang). On the old memcpy
+accessors the result changes with optimisation — the observer never sees the store at `-O2` but sees it at `-O0` —
+and on the volatile accessors it passes at every level.
+
+    cc -O2 -g -Wall -D_GNU_SOURCE $INC volatile_access_test.c -o /tmp/volatile_access_test -lpthread && /tmp/volatile_access_test
+
+It prints `all passed (6 ok)`. `RT_UNDER_TEST="<path>"` compiles the same source against a copy of `rt.h` (the
+fail-before side).
