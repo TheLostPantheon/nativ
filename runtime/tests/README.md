@@ -110,9 +110,13 @@ and no SDL: the header/version check, encode/decode round trip, change-only rows
 quick taps resolving to exact down/up edges, a hold spanning frames as one row with the poll
 counter moving on), malformed traces (short rows, missing v2 columns, out-of-range analog, trailing
 "unsupported" columns, bad hex, masks over 32 bits, frame/poll/ms going backwards), the replay's
-EOF lookup (hold the last state past the end), record+replay exclusivity, and the checkpoint
+EOF lookup (hold the last state past the end), record+replay exclusivity, the checkpoint
 fingerprint (repeatable state matches, a deliberately changed stable field is detected, an
-unreached checkpoint reports unknown rather than a mismatch).
+unreached checkpoint reports unknown rather than a mismatch), and `RECOMP_INPUT_REPLAY_KEY=ms`:
+the key parse (`NULL`/`""`/`"frame"` -> frame, `"ms"` -> ms, anything else refused), the
+time-keyed row lookup, and `input_rec_frame_at_ms`'s interpolation (a frame-only touch/motion row
+is served at the recorded frame its time reached, between controller rows, past EOF and before
+the first row included).
 
     cc -O1 -g -Wall -Wno-unused-function $INC input_rec_test.c ../gfx/input_rec.c -o /tmp/input_rec_test && /tmp/input_rec_test
 

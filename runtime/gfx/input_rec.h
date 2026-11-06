@@ -76,6 +76,22 @@ int  input_rec_parse_row(const char *line, int version, InputRecRow *out,
 int  input_rec_flags_ok(int rec, int play, char *err, size_t errsz);
 /* the replay lookup: the largest index with rows[i].frame <= frame, else -1; rows sorted by frame */
 int  input_rec_latest_at_or_before(const InputRecRow *rows, int n, uint64_t frame);
+/* RECOMP_INPUT_REPLAY_KEY: what a replay matches rows on. FRAME (default): the presented frame --
+ * faithful only when the replay presents frames at the recording's guest-time pace. MS: the row's
+ * recorded `ms` against the replay's own elapsed guest time since its first pad read -- for a
+ * recording made on the real clock at another frame rate than the replay's (a slow host live, the
+ * fixed test clock headless), where a title's time-driven screens take a different number of frames */
+#define INPUT_REC_KEY_FRAME 0
+#define INPUT_REC_KEY_MS    1
+/* NULL, "" or "frame" -> FRAME, "ms" -> MS, anything else -> -1 (refused loudly by the caller) */
+int  input_rec_replay_key_parse(const char *s);
+/* the time-keyed lookup: the largest index with rows[i].ms <= ms, else -1; v2 rows are in ms order
+ * (the loader refuses ms going backwards) */
+int  input_rec_latest_ms_at_or_before(const InputRecRow *rows, int n, uint64_t ms);
+/* the RECORDED frame at elapsed `ms`, interpolated between the controller rows around it (their last
+ * frame past the end, 0 before the first): under the ms key, touch and motion rows -- frame-only --
+ * are served at this frame, so they stay in step with the controller rows */
+uint64_t input_rec_frame_at_ms(const InputRecRow *rows, int n, uint64_t ms);
 
 /* --- replay checkpoint fingerprint -------------------------------------------------------
  * A small stable, RUNTIME-OBSERVABLE identity of what a replay run actually did: the loaded

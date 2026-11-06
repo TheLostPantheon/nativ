@@ -567,6 +567,8 @@ static uint64_t *load_recs; static size_t n_load_recs, load_cur;   /* "L frame":
 static MotionRec *motion_recs; static size_t n_motion_recs, motion_cur;
 static InputRecWriter rec_w;
 static InputRecFp play_fp;
+static int play_key;              /* INPUT_REC_KEY_FRAME / _MS (RECOMP_INPUT_REPLAY_KEY) */
+static uint64_t play_ms0; static int play_ms0_set;   /* ms key: guest time at the replay's first pad read (the recorder's ms origin) */
 static void input_rec_shutdown(void) {   /* graceful exit: bound the last hold, close the trace */
 	if (!rec_file) return;
 	input_rec_close_row(&rec_w);
@@ -645,6 +647,13 @@ static void input_rec_init(void) {
 		}
 	}
 	fclose(f); play_loaded = 1;
+	{	/* RECOMP_INPUT_REPLAY_KEY (input_rec.h): frame (default) or ms */
+		const char *k = getenv("RECOMP_INPUT_REPLAY_KEY");
+		play_key = input_rec_replay_key_parse(k);
+		if (play_key < 0) { fprintf(stderr, "RECOMP_INPUT_REPLAY_KEY: unknown key '%s' (frame | ms)\n", k); exit(1); }
+		if (play_key == INPUT_REC_KEY_MS && loader.version < 2) { fprintf(stderr, "RECOMP_INPUT_REPLAY_KEY=ms: %s is a v1 trace without ms columns\n", pl); exit(1); }
+		if (play_key == INPUT_REC_KEY_MS) fprintf(stderr, "[input-play] controller rows keyed by recorded ms against elapsed guest time (touch/motion rows at the recorded frame for that time; load anchors and RECOMP_INPUT_SHIFT unused)\n");
+	}
 	play_fp.version = loader.version;
 	play_fp.rows = n_ctrl_recs;
 	play_fp.trace_hash = loader.hash;
@@ -697,10 +706,25 @@ static int64_t input_shift(uint64_t at) {
 	int64_t d = 0; for (int i = 0; i < n; i++) if (at >= from[i]) d += delta[i];
 	return d;
 }
-static uint64_t play_frame(void) { int64_t f = (int64_t)frames + play_offset + input_shift(frames); return f < 0 ? 0 : (uint64_t)f; }
+/* the ms key's elapsed guest time since the replay's first pad read, in ms (side-effect-free clock
+ * read: serving input must not move the fixed clock) */
+static uint64_t play_elapsed_ms(void) {
+	uint64_t now = guest_time_us_peek();
+	if (!play_ms0_set) { play_ms0 = now; play_ms0_set = 1; }
+	return (now - play_ms0) / 1000;
+}
+static uint64_t play_frame(void) {
+	/* ms key: the recorded frame at this elapsed time, so the frame-only touch/motion rows stay in step */
+	if (play_key == INPUT_REC_KEY_MS) return input_rec_frame_at_ms(ctrl_recs, (int)n_ctrl_recs, play_elapsed_ms());
+	int64_t f = (int64_t)frames + play_offset + input_shift(frames); return f < 0 ? 0 : (uint64_t)f;
+}
 /* the latest recorded sample at or before the replay frame (records are in frame order) */
 static int play_ctrl(uint32_t *b, uint8_t st[4]) {
-	int at = input_rec_latest_at_or_before(ctrl_recs, (int)n_ctrl_recs, play_frame());
+	int at;
+	if (play_key == INPUT_REC_KEY_MS)
+		at = input_rec_latest_ms_at_or_before(ctrl_recs, (int)n_ctrl_recs, play_elapsed_ms());
+	else
+		at = input_rec_latest_at_or_before(ctrl_recs, (int)n_ctrl_recs, play_frame());
 	if (at < 0) return 0;
 	ctrl_cur = (size_t)at;
 	*b = ctrl_recs[at].buttons; memcpy(st, ctrl_recs[at].st, 4); return 1;

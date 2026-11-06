@@ -197,6 +197,54 @@ static void test_eof_lookup(void)
 	CK(input_rec_latest_at_or_before(rows, 0, 5) == -1);      /* empty trace */
 }
 
+/* --- time-keyed replay (RECOMP_INPUT_REPLAY_KEY=ms): a recording made at a different presented
+ * frame rate than its replay. Live ran ~150 ms a frame, the replay ~45: frame-keyed, the press the
+ * player made at 31.5 s arrives at replay frame 237 = ~10.7 s, on an earlier screen. Keyed by the
+ * recorded ms against the replay's own elapsed guest time, it arrives at 31.5 s whatever the frame. */
+static void test_ms_lookup(void)
+{
+	InputRecRow rows[4];
+	memset(rows, 0, sizeof rows);
+	rows[0].frame = 12;  rows[0].ms = 0;
+	rows[1].frame = 237; rows[1].ms = 31456; rows[1].buttons = 0x4000;   /* the press */
+	rows[2].frame = 238; rows[2].ms = 31606;                              /* its release */
+	rows[3].frame = 404; rows[3].ms = 56374; rows[3].buttons = 0x4000;
+	/* replay frame 237 at ~45 ms a frame is ~10.7 s of guest time */
+	CK(input_rec_latest_at_or_before(rows, 4, 237) == 1);              /* frame key: press served at 10.7 s */
+	CK(input_rec_latest_ms_at_or_before(rows, 4, 10700) == 0);         /* ms key: still neutral at 10.7 s */
+	CK(input_rec_latest_ms_at_or_before(rows, 4, 31455) == 0);
+	CK(input_rec_latest_ms_at_or_before(rows, 4, 31456) == 1);         /* the press at the recorded time */
+	CK(input_rec_latest_ms_at_or_before(rows, 4, 31500) == 1);         /* held until its release row */
+	CK(input_rec_latest_ms_at_or_before(rows, 4, 31606) == 2);
+	CK(input_rec_latest_ms_at_or_before(rows, 4, 9999999) == 3);       /* past EOF: hold the last state */
+	CK(input_rec_latest_ms_at_or_before(rows, 0, 5) == -1);            /* empty trace */
+	{	/* equal ms (two reads in one millisecond): the later row wins, as with frames */
+		InputRecRow eq[2]; memset(eq, 0, sizeof eq);
+		eq[0].ms = 5; eq[0].buttons = 1; eq[1].ms = 5; eq[1].buttons = 2;
+		CK(input_rec_latest_ms_at_or_before(eq, 2, 5) == 1);
+	}
+	/* touch/motion rows carry only a frame: under the ms key they are served at the RECORDED frame the
+	 * recording reached at that elapsed time (interpolated between the controller rows around it), so a
+	 * touch made 224 s into the live session is not served at the replay's frame 1536 (~70 s) */
+	CK(input_rec_frame_at_ms(rows, 4, 0) == 12);
+	CK(input_rec_frame_at_ms(rows, 4, 31456) == 237);
+	CK(input_rec_frame_at_ms(rows, 4, 31531) == 237);                  /* halfway 237 -> 238: still 237 */
+	CK(input_rec_frame_at_ms(rows, 4, 31606) == 238);
+	CK(input_rec_frame_at_ms(rows, 4, 43990) == 321);                  /* 238 + 166 * 12384 / 24768 = 238 + 83 */
+	CK(input_rec_frame_at_ms(rows, 4, 56374) == 404);
+	CK(input_rec_frame_at_ms(rows, 4, 9999999) == 404);                /* past EOF: the last row's frame */
+	CK(input_rec_frame_at_ms(rows, 0, 5) == 0);                        /* empty trace */
+	{	InputRecRow late[1]; memset(late, 0, sizeof late); late[0].frame = 12; late[0].ms = 100;
+		CK(input_rec_frame_at_ms(late, 1, 50) == 0); }                 /* before the first row: nothing recorded yet */
+	/* the key option: unset/empty/"frame" -> frame, "ms" -> ms, anything else refused */
+	CK(input_rec_replay_key_parse(NULL) == INPUT_REC_KEY_FRAME);
+	CK(input_rec_replay_key_parse("") == INPUT_REC_KEY_FRAME);
+	CK(input_rec_replay_key_parse("frame") == INPUT_REC_KEY_FRAME);
+	CK(input_rec_replay_key_parse("ms") == INPUT_REC_KEY_MS);
+	CK(input_rec_replay_key_parse("time") == -1);
+	CK(input_rec_replay_key_parse("MS") == -1);
+}
+
 /* --- record + replay together is refused; masks stay whole -------------------------------- */
 static void test_flags_and_masks(void)
 {
@@ -267,6 +315,7 @@ int main(void)
 	test_hold();
 	test_malformed();
 	test_eof_lookup();
+	test_ms_lookup();
 	test_flags_and_masks();
 	test_fingerprint();
 	printf("%d checks, %d failed\n", checks, failed);
