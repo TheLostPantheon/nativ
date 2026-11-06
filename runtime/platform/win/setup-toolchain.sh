@@ -22,7 +22,7 @@ esac
 mkdir -p "$D/dl"; cd "$D/dl"
 # a download's sha256 against its pin above, so a tampered or changed archive stops the script
 verify() { local h; h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}'); [[ -n $h ]] || h=$(shasum -a 256 "$1" | awk '{print $1}'); [[ $h == "$2" ]] && return; echo "checksum mismatch: $1 (expected $2, got $h)"; rm -f "$1"; exit 1; }
-fetch() { [[ -f $2 ]] || curl -fL --retry 3 -o "$2.part" "$1" && verify "$2.part" "$3" && mv -f "$2.part" "$2" 2>/dev/null || true; }
+fetch() { [[ -f $2 ]] || { curl -fL --retry 3 -o "$2.part" "$1" && verify "$2.part" "$3" && mv -f "$2.part" "$2" 2>/dev/null; }; }   # (braced, as linux/ and macos/: a file already here is not re-verified as .part)
 fetch "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW/$ASSET" "$ASSET" "$ASSET_SHA"
 fetch "https://github.com/libsdl-org/SDL/releases/download/release-$SDL/SDL3-devel-$SDL-mingw.tar.gz" "SDL3-devel-$SDL-mingw.tar.gz" "$SDL_SHA"
 fetch "https://github.com/madler/zlib/releases/download/v$ZLIB/zlib-$ZLIB.tar.gz" "zlib-$ZLIB.tar.gz" "$ZLIB_SHA"
