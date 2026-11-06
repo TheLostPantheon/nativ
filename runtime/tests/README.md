@@ -101,3 +101,17 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## Fiber attach pair: `fiber_attach_test.c`
+
+Checks the internal attach pair libult creates its ULT threads with — `_sceFiberAttachContextAndRun` and
+`_sceFiberAttachContextAndSwitch` (`kernel.c`): a context fiber runs on its context stack and returns to its thread
+with argOnReturn; from a fiber, a fresh SceFiber becomes the worker (entry and argOnInitialize cloned from the
+spawning fiber, the SceFiber registered with the host object's address) and control transfers one way to the thread —
+the switching fiber resumes later with its `*argOnRun` written. The pair is reached only through `hle_kernel[]`, so
+the same source compiles against an unpatched `kernel.c` (`-DFIBER_UNDER_TEST="<path>"`); on it the registration
+checks are the fail-before.
+
+    cc -O1 -g -Wall -Wno-unused-function -D_GNU_SOURCE $INC fiber_attach_test.c -o /tmp/fiber_attach_test -lpthread && /tmp/fiber_attach_test
+
+It prints `all passed (33 ok)`.
