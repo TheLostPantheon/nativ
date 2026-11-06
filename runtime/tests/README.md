@@ -43,7 +43,7 @@ A hang in that section fails after 30 seconds with every thread's scheduler stat
 supplies the pieces it needs from `main.c` and `display.c`: a 4 GiB guest memory block, the allocator and the
 function lookup.
 
-    cc -O1 -g -Wall -Wno-unused-function $INC kernel_test.c -o /tmp/kernel_test -lpthread && /tmp/kernel_test
+    cc -O1 -g -Wall -Wno-unused-function -D_GNU_SOURCE $INC kernel_test.c -o /tmp/kernel_test -lpthread && /tmp/kernel_test
 
 It prints `scheduler (RECOMP_SCHED=vita): N checks, 0 failed`, then `N checks, 0 failed`, and exits 0. A failed check
 names its line. Waiter tests use short sleeps to order threads, so a run takes about three seconds.
