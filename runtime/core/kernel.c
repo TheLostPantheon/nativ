@@ -1693,6 +1693,58 @@ static void h_fiber_switch(Cpu *c) {   /* (fiber, argOnRunTo, *argOnRun): from a
 	RET(0);
 }
 static void h_fiber_get_self(Cpu *c) { if (!A0) { RET(E_FIBER_NULL); return; } WR32(A0, cur_fiber ? cur_fiber->addr : 0); RET(0); }   /* (SceFiber **): 0 on a thread */
+/* the internal attach pair libult creates its ULT threads with (Vita3K SceFiber.cpp is the
+ * reference): give `fiber` its context stack (addrContext..+sizeContext), then run it from the
+ * thread / switch to it from the current fiber. The switching fiber is suspended with r0 =
+ * SCE_FIBER_OK and its argOnRun pointer saved; the target runs with argOnRunTo. */
+static void fiber_attach_context(Fiber *g, uint32_t a, uint32_t sz) {
+	if (a && sz) { g->ctx = a; g->ctx_size = sz; g->sp0 = (a + sz) & ~7u; }
+}
+static void h_fiber_attach_and_switch(Cpu *c) {   /* (fiber, addrContext, sizeContext, argOnRunTo, *argOnRun) */
+	Fiber *f = cur_fiber, *g = fiber_of(A0);
+	if (!A0) { RET(E_FIBER_NULL); return; }
+	if (!f) { RET(E_FIBER_PERMISSION); return; }
+	pthread_mutex_lock(&flock);
+	if (g && g->state == F_RUNNING) { pthread_mutex_unlock(&flock); RET(E_FIBER_STATE); return; }
+	if (!g) {   /* a fresh SceFiber: the attach CREATES the worker fiber and switches into it.
+	             * The reference asserts !fiber->addrContext here and runs the fiber at its entry
+	             * (SceFiberEntry(argOnInitialize, argOnRun)); the guest's struct is blank at this
+	             * point, so the entry comes from the spawning fiber itself -- the created worker
+	             * is another incarnation of the same entry shape. */
+		if (!A1 || !A2 || (A2 & 7) || (A1 & 7) || !f->entry) { pthread_mutex_unlock(&flock); RET(E_FIBER_INVALID); return; }
+		g = calloc(1, sizeof *g);
+		pthread_cond_init(&g->cv, 0);
+		g->addr = A0; g->entry = f->entry; g->arg_init = f->arg_init;
+		g->ctx = A1; g->ctx_size = A2;
+		snprintf(g->name, sizeof g->name, "%.24s", f->name);
+		WR32(A0, FIBER_TAG); WR32(A0 + 4, 0); WR64(A0 + 8, (uint64_t)(uintptr_t)g);
+	}
+	fiber_attach_context(g, A1, A2);
+	f->state = F_SUSPENDED; f->run_arg_p = STK(0);
+	fiber_resume(g, f->thread, A3);
+	fiber_park(f);
+	pthread_mutex_unlock(&flock);
+	RET(0);
+}
+static void h_fiber_attach_and_run(Cpu *c) {   /* (fiber, addrContext, sizeContext, argOnRunTo, *argOnReturn) */
+	Fiber *f = fiber_of(A0);
+	if (!A0) { RET(E_FIBER_NULL); return; }
+	if (!f) { RET(E_FIBER_INVALID); return; }
+	if (cur_fiber) { RET(E_FIBER_PERMISSION); return; }
+	Thread *t = SELF();
+	pthread_mutex_lock(&flock);
+	if (f->state == F_RUNNING) { pthread_mutex_unlock(&flock); RET(E_FIBER_STATE); return; }
+	t->tls = recomp_tpidruro;   /* this host thread IS the thread: its TLS is what its fibers share */
+	fiber_attach_context(f, A1, A2);
+	fiber_resume(f, t, A3);
+	while (!t->fgo) pthread_cond_wait(thread_fcv(t), &flock);
+	t->fgo = 0;
+	if (t->fexit) { pthread_mutex_unlock(&flock); pthread_exit(0); }   /* the fiber ended the thread */
+	uint32_t ret = t->fret_arg;
+	pthread_mutex_unlock(&flock);
+	if (STK(0)) WR32(STK(0), ret);
+	RET(0);
+}
 static void h_fiber_finalize(Cpu *c) {
 	Fiber *f = fiber_of(A0);
 	if (!A0) { RET(E_FIBER_NULL); return; }
@@ -1844,6 +1896,7 @@ const HleEntry hle_kernel[] = {
 	{"sceKernelCancelMsgPipe", h_cancel_msgpipe}, {"sceKernelGetMsgPipeInfo", h_msgpipe_info},
 	{"_sceFiberInitializeImpl", h_fiber_init}, {"_sceFiberInitializeWithInternalOptionImpl", h_fiber_init}, {"sceFiberOptParamInitialize", h_fiber_opt_param_init},
 	{"sceFiberRun", h_fiber_run}, {"sceFiberSwitch", h_fiber_switch}, {"sceFiberReturnToThread", h_fiber_return}, {"sceFiberGetSelf", h_fiber_get_self},
+	{"_sceFiberAttachContextAndRun", h_fiber_attach_and_run}, {"_sceFiberAttachContextAndSwitch", h_fiber_attach_and_switch},
 	{"sceFiberFinalize", h_fiber_finalize}, {"sceFiberGetInfo", h_fiber_info},
 	{"sceKernelBacktraceSelf", h_backtrace_self},
 	{0, 0},
