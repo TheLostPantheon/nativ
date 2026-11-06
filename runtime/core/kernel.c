@@ -39,6 +39,7 @@
 #define E_ILLEGAL_MODE          0x80020010u
 #define E_UID_CANNOT_FIND_BY_NAME 0x8002450Au
 #define E_UNKNOWN_UID           0x80028001u
+#define E_ALREADY_SENT          0x80028121u
 #define E_WAIT_TIMEOUT          0x80028005u
 #define E_WAIT_DELETE           0x80028006u
 #define E_UNKNOWN_THREAD_ID     0x80028021u
@@ -106,6 +107,7 @@ typedef struct Thread {
 	struct Fiber *fiber;         /* the fiber running in its place (fibers, below); 0 while the thread itself runs */
 	pthread_cond_t *fcv; int fgo, fexit; uint32_t fret_arg;   /* the handoff back from its fiber: fgo set and fret_arg its argOnReturn; fexit: the fiber ended the thread */
 	int cb_pending;              /* a callback it owns was notified (callbacks, below) */
+	int signal_pending;          /* _sceKernelWaitSignal/sceKernelSendSignal: a signal waiting to be taken (consumed by the wait) */
 	pthread_mutex_t *wait_m; pthread_cond_t *wait_cv;   /* where it sleeps in a CB wait, for a notifier to wake it */
 	/* the run-slot scheduler (RECOMP_SCHED=vita, below). It belongs to the guest thread, not to a
 	 * host thread: a fiber's host thread runs as its thread, on the thread's slot */
@@ -241,7 +243,11 @@ static void sched_hand(int slot, Thread *from, int why) {
 	pthread_cond_signal(&n->s_cv);
 }
 static void sched_release(Thread *t, int why) { int slot = t->s_slot; sched_slot[slot] = 0; sched_hand(slot, t, why); }   /* sched_m held, t in S_RUN */
-static void sched_wait_turn(Thread *t) { while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m); }   /* sched_m held */
+static void sched_wait_turn(Thread *t) {   /* sched_m held */
+	extern __thread int recomp_excl_valid;
+	recomp_excl_valid = 0;   /* the thread is about to yield the CPU: the firmware's scheduler clears the exclusive monitor on a context switch, so a strex after this point must fail and its loop retry (a stale ldrex value must never publish) */
+	while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m);
+}
 static void sched_get_slot(Thread *t, int front) {   /* sched_m held: a free slot it may use (nobody waiting can use it), else the list */
 	int slot = sched_free_slot(t);
 	if (slot >= 0) sched_take(t, slot);
@@ -634,6 +640,49 @@ static void h_wait_thread_end(Cpu *c) {   /* (uid, *status, *timeout) -> 0, the 
 	if (!done) { if (A2) WR32(A2, 0); RET(E_WAIT_TIMEOUT); return; }
 	timeout_left(A2, timed, &ts);
 	if (A1) WR32(A1, t->status);
+	RET(0);
+}
+/* _sceKernelWaitSignal / sceKernelSendSignal (SceThreadmgr): the per-thread signal a thread parks
+ * on -- the firmware's SceUlt parks its worker threads on this pair (Vita3K SceThreadmgr.cpp
+ * _sceKernelWaitSignal -> ThreadState::wait_for_signal, thread.cpp: a signal sent before ends the
+ * wait at once and is consumed by it; sceKernelSendSignal(uid) errors on uid 0 or an unknown
+ * thread). (unknown, delay, *timeout): the delay is unused on the reference too; no timeout = a
+ * wait that only a signal ends. Observed use: libult's worker thunk calls it as (0, 0, 0). */
+static void h_wait_signal(Cpu *c) {
+	Thread *t = SELF();
+	struct timespec ts; int timed = deadline(A2, &ts);
+	pthread_mutex_lock(&klock);
+	if (!t->signal_pending) {   /* a signal sent before ends the wait at once, with the timeout untouched */
+		thread_waits(4, 0x00010221u);   /* SCE_KERNEL_WAITTYPE_SIGNAL / SIGNAL_WAIT_ID (Vita3K kernel/types.h, thread.cpp) */
+		Thread *me = cb_thread();
+		if (me) cb_publish(me, &klock, &kcond);
+		int b = 0;
+		while (!t->signal_pending && !(me && cb_pending(me))) {
+			if (!b) b = sched_block_begin();
+			if (timed ? pthread_cond_timedwait(&kcond, &klock, &ts) == ETIMEDOUT : pthread_cond_wait(&kcond, &klock) != 0) break;
+		}
+		if (me) cb_publish(me, 0, 0);
+		pthread_mutex_unlock(&klock);
+		thread_waits(0, 0);
+		if (b) sched_block_end();
+		if (!t->signal_pending && me && cb_pending(me)) { timeout_left(A2, timed, &ts); RET(E_CB_RETRY); return; }
+		if (!t->signal_pending) { if (A2) WR32(A2, 0); RET(E_WAIT_TIMEOUT); return; }
+	} else {
+		pthread_mutex_unlock(&klock);
+	}
+	t->signal_pending = 0;
+	timeout_left(A2, timed, &ts);
+	RET(0);
+}
+static void h_send_signal(Cpu *c) {   /* (target thread uid) */
+	if (!A0) { RET(E_ILLEGAL_THREAD_ID); return; }
+	Thread *t = thread_of(A0);
+	if (!t) { RET(E_UNKNOWN_THREAD_ID); return; }
+	pthread_mutex_lock(&klock);
+	if (t->signal_pending) { pthread_mutex_unlock(&klock); RET(E_ALREADY_SENT); return; }   /* the firmware's flag: a second signal before the first is taken is an error the waker sees, so it holds the wake and retries (Vita3K ThreadState::send_signal) */
+	t->signal_pending = 1;
+	pthread_cond_broadcast(&kcond);
+	pthread_mutex_unlock(&klock);
 	RET(0);
 }
 static void h_thread_exit_status(Cpu *c) {
@@ -1367,6 +1416,7 @@ static void h_lock_lwmutex_cb(Cpu *c) { cb_call(c, h_lock_lwmutex); }
 static void h_wait_cond_cb(Cpu *c) { cb_call(c, h_wait_cond); }
 static void h_wait_lwcond_cb(Cpu *c) { cb_call(c, h_wait_lwcond); }
 static void h_wait_thread_end_cb(Cpu *c) { cb_call(c, h_wait_thread_end); }
+static void h_wait_signal_cb(Cpu *c) { cb_call(c, h_wait_signal); }
 static void h_delay_cb(Cpu *c) {
 	uint32_t us = A0 ? A0 : 1;
 	run_callbacks(c);
@@ -1846,5 +1896,8 @@ const HleEntry hle_kernel[] = {
 	{"sceFiberRun", h_fiber_run}, {"sceFiberSwitch", h_fiber_switch}, {"sceFiberReturnToThread", h_fiber_return}, {"sceFiberGetSelf", h_fiber_get_self},
 	{"sceFiberFinalize", h_fiber_finalize}, {"sceFiberGetInfo", h_fiber_info},
 	{"sceKernelBacktraceSelf", h_backtrace_self},
+	{"sceKernelWaitSignal", h_wait_signal}, {"_sceKernelWaitSignal", h_wait_signal},
+	{"sceKernelWaitSignalCB", h_wait_signal_cb}, {"_sceKernelWaitSignalCB", h_wait_signal_cb},
+	{"sceKernelSendSignal", h_send_signal}, {"_sceKernelSendSignal", h_send_signal},
 	{0, 0},
 };
