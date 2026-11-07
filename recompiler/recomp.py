@@ -1346,7 +1346,7 @@ def main():
     parts = [[] for _ in range(nsplit)]
     if nsplit:
         base = sys.argv[2][:-2] if sys.argv[2].endswith(".c") else sys.argv[2]
-        open(base + ".h", "w").write("\n".join(out + decls) + "\n")
+        write_if_changed(base + ".h", "\n".join(out + decls) + "\n")
         out = [f'#include "{os.path.basename(base)}.h"']
     else:
         out += decls
@@ -1364,7 +1364,7 @@ def main():
         else:
             out += body
     for n, part in enumerate(parts):
-        open(f"{base}_part{n}.c", "w").write("\n".join([f'#include "{os.path.basename(base)}.h"'] + part) + "\n")
+        write_if_changed(f"{base}_part{n}.c", "\n".join([f'#include "{os.path.basename(base)}.h"'] + part) + "\n")
     # --module NAME: a module loaded with the main program (a .suprx): its tables are suffixed and
     # register themselves with the host (main.c's module registry) before main() runs
     mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
@@ -1383,11 +1383,22 @@ def main():
     if mod:
         out.append("void recomp_register_module(const char *name, GuestFn (*lookup)(uint32_t), const char *(*import_name)(uint32_t), int (*is_arm)(uint32_t));")
         out.append(f'__attribute__((constructor)) static void register_{mod}(void) {{ recomp_register_module("{mod}", recomp_lookup{sfx}, recomp_import_name{sfx}, recomp_is_arm{sfx}); }}')
-    open(sys.argv[2], "w").write("\n".join(out) + "\n")
+    write_if_changed(sys.argv[2], "\n".join(out) + "\n")
     print(f"{len(fns)} functions, {len(stubs)} imports, {total} instructions, {len(bad)} unsupported -> {sys.argv[2]}")
     from collections import Counter
     for (k, n) in Counter(u[1].split()[0] for u in bad).most_common(15):
         print(f"  {n:4} {k}")
+
+
+def write_if_changed(path, text):
+    """a generated file, written only when its text differs from what is there: an unchanged part keeps its time, so a
+    recompile that changes a few functions rebuilds only their parts (runtime/build.py's "newer than" test). The bytes
+    are the same either way (text mode, as the open(path, "w") before)"""
+    try:
+        with open(path, "r", newline="") as f:
+            if f.read() == text.replace("\n", os.linesep): return
+    except (OSError, UnicodeDecodeError): pass
+    with open(path, "w") as f: f.write(text)
 
 
 if __name__ == "__main__":

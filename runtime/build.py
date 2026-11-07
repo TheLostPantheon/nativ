@@ -166,8 +166,12 @@ def main(argv):
         UCLIB = "-l:libunicorn.so.2" if os.path.isfile(os.path.join(UC, "lib", "libunicorn.so.2")) and not os.path.isfile(os.path.join(UC, "lib", "libunicorn.so")) else "-lunicorn"   # pip's Linux wheel
         FLAGS += ["-DRECOMP_VERIFY", "-I", os.path.join(UC, "include")]
         EXTRA = [part("verify"), "-L" + os.path.join(UC, "lib"), UCLIB, "-Wl,-rpath," + os.path.join(UC, "lib")]
-    srcs = [BASE + ".c"] + sorted(glob.glob(glob.escape(BASE) + "_part*.c"))
-    for m in mods: srcs += [m + ".c"] + sorted(glob.glob(glob.escape(m) + "_part*.c"))   # modules loaded with it (recomp.py --module)
+    # (each with its base's header, game.h: recomp.py rewrites only the files whose text changed, so a part can be older
+    # than a header whose declarations it compiles against)
+    header = {}
+    for b in [BASE] + mods:   # the game, then the modules loaded with it (recomp.py --module)
+        for s in [b + ".c"] + sorted(glob.glob(glob.escape(b) + "_part*.c")): header[s] = b + ".h"
+    srcs = list(header)
     srcs += sorted(glob.glob(os.path.join(ROOT, "third_party", "libatrac9", "*.c")))   # LibAtrac9 (MIT): the NGS ATRAC9 player's decoder
     # JOBS: compiles at once. A part file is ~10 MB of C: Uncharted's 40 parts all at once under GCC peaked
     # at 27 GB and systemd-oomd killed the build on a 30 GB Linux machine (one that also keeps a language
@@ -178,10 +182,33 @@ def main(argv):
         per = 3 if "Free Software Foundation" in " ".join(out_of([CC, "--version"])) else 2
         jobs = max(1, min(memory_gb() // per, os.cpu_count() or 1))
     rt = os.path.join(RECOMPILER, "rt.h")
+    # rt.h and the part's header by content (<object>.in: their hash when it was compiled), not by time: a checkout that
+    # rewrites rt.h unchanged (a branch switch, a pull, a second worktree) rebuilt every part -- ~20 min for a 30-part
+    # game -- for the same object code. An object from before these stamps: the time test once, then a stamp
+    sums = {}
+    def digest(*files):
+        if files not in sums:
+            h = hashlib.sha1()
+            for f in files:
+                try: h.update(open(f, "rb").read())
+                except OSError: h.update(b"\0missing")
+            sums[files] = h.hexdigest()
+        return sums[files]
+    def write_stamp(o, text):
+        with open(f"{o}.in.{os.getpid()}", "w") as f: f.write(text + "\n")
+        os.replace(f"{o}.in.{os.getpid()}", o + ".in")
     work = []
     for s in srcs:
         o = os.path.join(OBJ, os.path.splitext(os.path.basename(s))[0] + ".o")
-        if not os.path.isfile(o) or newer(s, o) or newer(rt, o): work.append(([CC, "-c"] + FLAGS + [s, "-o", o], s, o, CC, False))
+        ins = (rt, header[s]) if s in header else (rt,); now = digest(*ins)
+        try: was = open(o + ".in").read().strip()
+        except OSError: was = None
+        if not os.path.isfile(o) or newer(s, o): stale = True
+        elif was is None:
+            stale = any(newer(f, o) for f in ins)
+            if not stale: write_stamp(o, now)
+        else: stale = was != now
+        if stale: work.append(([CC, "-c"] + FLAGS + [s, "-o", o], s, o, CC, lambda o=o, now=now: write_stamp(o, now)))
     # the in-game overlay (runtime/ui/overlay.cpp, this project's one C++ file) and Dear ImGui itself
     # (third_party/imgui/, MIT: see its own README for the pinned release): built once into their own
     # cached objects -- nothing here depends on which game is being linked -- and reused by that game's later builds
@@ -204,20 +231,8 @@ def main(argv):
     CXXFLAGS += ["-I", IMGUIOBJ]
     for s in imgui_srcs:
         o = os.path.join(IMGUIOBJ, os.path.splitext(os.path.basename(s))[0] + ".o")
-        if not os.path.isfile(o) or newer(s, o) or newer(os.path.join(RT, "ui", "overlay.h"), o) or (s.endswith("overlay.cpp") and newer(PROMPTS_H, o)):
-            work.append(([CXX, "-c"] + CXXFLAGS + [s, "-o", f"{o}.{os.getpid()}"], s, o, CXX, True))
-
-    def compile_one(w):
-        argv, s, o, cc, tmp = w
-        r = subprocess.run(argv)
-        if r.returncode:
-            if tmp: _rm(argv[-1])
-            return s
-        if tmp: os.replace(argv[-1], o)
-        say(f"  {cc} {os.path.basename(s)}")
-        return None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex: failed = [f for f in ex.map(compile_one, work) if f]
-    if failed: die("build: " + ", ".join(os.path.basename(f) for f in failed) + " did not compile")
+        if not os.path.isfile(o) or newer(s, o) or newer(os.path.join(RT, "ui", "overlay.h"), o) or (s.endswith("overlay.cpp") and newer(PROMPTS_H, o)) or stale_deps(o):
+            work.append(deps_job([CXX, "-c"] + CXXFLAGS, s, o, CXX))
     # spirv-cross (SPIRV-Cross's C API): only needed where SDL_GPU doesn't consume SPIR-V directly,
     # i.e. on Metal (Mac); Vulkan (Linux/Windows) takes our SPIR-V as-is, no translation at runtime.
     SPIRV_CROSS = []
@@ -271,9 +286,46 @@ def main(argv):
         "ssao fsr/fsr net np http sha1 ssl_local online/m2_server online/m2_wire online/m2_rooms online/m2_proxy online/discovery online/basic_msg online/stun online/overlay online/dht online/upnp online/aes128 online/status online/crypto").split()]
     # the game's own host code (vitarecomp: every .c in packs/<title>/), in this game's build alone
     host += [f for f in (ENV.get("RECOMP_PACK_SOURCES") or "").split(os.pathsep) if f]
+    # the runtime's own sources (and the pack's) as cached objects, compiled in parallel with the game's parts -- they were
+    # compiled inside the link command, one after another, on every build: ~60 files, minutes for a one-line change.
+    # Each is rebuilt when it or a header it includes (the compiler's -MMD list) is newer than its object; the objects of
+    # one set of flags (RUN_ENV, GAME_ADDRS, the toolchain ...) in their own folder, OBJ/host_<hash>, so a diagnostic build
+    # with other defaults (BUILD_EXTRA_ENV) never overwrites the play build's
+    lists = EXTRA + SPIRV_CROSS + AVCODEC + CURL
+    hsrcs = PLATFORM + host + [a for a in lists if a.endswith((".c", ".m")) and os.path.isfile(a)]
+    hcflags, lwords, k = FLAGS + ENVDEF + ["-Wall"] + sdl_cflags, [], 0
+    while k < len(lists):   # the libraries' words: compile flags (-D, -I ...) and link words, each in their order
+        a = lists[k]
+        if a in ("-I", "-D", "-isystem", "-include"): hcflags += lists[k:k + 2]; k += 2; continue
+        if a.startswith(("-D", "-I", "-isystem", "-F")) or a == "-pthread": hcflags.append(a)
+        if not a.startswith(("-D", "-I", "-isystem")) and a not in hsrcs: lwords.append(a)
+        k += 1
+    HOSTOBJ = os.path.join(OBJ, "host_" + hashlib.sha1("\0".join([CC] + hcflags).encode()).hexdigest()[:10]); os.makedirs(HOSTOBJ, exist_ok=True)
+    hobjs = []
+    for s in hsrcs:
+        rel = os.path.relpath(s, ROOT)
+        name = rel.replace(os.sep, "__").replace("/", "__") if not rel.startswith("..") else os.path.basename(s) + "_" + hashlib.sha1(s.encode()).hexdigest()[:8]
+        o = os.path.join(HOSTOBJ, os.path.splitext(name)[0] + ".o"); hobjs.append(o)
+        if not os.path.isfile(o) or newer(s, o) or stale_deps(o): work.append(deps_job([CC, "-c"] + hcflags, s, o, CC))
+
+    def compile_one(w):
+        argv, s, o, cc, done = w
+        r = subprocess.run(argv)
+        if r.returncode:
+            if done: _rm(argv[-1]); _rm(o + f".d.{os.getpid()}")
+            return s
+        if done: done()
+        say(f"  {cc} {os.path.basename(s)}")
+        return None
+    # the biggest first: a game's largest part (a 24 MB part file) is the build's longest compile and starts at once
+    # instead of when the alphabet reaches it
+    work.sort(key=lambda w: -os.path.getsize(w[1]))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex: failed = [f for f in ex.map(compile_one, work) if f]
+    if failed: die("build: " + ", ".join(os.path.basename(f) for f in failed) + " did not compile")
     objs = sorted(glob.glob(os.path.join(glob.escape(OBJ), "*.o"))) + sorted(glob.glob(os.path.join(glob.escape(IMGUIOBJ), "*.o")))
-    # (Linux links libm/pthread explicitly; zlib: PSARC archives)
-    link = [CC] + FLAGS + ENVDEF + ["-Wall"] + sdl_cflags + PLATFORM + host + EXTRA + objs + sdl_libs + SPIRV_CROSS + AVCODEC + CURL + CXXLIB + LIBS + ["-o", OUT]
+    # (Linux links libm/pthread explicitly; zlib: PSARC archives) -- objects only: the code generation flags a link
+    # needs (RECOMP_CFLAGS' -flto) and the libraries' link words
+    link = [CC] + CPUFLAGS + extra + ["-w"] + hobjs + lwords + objs + sdl_libs + CXXLIB + LIBS + ["-o", OUT]
     sys.stdout.flush()
     r = subprocess.run(link)
     if r.returncode: return r.returncode
@@ -285,6 +337,29 @@ def main(argv):
     if MT: beside(os.path.join(MT, "SDL3", "lib", "libSDL3.0.dylib"))   # (what -rpath @executable_path finds)
     say(f"built {OUT}")
     return 0
+
+
+def deps_file(o): return o + ".d"
+
+
+def stale_deps(o):
+    """whether a file the object was compiled from (the compiler's -MMD list: its source and headers) is newer than it;
+    no list: stale"""
+    try: text = open(deps_file(o)).read()
+    except OSError: return True
+    i = text.find(": ")   # (after the target: C:\... has a colon of its own)
+    if i < 0: return True
+    text = re.sub(r"\\\r?\n", " ", text[i + 2:])   # (continued lines; a space in a name is "\ ")
+    return any(newer(d.replace("\\ ", " "), o) for d in re.split(r"(?<!\\)\s+", text) if d)
+
+
+def deps_job(argv, s, o, cc):
+    """a compile into a temporary, with its header list (-MMD), both renamed into place when it succeeds: whole or not at
+    all, so two builds of one title never see half a file"""
+    pid = os.getpid(); _rm(deps_file(o))   # (a compile that dies leaves no list: compiled again next time)
+    def done():
+        os.replace(f"{o}.{pid}", o); os.replace(f"{o}.d.{pid}", deps_file(o))
+    return (argv + [s, "-MMD", "-MF", f"{o}.d.{pid}", "-o", f"{o}.{pid}"], s, o, cc, done)
 
 
 def _rm(p):
