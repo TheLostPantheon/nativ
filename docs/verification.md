@@ -63,7 +63,10 @@ reported, not dropped.
 **`dev/tests/neon_test.py`** checks NEON and VFP lane behaviour against a Python model written from the ARM manual,
 not Unicorn. Each case is a short Thumb-2 sequence: clang assembles it, the recompiler translates it, and a harness
 runs the C over random states with edge values mixed in (saturation bounds, shift counts, denormals, NaNs). It covers
-171 forms. Run it after any change to the NEON or VFP translation or the lane helpers in `rt.h`.
+191 forms. Tests and developer tools translate assembled byte sequences through `recomp.translate_assembled()`
+rather than constructing the recompiler's internal `Fn` representation. The Apple Silicon workflow runs a short
+deterministic sample for relevant changes and the full default iteration count on tags, manual runs and the weekly
+schedule. Run it locally after any change to the NEON or VFP translation or the lane helpers in `rt.h`.
 
 ## Checking the runtime
 

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """NEON/VFP lane semantics of the recompiler against a model of the ARM ARM (ARMv7-A).
 
-Each case is a short Thumb-2 sequence: clang assembles it (its ARM backend, -target armv7a), capstone
-decodes it the way recomp.py does, Fn.build() translates it to C, and a tiny harness runs the C over
-initialised Cpu states (plus a 4 KiB window of guest memory) piped through stdin. The same states go
-through the Python model below, written from the ARM ARM's pseudocode (not from the recompiler, and not
-from Unicorn, whose NEON crashes on Apple Silicon). Inputs are random with edge values mixed in per
-byte: saturation bounds, negative and oversize shift counts, out-of-range table indices, f32
-denormals, NaNs, infinities and the two zeros.
+Each case is a short Thumb-2 sequence: clang assembles it (its ARM backend, -target armv7a), and
+recomp.translate_assembled() decodes and translates it to C. A tiny harness runs the C over initialised
+Cpu states (plus a 4 KiB window of guest memory) piped through stdin. The same states go through the
+Python model below, written from the ARM ARM's pseudocode (not from the recompiler, and not from
+Unicorn, whose NEON crashes on Apple Silicon). Inputs are random with edge values mixed in per byte:
+saturation bounds, negative and oversize shift counts, out-of-range table indices, f32 denormals, NaNs,
+infinities and the two zeros.
 
-usage: tests/neon_test.py [-n ITER] [-k PATTERN] [-v]      (from the repository root, with .venv's python)
+usage: dev/tests/neon_test.py [-n ITER] [-k PATTERN] [-v]  (from the repository root, with .venv's python)
 """
 import os, random, struct, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "recompiler"))
 import recomp
-from recomp import md, Fn
+from recomp import md
 from capstone.arm import ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM
 
 MEMBASE, MEMSZ = 0x1000, 0x1000
@@ -40,11 +40,7 @@ def assemble(asm):
     raise RuntimeError("no .text")
 
 def translate(entry, code):
-    insns = list(md.disasm(code, entry))
-    assert sum(i.size for i in insns) == len(code), "undecodable bytes"
-    f = Fn(entry, insns, {entry})
-    lines = f.build()
-    return insns, lines, f.unimpl
+    return recomp.translate_assembled(entry, code)
 
 HARNESS = r'''
 #include <stdio.h>
@@ -107,6 +103,11 @@ def fzf(b):
     if (b & 0x7f800000) == 0x7f800000 and (b & 0x7fffff): return 0x7fc00000
     return b
 def f32(b): return struct.unpack("<f", struct.pack("<I", b))[0]
+def f32bits(v):
+    try:
+        return struct.unpack("<I", struct.pack("<f", v))[0]
+    except OverflowError:
+        return 0xff800000 if v < 0 else 0x7f800000
 def fmax(a, b):
     a, b = fzf(a), fzf(b)
     if (a & 0x7fffffff) > 0x7f800000 or (b & 0x7fffffff) > 0x7f800000: return 0x7fc00000
@@ -121,7 +122,7 @@ def fmin(a, b):
     return a if x < y else b
 def fadd(a, b):
     a, b = fzf(a), fzf(b)
-    r = struct.unpack("<I", struct.pack("<f", f32(a) + f32(b)))[0] if not (f32(a) != f32(a) or f32(b) != f32(b)) else 0x7fc00000
+    r = f32bits(f32(a) + f32(b)) if not (f32(a) != f32(a) or f32(b) != f32(b)) else 0x7fc00000
     return fzf(r)
 
 def sat(v, bits, signed):

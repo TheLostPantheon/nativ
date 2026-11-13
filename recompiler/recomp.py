@@ -1166,6 +1166,20 @@ class Fn:
         return lines
 
 
+def translate_assembled(entry, code, arm=False):
+    """Translate a contiguous assembled byte sequence for tests and developer tools.
+
+    Returns the decoded instructions, generated C lines and unsupported-instruction records.
+    """
+    dis = md_arm if arm else md
+    insns = list(dis.disasm(code, entry))
+    decoded = sum(i.size for i in insns)
+    if decoded != len(code):
+        raise ValueError(f"decoded {decoded} of {len(code)} bytes at 0x{entry:x}")
+    f = Fn(entry, insns, {entry}, arm=arm)
+    return insns, f.build(), f.unimpl
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
