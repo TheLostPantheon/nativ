@@ -1111,7 +1111,14 @@ static void exec_i8mad(Ctx *cx, const UOp *op) {
 	for (int r = 0; r < op->reps; r++) {
 		int off0 = slot_offset(cx, op->repmode, op->s0.bank, 0, r, unit), off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit);
 		int off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
-		uint32_t w0 = read_i32(cx, &op->s0, off0, 0), w1 = read_i32(cx, &op->s1, off1, 0), w2 = read_i32(cx, &op->s2, off2, 0);
+		/* the four U8 lanes are one packed word in and out: read as TY_U8, read_i32 returned lane 0 alone and
+		 * write_raw_lane stored lane 0 alone, so every lane but R came out 0 (and s0's negate, which selects
+		 * subtract below, negated the read too). Burning Skies' spot-shadow resolve (fragment 0x171fedc0) merges
+		 * its lit/shadowed byte into the light's own channel this way: every light but the first lost its shadow
+		 * mask to 0, fully shadowed, and the deferred lights it gates added nothing */
+		UOperand s0 = op->s0, s1 = op->s1, s2 = op->s2, dst = op->dst;
+		s0.type = s1.type = s2.type = dst.type = TY_U32; s0.negabs = 0;
+		uint32_t w0 = read_i32(cx, &s0, off0, 0), w1 = read_i32(cx, &s1, off1, 0), w2 = read_i32(cx, &s2, off2, 0);
 		int csel0 = op->sub & 3, asel0 = op->sub2 & 1, csel1 = (op->sub2 >> 1) & 1, csel2 = (op->sub2 >> 2) & 1;
 		uint32_t addrgb = csel0 == 0 ? (w0 & 0xFFFFFF) : csel0 == 1 ? (w1 & 0xFFFFFF) : csel0 == 2 ? ((w0 >> 24) * 0x010101u) : ((w1 >> 24) * 0x010101u);
 		uint32_t adda = asel0 == 0 ? (w0 >> 24) : (w1 >> 24);
@@ -1124,7 +1131,7 @@ static void exec_i8mad(Ctx *cx, const UOp *op) {
 			if (v < 0) v = 0; if (v > 255) v = 255;
 			result |= ((uint32_t)v & 0xFF) << (8 * lane);
 		}
-		write_raw_lane(cx, &op->dst, offd, 0, result);
+		write_raw_lane(cx, &dst, offd, 0, result);
 	}
 }
 static void exec_i16mad(Ctx *cx, const UOp *op) {

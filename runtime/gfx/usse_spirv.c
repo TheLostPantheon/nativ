@@ -949,8 +949,7 @@ static void imad_offsets(Gen *g, const UOp *op, int r, int off[4], int *ok) {
 	off[2] = slot_off(g, op->repmode, op->s2.bank, r, unit, 2, ok); off[3] = slot_off(g, op->repmode, op->dst.bank, r, unit, 3, ok);
 }
 /* component 0 of the operand in its decoded type, as usse.c's read_i32(.., 0): the whole word for
- * I32MAD's S32 operands, lane 0 for I16MAD's U16 and I8MAD's U8 (the interpreter is the reference;
- * whether I8MAD should see the full packed word is a question for it, not this port) */
+ * I32MAD's S32 operands, lane 0 for I16MAD's U16 (I8MAD reads its packed words as TY_U32: emit_i8mad) */
 static uint32_t read_word(Gen *g, const UOperand *o, int off, int *ok) { return read_raw_comp(g, o, off, 0, ok); }
 static void write_word(Gen *g, const UOperand *o, int off, uint32_t v, int *ok) { write_raw_comp(g, o, off, 0, v, ok); }
 static uint32_t sop_read_word(Gen *g, const UOperand *o, int off, int *ok) {
@@ -1065,8 +1064,10 @@ static void emit_i8mad(Gen *g, const UOp *op, int *ok) {
 	Spv *s = &g->s;
 	for (int r = 0; r < op->reps; r++) {
 		int off[4]; imad_offsets(g, op, r, off, ok);
-		UOperand s0 = op->s0; s0.negabs = 0;   /* s0's negate selects subtract below, as usse.c */
-		uint32_t w0 = read_word(g, &s0, off[0], ok), w1 = read_word(g, &op->s1, off[1], ok), w2 = read_word(g, &op->s2, off[2], ok);
+		/* the four U8 lanes as one packed word in and out (usse.c exec_i8mad); s0's negate selects subtract below */
+		UOperand s0 = op->s0, s1 = op->s1, s2 = op->s2, dst = op->dst;
+		s0.type = s1.type = s2.type = dst.type = TY_U32; s0.negabs = 0;
+		uint32_t w0 = read_word(g, &s0, off[0], ok), w1 = read_word(g, &s1, off[1], ok), w2 = read_word(g, &s2, off[2], ok);
 		if (!*ok) return;
 		int csel0 = op->sub & 3, asel0 = op->sub2 & 1, csel1 = (op->sub2 >> 1) & 1, csel2 = (op->sub2 >> 2) & 1;
 		uint32_t rep = c_uint(s, 0x010101u), rep4 = c_uint(s, 0x01010101u);
@@ -1085,7 +1086,7 @@ static void emit_i8mad(Gen *g, const UOp *op, int *ok) {
 			uint32_t cl = result3(s, &s->func, SpvOpSelect, t_uint(s), result2(s, &s->func, SpvOpUGreaterThan, t_bool(s), lo, c_uint(s, 255)), c_uint(s, 255), lo);
 			result = uop2(s, SpvOpBitwiseOr, result, uop2(s, SpvOpShiftLeftLogical, cl, c_uint(s, 8u * lane)));
 		}
-		write_word(g, &op->dst, off[3], result, ok);
+		write_word(g, &dst, off[3], result, ok);
 	}
 }
 static void emit_i16mad(Gen *g, const UOp *op, int *ok) {
