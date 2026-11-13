@@ -20,9 +20,14 @@ void main() {
 		float al = c.a <= 0.0 ? 0.0 : c.a >= 1.0 ? 3.0 : floor(c.a * 3.0 + 0.5);
 		o = vec4(q(c.r, 5u), q(c.g, 5u), q(c.b, 5u), al / 3.0); return;
 	}
-	if (u.mode == 3u || u.mode == 4u) {                                                            // the pixel's words as U8U8U8U8 / S8S8S8S8 bytes
-		uint w = floatBitsToUint(sub == 1u ? c.g : sub == 2u ? c.b : sub == 3u ? c.a : c.r); vec4 r;
-		for (int k = 0; k < 4; k++) { uint bb = (w >> (8u * uint(k))) & 255u; r[k] = u.mode == 3u ? float(bb) / 255.0 : s8(bb); }
+	if (u.mode == 3u || u.mode == 4u || u.mode == 9u || u.mode == 10u) {                            // the pixel's words as U8U8U8U8 / S8S8S8S8 bytes; 9/10 rebuild exact UNORM halves
+		uint w;
+		if (u.mode >= 9u) {
+			uvec4 h = uvec4(clamp(c, 0.0, 1.0) * 65535.0 + 0.5);
+			w = sub == 0u ? h.x | (h.y << 16) : h.z | (h.w << 16);
+		} else w = floatBitsToUint(sub == 1u ? c.g : sub == 2u ? c.b : sub == 3u ? c.a : c.r);
+		vec4 r; bool unorm = u.mode == 3u || u.mode == 9u;
+		for (int k = 0; k < 4; k++) { uint bb = (w >> (8u * uint(k))) & 255u; r[k] = unorm ? float(bb) / 255.0 : s8(bb); }
 		o = swizzle(r, u.swz); return;
 	}
 	o = swizzle(c, u.swz);                                                                         // 0: the same values (F16x4, U8x4)

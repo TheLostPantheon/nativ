@@ -60,6 +60,7 @@ means the renderer lost it. `RECOMP_FRAME_HISTORY_LOG=1` prints those lines for 
 | `RECOMP_AUDIO_WAV_DIR=<dir>` | Each audio port to its own WAV, in its real format. |
 | `RECOMP_NGS_DEBUG=1` | NGS voice setup and parameters. |
 | `RECOMP_NGS_WAV_DIR=<dir>` | NGS taken apart: each master bus before clipping, each voice's output and decoded source, the reverb buses, and `voices.log` with plays, events and patches. |
+| `RECOMP_NGS_REVERB=0` | Drop NGS reverb-bus effect returns while preserving direct voice routes. |
 
 ## Where the time goes
 

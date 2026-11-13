@@ -48,7 +48,8 @@ instead of every second one. It's experimental and per game, because games assum
 
 `runtime/audio/ngs.c` implements NGS, the Vita's voice engine (a DSP on the hardware): racks, voices (simple, Scream
 PCM and ATRAC9), patches and buses. ATRAC9 is decoded by LibAtrac9 (MIT, in `third_party/libatrac9`), and output goes
-through SDL. Reverb sends are dropped for now.
+through SDL. `runtime/audio/audiodec.c` provides the direct `SceAudiodec` ATRAC9 interface used by middleware such as
+FMOD. Reverb sends are dropped for now.
 
 ## Graphics
 
@@ -73,6 +74,12 @@ through SDL's GPU API: Metal on macOS, by way of SPIRV-Cross, and Vulkan elsewhe
   (`gfx/usse_spirv.c`) and cached by its content, since the shader patcher moves programs around between frames.
 - **Everything stays on the GPU.** Render targets keep the precision of their Vita format. Guest memory is only
   written when something reads it: a screenshot, a CPU write into a target, or a format pairing without a view.
+- **Packed target words stay exact.** A fragment program that writes U32/S32 payload words into an RGBA16F surface
+  uses an R16G16B16A16 UNORM backing while those draws run. This preserves every bit, including patterns that look
+  like half-float NaNs and would otherwise be canonicalised by a floating-point attachment.
+- **Depth and stencil state stays face-correct.** Front and back faces can use distinct Vita stencil comparisons and
+  operations. Deferred light volumes rely on opposing increment/decrement depth-fail operations to keep their
+  geometry out of the lit image.
 - **Views.** When a game reads a target's memory as a texture in another format, layout or region, the backend
   builds a view on the GPU that holds what the software decoder would have read. A view is rebuilt only when its
   target changes.
@@ -91,6 +98,21 @@ the gate and the game's own CPU reads all see Vita-sized surfaces.
 A read that reinterprets a target's bytes at another texel size takes its word from the 1x pixel under the sample
 (`snap_fetch` in `usse_spirv.c`). `RECOMP_RENDER_SCALE_SWITCH=frame:n,...` changes the scale in a headless run, which
 is how to test that path. `RECOMP_GPU_DUMP_PRESENT=path` writes the presented frame at the render scale.
+
+### Window presentation
+
+The normal window path hands the completed GPU texture to SDL's GPU swapchain without downloading it. A title can
+instead set `RECOMP_PRESENT_BACKEND=renderer`: the GPU backend synchronises the final Vita-sized surface to guest
+memory, `runtime/ui/window.c` uploads it to a streaming texture, and SDL Renderer presents it with the same aspect mode
+and ImGui menu, HUD and touch markers. On Windows this uses SDL's Direct3D 11 renderer and is available for drivers
+whose Vulkan/D3D12 SDL GPU swapchain cannot sustain the title's frame rate. The extra final-surface readback makes this
+a per-title compatibility path rather than the global default.
+
+A renderer-path title verified with `RECOMP_FSR1_SUPPORTED=1` also offers AMD FidelityFX FSR1 spatial upscaling. With
+it enabled (`fsr1=1`, or `RECOMP_FSR1=1`), EASU reconstructs the finished Vulkan frame at the visible output size and
+RCAS sharpens it before the path's single readback. SDL Renderer then uploads that larger image to Direct3D 11; ImGui
+and touch markers are still drawn afterward at output resolution. This improves native 960x544 scaling rather than
+lowering the game's internal render resolution.
 
 ### The shader archive (macOS)
 

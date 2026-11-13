@@ -81,9 +81,10 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 /* cube_mask: bit u set when texture unit u holds a cube map (GfxTexture layout 3) for the draws this
  * shader serves -- its SMPs sample a Cube image with the full (u,v,w) direction; part of the caller's
  * shader cache key, since the image type is baked into the module */
-/* color_kind: the render target's texture family (0 RGBA8, 1 RGBA16F, 2 RGBA32F), which decides how a
- * fragment program's raw-word colour output (U32/S32) is laid into the four output channels so the
- * target holds those bits exactly; value colours don't depend on it */
+/* color_kind: the render target's texture family (0 RGBA8, 1 RGBA16F, 2 RGBA32F,
+ * USSE_COLOR_KIND_F16_RAW R16G16B16A16_UNORM), which decides how a fragment program's raw-word
+ * colour output (U32/S32) is laid into the four output channels. Value colours don't depend on it. */
+#define USSE_COLOR_KIND_F16_RAW 5
 void usse_spirv_free(SpirvModule *m);
 /* the sa_tex_unit entries the last usse_spirv_translate read (bit i of out[i / 32]), the low byte of each being all it used:
  * a module depends on these and on nothing else of sa_tex_unit (gfx_gpu.c's shader recipes keep just them) */

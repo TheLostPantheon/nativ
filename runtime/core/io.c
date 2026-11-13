@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include "hle.h"
 #include "guestwatch.h"
+#include "settings.h"
 
 /* ---- files: a Vita path "dev:rest" is <RECOMP_FS>/dev/rest on the host (app0: is the game's
  * install folder, ux0:data its data); "/dev/rest" (FIOS's own spelling) the same; a relative path
@@ -126,6 +127,24 @@ static void addcont_marker(const char *gp, const char *hp) {
 		p += l;
 	}
 }
+/* A game that offers the per-game "skip_mission_intros" option can use chapter_##.bik for replayed
+ * mission briefings. Refusing only those sources follows the same clean missing-movie path it uses
+ * for absent logo/legal videos, without suppressing story cinematics or weapon tutorials.
+ * RECOMP_SKIP_MISSION_INTROS=0|1 overrides the saved option for tests. */
+static int skip_mission_intro(const char *gp) {
+	const char *e = getenv("RECOMP_SKIP_MISSION_INTROS");
+	if (!(e ? atoi(e) != 0 : settings_game_option("skip_mission_intros") && settings_int("skip_mission_intros", 0))) return 0;
+	char path[256]; size_t n = strlen(gp);
+	if (n >= sizeof path) return 0;
+	for (size_t i = 0; i <= n; i++) path[i] = gp[i] == '\\' ? '/' : gp[i];
+	char *p = path;
+	while (*p == '/') p++;
+	if (!strncasecmp(p, "app0:", 5)) { p += 5; while (*p == '/') p++; }
+	static const char prefix[] = "video/e3/chapter_";
+	if (strncasecmp(p, prefix, sizeof prefix - 1)) return 0;
+	p += sizeof prefix - 1;
+	return p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9' && !strcasecmp(p + 2, ".bik");
+}
 static void h_io_open(Cpu *c) {   /* (path, SCE_O_* flags, mode) -> fd */
 	/* the console's TTYs (the C library's stdin/stdout/stderr): the host's standard streams */
 	const char *gp = (char *)G(A0);
@@ -135,6 +154,10 @@ static void h_io_open(Cpu *c) {   /* (path, SCE_O_* flags, mode) -> fd */
 	if ((fl & 3) == 2) mode = O_WRONLY; else if ((fl & 3) == 3) mode = O_RDWR;
 	if (fl & 0x200) mode |= O_CREAT; if (fl & 0x400) mode |= O_TRUNC; if (fl & 0x100) mode |= O_APPEND; if (fl & 0x800) mode |= O_EXCL;
 	if ((mode & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) && readonly_refused("open for writing", gp, hp)) { RET(sce_err(EROFS)); return; }
+	if (mode == O_RDONLY && skip_mission_intro(gp)) {
+		fprintf(stderr, "    open %s: skipped (setting \"skip_mission_intros\")\n", gp);
+		RET(SCE_ENOENT); return;
+	}
 	if (mode == O_RDONLY) addcont_marker(gp, hp);
 	int fd = open(hp, mode, 0644), e = errno;
 	fprintf(stderr, "    open %s -> %s%s (fd %#x)\n", (char *)G(A0), hp, fd < 0 ? " (not found)" : "", fd < 0 ? 0 : (uint32_t)fd + 0x100);

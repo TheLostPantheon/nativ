@@ -886,9 +886,19 @@ static uint64_t rc_shader_text(char *o, size_t n, const ShaderEntry *e, int is_f
 	}
 	return k < (int)n ? hash_bytes(o, (size_t)k) : 0;
 }
+/* The front face of every pipeline that takes a draw's cull_sdl (gfx_gpu_draw resolves it against this convention):
+ * the draw's own, its visibility query's and its motion pass's must agree, or a query counts the faces the draw culls */
+#define GXM_FRONT_FACE SDL_GPU_FRONTFACE_CLOCKWISE
+static int32_t pipe_stencil_face(uint8_t front, uint8_t back, int two_sided) {
+	return two_sided ? (int32_t)front | (int32_t)back << 8 | 1 << 16 : front;
+}
 static void pipe_state(const GfxDraw *d, int has_depth, int ckind, int depth_ok, int stencil_ok, int cull_sdl, int null_fs, int32_t v[NPV]) {   /* what get_pipeline builds from */
 	const int32_t t[NPV] = { d->cull, cull_sdl, has_depth, ckind, depth_ok, stencil_ok, null_fs, d->depth_write, (int32_t)d->depth_func,
-		d->stencil_func, d->stencil_fail, d->depth_fail, d->depth_pass, d->stencil_cmask, d->stencil_wmask, d->fp_disabled,
+		pipe_stencil_face(d->stencil_func, d->back_stencil_func, d->two_sided_stencil),
+		pipe_stencil_face(d->stencil_fail, d->back_stencil_fail, d->two_sided_stencil),
+		pipe_stencil_face(d->depth_fail, d->back_depth_fail, d->two_sided_stencil),
+		pipe_stencil_face(d->depth_pass, d->back_depth_pass, d->two_sided_stencil),
+		d->stencil_cmask, d->stencil_wmask, d->fp_disabled,
 		d->blend.present, d->blend.mask, d->blend.color_func, d->blend.alpha_func, d->blend.color_src, d->blend.color_dst, d->blend.alpha_src, d->blend.alpha_dst,
 		d->depth_bias_factor, d->depth_bias_units };
 	memcpy(v, t, sizeof t);
@@ -1577,7 +1587,7 @@ typedef struct {
  * the lighting passes' bandwidth, off by default until that difference is measured as harmless. (The
  * translator sees it as its own colour kind: a raw-word colour program would lay its words out as
  * bytes there, as it would for RGBA8 -- no program writes raw words into an HDR target.) */
-enum { TK_U8, TK_F16, TK_F32, TK_U8S, TK_HDR10 };
+enum { TK_U8, TK_F16, TK_F32, TK_U8S, TK_HDR10, TK_F16RAW = USSE_COLOR_KIND_F16_RAW };
 /* The F32 family (F32: one word a pixel, F32F32: two; the Vita has no wider float colour format)
  * renders as R32G32_FLOAT, 8 bytes a texel, not RGBA32F's 16: gfx_soft.c's target_write stores
  * exactly words 0 and 1 of the colour and its decode reads back (r, g, 0, 1), which is what an R32G32
@@ -1615,9 +1625,11 @@ static int target_kind(uint32_t fmt) {
 }
 static SDL_GPUTextureFormat kind_format(int k) {
 	return k == TK_F32 ? (f32_rg() ? SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT : SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT) : k == TK_F16 ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT
+	     : k == TK_F16RAW ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UNORM
 	     : k == TK_HDR10 ? SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT : k == TK_U8S ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 }
-static uint32_t kind_bytes(int k) { return k == TK_F32 ? (f32_rg() ? 8u : 16u) : k == TK_F16 ? 8 : 4; }   /* (TK_HDR10: 4) */
+static uint32_t kind_bytes(int k) { return k == TK_F32 ? (f32_rg() ? 8u : 16u) : k == TK_F16 || k == TK_F16RAW ? 8 : 4; }   /* (TK_HDR10: 4) */
+static int target_kind_matches(int logical, int stored) { return logical == stored || (logical == TK_F16 && stored == TK_F16RAW); }
 /* ---- internal resolution. RECOMP_RENDER_SCALE=n (1-RSCALE_MAX; F2 in the window cycles them): every GPU
  * render target, depth/stencil surface, view and FRAGCOLOR copy is n times its guest surface's size,
  * and every draw's viewport and scissor n times its own -- the game's geometry is rasterised at n
@@ -1785,7 +1797,7 @@ static TargetEntry *get_target(const GfxTarget *t) {
 	return get_target_at(t, sx, sy);
 }
 static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy) {
-	for (int i = 0; i < ntargets; i++) if (targets[i].addr == t->data && targets[i].width == t->stride && targets[i].height == t->height && targets[i].kind == target_kind(t->format) && targets[i].type == t->type && targets[i].sx == sx && targets[i].sy == sy) {
+	for (int i = 0; i < ntargets; i++) if (targets[i].addr == t->data && targets[i].width == t->stride && targets[i].height == t->height && target_kind_matches(target_kind(t->format), targets[i].kind) && targets[i].type == t->type && targets[i].sx == sx && targets[i].sy == sy) {
 		TargetEntry *e = &targets[i];
 		e->used = ++target_clock;
 		/* the same colour address can be used by one scene with a depth buffer and another
@@ -1859,7 +1871,7 @@ static void floats_to_texels(int kind, const float *in, uint8_t *out, uint32_t n
 	for (uint32_t i = 0; i < n; i++) {
 		const float *c = in + 4 * i;
 		if (kind == TK_F32) memcpy(out + tb * i, c, tb);   /* R32G32: the first two words; RGBA32F: all four */
-		else if (kind == TK_F16) { uint16_t h[4] = { f2h(c[0]), f2h(c[1]), f2h(c[2]), f2h(c[3]) }; memcpy(out + 8 * i, h, 8); }
+		else if (kind == TK_F16 || kind == TK_F16RAW) { uint16_t h[4] = { f2h(c[0]), f2h(c[1]), f2h(c[2]), f2h(c[3]) }; memcpy(out + 8 * i, h, 8); }
 		else if (kind == TK_HDR10) { uint32_t p = to_ufloat(c[0], 6) | to_ufloat(c[1], 6) << 11 | to_ufloat(c[2], 5) << 22; memcpy(out + 4 * i, &p, 4); }
 		else for (int k = 0; k < 4; k++) { float v = c[k]; out[4 * i + k] = (uint8_t)(v <= 0 ? 0 : v >= 1 ? 255 : (uint32_t)(v * 255 + .5f)); }
 	}
@@ -1869,7 +1881,7 @@ static void texels_to_floats(int kind, const uint8_t *in, float *out, uint32_t n
 	for (uint32_t i = 0; i < n; i++) {
 		float *c = out + 4 * i;
 		if (kind == TK_F32) { memcpy(c, in + tb * i, tb); if (tb == 8) { c[2] = 0; c[3] = 1; } }   /* R32G32 samples as (r, g, 0, 1): gfx_soft.c's F32F32 decode */
-		else if (kind == TK_F16) { uint16_t h[4]; memcpy(h, in + 8 * i, 8); for (int k = 0; k < 4; k++) c[k] = h2f(h[k]); }
+		else if (kind == TK_F16 || kind == TK_F16RAW) { uint16_t h[4]; memcpy(h, in + 8 * i, 8); for (int k = 0; k < 4; k++) c[k] = h2f(h[k]); }
 		else if (kind == TK_HDR10) { uint32_t p; memcpy(&p, in + 4 * i, 4); c[0] = from_ufloat(p & 0x7ff, 6); c[1] = from_ufloat((p >> 11) & 0x7ff, 6); c[2] = from_ufloat(p >> 22, 5); c[3] = 1; }
 		else for (int k = 0; k < 4; k++) c[k] = in[4 * i + k] / 255.f;
 	}
@@ -1892,11 +1904,15 @@ static void target_upload_from_guest(TargetEntry *e) {
 	if (e == scene_entry || batch_uses(e->color)) batch_flush("target upload");   /* the upload's own command buffer would otherwise run before the pending draws (or view passes) it must follow */
 	if (trace_sync()) fprintf(stderr, "gpu trace: upload target %#x from guest (after %u gpu + %u software draws)\n", e->addr, n_gpu_draws, n_fallback);
 	uint32_t npx = e->width * e->height, n = kind_bytes(e->kind) * npx;
-	float *f = malloc(16u * npx); uint8_t *raw = malloc(n);
+	float *f = 0; uint8_t *raw = malloc(n);
 	GfxTarget t = target_entry_as_gfx(e);
-	gfx_decode_target_f32(&t, f);   /* the game's own declared colour format (565, F16, F32F32, ...), decoded as gfx_soft.c reads it */
-	if (trace_sync() && npx > 10 * e->width + 10) fprintf(stderr, "gpu trace:   upload (10,10) = %g %g %g, guest word %#x\n", f[4 * (10 * e->width + 10)], f[4 * (10 * e->width + 10) + 1], f[4 * (10 * e->width + 10) + 2], RD32(e->addr + 4 * (10 * e->width + 10)));
-	floats_to_texels(e->kind, f, raw, npx);
+	if (e->kind == TK_F16RAW) gfx_decode_target_raw(&t, raw);
+	else {
+		f = malloc(16u * npx);
+		gfx_decode_target_f32(&t, f);   /* the game's own declared colour format (565, F16, F32F32, ...), decoded as gfx_soft.c reads it */
+		if (trace_sync() && npx > 10 * e->width + 10) fprintf(stderr, "gpu trace:   upload (10,10) = %g %g %g, guest word %#x\n", f[4 * (10 * e->width + 10)], f[4 * (10 * e->width + 10) + 1], f[4 * (10 * e->width + 10) + 2], RD32(e->addr + 4 * (10 * e->width + 10)));
+		floats_to_texels(e->kind, f, raw, npx);
+	}
 	SDL_GPUTransferBufferCreateInfo xci = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = n };
 	SDL_GPUTransferBuffer *xb = SDL_CreateGPUTransferBuffer(gpu(), &xci);
 	void *map = SDL_MapGPUTransferBuffer(gpu(), xb, true); memcpy(map, raw, n); SDL_UnmapGPUTransferBuffer(gpu(), xb);
@@ -1944,7 +1960,8 @@ static void target_download_texels(TargetEntry *e, float *out, uint8_t *raw) {  
 }
 /* an 8-bit target whose guest format is the GPU texture's own byte layout (gfx_target_plain_rgba8): guest memory takes the
  * downloaded bytes as they are -- the float round trip (decode, then encode texel by texel) cost ~3 ms a 960x544 present */
-static int target_raw_ok(const TargetEntry *e, const GfxTarget *t) { return (e->kind == TK_U8 || e->kind == TK_U8S) && t->stride == e->width && gfx_target_plain_rgba8(t); }
+static int target_raw_f16(int kind, const GfxTarget *t) { return kind == TK_F16RAW && (t->format & 0xF1800000u) == 0x01000000u && gfx_target_bpp(t) == 8; }
+static int target_raw_ok(const TargetEntry *e, const GfxTarget *t) { return target_raw_f16(e->kind, t) || ((e->kind == TK_U8 || e->kind == TK_U8S) && t->stride == e->width && gfx_target_plain_rgba8(t)); }
 static void target_download_to_buffer(TargetEntry *e, uint8_t *out) {   /* as RGBA8, for RECOMP_GFX_CHECK's comparison */
 	uint32_t npx = e->width * e->height;
 	float *f = malloc(16u * npx); target_download_floats(e, f);
@@ -1962,7 +1979,14 @@ static void target_download_to_guest(TargetEntry *e) {
 	GfxTarget t = target_entry_as_gfx(e);
 	uint32_t gbytes = (uint32_t)gfx_target_bpp(&t) * npx;
 	if (target_raw_ok(e, &t)) {
-		gwatch_write_begin(e->addr, gbytes); target_download_texels(e, 0, G(e->addr)); gwatch_write_end(e->addr, gbytes);
+		if (target_raw_f16(e->kind, &t)) {
+			uint8_t *raw = malloc(gbytes);
+			target_download_texels(e, 0, raw);
+			gwatch_write_begin(e->addr, gbytes); gfx_encode_target_raw(&t, raw); gwatch_write_end(e->addr, gbytes);
+			free(raw);
+		} else {
+			gwatch_write_begin(e->addr, gbytes); target_download_texels(e, 0, G(e->addr)); gwatch_write_end(e->addr, gbytes);
+		}
 		e->gpu_dirty = 0;
 		textures_invalidate(e->addr, e->addr + gbytes);
 		t_tgt_download += us_now() - tdl0;
@@ -1994,6 +2018,7 @@ typedef struct PipeEntry {
 	uint32_t vprog, fprog;
 	GfxBlend blend; int cull; int cull_sdl; uint32_t depth_func; int depth_write;   /* cull_sdl: the SDL cull mode this draw's cull + viewport flip resolve to */
 	uint8_t stencil_func, stencil_fail, depth_fail, depth_pass, stencil_cmask, stencil_wmask, stencil_ref;
+	uint8_t two_sided_stencil, back_stencil_func, back_stencil_fail, back_depth_fail, back_depth_pass;
 	int has_depth, ckind;   /* ckind: the colour target's kind (its texture format) */
 	int depth_ok, stencil_ok;   /* the bound depth/stencil surface's own format: an S8-only surface
 	                             * must not depth-test, a depth-only one must not stencil-test */
@@ -2051,6 +2076,7 @@ static uint32_t pipe_key_hash(const GfxDraw *d, const void *vs, const void *fs, 
 #define PH(v) do { h ^= (uint64_t)(v); h *= 1099511628211ULL; } while (0)
 	PH((uintptr_t)vs); PH((uintptr_t)fs); PH((uint32_t)d->cull); PH((uint32_t)cull_sdl); PH(d->depth_func); PH((uint32_t)d->depth_write);
 	PH(d->stencil_func | (uint32_t)d->stencil_fail << 8 | (uint32_t)d->depth_fail << 16 | (uint32_t)d->depth_pass << 24); PH(d->stencil_cmask | (uint32_t)d->stencil_wmask << 8);
+	PH(d->two_sided_stencil | (uint32_t)d->back_stencil_func << 8 | (uint32_t)d->back_stencil_fail << 16 | (uint32_t)d->back_depth_fail << 20 | (uint32_t)d->back_depth_pass << 24);
 	{ const uint8_t *b = (const uint8_t *)&d->blend; for (size_t i = 0; i < sizeof d->blend; i++) PH(b[i]); }
 	PH((uint32_t)has_depth | (uint32_t)ckind << 4 | (uint32_t)depth_ok << 8 | (uint32_t)stencil_ok << 9 | (uint32_t)d->fp_disabled << 10);
 	PH((uint8_t)d->depth_bias_factor | (uint32_t)(uint8_t)d->depth_bias_units << 8 | (uint32_t)dbs << 16);
@@ -2146,9 +2172,14 @@ static void pipe_create_info(const GfxDraw *d, const ShaderEntry *vs, const Shad
 	dss.enable_depth_test = dtest; dss.enable_depth_write = dtest && d->depth_write; dss.compare_op = conv_cmp(d->depth_func);
 	/* ALWAYS with keep/keep/keep is a no-op; ALWAYS with a write op (Unit 13 draws its clip masks
 	 * that way: always, depth-pass INCR) is not -- skipping those dropped the mask entirely */
-	dss.enable_stencil_test = has_depth && stencil_ok && (d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass);
-	SDL_GPUStencilOpState sos = { conv_sop(d->stencil_fail), conv_sop(d->depth_pass), conv_sop(d->depth_fail), conv_cmp(d->stencil_func) };
-	dss.front_stencil_state = dss.back_stencil_state = sos; dss.compare_mask = d->stencil_cmask; dss.write_mask = d->stencil_wmask;
+	int fst = d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass;
+	int bst = d->two_sided_stencil && (d->back_stencil_func != 7 || d->back_stencil_fail || d->back_depth_fail || d->back_depth_pass);
+	dss.enable_stencil_test = has_depth && stencil_ok && (fst || bst);
+	SDL_GPUStencilOpState fsos = { conv_sop(d->stencil_fail), conv_sop(d->depth_pass), conv_sop(d->depth_fail), conv_cmp(d->stencil_func) };
+	SDL_GPUStencilOpState bsos = d->two_sided_stencil
+		? (SDL_GPUStencilOpState){ conv_sop(d->back_stencil_fail), conv_sop(d->back_depth_pass), conv_sop(d->back_depth_fail), conv_cmp(d->back_stencil_func) }
+		: fsos;
+	dss.front_stencil_state = fsos; dss.back_stencil_state = bsos; dss.compare_mask = d->stencil_cmask; dss.write_mask = d->stencil_wmask;
 
 	/* A draw with its fragment program disabled (sceGxmSetFrontFragmentProgramEnable DISABLED: Uncharted's
 	 * ~80 shadow casters and its stencil light volumes a frame, Unit 13's clip masks) writes depth and
@@ -2177,7 +2208,7 @@ static void pipe_create_info(const GfxDraw *d, const ShaderEntry *vs, const Shad
 	 * gradient, specifically) -- so the winding convention this pipeline's CCW front_face implies
 	 * isn't pinned down yet; left off (as before) rather than guessed at. */
 	ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl;   /* resolved by the caller from SceGxmCullMode and the viewport's y flip (see gfx_gpu_draw) */
-	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+	ci.rasterizer_state.front_face = GXM_FRONT_FACE;
 	ci.rasterizer_state.enable_depth_clip = false;   /* clamp, not clip: gfx_soft.c (the reference) never discards a fragment for its z being outside [0,w], only for failing the depth test */
 	if (d->depth_bias_factor || d->depth_bias_units) {   /* polygon offset (GfxDraw.depth_bias_*): units in the depth format's steps, factor on the slope */
 		ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor = (float)d->depth_bias_units;
@@ -2204,6 +2235,8 @@ static PipeEntry *get_pipeline(const GfxDraw *d, const ShaderEntry *vs, const Sh
 		PipeEntry *p = &pipelines[i - 1];
 		if (p->hkey == hk && p->vprog == vs->hash && p->fprog == fs->hash && p->vse == vs && p->fse == fs && p->cull == d->cull && p->cull_sdl == cull_sdl && p->depth_func == d->depth_func && p->depth_write == d->depth_write
 		    && p->stencil_func == d->stencil_func && p->stencil_fail == d->stencil_fail && p->depth_fail == d->depth_fail && p->depth_pass == d->depth_pass
+		    && p->two_sided_stencil == d->two_sided_stencil && p->back_stencil_func == d->back_stencil_func && p->back_stencil_fail == d->back_stencil_fail
+		    && p->back_depth_fail == d->back_depth_fail && p->back_depth_pass == d->back_depth_pass
 		    && p->stencil_cmask == d->stencil_cmask && p->stencil_wmask == d->stencil_wmask   /* the reference is dynamic state, not part of the pipeline */
 		    && !memcmp(&p->blend, &d->blend, sizeof(GfxBlend)) && p->has_depth == has_depth && p->ckind == ckind
 		    && p->depth_ok == depth_ok && p->stencil_ok == stencil_ok && p->fp_disabled == d->fp_disabled && p->dbf == d->depth_bias_factor && p->dbu == d->depth_bias_units && p->dbs == dbs)
@@ -2222,6 +2255,8 @@ static PipeEntry *get_pipeline(const GfxDraw *d, const ShaderEntry *vs, const Sh
 	memset(p, 0, sizeof *p); p->hkey = hk; p->used = ++pipe_clock; p->low = p->prebuilt = (uint8_t)low; n_pipes_made++; p->hnext = pipe_head[hk % PIPE_HASH]; pipe_head[hk % PIPE_HASH] = (int)(p - pipelines) + 1;
 	p->vprog = vs->hash; p->fprog = fs->hash; p->blend = d->blend;   /* the programs by content: the patcher moves them between frames */ p->cull = d->cull; p->cull_sdl = cull_sdl; p->depth_func = d->depth_func; p->depth_write = d->depth_write;
 	p->stencil_func = d->stencil_func; p->stencil_fail = d->stencil_fail; p->depth_fail = d->depth_fail; p->depth_pass = d->depth_pass;
+	p->two_sided_stencil = d->two_sided_stencil; p->back_stencil_func = d->back_stencil_func; p->back_stencil_fail = d->back_stencil_fail;
+	p->back_depth_fail = d->back_depth_fail; p->back_depth_pass = d->back_depth_pass;
 	p->stencil_cmask = d->stencil_cmask; p->stencil_wmask = d->stencil_wmask; p->stencil_ref = d->stencil_ref; p->has_depth = has_depth; p->ckind = ckind;
 	p->depth_ok = depth_ok; p->stencil_ok = stencil_ok; p->fp_disabled = d->fp_disabled; p->dbf = d->depth_bias_factor; p->dbu = d->depth_bias_units; p->dbs = (uint8_t)dbs;
 	p->smp_units = fs->smp_units; p->nsmp = fs->nsmp; p->fetch = fs->fetch == 1; p->vse = vs; p->fse = fs;
@@ -2475,7 +2510,8 @@ static void target_alias_sync(TargetEntry *e) {
 	int via_guest = 0;
 	for (int k = 0; k < n; k++) {
 		TargetEntry *o = list[k];
-		int same = o->addr == e->addr && o->width == e->width && o->height == e->height && o->type == e->type && kind_bytes(o->kind) == kind_bytes(e->kind) && e->color && o->sx == e->sx && o->sy == e->sy;
+		int same = o->addr == e->addr && o->width == e->width && o->height == e->height && o->type == e->type && kind_bytes(o->kind) == kind_bytes(e->kind)
+		        && (o->kind == e->kind || (o->kind != TK_F16RAW && e->kind != TK_F16RAW)) && e->color && o->sx == e->sx && o->sy == e->sy;
 		if (log) fprintf(stderr, "    alias %s: scene %#x fmt %#x %ux%u <- %#x fmt %#x %ux%u (frame %llu)\n", same ? "copy" : "sync", e->addr, e->format, e->width, e->height,
 		                 o->addr, o->format, o->width, o->height, (unsigned long long)gpu_frame_no);
 		if (same) {   /* on the GPU: the whole texture, at the render scale */
@@ -2503,9 +2539,13 @@ static void target_alias_sync(TargetEntry *e) {
  * target seen read that way (TargetEntry.self_read), the target goes to guest memory once, and memory holds the scene's
  * starting pixels for all its draws. Reads of other parts of the target keep the target as rendered so far, as the
  * tile order makes them on the console for regions finished earlier (Killzone's bloom atlas reads its earlier levels
- * in the same scene). "The part it is drawing": the texture's rectangle covers at least half of the draw's clip rect. */
+ * in the same scene). "The part it is drawing": the sampled surface and the draw's actual vertex extent overlap by at
+ * least half of each. Requiring overlap in both directions distinguishes an in-place strip from a small level written
+ * into a texture descriptor spanning a whole post-processing atlas. */
 static int scene_snap;                               /* the current scene's starting pixels: 1 in guest memory, 2 in its GPU snapshot (target_snapshot) */
 static int cur_wx0, cur_wy0, cur_wx1, cur_wy1;       /* the draw being recorded: its clip rect, target pixels */
+static const GfxDraw *cur_bounds_draw;
+static int cur_bounds_state, cur_bx0, cur_by0, cur_bx1, cur_by1;
 /* The starting pixels on the GPU instead (RECOMP_GPU_SNAP=0|1; on by default with Vulkan, as RECOMP_GPU_TRANSFER): a copy of the target taken as
  * the scene begins, which those reads sample (target_view: a view or mip_view of the snapshot). The download made Killzone's
  * strip scene a fence wait on the GPU every frame, 4.3 ms on the RTX laptop. Anything that can only read the starting pixels
@@ -2536,17 +2576,52 @@ static void snap_to_guest(TargetEntry *e) {   /* the guest-memory path needs the
 	e->gpu_dirty = 1;   /* (the target itself has drawn on since) */
 	scene_snap = 1;
 }
-static int same_region_read(const GfxTexture *tex) {
-	if (!scene_entry || scene_entry == &scratch_entry || !tex || !tex->data) return 0;
+static void current_write_bounds(int *x0, int *y0, int *x1, int *y1) {
+	if (!cur_bounds_state) {
+		static GfxBoundsJob *job;
+		float b[6];
+		cur_bx0 = cur_wx0; cur_by0 = cur_wy0; cur_bx1 = cur_wx1; cur_by1 = cur_wy1;
+		int r = cur_bounds_draw && (job || (job = gfx_bounds_job_new())) ? gfx_bounds_prepare(job, cur_bounds_draw) : 0;
+		if (r == 1) gfx_bounds_run(job);
+		if (r && gfx_bounds_result(job, b)) {
+			float px[2], py[2];
+			for (int k = 0; k < 2; k++) {
+				float nx = b[k], ny = b[2 + k];
+				if (cur_bounds_draw->viewport_set && cur_bounds_draw->viewport_disabled) { px[k] = nx; py[k] = ny; }
+				else if (cur_bounds_draw->viewport_set) {
+					px[k] = cur_bounds_draw->vp_xoff + cur_bounds_draw->vp_xscale * nx;
+					py[k] = cur_bounds_draw->vp_yoff + cur_bounds_draw->vp_yscale * ny;
+				} else {
+					uint32_t vw = scene_target.width && scene_target.width <= scene_entry->width ? scene_target.width : scene_entry->width;
+					px[k] = (nx + 1) * 0.5f * (float)vw;
+					py[k] = (1 - ny) * 0.5f * (float)scene_entry->height;
+				}
+			}
+			float fx0 = floorf(fminf(px[0], px[1])) - 1, fx1 = ceilf(fmaxf(px[0], px[1])) + 1;
+			float fy0 = floorf(fminf(py[0], py[1])) - 1, fy1 = ceilf(fmaxf(py[0], py[1])) + 1;
+			if (fx0 < fx1 && fy0 < fy1) {
+				if (fx0 > cur_bx0) cur_bx0 = (int)fx0; if (fy0 > cur_by0) cur_by0 = (int)fy0;
+				if (fx1 < cur_bx1) cur_bx1 = (int)fx1; if (fy1 < cur_by1) cur_by1 = (int)fy1;
+			}
+		}
+		cur_bounds_state = 1;
+	}
+	*x0 = cur_bx0; *y0 = cur_by0; *x1 = cur_bx1; *y1 = cur_by1;
+}
+enum { SCENE_READ_NONE, SCENE_READ_SNAPSHOT, SCENE_READ_LIVE };
+static int scene_region_read(const GfxTexture *tex) {
+	if (!scene_entry || scene_entry == &scratch_entry || !tex || !tex->data) return SCENE_READ_NONE;
 	GfxTarget tg = target_entry_as_gfx(scene_entry);
 	uint32_t bpp = (uint32_t)gfx_target_bpp(&tg), pitch = bpp * scene_entry->width;
-	if (!bpp || !pitch || tex->data < scene_entry->addr || tex->data >= scene_entry->addr + pitch * scene_entry->height) return 0;
+	if (!bpp || !pitch || tex->data < scene_entry->addr || tex->data >= scene_entry->addr + pitch * scene_entry->height) return SCENE_READ_NONE;
 	uint32_t off = tex->data - scene_entry->addr;
 	int ty0 = (int)(off / pitch), tx0 = (int)((off % pitch) / bpp), tx1 = tx0 + tex->width, ty1 = ty0 + tex->height;
-	int ix0 = tx0 > cur_wx0 ? tx0 : cur_wx0, iy0 = ty0 > cur_wy0 ? ty0 : cur_wy0, ix1 = tx1 < cur_wx1 ? tx1 : cur_wx1, iy1 = ty1 < cur_wy1 ? ty1 : cur_wy1;
-	if (ix1 <= ix0 || iy1 <= iy0) return 0;
-	long inter = (long)(ix1 - ix0) * (iy1 - iy0), warea = (long)(cur_wx1 - cur_wx0) * (cur_wy1 - cur_wy0);
-	return warea > 0 && 2 * inter >= warea;
+	int wx0, wy0, wx1, wy1; current_write_bounds(&wx0, &wy0, &wx1, &wy1);
+	int ix0 = tx0 > wx0 ? tx0 : wx0, iy0 = ty0 > wy0 ? ty0 : wy0, ix1 = tx1 < wx1 ? tx1 : wx1, iy1 = ty1 < wy1 ? ty1 : wy1;
+	if (ix1 <= ix0 || iy1 <= iy0) return SCENE_READ_LIVE;
+	long inter = (long)(ix1 - ix0) * (iy1 - iy0);
+	long warea = (long)(wx1 - wx0) * (wy1 - wy0), tarea = (long)(tx1 - tx0) * (ty1 - ty0);
+	return warea > 0 && tarea > 0 && 2 * inter >= warea && 2 * inter >= tarea ? SCENE_READ_SNAPSHOT : SCENE_READ_LIVE;
 }
 /* ---- the HUD at its native shape on a wider aspect ratio (settings "hud_layout": edges | 16:9 | stretch). The game's camera
  * hook widens the 3D view k times (window_aspect_widen), but its 2D elements are still laid out for 960 x 544 and the wider
@@ -2779,7 +2854,7 @@ static SDL_GPUGraphicsPipeline *mv_pipeline(PipeEntry *pe) {
 	SDL_GPUGraphicsPipelineCreateInfo ci = {0};
 	ci.vertex_shader = vs->shader; ci.fragment_shader = fs; ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
 	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)pe->cull_sdl;
-	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE; ci.rasterizer_state.enable_depth_clip = false;
+	ci.rasterizer_state.front_face = GXM_FRONT_FACE; ci.rasterizer_state.enable_depth_clip = false;
 	if (pe->dbf || pe->dbu) { ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor = (float)pe->dbu; ci.rasterizer_state.depth_bias_slope_factor = (float)(pe->dbf * pe->dbs); }
 	SDL_GPUCompareOp op = conv_cmp(pe->depth_func);
 	op = op == SDL_GPU_COMPAREOP_GREATER || op == SDL_GPU_COMPAREOP_GREATER_OR_EQUAL ? SDL_GPU_COMPAREOP_GREATER_OR_EQUAL
@@ -2947,7 +3022,7 @@ static void mv_capture(TargetEntry *e, uint64_t f) {
 		for (uint32_t i = 0; i < w * h; i++) {
 			const uint8_t *q = px + (size_t)bpp * i; float v[3] = { 0, 0, 0 }; uint8_t c[3];
 			if (e->kind == TK_U8 || e->kind == TK_U8S) { memcpy(c, q, 3); fwrite(c, 1, 3, fc); continue; }
-			if (e->kind == TK_F16) for (int k = 0; k < 3; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); v[k] = half_to_float(hv); }
+			if (e->kind == TK_F16 || e->kind == TK_F16RAW) for (int k = 0; k < 3; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); v[k] = half_to_float(hv); }
 			else if (e->kind == TK_HDR10) {   /* R11G11B10_UFLOAT: 6- and 5-bit mantissas over 5-bit exponents */
 				uint32_t x; memcpy(&x, q, 4); const uint32_t f[3] = { x & 0x7ff, (x >> 11) & 0x7ff, x >> 22 }; const int mb[3] = { 6, 6, 5 };
 				for (int k = 0; k < 3; k++) { uint32_t m = f[k] & ((1u << mb[k]) - 1), ex = f[k] >> mb[k]; v[k] = ex ? ldexpf(1.0f + (float)m / (float)(1u << mb[k]), (int)ex - 15) : ldexpf((float)m / (float)(1u << mb[k]), -14); }
@@ -3166,12 +3241,16 @@ static void readback_complete(Readback *r) {
 	if (r->pinned) { if (nparked < MAXREADBACK) parked[nparked++] = r->fence; }   /* (never freed under a lock-free waiter; at most MAXREADBACK can be pinned between presents) */
 	else SDL_ReleaseGPUFence(gpu(), r->fence);
 	uint32_t npx = r->t.stride * r->t.height;
-	const int raw = (r->kind == TK_U8 || r->kind == TK_U8S) && r->t.stride == r->t.width && gfx_target_plain_rgba8(&r->t);   /* (target_raw_ok: the bytes as they are) */
+	const int raw = target_raw_f16(r->kind, &r->t) || ((r->kind == TK_U8 || r->kind == TK_U8S) && r->t.stride == r->t.width && gfx_target_plain_rgba8(&r->t));   /* (target_raw_ok: the bytes as they are) */
 	const uint32_t gbytes = (uint32_t)gfx_target_bpp(&r->t) * npx;
 	float *f = raw ? 0 : malloc(16u * npx);
 	const uint8_t *map = SDL_MapGPUTransferBuffer(gpu(), r->xb, false);
 	if (map) {
-		if (raw) { gwatch_write_begin(r->t.data, gbytes); memcpy(G(r->t.data), map, gbytes); gwatch_write_end(r->t.data, gbytes); }
+		if (raw) {
+			gwatch_write_begin(r->t.data, gbytes);
+			if (target_raw_f16(r->kind, &r->t)) gfx_encode_target_raw(&r->t, map); else memcpy(G(r->t.data), map, gbytes);
+			gwatch_write_end(r->t.data, gbytes);
+		}
 		else texels_to_floats(r->kind, map, f, npx);
 		SDL_UnmapGPUTransferBuffer(gpu(), r->xb);
 	}
@@ -3350,6 +3429,24 @@ void gfx_gpu_guest_written(uint32_t addr, uint32_t len) {
 }
 /* every GPU target -> guest memory (gfxreplay's RECOMP_REPLAY_DRAWS dump: the state mid-frame) */
 void gfx_gpu_sync_all(void) { if (!gpu()) return; batch_flush("sync to guest"); readbacks_complete(0, ~0u); for (int i = 0; i < ntargets; i++) if (targets[i].gpu_dirty) target_download_to_guest(&targets[i]); }
+static int target_switch_kind(TargetEntry *e, int kind) {
+	if (!e || e->kind == kind) return 1;
+	if (e != scene_entry || scene_snap || !SDL_GPUTextureSupportsFormat(gpu(), kind_format(kind), SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER)) return 0;
+	batch_flush("target storage changed");
+	readbacks_complete(e->addr, e->addr + target_bytes(e));
+	if (e->gpu_dirty) { sync_why = "(target storage changed)"; target_download_to_guest(e); }
+	SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(kind), .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+		.width = TSX(e, e->width), .height = TSY(e, e->height), .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+	SDL_GPUTexture *color = SDL_CreateGPUTexture(gpu(), &ci);
+	if (!color) { fprintf(stderr, "    gpu: target %#x raw storage: %s\n", e->addr, SDL_GetError()); return 0; }
+	if (e->color) SDL_ReleaseGPUTexture(gpu(), e->color);
+	if (e->fetch_copy) SDL_ReleaseGPUTexture(gpu(), e->fetch_copy);
+	if (e->lo) SDL_ReleaseGPUTexture(gpu(), e->lo);
+	if (e->snap) SDL_ReleaseGPUTexture(gpu(), e->snap);
+	e->color = color; e->fetch_copy = e->lo = e->snap = 0; e->format = scene_target.format; e->kind = kind;
+	e->cpu_dirty = 1; e->gpu_dirty = 0; e->gen = ++write_clock;
+	return 1;
+}
 /* a scene's visibility results are in guest memory before it ends (RECOMP_VIS_SYNC=0: a frame or so later, as they come
  * back). The game reads them once the scene's notification says it is done, and the host writes notifications at the
  * kick, right after this: read a frame late, Killzone's occlusion culling hid what had just come into view -- objects and
@@ -3434,8 +3531,10 @@ static const char *view_msl =
 	"  if (u.mode == 5u || u.mode == 6u) return swizzle(float4(c.r, 0.0, 0.0, 1.0), u.swz);\n"                   /* U8, F32 (one component) */
 	"  if (u.mode == 1u) return float4(q(c.r, 6u), q(c.g, 6u), q(c.b, 5u), 1.0);\n"                          /* F11F11F10 */
 	"  if (u.mode == 2u) { float al = c.a <= 0.0 ? 0.0 : c.a >= 1.0 ? 3.0 : floor(c.a * 3.0 + .5); return float4(q(c.r, 5u), q(c.g, 5u), q(c.b, 5u), al / 3.0); }\n"   /* U2F10F10F10 */
-	"  if (u.mode == 3u || u.mode == 4u) { uint w = as_type<uint>(sub == 1u ? c.g : sub == 2u ? c.b : sub == 3u ? c.a : c.r); float4 o;\n"   /* the pixel's words as U8U8U8U8 / S8S8S8S8 bytes */
-	"    for (uint k = 0u; k < 4u; k++) { uint bb = (w >> (8u * k)) & 255u; o[k] = u.mode == 3u ? float(bb) / 255.0 : s8(bb); } return swizzle(o, u.swz); }\n"
+	"  if (u.mode == 3u || u.mode == 4u || u.mode == 9u || u.mode == 10u) { uint w;\n"   /* the pixel's words as U8U8U8U8 / S8S8S8S8 bytes; modes 9/10 rebuild them from exact R16G16B16A16_UNORM halves */
+	"    if (u.mode >= 9u) { uint lo = uint(saturate(sub == 0u ? c.r : c.b) * 65535.0 + 0.5), hi = uint(saturate(sub == 0u ? c.g : c.a) * 65535.0 + 0.5); w = lo | (hi << 16); }\n"
+	"    else w = as_type<uint>(sub == 1u ? c.g : sub == 2u ? c.b : sub == 3u ? c.a : c.r); float4 o; bool unorm = u.mode == 3u || u.mode == 9u;\n"
+	"    for (uint k = 0u; k < 4u; k++) { uint bb = (w >> (8u * k)) & 255u; o[k] = unorm ? float(bb) / 255.0 : s8(bb); } return swizzle(o, u.swz); }\n"
 	"  return swizzle(c, u.swz); }\n"                                                                                           /* 0: the same values (F16x4, U8x4) */
 	"fragment float4 main0_view_depth(VOut in [[stage_in]], depth2d<float> src [[texture(0)]], sampler s [[sampler(0)]], constant ViewU &u [[buffer(0)]]) {\n"
 	"  uint sub; uint2 sp = srcpix(uint2(in.position.xy), u, sub); float d = src.read(sp); float m = u.mode == 1u ? 65535.0 : 16777215.0; float qd = floor(d * m + .5) / m; return float4(qd, qd, qd, 1.0); }\n";   /* X8U24: 24-bit depth, as the software path stores and reads it; mode 1, D16 read as U16: 16-bit */
@@ -3443,7 +3542,7 @@ static const char *view_msl =
  * Two independent changes to the view pass above, both off at RECOMP_GPU_VIEW_FAST=0 (the view_msl /
  * view_pipeline / RGBA32F-only pass just above, unchanged):
  * 1. Narrow view textures. view_entry's RGBA32F texture is wider than most decodes need: a byte view
- *    (mode 3/4) only ever writes n/255 or v/127 per channel, an identity view of an F16 target (mode 0)
+ *    (mode 3/4/9/10) only ever writes n/255 or v/127 per channel, an identity view of an F16 target (mode 0)
  *    only ever holds f16-exact values, F11F11F10 tiles (mode 1) decode to exactly the f11/f10 grid. view_format
  *    picks the narrowest exact format for those (point-sampled only: a linear-filtered view keeps RGBA32F,
  *    since filtering a narrow format isn't the same arithmetic as filtering floats); the HDR view (mode 2,
@@ -3481,8 +3580,8 @@ static SDL_GPUTextureFormat view_format(int from_depth, int mode, int src_kind, 
 	SDL_GPUTextureFormat f = SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT;
 	if (!view_fast_on() || from_depth || filtered) return f;
 	switch (mode) {
-	case 3: case 5: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM; break;
-	case 4: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_SNORM; break;
+	case 3: case 5: case 9: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM; break;
+	case 4: case 10: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_SNORM; break;
 	case 0: f = src_kind == TK_F32 ? SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT : kind_format(src_kind); break;
 	case 1: f = SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT; break;
 	/* mode 2 (HDR, U2F10F10F10): stays RGBA32F -- the 2-bit alpha is not f16-exact */
@@ -3691,7 +3790,7 @@ static TexEntry views[MAXVIEW]; static int nviews;
 static void views_release_samplers(void) { for (int i = 0; i < nviews; i++) tex_release_samplers(&views[i]); }
 static int no_views(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_VIEWS") != 0; return v; }   /* RECOMP_GPU_NO_VIEWS=1: the guest-memory path for every render-target read (an A/B check) */
 /* which decode the view shader runs for a target's format read by a texture's base format (-1: none known); tex_bpp: the texture's bytes per texel */
-static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp, uint32_t swz[4]) {
+static int view_mode(uint32_t tgt_fmt, int tgt_kind, const GfxTexture *tex, uint32_t *tex_bpp, uint32_t swz[4]) {
 	uint32_t tb = tgt_fmt & 0xF1800000u, xb = tex->format & 0xff000000u, sw = (tex->format >> 12) & 7;
 	*tex_bpp = 4;
 	/* gfx_soft.c's apply_swizzle, as component selectors: four-component formats permute, one-component
@@ -3700,6 +3799,11 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	static const uint8_t sw1[8][4] = { {0,4,4,5}, {0,4,4,4}, {0,5,5,5}, {0,0,0,0}, {0,0,0,4}, {0,0,0,5}, {4,4,4,0}, {5,5,5,0} };
 	int ncomp = xb == 0x0c000000u || xb == 0x0d000000u || xb == 0x1b000000u ? 4 : xb == 0x00000000u || xb == 0x12000000u ? 1 : 0;
 	for (int k = 0; k < 4; k++) swz[k] = ncomp == 4 ? sw4[sw][k] : ncomp == 1 ? sw1[sw][k] : (uint32_t)k;
+	if (tb == 0x01000000u && tgt_kind != TK_F16RAW) {
+		static const uint8_t inv_order[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
+		uint32_t order = (tgt_fmt >> 20) & 3;
+		for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = inv_order[order][swz[k]];
+	}
 	switch (tb) {
 	case 0x80800000u: *tex_bpp = 1; return xb == 0x00000000u ? 5 : -1;                          /* U8 as U8 */
 	case 0xB0800000u: *tex_bpp = 2; if (xb != 0x07000000u) return -1;                         /* U8U8 as U8U8: the RGBA8 target's r, g (gfx_soft.c stores R in the
@@ -3709,7 +3813,9 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	case 0x10800000u: return xb == 0x12000000u ? 6 : -1;                                        /* F32 as F32 (mode 5's decode at full precision: Uncharted's
 	                                                                                               * shadow mask went through guest memory, its lighting read
 	                                                                                               * it at 1x and every lit silhouette got a 1x-pixel halo) */
-	case 0x01000000u: *tex_bpp = 8; return xb == 0x1b000000u ? 0 : -1;                          /* F16F16F16F16 as F16F16F16F16 */
+	case 0x01000000u:
+		if (tgt_kind == TK_F16RAW) return xb == 0x0c000000u ? 9 : xb == 0x0d000000u ? 10 : -1; /* exact packed halves as U8U8U8U8 / S8S8S8S8 */
+		*tex_bpp = 8; return xb == 0x1b000000u ? 0 : -1;                                      /* F16F16F16F16 as F16F16F16F16 */
 	case 0x21000000u: return xb == 0x1a000000u ? 1 : -1;                                        /* F11F11F10 as F11F11F10 */
 	case 0x41000000u: return xb == 0x9a000000u ? 2 : -1;                                        /* U2F10F10F10 as U2F10F10F10 */
 	case 0x11000000u: return xb == 0x0c000000u ? 3 : xb == 0x0d000000u ? 4 : -1;                /* F32F32 as U8U8U8U8 / S8S8S8S8 bytes */
@@ -3835,9 +3941,10 @@ static TexEntry *mip_view(const GfxTexture *tex, TargetEntry *best, SDL_GPUTextu
 static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 	*exact = 0;
 	int snap = 0;   /* the scene's own pixels under the draw: as the scene began (same_region_read) */
-	if (same_region_read(tex)) {
+	int scene_read = scene_region_read(tex);
+	if (scene_read == SCENE_READ_SNAPSHOT) {
 		if (scene_snap) snap = 1;
-		else if (!scene_entry->self_read) { scene_entry->self_read = 1; fprintf(stderr, "    gpu: target %#x %ux%u read under its own draw (texture %#x %ux%u, draw clip %d,%d-%d,%d): its scenes start from guest memory\n", scene_entry->addr, scene_entry->width, scene_entry->height, tex->data, tex->width, tex->height, cur_wx0, cur_wy0, cur_wx1, cur_wy1); }
+		else if (!scene_entry->self_read) { scene_entry->self_read = 1; fprintf(stderr, "    gpu: target %#x %ux%u read under its own draw (texture %#x %ux%u, draw bounds %d,%d-%d,%d): its scenes start from guest memory\n", scene_entry->addr, scene_entry->width, scene_entry->height, tex->data, tex->width, tex->height, cur_bx0, cur_by0, cur_bx1, cur_by1); }
 	}
 	uint32_t span = tex_span(tex), xhi = tex->data + (span ? span : 4u * tex->width * tex->height);   /* the bytes it reads (a generous 16 a texel, as before, reached past small textures into the next target) */
 	TargetEntry *best = 0; DepthEntry *dbest = 0;
@@ -3876,7 +3983,7 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 	const int snap2 = snap && scene_snap == 2 && best == scene_entry && best->snap && !dbest;   /* the starting pixels in the GPU snapshot */
 	if (snap && !snap2) { if (scene_snap == 2) snap_to_guest(scene_entry); goto guest; }
 	if (best && !dbest && gfx_texture_levels(tex) > 1 && !no_views()) { TexEntry *mv = mip_view(tex, best, snap2 ? best->snap : 0, snap2 ? best->snap_gen : 0); if (mv) return mv; }   /* every level a GPU target (the transfer chain's) */
-	if (ex && !snap2 && (!dbest || best->gen > dbest->gen) && !getenv("RECOMP_GPU_DEBUG_NO_RTT")) {
+	if (ex && scene_read != SCENE_READ_LIVE && !snap2 && (!dbest || best->gen > dbest->gen) && !getenv("RECOMP_GPU_DEBUG_NO_RTT")) {
 		if (best == scene_entry) batch_flush("scene target sampled");   /* sampled while it is the attachment (undefined either way): at least after the draws before it */
 		*exact = best; return 0;
 	}
@@ -3898,12 +4005,13 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 			}
 			if (trace_sync()) fprintf(stderr, "gpu trace: no view of depth %#x %ux%u (gpu newer %d, gen %llu) for texture %#x fmt %#x %ux%u u%#x: decoded from guest memory\n", dbest->key, dbest->w, dbest->h, dbest->gpu_newer, (unsigned long long)dbest->gen, tex->data, tex->format, tex->width, tex->height, tex->u_mode);
 		} else if (best) {
-			uint32_t tex_bpp; int mode = view_mode(best->format, tex, &tex_bpp, u.swz);
+			uint32_t tex_bpp; int mode = view_mode(best->format, best->kind, tex, &tex_bpp, u.swz);
 			GfxTarget tg = target_entry_as_gfx(best);
 			/* an sRGB target: the view pass reads decoded values. Mode 0 (U8U8U8U8 as U8U8U8U8, a sub-rectangle) passes them on
 			 * -- into an sRGB view texture (re-encoded to the same bytes) or RGBA32F (kept decoded) -- and the draw's shader treats
-			 * the view as it treats the target bound directly (bind_unit's sRGB masks). The other reinterpretations read raw bytes:
-			 * guest memory. Killzone's streak strip (the bottom 384x64 of an sRGB 384x192 target) went down twice a frame. */
+			 * the view as it treats the target bound directly (bind_unit's sRGB masks). Other reinterpretations read raw bytes,
+			 * which an sRGB target cannot provide directly: guest memory. TK_F16RAW's exact UNORM lanes use modes 9/10.
+			 * Killzone's streak strip (the bottom 384x64 of an sRGB 384x192 target) went down twice a frame. */
 			if (best->kind == TK_U8S && mode != 0) mode = -1;
 			if (mode >= 0 && view_mapping(best->addr, best->width, best->width, best->height, best->type, (uint32_t)gfx_target_bpp(&tg), tex, tex_bpp, best->sx, best->sy, &u)) {   /* a TargetEntry's width is the surface stride */
 				u.mode = (uint32_t)mode;
@@ -4600,7 +4708,9 @@ static void soft_fallback(const GfxDraw *d, const char *why) {
 	 * of round trips that never wrote a byte. (On the hardware it runs at the marked pixels; that needs it on the GPU.) */
 	else if (scene_target.depth && (!scene_target.ds_data || (scene_target.ds_format & 0x00022000u))
 	    && !(scene_target.ds_data && (scene_target.ds_force_load || scene_target.ds_force_store))
-	    && !stencil_passes(d->stencil_func, d->stencil_ref & d->stencil_cmask, (scene_target.ds_data ? scene_target.ds_background_stencil : 0) & d->stencil_cmask))
+	    && !stencil_passes(d->stencil_func, d->stencil_ref & d->stencil_cmask, (scene_target.ds_data ? scene_target.ds_background_stencil : 0) & d->stencil_cmask)
+	    && (!d->two_sided_stencil || !stencil_passes(d->back_stencil_func, d->stencil_ref & d->stencil_cmask,
+	                                                 (scene_target.ds_data ? scene_target.ds_background_stencil : 0) & d->stencil_cmask)))
 		why = "stencil test can't pass on the software path: draw skipped", skip = 1;
 	__atomic_add_fetch(&n_fallback, 1, __ATOMIC_RELAXED); disp_note(DISP_SOFT);
 	if (trace_sync()) fprintf(stderr, "gpu trace: software fallback (%s) after %u gpu draws, fprog %#x\n", why, n_gpu_draws, d->fprog);
@@ -4740,27 +4850,38 @@ static SDL_GPUShader *query_fragment_shader(void) {
 	if (!qbuf || !qzero) { SDL_ReleaseGPUShader(gpu(), sh); sh = 0; }
 	return sh;
 }
-typedef struct { const void *vse; int cull_sdl, has_depth, ckind, depth_ok, stencil_ok; uint32_t depth_func; uint8_t stencil_func, stencil_cmask; PipeEntry e; } QueryPipe;
+typedef struct {
+	const void *vse;
+	int cull_sdl, has_depth, ckind, depth_ok, stencil_ok;
+	uint32_t depth_func;
+	uint8_t stencil_func, back_stencil_func, stencil_cmask;
+	PipeEntry e;
+} QueryPipe;
 #define MAXQPIPE 1024
 static QueryPipe qpipes[MAXQPIPE]; static int nqpipes;
 static PipeEntry *query_pipeline(const GfxDraw *d, const ShaderEntry *vs, int has_depth, int ckind, int depth_ok, int stencil_ok, int cull_sdl) {
 	SDL_GPUShader *fs = query_fragment_shader(); if (!fs) return 0;
 	uint8_t sf = stencil_ok && has_depth ? d->stencil_func : 7;
+	uint8_t bsf = stencil_ok && has_depth && d->two_sided_stencil ? d->back_stencil_func : sf;
 	for (int i = 0; i < nqpipes; i++) { QueryPipe *q = &qpipes[i];
-		if (q->vse == vs && q->cull_sdl == cull_sdl && q->has_depth == has_depth && q->ckind == ckind && q->depth_ok == depth_ok && q->stencil_ok == stencil_ok && q->depth_func == d->depth_func && q->stencil_func == sf && q->stencil_cmask == d->stencil_cmask)
+		if (q->vse == vs && q->cull_sdl == cull_sdl && q->has_depth == has_depth && q->ckind == ckind && q->depth_ok == depth_ok && q->stencil_ok == stencil_ok && q->depth_func == d->depth_func
+		    && q->stencil_func == sf && q->back_stencil_func == bsf && q->stencil_cmask == d->stencil_cmask)
 			return !pipeline_pending(&q->e) && q->e.pipe ? &q->e : 0; }   /* (still being built: no query this time, the counter keeps its last value) */
 	if (nqpipes >= MAXQPIPE) { static int said; if (!said++) fprintf(stderr, "    gpu: the visibility-query pipeline table is full (%d): new queries keep their counters' last values\n", MAXQPIPE); return 0; }
 	QueryPipe *q = &qpipes[nqpipes++]; memset(q, 0, sizeof *q);
-	q->vse = vs; q->cull_sdl = cull_sdl; q->has_depth = has_depth; q->ckind = ckind; q->depth_ok = depth_ok; q->stencil_ok = stencil_ok; q->depth_func = d->depth_func; q->stencil_func = sf; q->stencil_cmask = d->stencil_cmask;
+	q->vse = vs; q->cull_sdl = cull_sdl; q->has_depth = has_depth; q->ckind = ckind; q->depth_ok = depth_ok; q->stencil_ok = stencil_ok; q->depth_func = d->depth_func;
+	q->stencil_func = sf; q->back_stencil_func = bsf; q->stencil_cmask = d->stencil_cmask;
 	SDL_GPUColorTargetDescription ctd = { .format = kind_format(ckind) }; ctd.blend_state.enable_color_write_mask = true; ctd.blend_state.color_write_mask = 0;
 	SDL_GPUGraphicsPipelineCreateInfo ci = {0};
 	ci.vertex_shader = vs->shader; ci.fragment_shader = fs; ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
-	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl; ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE; ci.rasterizer_state.enable_depth_clip = false;
+	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl; ci.rasterizer_state.front_face = GXM_FRONT_FACE; ci.rasterizer_state.enable_depth_clip = false;
 	ci.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
 	ci.depth_stencil_state.enable_depth_test = has_depth && depth_ok; ci.depth_stencil_state.enable_depth_write = false; ci.depth_stencil_state.compare_op = conv_cmp(d->depth_func);
-	ci.depth_stencil_state.enable_stencil_test = sf != 7;   /* the test only: KEEP everywhere, nothing written */
-	SDL_GPUStencilOpState sos = { SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, conv_cmp(sf) };
-	ci.depth_stencil_state.front_stencil_state = ci.depth_stencil_state.back_stencil_state = sos; ci.depth_stencil_state.compare_mask = d->stencil_cmask; ci.depth_stencil_state.write_mask = 0;
+	ci.depth_stencil_state.enable_stencil_test = sf != 7 || bsf != 7;   /* the test only: KEEP everywhere, nothing written */
+	SDL_GPUStencilOpState fsos = { SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, conv_cmp(sf) };
+	SDL_GPUStencilOpState bsos = { SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, conv_cmp(bsf) };
+	ci.depth_stencil_state.front_stencil_state = fsos; ci.depth_stencil_state.back_stencil_state = bsos;
+	ci.depth_stencil_state.compare_mask = d->stencil_cmask; ci.depth_stencil_state.write_mask = 0;
 	ci.target_info.color_target_descriptions = &ctd; ci.target_info.num_color_targets = 1; ci.target_info.has_depth_stencil_target = has_depth; ci.target_info.depth_stencil_format = depth_format();
 	/* built like every other pipeline (gpu_async: on a worker): a first-ever one is tens of ms, and a level's flares need
 	 * dozens at once -- built here, Killzone's first frames with flares took 2-3 s each */
@@ -5043,7 +5164,13 @@ static void rc_registered(uint32_t addr) {   /* a program the game registered: t
 static void draw_of_state(const int32_t v[NPV], GfxDraw *d) {   /* the GfxDraw fields of pipe_state's record */
 	memset(d, 0, sizeof *d);
 	d->cull = v[0]; d->depth_write = v[7]; d->depth_func = (uint32_t)v[8];
-	d->stencil_func = (uint8_t)v[9]; d->stencil_fail = (uint8_t)v[10]; d->depth_fail = (uint8_t)v[11]; d->depth_pass = (uint8_t)v[12]; d->stencil_cmask = (uint8_t)v[13]; d->stencil_wmask = (uint8_t)v[14]; d->fp_disabled = (uint8_t)v[15];
+	d->two_sided_stencil = (uint8_t)((v[9] >> 16) & 1);
+	d->stencil_func = (uint8_t)v[9]; d->stencil_fail = (uint8_t)v[10]; d->depth_fail = (uint8_t)v[11]; d->depth_pass = (uint8_t)v[12];
+	d->back_stencil_func = d->two_sided_stencil ? (uint8_t)(v[9] >> 8) : d->stencil_func;
+	d->back_stencil_fail = d->two_sided_stencil ? (uint8_t)(v[10] >> 8) : d->stencil_fail;
+	d->back_depth_fail = d->two_sided_stencil ? (uint8_t)(v[11] >> 8) : d->depth_fail;
+	d->back_depth_pass = d->two_sided_stencil ? (uint8_t)(v[12] >> 8) : d->depth_pass;
+	d->stencil_cmask = (uint8_t)v[13]; d->stencil_wmask = (uint8_t)v[14]; d->fp_disabled = (uint8_t)v[15];
 	d->blend.present = v[16]; d->blend.mask = (uint8_t)v[17]; d->blend.color_func = (uint8_t)v[18]; d->blend.alpha_func = (uint8_t)v[19];
 	d->blend.color_src = (uint8_t)v[20]; d->blend.color_dst = (uint8_t)v[21]; d->blend.alpha_src = (uint8_t)v[22]; d->blend.alpha_dst = (uint8_t)v[23];
 	d->depth_bias_factor = (int8_t)v[24]; d->depth_bias_units = (int8_t)v[25];
@@ -5269,9 +5396,10 @@ static void predict_warm(uint32_t hash) {   /* a program in the game's files: it
 	UsseDraw d; memset(&d, 0, sizeof d); usse_setup_registers(prog, &d, 0, 0);   /* (its literals and dependent-sampler table: no uniform buffers) */
 	uint32_t sa[256]; for (int i = 0; i < 256; i++) sa[i] = d.sa_unit[i] ? d.sa_unit[i] - 1u : d.sa[i].u;   /* (gfx_gpu_draw's sa_for_smp) */
 	const uint32_t cube = usse_spirv_predict_cube(prog, fl, sa);
-	for (int k = 0; k < 3; k++) {   /* kind 0; and 1, 2 for a raw-word colour (usse_spirv_key keeps those) */
-		int kind = k; uint32_t c = cube; usse_spirv_key(prog, fl, sa, &kind, &c, 0);
-		if (kind != k) break;
+	const int kinds[] = {TK_U8, TK_F16, TK_F32, TK_F16RAW};
+	for (unsigned k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {   /* raw-word colour variants that usse_spirv_key keeps */
+		int kind = kinds[k]; uint32_t c = cube; usse_spirv_key(prog, fl, sa, &kind, &c, 0);
+		if (kind != kinds[k]) continue;
 		ShaderEntry *e = calloc(1, sizeof *e); ShaderJob sj;
 		if (!e) break;
 		e->addr = rc.scratch[0]; e->hash = hash; e->kind = kind; e->cube_mask = c; e->prebuilt = 1;   /* (prebuilt: no hitch log) */
@@ -5549,6 +5677,11 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	const UsseProgram *vp = usse_get(d->vprog), *fp = usse_get(d->fprog);
 	const UsseVertexLayout *vl = usse_vertex_layout(vp);
 	const UsseFragLayout *fl = usse_fragment_layout(fp);
+	const int raw_color = usse_fragment_raw_color(fl);
+	const int raw_f16 = raw_color && (scene_target.format & 0xF1800000u) == 0x01000000u && gfx_target_bpp(&scene_target) == 8;
+	if (raw_f16 && d->blend.present) { soft_fallback(d, "raw-word colour with blending"); return; }
+	if (raw_f16 && !target_switch_kind(scene_entry, TK_F16RAW)) { soft_fallback(d, "raw-word target storage"); return; }
+	if (!raw_f16 && scene_entry->kind == TK_F16RAW && !target_switch_kind(scene_entry, TK_F16)) { soft_fallback(d, "float target storage"); return; }
 
 	/* secondary programs run on the CPU regardless of backend (see usse_spirv.h): this resolves
 	 * dependent-sampler texture-unit assignment too, which the translator needs up front */
@@ -5600,13 +5733,17 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	/* fetch mode 1 (no framebuffer read: Vulkan) and a FRAGCOLOR program whose use of the colour it reads is a
 	 * blend the blend unit can do (usse_fragment_fb_blend -- Uncharted's deferred lights add into the HDR target,
 	 * its particles alpha-blend into it in the shader): that variant and blend, instead of a copy of the whole
-	 * target before the draw. A float target only (an 8-bit one clamps the source before blending, the Vita
-	 * clamps the result) and no GXM blend of the draw's own. The Vita rounds each result to the target's format
+	 * target before the draw. Additive blends stay on float targets (an 8-bit one clamps the source before
+	 * blending, while the Vita clamps the result); alpha lerps can also use linear U8 targets and need the blend
+	 * unit so overlapping primitives in one draw see each other's results. No GXM blend of the draw's own.
+	 * The Vita rounds each result to the target's format
 	 * (U2F10F10F10's 5-bit mantissas), the blend unit keeps F16 between draws: a little more precise.
 	 * RECOMP_GPU_NO_ADDITIVE=1: the copies. */
 	static int no_additive = -1; if (no_additive < 0) no_additive = getenv("RECOMP_GPU_NO_ADDITIVE") != 0;
-	g_fzero_draw = fl && fl->frag_color_used && fetch_mode() == 1 && !no_additive && (scene_entry->kind == TK_F16 || scene_entry->kind == TK_HDR10)
+	int fb_blend = fl && fl->frag_color_used && fetch_mode() == 1 && !no_additive
 	               && !(d->blend.present && (d->blend.color_func || d->blend.alpha_func)) ? usse_fragment_fb_blend(fp) : 0;
+	g_fzero_draw = (scene_entry->kind == TK_F16 || scene_entry->kind == TK_HDR10
+	                || (scene_entry->kind == TK_U8 && fb_blend >= USSE_FB_LERP_KEEP)) ? fb_blend : 0;
 	if (g_fzero_draw) {
 		static uint32_t told[64]; static int ntold; uint32_t h = usse_program_hash(fp); int seen = 0;
 		static const char *what[5] = { "", "adds to it: ONE/ONE", "adds to it, alpha replaced: ONE/ONE, alpha ONE/ZERO", "blends over it, alpha kept: ONE/ONE_MINUS_SRC_ALPHA", "blends over it: ONE/ONE_MINUS_SRC_ALPHA" };
@@ -5640,16 +5777,12 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	/* ds_format 0 (an old capture, or a surface we never saw ourselves): both planes present, as before */
 	int ds_depth_ok = !scene_target.ds_data || (scene_target.ds_format & 0x00044000u) != 0;
 	int ds_stencil_ok = !scene_target.ds_data || (scene_target.ds_format & 0x00022000u) != 0;
-	/* SceGxmCullMode against the NDC winding (gfx_soft.c's record_tri: CW culls a negative NDC
-	 * area, CCW a positive one). SDL_GPU's front face is in its NDC too (y up, as Metal evaluates
-	 * it; its Vulkan backend flips the viewport and the winding itself), and the game's clip
-	 * position goes to gl_Position untouched, so CW is simply the back face of a CCW-front
-	 * pipeline, whatever the viewport does with y. Checked on Unit 13's frame 1200: the other
-	 * convention culls the full-screen ambient pass entirely. RECOMP_GPU_CULL_SWAP=1: that other
-	 * convention, for diagnosis. */
+	/* SceGxmCullMode names the NDC winding to cull. The pipeline's clockwise front face instead
+	 * matches GXM's post-viewport front/back stencil sense, so the corresponding SDL cull face is
+	 * inverted here. RECOMP_GPU_CULL_SWAP=1 keeps the opposite mapping for diagnosis. */
 	static int swap = -1; if (swap < 0) swap = getenv("RECOMP_GPU_CULL_SWAP") != 0;
-	int cull_sdl = g_points_draw ? SDL_GPU_CULLMODE_NONE : d->cull == 1 ? (swap ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK)
-	             : d->cull == 2 ? (swap ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT) : SDL_GPU_CULLMODE_NONE;
+	int cull_sdl = g_points_draw ? SDL_GPU_CULLMODE_NONE : d->cull == 1 ? (swap ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT)
+	             : d->cull == 2 ? (swap ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK) : SDL_GPU_CULLMODE_NONE;
 	uint64_t tp0 = us_now();
 	PipeEntry *pipe = get_pipeline(d, vs, fs, scene_target.depth != 0, scene_entry->kind, ds_depth_ok, ds_stencil_ok, cull_sdl, -1, 0);
 	t_pipe += us_now() - tp0;
@@ -5865,6 +5998,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		if (sx1 < sx0) sx1 = sx0; if (sy1 < sy0) sy1 = sy0;
 	}
 	cur_wx0 = sx0; cur_wy0 = sy0; cur_wx1 = sx1; cur_wy1 = sy1;   /* (same_region_read, for the binds below) */
+	cur_bounds_draw = d; cur_bounds_state = 0;
 	SDL_GPUTextureSamplerBinding tsb[25]; int ntsb = 0;
 	if (pipe->fetch && !scene_entry->fetch_copy) {   /* the framebuffer copy this draw's FRAGCOLOR reads (taken in its batch's copy pass) */
 		SDL_GPUTextureCreateInfo fci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(scene_entry->kind), .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | (fetch_blit() ? SDL_GPU_TEXTUREUSAGE_COLOR_TARGET : 0),
@@ -6006,9 +6140,12 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * and so flush the batch, before every draw */
 	scene_entry->gpu_dirty = 1; scene_entry->gen = ++write_clock; scene_first_draw = 0;
 	if (scene_depth_entry && scene_target.depth) {
-		int st_on = ds_stencil_ok && (d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass);   /* get_pipeline's enable_stencil_test */
+		int fst = d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass;
+		int bst = d->two_sided_stencil && (d->back_stencil_func != 7 || d->back_stencil_fail || d->back_depth_fail || d->back_depth_pass);
+		int st_writes = (fst && (d->stencil_fail || d->depth_fail || d->depth_pass))
+		             || (bst && (d->back_stencil_fail || d->back_depth_fail || d->back_depth_pass));
 		int zwrites = ds_clear || (ds_depth_ok && d->depth_write);
-		int writes = zwrites || (st_on && d->stencil_wmask && (d->stencil_fail || d->depth_fail || d->depth_pass));
+		int writes = zwrites || (ds_stencil_ok && d->stencil_wmask && st_writes);
 		scene_depth_entry->gpu_newer = 1;
 		if (writes) scene_depth_entry->gen = ++write_clock;
 		if (zwrites) scene_depth_entry->zgen = scene_depth_entry->gen;
@@ -6288,13 +6425,13 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 			if (fo) fclose(fo);
 			SDL_UnmapGPUTransferBuffer(gpu(), xb); SDL_ReleaseGPUTransferBuffer(gpu(), xb);
 		}
-		extern int window_active(void); extern void window_present_gpu(void *tex, uint32_t w, uint32_t h, int raw);
+		extern int window_active(void), window_gpu_direct_present(void); extern void window_present_gpu(void *tex, uint32_t w, uint32_t h, int raw);
 		static int no_gpu_present = -1; if (no_gpu_present < 0) no_gpu_present = getenv("RECOMP_GPU_NO_PRESENT") != 0;   /* RECOMP_GPU_NO_PRESENT=1: present through guest memory as before */
 		/* an sRGB frame goes to the window as raw texels (a copy, not a blit) where the backend copies between the sRGB and
 		 * plain forms of a format: Vulkan does. Through guest memory instead, Killzone's windowed frames each cost a download
 		 * and a wait for the whole frame, and the window showed the 1x frame at any render scale (2026-10-26) */
 		static int srgb_copy = -1; if (srgb_copy < 0) { const char *dv = SDL_GetGPUDeviceDriver(gpu()); srgb_copy = dv && !strcmp(dv, "vulkan"); }
-		const int via_gpu = e->gpu_dirty && !gfx_soft_shot_due() && format == 0 && window_active() && !no_gpu_present && (e->kind != TK_U8S || srgb_copy);
+		const int via_gpu = e->gpu_dirty && !gfx_soft_shot_due() && format == 0 && window_active() && window_gpu_direct_present() && !no_gpu_present && (e->kind != TK_U8S || srgb_copy);
 		hist_record(base, e, TSX(e, width), TSY(e, height), via_gpu);
 		{ const int m = __atomic_exchange_n(&hist_save_mark, 0, __ATOMIC_ACQ_REL); if (m) hist_save(m); }
 		{ static long at = -2; if (at == -2) { const char *v = getenv("RECOMP_FRAME_HISTORY_SAVE_AT"); at = v ? atol(v) : -1; }   /* RECOMP_FRAME_HISTORY_SAVE_AT=frame: F5's save without a window (tests) */

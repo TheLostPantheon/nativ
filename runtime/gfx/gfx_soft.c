@@ -1227,10 +1227,8 @@ static uint32_t target_index(const GfxTarget *t, int x, int y) {
 	}
 	return (uint32_t)y * t->stride + (uint32_t)x;
 }
-/* U4U4U4U4 targets: output channel k (R, G, B, A) is nibble u4_order[swizzle][k] -- ABGR, ARGB,
- * RGBA, BGRA, the byte orders of the 8-bit default case (R in the low nibble, as the texture
- * decode reads the format) */
-static const uint8_t u4_order[4][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {3, 2, 1, 0}, {1, 2, 3, 0}};
+/* Output channel k (R, G, B, A) occupies color_order[order][k] in the surface. */
+static const uint8_t color_order[4][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {3, 2, 1, 0}, {1, 2, 3, 0}};
 static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]);
 /* an sRGB colour surface (gfx.h GFX_TGT_GAMMA; U8U8U8U8, the one family the GPU's sRGB targets
  * cover): reads decode the colour channels to linear -- blending and FRAGCOLOR preloads see what
@@ -1244,7 +1242,12 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 	uint32_t a = t->data + target_bpp_of(t) * target_index(t, x, y);
 	switch (target_base_of(t)) {
 	case 0x30000000u: { uint16_t p = RD16(a); c[0] = (p >> 11) / 31.f; c[1] = ((p >> 5) & 63) / 63.f; c[2] = (p & 31) / 31.f; c[3] = 1; return; }
-	case 0x01000000u: for (int k = 0; k < 4; k++) c[k] = half_to_float_soft(RD16(a + 2 * k)); return;
+	case 0x01000000u: {
+		float p[4]; const uint8_t *o = color_order[(t->format >> 20) & 3];
+		for (int k = 0; k < 4; k++) p[k] = half_to_float_soft(RD16(a + 2 * k));
+		for (int k = 0; k < 4; k++) c[k] = p[o[k]];
+		return;
+	}
 	case 0x00800000u: c[0] = half_to_float_soft(RD16(a)); c[1] = half_to_float_soft(RD16(a + 2)); c[2] = 0; c[3] = 1; return;
 	case 0x11000000u: { uint32_t r = RD32(a), g = RD32(a + 4); memcpy(&c[0], &r, 4); memcpy(&c[1], &g, 4); c[2] = 0; c[3] = 1; return; }
 	case 0x10800000u: { uint32_t r = RD32(a); memcpy(&c[0], &r, 4); c[1] = c[2] = 0; c[3] = 1; return; }
@@ -1265,7 +1268,7 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 	case 0x50000000u: {   /* U4U4U4U4: four nibbles in the 8-bit case's channel orders (ABGR: R lowest). Killzone:
 	                       * Mercenary renders a few small masks into one; the 4-byte default below read and
 	                       * wrote two pixels at a time at this format's 2-byte stride */
-		uint16_t p = RD16(a); const uint8_t *o = u4_order[(t->format >> 20) & 3];
+		uint16_t p = RD16(a); const uint8_t *o = color_order[(t->format >> 20) & 3];
 		for (int k = 0; k < 4; k++) c[k] = ((p >> (4 * o[k])) & 15) / 15.f;
 		return;
 	}
@@ -1296,7 +1299,12 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	uint32_t a = t->data + target_bpp_of(t) * target_index(t, x, y);
 	switch (target_base_of(t)) {
 	case 0x30000000u: { uint32_t r = to8(c[0]) >> 3, g = to8(c[1]) >> 2, b = to8(c[2]) >> 3; WR16(a, (uint16_t)(r << 11 | g << 5 | b)); return; }
-	case 0x01000000u: for (int k = 0; k < 4; k++) WR16(a + 2 * k, float_to_half_soft(c[k])); return;
+	case 0x01000000u: {
+		float p[4]; const uint8_t *o = color_order[(t->format >> 20) & 3];
+		for (int k = 0; k < 4; k++) p[o[k]] = c[k];
+		for (int k = 0; k < 4; k++) WR16(a + 2 * k, float_to_half_soft(p[k]));
+		return;
+	}
 	case 0x00800000u: WR16(a, float_to_half_soft(c[0])); WR16(a + 2, float_to_half_soft(c[1])); return;
 	case 0x11000000u: { uint32_t r, g; memcpy(&r, &c[0], 4); memcpy(&g, &c[1], 4); WR32(a, r); WR32(a + 4, g); return; }
 	case 0x10800000u: { uint32_t r; memcpy(&r, &c[0], 4); WR32(a, r); return; }
@@ -1313,7 +1321,7 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	case 0x20800000u: WR16(a, (uint16_t)to16s(c[0])); return;                          /* S16 */
 	case 0x50000000u: {   /* U4U4U4U4 (target_read_of's layout), quantised from the 8-bit value so the GPU path's
 	                       * RGBA8 round trip (gfx_encode_target_rgba8) stores exactly the nibbles this path does */
-		const uint8_t *o = u4_order[(t->format >> 20) & 3]; uint32_t p = 0;
+		const uint8_t *o = color_order[(t->format >> 20) & 3]; uint32_t p = 0;
 		for (int k = 0; k < 4; k++) p |= ((to8(c[k]) * 15 + 127) / 255) << (4 * o[k]);
 		WR16(a, (uint16_t)p); return;
 	}
@@ -1355,6 +1363,16 @@ void gfx_decode_target_f32(const GfxTarget *t, float *out) {   /* raw, as the RG
 }
 void gfx_encode_target_f32(const GfxTarget *t, const float *in) {
 	for (uint32_t y = 0; y < t->height; y++) for (uint32_t x = 0; x < t->stride; x++) target_write_raw_of(t, (int)x, (int)y, in + 4 * (y * t->stride + x));
+}
+void gfx_decode_target_raw(const GfxTarget *t, uint8_t *out) {
+	const uint32_t bpp = (uint32_t)target_bpp_of(t);
+	for (uint32_t y = 0; y < t->height; y++) for (uint32_t x = 0; x < t->stride; x++)
+		memcpy(out + bpp * (y * t->stride + x), G(t->data + bpp * target_index(t, (int)x, (int)y)), bpp);
+}
+void gfx_encode_target_raw(const GfxTarget *t, const uint8_t *in) {
+	const uint32_t bpp = (uint32_t)target_bpp_of(t);
+	for (uint32_t y = 0; y < t->height; y++) for (uint32_t x = 0; x < t->stride; x++)
+		memcpy(G(t->data + bpp * target_index(t, (int)x, (int)y)), in + bpp * (y * t->stride + x), bpp);
 }
 static float factor(int f, const float s[4], const float d[4], int k) {
 	switch (f) {
@@ -1412,7 +1430,7 @@ static void stats_init(void) {
 	const char *e = getenv("RECOMP_GFX_STATS");
 	gfx_stats = !e ? 0 : !strcmp(e, "black") ? 2 : 1;
 }
-typedef struct { float sx[3], sy[3], inv_area; int y0, y1, x0, x1; Vert v[3]; uint32_t draw; } Tri;
+typedef struct { float sx[3], sy[3], inv_area; int y0, y1, x0, x1; Vert v[3]; uint32_t draw; uint8_t back; } Tri;
 static DrawRec *recs; static uint32_t nrecs, cap_recs;
 static Tri *tris; static uint32_t ntris, cap_tris;
 static GfxTarget scene_target;   /* (defined with the scene state below) */
@@ -1892,6 +1910,11 @@ static void raster_rows(const Tri *t, const DrawRec *r, int ylo, int yhi) {
 	const GfxDraw *d = &r->d; const Shader *s = &r->s;
 	const Vert *v0 = &t->v[0], *v1 = &t->v[1], *v2 = &t->v[2];
 	const float *sx = t->sx, *sy = t->sy;
+	const int back = t->back && d->two_sided_stencil;
+	const uint8_t stencil_func = back ? d->back_stencil_func : d->stencil_func;
+	const uint8_t stencil_fail = back ? d->back_stencil_fail : d->stencil_fail;
+	const uint8_t depth_fail = back ? d->back_depth_fail : d->depth_fail;
+	const uint8_t depth_pass_op = back ? d->back_depth_pass : d->depth_pass;
 	int y0 = t->y0 > ylo ? t->y0 : ylo, y1 = t->y1 < yhi ? t->y1 : yhi;
 	Depth *dp = scene_depth;
 	/* RECOMP_PIXEL_CENTER: where in the pixel the sample point sits (default 0.5, the GL/D3D10 convention) */
@@ -1918,13 +1941,13 @@ static void raster_rows(const Tri *t, const DrawRec *r, int ylo, int yhi) {
 				if (do_depth) { z = b0 * v0->z + b1 * v1->z + b2 * v2->z + zbias; dz = &dp->z[y * dp->w + x]; }   /* v.z is z/w already */
 				if (do_stencil) sp = &dp->st[y * dp->w + x];
 				uint8_t m = d->stencil_cmask, ref = d->stencil_ref;
-				if (do_stencil && !depth_pass(d->stencil_func, (float)(ref & m), (float)(*sp & m))) {
-					*sp = (*sp & ~d->stencil_wmask) | (stencil_op(d->stencil_fail, *sp, ref) & d->stencil_wmask);
+				if (do_stencil && !depth_pass(stencil_func, (float)(ref & m), (float)(*sp & m))) {
+					*sp = (*sp & ~d->stencil_wmask) | (stencil_op(stencil_fail, *sp, ref) & d->stencil_wmask);
 					ST(r, st_sfail);
 					continue;
 				}
 				if (do_depth && !depth_pass(d->depth_func, z, *dz)) {
-					if (do_stencil) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(d->depth_fail, *sp, ref) & d->stencil_wmask);
+					if (do_stencil) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(depth_fail, *sp, ref) & d->stencil_wmask);
 					ST(r, st_dfail);
 					continue;
 				}
@@ -1948,7 +1971,7 @@ static void raster_rows(const Tri *t, const DrawRec *r, int ylo, int yhi) {
 				if (s->sampler && c[3] <= 0.0f) { ST(r, st_discard); continue; }
 			}
 			if (dz && d->depth_write) *dz = z;
-			if (sp) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(d->depth_pass, *sp, d->stencil_ref) & d->stencil_wmask);
+			if (sp) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(depth_pass_op, *sp, d->stencil_ref) & d->stencil_wmask);
 			if (d->vis_addr) __atomic_fetch_add(&((DrawRec *)r)->vis_count, 1, __ATOMIC_RELAXED);
 			/* sceGxmSetFrontFragmentProgramEnable(..., DISABLED): depth/stencil above still ran
 			 * (matching real hardware: a depth/shadow prepass that writes no colour at all) */
@@ -2035,12 +2058,15 @@ static void record_tri_clipped(const Vert *a, const Vert *b, const Vert *c3) {
 	 * driver's CULL_CW/CULL_CCW name the winding to cull by that same (clip-space, pre-viewport)
 	 * sense (Vita3K's gxm_to_vulkan.cpp maps CULL_CW to culling the winding opposite its own
 	 * CCW-is-front pipeline convention, i.e. literally "cull clockwise"). */
+	float area_ndc = (xn[1] - xn[0]) * (yn[2] - yn[0]) - (xn[2] - xn[0]) * (yn[1] - yn[0]);
 	if (d->cull == 1 || d->cull == 2) {
-		float area_ndc = (xn[1] - xn[0]) * (yn[2] - yn[0]) - (xn[2] - xn[0]) * (yn[1] - yn[0]);
 		if ((d->cull == 1 && area_ndc < 0) || (d->cull == 2 && area_ndc > 0)) { ST(rec, st_culled); return; }
 	}
 	float area = (t.sx[1] - t.sx[0]) * (t.sy[2] - t.sy[0]) - (t.sx[2] - t.sx[0]) * (t.sy[1] - t.sy[0]);
 	if (area == 0) { ST(rec, st_zero); return; }
+	/* Front/back stencil state follows the post-viewport winding. Screen y grows downward, so a
+	 * positive area is the Vita's clockwise front face. Culling above stays in the API's NDC sense. */
+	t.back = area < 0;
 	t.inv_area = 1.0f / area;
 	t.x0 = (int)fminf(fminf(t.sx[0], t.sx[1]), t.sx[2]); t.x1 = (int)fmaxf(fmaxf(t.sx[0], t.sx[1]), t.sx[2]) + 1;
 	t.y0 = (int)fminf(fminf(t.sy[0], t.sy[1]), t.sy[2]); t.y1 = (int)fmaxf(fmaxf(t.sy[0], t.sy[1]), t.sy[2]) + 1;

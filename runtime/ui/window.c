@@ -2,9 +2,11 @@
  * The host window (SDL3): shows presented frames and turns keyboard and gamepad input into the
  * Vita's controller state. SDL wants the process's main thread, so in windowed mode the game runs
  * on its own thread (window_run) and hands each frame over through a shared buffer. Presentation
- * goes through SDL's GPU API (SDL_GPU): the software backend's frame is uploaded as a sampled
- * texture and blitted to the swapchain. This also stands up the SDL_GPUDevice/SDL_Window that a
- * future RECOMP_GFX=gpu backend (gfx_gpu.c) will render into directly instead of blitting.
+ * normally goes through SDL's GPU API (SDL_GPU): the software backend's frame is uploaded as a
+ * sampled texture and blitted to the swapchain, while gfx_gpu.c can hand its finished texture over
+ * directly. RECOMP_PRESENT_BACKEND=renderer instead synchronises the final Vita frame to the CPU
+ * and presents it through SDL_Renderer (Direct3D 11 on Windows). A supported title can run FSR1
+ * on the finished Vulkan texture first, then read back that output instead.
  *
  * keys: arrows d-pad, Z cross, X circle, A square, S triangle, Enter start, Backspace select,
  *       Q/W L/R triggers; any SDL gamepad (A/B/X/Y as cross/circle/square/triangle); F1 cycles the
@@ -18,6 +20,8 @@
  *       hides the bar. The OS cursor hides after a few seconds still over the picture (overlay.cpp).
  * env:  RECOMP_HEADLESS=1   no window (tests, the checker); RECOMP_SCALE=n window scale (default 1)
  *       RECOMP_RENDER_SCALE=n the GPU backend's internal resolution (1-6, default 1; F2 cycles them: gfx_gpu.c)
+ *       RECOMP_PRESENT_BACKEND=renderer present the CPU-synchronised final frame through SDL_Renderer
+ *       RECOMP_FSR1=0|1     override FSR1 spatial upscaling for a supported renderer-path game
  *       RECOMP_OSD=0|1|2    the overlay's level at start-up (default 0: see metrics.c and window_present_gpu's own comment on why the GPU path doesn't default it on)
  *       RECOMP_METRICS=1    one performance line to stderr a second (metrics.c), with or without a window
  *       RECOMP_OSD_DUMP=f   writes the overlay's own bitmap to f once, to check the font (see metrics.c)
@@ -41,6 +45,7 @@
 #include "metrics.h"
 #include "settings.h"
 #include "overlay.h"
+#include "fsr1/fsr1.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
        TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
@@ -392,6 +397,28 @@ int window_touch_contacts(int port, int *keys, int *xs, int *ys, int max) {
 	return n;
 }
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static int overlay_marks_now(OverlayMark *mk, float rear[4]) {
+	int n = 0, mt = 0, mtx = 0, mty = 0;
+	if (!rel_on && !overlay_is_open() && !overlay_mouse_captured() && ((SDL_GetModState() & SDL_KMOD_ALT) || touch_down || mouse_rear_down)) {
+		float px, py; SDL_GetMouseState(&px, &py);
+		mt = mouse_to_touch(px, py, 0, &mtx, &mty);
+	}
+	overlay_touch_cursor(mt);
+	if (flick_down) { touch_to_point(flick_x, flick_y, &mk[n].x, &mk[n].y); mk[n].rear = 0; mk[n].pressed = 1; mk[n++].cursor = 0; }
+	if (twist_down) for (int i = 0; i < 2; i++) { touch_to_point(twist_x[i], twist_y[i], &mk[n].x, &mk[n].y); mk[n].rear = 0; mk[n].pressed = 1; mk[n++].cursor = 0; }
+	if (cur_mode) { touch_to_point(cur_x[cur_mode - 1], cur_y[cur_mode - 1], &mk[n].x, &mk[n].y); mk[n].rear = cur_mode == 2; mk[n].pressed = cur_down; mk[n++].cursor = 1; }
+	if (cur_mode && cur2_on) { touch_to_point(cur2_x[cur_mode - 1], cur2_y[cur_mode - 1], &mk[n].x, &mk[n].y); mk[n].rear = cur_mode == 2; mk[n].pressed = cur_down; mk[n++].cursor = 1; }
+	for (int i = 0; i < TP_FINGERS; i++) if (tp_down[i]) { touch_to_point(tp_x[i], tp_y[i], &mk[n].x, &mk[n].y); mk[n].rear = tp_port[i]; mk[n].pressed = 1; mk[n++].cursor = 0; }
+	for (int i = 0; i < ST_FINGERS; i++) if (st_down[i] && st_port[i]) { touch_to_point(st_x[i], st_y[i], &mk[n].x, &mk[n].y); mk[n].rear = 1; mk[n].pressed = 1; mk[n++].cursor = 0; }
+	if (mt) { touch_to_point(mtx, mouse_rear_down ? clampi(mty, REAR_Y0, REAR_Y1) : mty, &mk[n].x, &mk[n].y); mk[n].rear = mouse_rear_down; mk[n].pressed = touch_down || mouse_rear_down; mk[n++].cursor = 1; }
+	else if (mouse_rear_down) { touch_to_point(mouse_rear_x, mouse_rear_y, &mk[n].x, &mk[n].y); mk[n].rear = 1; mk[n].pressed = 1; mk[n++].cursor = 0; }
+	int rear_in_play = cur_mode == 2 || rb_held || mouse_rear_down;
+	for (int i = 0; i < TP_FINGERS; i++) rear_in_play |= tp_down[i] && tp_port[i];
+	for (int i = 0; i < ST_FINGERS; i++) rear_in_play |= st_down[i] && st_port[i];
+	rear[0] = rear[1] = rear[2] = rear[3] = 0;
+	if (rear_in_play) { float x0, y0, x1, y1; touch_to_point(0, REAR_Y0, &x0, &y0); touch_to_point(1920, REAR_Y1 + 1, &x1, &y1); rear[0] = x0; rear[1] = y0; rear[2] = x1 - x0; rear[3] = y1 - y0; }
+	return n;
+}
 static int touchpad_active(void) { for (int i = 0; i < TP_FINGERS; i++) if (tp_down[i]) return 1; return 0; }
 /* everything gamepad touch holds, let go: the menu opened, or the pad went away */
 static void gamepad_touch_release(void) {
@@ -447,8 +474,26 @@ static void screen_finger(const SDL_Event *e) {
 int window_active(void) { return active; }
 
 static SDL_GPUDevice *gpu;
+static SDL_Renderer *present_renderer;
+static SDL_Texture *present_texture;
+static uint32_t present_tw, present_th;
+static SDL_GPUTransferBuffer *present_download;
+static uint32_t present_download_bytes;
 void *window_gpu_device(void) { return gpu; }   /* for a future gfx_gpu.c */
 void *window_handle(void) { return win; }
+int window_fsr1_supported(void) {
+	static int supported = -1;
+	if (supported < 0) { const char *e = getenv("RECOMP_FSR1_SUPPORTED"); supported = e && *e == '1'; }
+	return supported && present_renderer != 0;
+}
+static int window_fsr1_enabled(void) {
+	if (!window_fsr1_supported()) return 0;
+	const char *e = getenv("RECOMP_FSR1");
+	return e ? *e != '0' : settings_int("fsr1", 1) != 0;
+}
+/* The GPU swapchain consumes a texture directly. The renderer path can do the same when FSR1
+ * is enabled: it spatially upscales that texture, then performs its single readback. */
+int window_gpu_direct_present(void) { return present_renderer == 0 || window_fsr1_enabled(); }
 
 /* ---- audio: an SDL audio stream per Vita output port, bound to the default playback device.
  * Output queues the samples and blocks while more than a few buffers wait, so the game is paced
@@ -563,8 +608,8 @@ void audio_output(int dev, const void *buf, uint32_t bytes) {
 	}
 }
 
-/* the GPU backend's frame: blitted (on the game thread) into one of three RGBA8 textures here, the
- * present loop shows the latest; three so the one being written is never the one being shown */
+/* the GPU backend's frame: blitted (on the game thread) into an RGBA8 texture here; the present
+ * loop shows the latest */
 static SDL_GPUTexture *gtex[3]; static uint32_t gtw[3], gth[3]; static int gidx = -1, gshow = -1, gnew;
 static uint32_t gtl[3];   /* each one's mip levels (window_present_gpu: more than one when it is over twice the window's size) */
 void window_pixel_size(uint32_t *w, uint32_t *h) { *w = win_pw; *h = win_ph; }
@@ -612,8 +657,95 @@ static int osd_round_trip(SDL_GPUTexture *src, SDL_GPUTexture *dst, uint32_t w, 
 	return 1;
 }
 static int osd_cpu(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_OSD_CPU") != 0; return v; }   /* RECOMP_OSD_CPU=1: the overlay composited into the frame's pixels on the CPU, as before the ImGui HUD */
+static void renderer_present_gpu(SDL_GPUTexture *src, uint32_t w, uint32_t h, int raw) {
+	uint32_t tw = w, th = h;
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
+	if (!cmd) { fprintf(stderr, "    window: cannot acquire FSR1 command buffer (%s)\n", SDL_GetError()); return; }
+	if (window_fsr1_enabled()) {
+		const uint32_t ww = win_pw ? win_pw : w, wh = win_ph ? win_ph : h;
+		float sx, sy, sw, sh, dx, dy, dw, dh;
+		present_rect((float)ww, (float)wh, (float)w, (float)h, &sx, &sy, &sw, &sh, &dx, &dy, &dw, &dh);
+		uint32_t ow = (uint32_t)(dw * (float)w / sw + 0.5f);
+		uint32_t oh = (uint32_t)(dh * (float)h / sh + 0.5f);
+		if (ow >= w && oh >= h && ow <= 16384 && oh <= 16384) {
+			const char *se = getenv("RECOMP_SHARPEN");
+			Fsr1Frame f = {
+				.color = src, .input_w = w, .input_h = h, .output_w = ow, .output_h = oh,
+				.sharpness = se ? (float)atof(se) : (float)settings_float("sharpen", 0.35),
+				.srgb = raw,
+			};
+			SDL_GPUTexture *upscaled = fsr1_dispatch(gpu, cmd, &f);
+			if (upscaled) {
+				src = upscaled; tw = ow; th = oh;
+				static int said;
+				if (!said) { fprintf(stderr, "    window: FSR1 EASU+RCAS %ux%u -> %ux%u\n", w, h, tw, th); said = 1; }
+			}
+		}
+	}
+	const uint64_t bytes64 = 4ull * tw * th;
+	if (!tw || !th || tw > 16384 || th > 16384 || bytes64 > UINT32_MAX) {
+		fprintf(stderr, "    window: renderer frame %ux%u is too large\n", tw, th);
+		SDL_CancelGPUCommandBuffer(cmd);
+		return;
+	}
+	const uint32_t bytes = (uint32_t)bytes64;
+	if (!present_download || present_download_bytes != bytes) {
+		if (present_download) SDL_ReleaseGPUTransferBuffer(gpu, present_download);
+		SDL_GPUTransferBufferCreateInfo ci = {.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = bytes};
+		present_download = SDL_CreateGPUTransferBuffer(gpu, &ci);
+		present_download_bytes = present_download ? bytes : 0;
+	}
+	if (!present_download) {
+		fprintf(stderr, "    window: cannot create renderer download buffer (%s)\n", SDL_GetError());
+		SDL_CancelGPUCommandBuffer(cmd);
+		return;
+	}
+	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	if (!cp) {
+		fprintf(stderr, "    window: cannot begin renderer download (%s)\n", SDL_GetError());
+		SDL_CancelGPUCommandBuffer(cmd);
+		return;
+	}
+	SDL_GPUTextureRegion source = {.texture = src, .w = tw, .h = th, .d = 1};
+	SDL_GPUTextureTransferInfo destination = {.transfer_buffer = present_download, .pixels_per_row = tw, .rows_per_layer = th};
+	SDL_DownloadFromGPUTexture(cp, &source, &destination);
+	SDL_EndGPUCopyPass(cp);
+	const uint64_t t0 = now_us();
+	SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+	if (!fence) { fprintf(stderr, "    window: cannot submit renderer download (%s)\n", SDL_GetError()); return; }
+	const bool waited = SDL_WaitForGPUFences(gpu, true, &fence, 1);
+	SDL_ReleaseGPUFence(gpu, fence);
+	if (!waited) { fprintf(stderr, "    window: renderer download wait failed (%s)\n", SDL_GetError()); return; }
+	const uint8_t *pixels = SDL_MapGPUTransferBuffer(gpu, present_download, false);
+	if (!pixels) { fprintf(stderr, "    window: cannot map renderer download (%s)\n", SDL_GetError()); return; }
+	pthread_mutex_lock(&lock);
+	if (!frame || fw != tw || fh != th) {
+		uint8_t *replacement = malloc(bytes);
+		if (replacement) { free(frame); frame = replacement; fw = tw; fh = th; }
+		else fprintf(stderr, "    window: cannot allocate %u bytes for the renderer frame\n", bytes);
+	}
+	if (frame && fw == tw && fh == th) {
+		memcpy(frame, pixels, bytes);
+		gnew = 0; gshow = -1;
+		new_frame = 1;
+	}
+	pthread_mutex_unlock(&lock);
+	SDL_UnmapGPUTransferBuffer(gpu, present_download);
+	static int time_on = -1;
+	static uint64_t total_us;
+	static uint32_t samples;
+	if (time_on < 0) time_on = getenv("RECOMP_FSR1_TIME") != 0;
+	if (time_on) {
+		total_us += now_us() - t0;
+		if (++samples == 60) {
+			fprintf(stderr, "    fsr1: dispatch + %ux%u readback %.2f ms average\n", tw, th, (double)total_us / 60000.0);
+			total_us = 0; samples = 0;
+		}
+	}
+}
 void window_present_gpu(void *src, uint32_t w, uint32_t h, int raw) {
 	if (!active || !gpu || !w || !h || w > 16384 || h > 16384) return;
+	if (present_renderer) { renderer_present_gpu(src, w, h, raw); return; }
 	pthread_mutex_lock(&lock);
 	int n = (gidx + 1) % 3; if (n == gshow) n = (n + 1) % 3;
 	/* a frame over twice the window's size (render scale 4x and up on most displays) carries mip levels,
@@ -842,6 +974,50 @@ static void pad_resync(SDL_Gamepad *pad) {   /* L and R as held now (the menu cl
 
 typedef struct { void *(*fn)(void *); void *arg; } Game;
 static void *game_main(void *p) { Game *g = p; g->fn(g->arg); return 0; }
+static void renderer_present_frame(uint64_t *last_overlay_t) {
+	uint64_t t0 = now_us();
+	static int texture_error;
+	pthread_mutex_lock(&lock);
+	if (new_frame) {
+		if (present_tw != fw || present_th != fh) {
+			if (present_texture) SDL_DestroyTexture(present_texture);
+			present_texture = 0;
+			present_tw = fw; present_th = fh;
+		}
+		if (!present_texture) {
+			present_texture = SDL_CreateTexture(present_renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)fw, (int)fh);
+			if (present_texture) SDL_SetTextureScaleMode(present_texture, SDL_SCALEMODE_LINEAR);
+		}
+		if (!present_texture && !texture_error) { fprintf(stderr, "    window: cannot create renderer texture (%s)\n", SDL_GetError()); texture_error = 1; }
+		else if (present_texture && !SDL_UpdateTexture(present_texture, 0, frame, (int)(4 * fw)) && !texture_error) {
+			fprintf(stderr, "    window: cannot update renderer texture (%s)\n", SDL_GetError()); texture_error = 1;
+		}
+		new_frame = 0;
+	}
+	SDL_Texture *tex = present_texture; uint32_t sw = present_tw, sh = present_th;
+	pthread_mutex_unlock(&lock);
+
+	int ww = 0, wh = 0;
+	SDL_GetCurrentRenderOutputSize(present_renderer, &ww, &wh);
+	if (ww > 0 && wh > 0) { win_pw = (uint32_t)ww; win_ph = (uint32_t)wh; }
+	SDL_SetRenderDrawColor(present_renderer, 0, 0, 0, 255);
+	SDL_RenderClear(present_renderer);
+	if (tex && ww > 0 && wh > 0) {
+		float sx, sy, sw2, sh2, dx, dy, dw, dh;
+		present_rect((float)ww, (float)wh, (float)sw, (float)sh, &sx, &sy, &sw2, &sh2, &dx, &dy, &dw, &dh);
+		SDL_FRect src = {sx, sy, sw2, sh2}, dst = {dx, dy, dw, dh};
+		SDL_RenderTexture(present_renderer, tex, &src, &dst);
+	}
+	double dt = *last_overlay_t ? (double)(t0 - *last_overlay_t) / 1e6 : 1.0 / 60.0;
+	*last_overlay_t = t0;
+	OverlayMark marks[TP_FINGERS + ST_FINGERS + 6]; float rear[4];
+	int nmarks = overlay_marks_now(marks, rear);
+	overlay_frame_renderer((uint32_t)ww, (uint32_t)wh, dt);
+	overlay_marks_renderer((uint32_t)ww, (uint32_t)wh, dt, marks, nmarks, rear);
+	uint64_t t1 = now_us();
+	SDL_RenderPresent(present_renderer);
+	metrics_window_frame(t1 - t0);   /* the renderer's vsync wait is pacing, not host work */
+}
 
 /* (re)create the GPU-side texture + transfer buffer that the CPU frame is uploaded into, when its
  * size changes; returns 0 if the GPU texture isn't ready (e.g. device/window not yet claimed) */
@@ -892,8 +1068,22 @@ void window_run(void *(*fn)(void *), void *arg) {
 	}
 	SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	{ extern void *gfx_gpu_create_device(void); gpu = gfx_gpu_create_device(); }
-	if (gpu) SDL_ClaimWindowForGPUDevice(gpu, win);
-	if (gpu) {
+	{ const char *p = getenv("RECOMP_PRESENT_BACKEND");
+	  if (gpu && p && !strcmp(p, "renderer")) {
+		present_renderer = SDL_CreateRenderer(win,
+#ifdef _WIN32
+			"direct3d11"
+#else
+			0
+#endif
+		);
+		if (present_renderer) {
+			if (!SDL_SetRenderVSync(present_renderer, 1)) fprintf(stderr, "    window: renderer vsync unavailable (%s)\n", SDL_GetError());
+			fprintf(stderr, "    window: present backend SDL renderer (%s)\n", SDL_GetRendererName(present_renderer));
+		} else fprintf(stderr, "    window: SDL renderer unavailable (%s), using the GPU swapchain\n", SDL_GetError());
+	  } }
+	if (gpu && !present_renderer) SDL_ClaimWindowForGPUDevice(gpu, win);
+	if (gpu && !present_renderer) {
 		/* the swapchain's present mode. On Vulkan, mailbox where the display has it: with vsync (fifo) this loop's submit
 		 * waits for the swapchain image on the GPU's one queue, and every scene the game submits after it waits out the
 		 * refresh too. Killzone's CPU reads of its exposure target waited ~6 ms each: 40 fps windowed against 66 headless
@@ -912,7 +1102,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 	 * (the present loop) -- is the Vita's single flip; games time their audio against that (Uncharted's
 	 * cutscene dialogue ran ~47 ms ahead of the mouths with 2 and the frame picked first, 2026-10-09).
 	 * settings "frames_in_flight" 1..3 (RECOMP_FRAMES_IN_FLIGHT wins) */
-	if (gpu) {
+	if (gpu && !present_renderer) {
 		frames_in_flight = getenv("RECOMP_FRAMES_IN_FLIGHT") ? atoi(getenv("RECOMP_FRAMES_IN_FLIGHT")) : settings_int("frames_in_flight", 1);
 		if (frames_in_flight < 1) frames_in_flight = 1; if (frames_in_flight > 3) frames_in_flight = 3;
 		if (!SDL_SetGPUAllowedFramesInFlight(gpu, (Uint32)frames_in_flight)) { fprintf(stderr, "frames in flight %d refused (%s): SDL's 2\n", frames_in_flight, SDL_GetError()); frames_in_flight = 2; }
@@ -924,7 +1114,8 @@ void window_run(void *(*fn)(void *), void *arg) {
 	{ char b[16]; settings_str("aspect", "fit", b, sizeof b);
 	  aspect_mode = !strcmp(b, "stretch") ? ASPECT_STRETCH : !strcmp(b, "fill") ? ASPECT_FILL : ASPECT_FIT; }   /* window_set_aspect also saves: read it in directly instead, nothing changed yet */
 	if (settings_int("fullscreen", 0)) SDL_SetWindowFullscreen(win, true);
-	if (gpu) overlay_init(gpu, win, SDL_GetGPUSwapchainTextureFormat(gpu, win));
+	if (present_renderer) overlay_init_renderer(present_renderer, win);
+	else if (gpu) overlay_init(gpu, win, SDL_GetGPUSwapchainTextureFormat(gpu, win));
 	SDL_Gamepad *pad = 0;
 	int pad_back = 0, pad_start = 0, pad_combo_latch = 0;
 	uint64_t last_overlay_t = 0;
@@ -1324,6 +1515,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 
 		if (!gpu) { SDL_Delay(1); continue; }
 		if (overlay_game_paused()) { extern void gfx_shader_prep_tick(void); gfx_shader_prep_tick(); }   /* (a paused game doesn't present: the shader warm-up steps on from here, its prep card's too) */
+		if (present_renderer) { renderer_present_frame(&last_overlay_t); continue; }
 		if (self_paced) {   /* no vsync wait paces this loop: a present once the game has a new frame, else once a refresh (menus, the overlay); spinning presented ~1200 times a second and slowed the game */
 			const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
 			const uint64_t period = (uint64_t)(1e6 / (dm && dm->refresh_rate > 1 ? dm->refresh_rate : 60.0f));
@@ -1334,16 +1526,17 @@ void window_run(void *(*fn)(void *), void *arg) {
 		SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
 		if (!cmd) continue;
 		uint64_t t_blit1 = now_us();   /* the swapchain wait below is vsync, not a cost metrics.c should count */
-		/* this loop's frame two submits back is finished before SDL's acquire below looks at its own
-		 * in-flight fence (SDL allows two frames in flight: that fence is this frame's or an older one):
-		 * a locked poll of this loop's own fence for it, then the sweep that retires it from SDL's
-		 * submitted list -- in SDL 3.4.16 the acquire reads, waits on and releases that fence unlocked,
-		 * racing every other thread's submit, and then blocks for vsync, so it can't run under the
-		 * host's lock itself; see gpulock.h. The pacing is what it was: the acquire's wait finds the
-		 * fence done and blocks only in nextDrawable, for vsync, as before. */
+		/* SDL 3.4.16's Metal acquire reads, waits on and releases its in-flight fence unlocked, racing
+		 * every other thread's submit. Finish and retire that command buffer first; see gpulock.h.
+		 * Vulkan's fences are safe here, and waiting on our own fence before SDL's in-flight wait
+		 * serialises two presentation slots: a 30 fps game reaches the window at only 10-18 fps. */
 		static SDL_GPUFence *frame_fence[3]; static int frame_fi;
-		{ int k = (frame_fi + 3 - frames_in_flight) % 3;   /* the submit SDL's acquire will look at: frames_in_flight back */
-		  if (frame_fence[k]) { SDL_WaitForGPUFences(gpu, true, &frame_fence[k], 1); SDL_ReleaseGPUFence(gpu, frame_fence[k]); frame_fence[k] = 0; } }
+		static int fence_guard = -1;
+		if (fence_guard < 0) { const char *dv = SDL_GetGPUDeviceDriver(gpu); fence_guard = dv && !strcmp(dv, "metal"); }
+		if (fence_guard) {
+			int k = (frame_fi + 3 - frames_in_flight) % 3;   /* the submit SDL's acquire will look at: frames_in_flight back */
+			if (frame_fence[k]) { SDL_WaitForGPUFences(gpu, true, &frame_fence[k], 1); SDL_ReleaseGPUFence(gpu, frame_fence[k]); frame_fence[k] = 0; }
+		}
 		/* this loop's SDL_GPU calls under the renderer's lock (gfx_dispatch.c), with Vulkan: SDL's Vulkan backend (3.4.16) isn't
 		 * safe against this thread recording and submitting while the renderer creates, records and submits on others. With
 		 * GPU transfers and snapshots on (gfx_gpu.c), which make and copy more each frame, Killzone crashed inside SDL in this
@@ -1353,13 +1546,13 @@ void window_run(void *(*fn)(void *), void *arg) {
 		extern void gfx_lock_enter(void), gfx_lock_leave(void);
 		static int wlock = -1; if (wlock < 0) { const char *e = getenv("RECOMP_WINDOW_LOCK"), *dv = SDL_GetGPUDeviceDriver(gpu); wlock = e && *e ? *e != '0' : dv && !strcmp(dv, "vulkan"); }
 		if (wlock) gfx_lock_enter();
-		gpu_sweep(gpu);
-		if (wlock && !self_paced) gfx_lock_leave();   /* (vsync: the acquire waits a refresh, outside the lock) */
+		if (fence_guard) gpu_sweep(gpu);
+		if (wlock) gfx_lock_leave();   /* acquire can wait for an in-flight frame even without vsync */
 		SDL_GPUTexture *swap = 0;
 		uint32_t ww = 0, wh = 0;
 		int got_swap = SDL_WaitAndAcquireGPUSwapchainTexture(cmd, win, &swap, &ww, &wh);
 		uint64_t t_blit2 = now_us();
-		if (wlock && !self_paced) gfx_lock_enter();
+		if (wlock) gfx_lock_enter();
 		if (got_swap && ww && wh) { win_pw = ww; win_ph = wh; }
 		/* the frame to show, picked after the drawable wait: whatever the game flipped while this loop
 		 * waited for vsync goes out now, not a refresh later */
@@ -1411,34 +1604,13 @@ void window_run(void *(*fn)(void *), void *arg) {
 			 * (src_tex): see overlay_frame's own comment on why LOAD, not CLEAR */
 			double dt = last_overlay_t ? (double)(t_blit0 - last_overlay_t) / 1e6 : 1.0 / 60.0;
 			last_overlay_t = t_blit0;
-			/* the free pointer as a touch cursor -- Alt / Option held, or a click under way -- over the picture: the
-			 * bumper cursor's ring in its place (the OS arrow hidden, overlay_touch_cursor), blue on the front panel,
-			 * orange on the rear (the right button), filled while pressed; over the bars or a menu, the arrow */
-			int mt = 0, mtx = 0, mty = 0;
-			if (!rel_on && !overlay_is_open() && !overlay_mouse_captured() && ((SDL_GetModState() & SDL_KMOD_ALT) || touch_down || mouse_rear_down)) {
-				float px, py; SDL_GetMouseState(&px, &py);
-				mt = mouse_to_touch(px, py, 0, &mtx, &mty);
-			}
-			overlay_touch_cursor(mt);
+			OverlayMark mk[TP_FINGERS + ST_FINGERS + 6]; float rear[4];
+			int nm = overlay_marks_now(mk, rear);
 			overlay_frame(cmd, swap, ww, wh, dt);
-			/* the gamepad-touch markers: the bumper cursor, the touchpad's fingers, a right-button rear
-			 * touch; the rear panel's rows outlined while rear touch is in play */
-			OverlayMark mk[TP_FINGERS + ST_FINGERS + 6]; int nm = 0; float rear[4] = {0, 0, 0, 0};
-			if (flick_down) { touch_to_point(flick_x, flick_y, &mk[nm].x, &mk[nm].y); mk[nm].rear = 0; mk[nm].pressed = 1; mk[nm].cursor = 0; nm++; }
-			if (twist_down) for (int i = 0; i < 2; i++) { touch_to_point(twist_x[i], twist_y[i], &mk[nm].x, &mk[nm].y); mk[nm].rear = 0; mk[nm].pressed = 1; mk[nm].cursor = 0; nm++; }
-			if (cur_mode) { touch_to_point(cur_x[cur_mode - 1], cur_y[cur_mode - 1], &mk[nm].x, &mk[nm].y); mk[nm].rear = cur_mode == 2; mk[nm].pressed = cur_down; mk[nm].cursor = 1; nm++; }
-			if (cur_mode && cur2_on) { touch_to_point(cur2_x[cur_mode - 1], cur2_y[cur_mode - 1], &mk[nm].x, &mk[nm].y); mk[nm].rear = cur_mode == 2; mk[nm].pressed = cur_down; mk[nm].cursor = 1; nm++; }
-			for (int i = 0; i < TP_FINGERS; i++) if (tp_down[i]) { touch_to_point(tp_x[i], tp_y[i], &mk[nm].x, &mk[nm].y); mk[nm].rear = tp_port[i]; mk[nm].pressed = 1; mk[nm].cursor = 0; nm++; }
-			for (int i = 0; i < ST_FINGERS; i++) if (st_down[i] && st_port[i]) { touch_to_point(st_x[i], st_y[i], &mk[nm].x, &mk[nm].y); mk[nm].rear = 1; mk[nm].pressed = 1; mk[nm].cursor = 0; nm++; }   /* (a rear touch from the screen: the finger isn't where it lands) */
-			if (mt) { touch_to_point(mtx, mouse_rear_down ? clampi(mty, REAR_Y0, REAR_Y1) : mty, &mk[nm].x, &mk[nm].y); mk[nm].rear = mouse_rear_down; mk[nm].pressed = touch_down || mouse_rear_down; mk[nm].cursor = 1; nm++; }
-			else if (mouse_rear_down) { touch_to_point(mouse_rear_x, mouse_rear_y, &mk[nm].x, &mk[nm].y); mk[nm].rear = 1; mk[nm].pressed = 1; mk[nm].cursor = 0; nm++; }
-			int rear_in_play = cur_mode == 2 || rb_held || mouse_rear_down;
-			for (int i = 0; i < TP_FINGERS; i++) rear_in_play |= tp_down[i] && tp_port[i];
-			for (int i = 0; i < ST_FINGERS; i++) rear_in_play |= st_down[i] && st_port[i];
-			if (rear_in_play) { float x0, y0, x1, y1; touch_to_point(0, REAR_Y0, &x0, &y0); touch_to_point(1920, REAR_Y1 + 1, &x1, &y1); rear[0] = x0; rear[1] = y0; rear[2] = x1 - x0; rear[3] = y1 - y0; }
 			overlay_marks(cmd, swap, ww, wh, dt, mk, nm, rear);
 		}
-		frame_fence[frame_fi] = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); frame_fi = (frame_fi + 1) % 3;   /* vsync via the swapchain paces this loop; the fence is for the poll above, frames_in_flight on */
+		if (fence_guard) { frame_fence[frame_fi] = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); frame_fi = (frame_fi + 1) % 3; }
+		else SDL_SubmitGPUCommandBuffer(cmd);   /* SDL's swapchain in-flight fence paces this loop */
 		if (wlock) gfx_lock_leave();
 		uint64_t t_blit3 = now_us();
 		{	/* each newly shown GPU frame: the flip -> submit time, plus the compositor and scan-out estimate,
