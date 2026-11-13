@@ -101,3 +101,11 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## The "2" pad reads: `ctrl_v2_test.c`
+
+Checks `runtime/input/ctrl_v2.h`: `sceCtrlPeekBufferPositive2` / `sceCtrlReadBufferPositive2` report the handheld's L and R
+as `SCE_CTRL_L1` / `SCE_CTRL_R1` (0x400 / 0x800), not as the other reads' trigger bits (0x100 / 0x200); every other
+button passes unchanged. `-DCTRL_V2_IDENTITY` builds it against the old behaviour (4 of 7 checks fail).
+
+    cc -O1 -Wall -I ../input ctrl_v2_test.c -o ctrl_v2_test && ./ctrl_v2_test
