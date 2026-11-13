@@ -1034,12 +1034,20 @@ static uint32_t u8_pack4(const float v[4]) {
 	uint32_t b = (uint32_t)(clamp01(v[2]) * 255.0f + 0.5f), a = (uint32_t)(clamp01(v[3]) * 255.0f + 0.5f);
 	return r | (g << 8) | (b << 16) | (a << 24);
 }
+static uint32_t sop_read_word(Ctx *cx, const UOperand *o, int off) {
+	UOperand w = *o; w.type = TY_U32; w.negabs = 0;
+	return read_i32(cx, &w, off, 0);
+}
+static void sop_write_word(Ctx *cx, const UOperand *o, int off, uint32_t v) {
+	UOperand w = *o; w.type = TY_U32;
+	write_raw_lane(cx, &w, off, 0, v);
+}
 static float cop_eval(int op, float x, float y) { switch (op) { case 0: return x + y; case 1: return x - y; case 2: return x < y ? x : y; default: return x > y ? x : y; } }
 static void exec_sop2(Ctx *cx, const UOp *op) {
 	static const int unit[4] = {1, 1, 1, 1};
 	for (int r = 0; r < op->reps; r++) {
 		int off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit), off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
-		uint32_t w1 = read_i32(cx, &op->s1, off1, 0), w2 = read_i32(cx, &op->s2, off2, 0);
+		uint32_t w1 = sop_read_word(cx, &op->s1, off1), w2 = sop_read_word(cx, &op->s2, off2);
 		float c1[3], a1, c2[3], a2; u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 		if (op->s1.negabs & 1) { for (int k = 0; k < 3; k++) c1[k] = 1 - c1[k]; a1 = 1 - a1; }
 		int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
@@ -1055,11 +1063,11 @@ static void exec_sop2(Ctx *cx, const UOp *op) {
 		float out[4];
 		for (int k = 0; k < 3; k++) out[k] = cop_eval(op->sub, cf1[k] * c1[k], cf2[k] * c2[k]);
 		out[3] = cop_eval(op->sub2, af1 * a1, af2 * a2);
-		write_raw_lane(cx, &op->dst, offd, 0, u8_pack4(out));
+		sop_write_word(cx, &op->dst, offd, u8_pack4(out));
 	}
 }
 static void exec_sop2m(Ctx *cx, const UOp *op) {
-	uint32_t w1 = read_i32(cx, &op->s1, 0, 0), w2 = read_i32(cx, &op->s2, 0, 0);
+	uint32_t w1 = sop_read_word(cx, &op->s1, 0), w2 = sop_read_word(cx, &op->s2, 0);
 	float c1[3], a1, c2[3], a2; u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 	float s1v[4] = {c1[0], c1[1], c1[2], a1}, s2v[4] = {c2[0], c2[1], c2[2], a2};
 	int sel1 = op->args[0] & 0xFF, mod1 = op->args[0] & 0x100, sel2 = op->args[1] & 0xFF, mod2 = op->args[1] & 0x100;
@@ -1072,13 +1080,13 @@ static void exec_sop2m(Ctx *cx, const UOp *op) {
 	}
 	for (int k = 0; k < 3; k++) res[k] = cop_eval(op->sub, t1[k], t2[k]);
 	res[3] = cop_eval(op->sub2, t1[3], t2[3]);
-	uint32_t old = read_i32(cx, &op->dst, 0, 0); float oldc[3], olda; u8_unpack(old, oldc, &olda);
+	uint32_t old = sop_read_word(cx, &op->dst, 0); float oldc[3], olda; u8_unpack(old, oldc, &olda);
 	float finalv[4] = {oldc[0], oldc[1], oldc[2], olda};
 	for (int k = 0; k < 4; k++) if (op->mask & (1 << k)) finalv[k] = res[k];
-	write_raw_lane(cx, &op->dst, 0, 0, u8_pack4(finalv));
+	sop_write_word(cx, &op->dst, 0, u8_pack4(finalv));
 }
 static void exec_sop3(Ctx *cx, const UOp *op) {
-	uint32_t w0 = read_i32(cx, &op->s0, 0, 0), w1 = read_i32(cx, &op->s1, 0, 0), w2 = read_i32(cx, &op->s2, 0, 0);
+	uint32_t w0 = sop_read_word(cx, &op->s0, 0), w1 = sop_read_word(cx, &op->s1, 0), w2 = sop_read_word(cx, &op->s2, 0);
 	float c0[3], a0, c1[3], a1, c2[3], a2; u8_unpack(w0, c0, &a0); u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 	int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
 	int asel1 = op->args[2] & 0xFF, amod1 = op->args[2] & 0x100;
@@ -1096,7 +1104,7 @@ static void exec_sop3(Ctx *cx, const UOp *op) {
 	float out[4];
 	for (int k = 0; k < 3; k++) out[k] = cop_eval(op->sub, cf1[k] * c1[k], cf2[k] * c2[k]);
 	out[3] = cop_eval(op->sub2, af1 * a1, af2 * a2);
-	write_raw_lane(cx, &op->dst, 0, 0, u8_pack4(out));
+	sop_write_word(cx, &op->dst, 0, u8_pack4(out));
 }
 static void exec_i8mad(Ctx *cx, const UOp *op) {
 	static const int unit[4] = {1, 1, 1, 1};
@@ -1667,6 +1675,7 @@ const UOp *usse_program_code(const UsseProgram *p, int secondary, int *count) {
 }
 const UsseVertexLayout *usse_vertex_layout(const UsseProgram *p) { return &p->vl; }
 const UsseFragLayout *usse_fragment_layout(const UsseProgram *p) { return &p->fl; }
+int usse_fragment_raw_color(const UsseFragLayout *fl) { return fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32); }
 const UsseAttrSlot *usse_find_attr(const UsseVertexLayout *vl, int reg) {
 	for (int i = 0; i < vl->nattrs; i++) {
 		const UsseAttrSlot *s = &vl->attrs[i];

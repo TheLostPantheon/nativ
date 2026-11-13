@@ -139,6 +139,10 @@ typedef struct {
 	 * blood) lean on it to win against the wall they lie on; without it they z-fought and flashed in and out. 0 in an
 	 * old capture. */
 	int8_t depth_bias_factor, depth_bias_units;
+	/* A Vita two-sided stencil state can use different compare/operations for back faces. The shared
+	 * reference, masks and depth state remain in the front fields above. 0 in an old capture: one-sided. */
+	uint8_t two_sided_stencil;
+	uint8_t back_stencil_func, back_stencil_fail, back_depth_fail, back_depth_pass;
 } GfxDraw;
 
 /* GfxDraw.prim is the SceGxmPrimitiveType exactly as the game passed it to sceGxmDraw (and as
@@ -291,6 +295,8 @@ void gfx_decode_target_rgba8(const GfxTarget *t, uint8_t *out);
 void gfx_encode_target_rgba8(const GfxTarget *t, const uint8_t *in);
 void gfx_decode_target_f32(const GfxTarget *t, float *out);       /* the same, RGBA floats at full precision */
 void gfx_encode_target_f32(const GfxTarget *t, const float *in);
+void gfx_decode_target_raw(const GfxTarget *t, uint8_t *out);     /* tightly packed pixels, preserving every target-format bit */
+void gfx_encode_target_raw(const GfxTarget *t, const uint8_t *in);
 int gfx_target_plain_rgba8(const GfxTarget *t);   /* a linear U8U8U8U8 surface in R,G,B,A byte order: an RGBA8 GPU texture's bytes are its bytes (no float round trip) */
 /* gfx_soft.c's own raw bytes/pixel for a target's declared colour format (1/2/4/8) */
 int gfx_target_bpp(const GfxTarget *t);

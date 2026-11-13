@@ -1356,6 +1356,16 @@ void gfx_decode_target_f32(const GfxTarget *t, float *out) {   /* raw, as the RG
 void gfx_encode_target_f32(const GfxTarget *t, const float *in) {
 	for (uint32_t y = 0; y < t->height; y++) for (uint32_t x = 0; x < t->stride; x++) target_write_raw_of(t, (int)x, (int)y, in + 4 * (y * t->stride + x));
 }
+void gfx_decode_target_raw(const GfxTarget *t, uint8_t *out) {
+	const uint32_t bpp = (uint32_t)target_bpp_of(t);
+	for (uint32_t y = 0; y < t->height; y++) for (uint32_t x = 0; x < t->stride; x++)
+		memcpy(out + bpp * (y * t->stride + x), G(t->data + bpp * target_index(t, (int)x, (int)y)), bpp);
+}
+void gfx_encode_target_raw(const GfxTarget *t, const uint8_t *in) {
+	const uint32_t bpp = (uint32_t)target_bpp_of(t);
+	for (uint32_t y = 0; y < t->height; y++) for (uint32_t x = 0; x < t->stride; x++)
+		memcpy(G(t->data + bpp * target_index(t, (int)x, (int)y)), in + bpp * (y * t->stride + x), bpp);
+}
 static float factor(int f, const float s[4], const float d[4], int k) {
 	switch (f) {
 	case 0: return 0; case 1: return 1;
@@ -1412,7 +1422,7 @@ static void stats_init(void) {
 	const char *e = getenv("RECOMP_GFX_STATS");
 	gfx_stats = !e ? 0 : !strcmp(e, "black") ? 2 : 1;
 }
-typedef struct { float sx[3], sy[3], inv_area; int y0, y1, x0, x1; Vert v[3]; uint32_t draw; } Tri;
+typedef struct { float sx[3], sy[3], inv_area; int y0, y1, x0, x1; Vert v[3]; uint32_t draw; uint8_t back; } Tri;
 static DrawRec *recs; static uint32_t nrecs, cap_recs;
 static Tri *tris; static uint32_t ntris, cap_tris;
 static GfxTarget scene_target;   /* (defined with the scene state below) */
@@ -1892,6 +1902,11 @@ static void raster_rows(const Tri *t, const DrawRec *r, int ylo, int yhi) {
 	const GfxDraw *d = &r->d; const Shader *s = &r->s;
 	const Vert *v0 = &t->v[0], *v1 = &t->v[1], *v2 = &t->v[2];
 	const float *sx = t->sx, *sy = t->sy;
+	const int back = t->back && d->two_sided_stencil;
+	const uint8_t stencil_func = back ? d->back_stencil_func : d->stencil_func;
+	const uint8_t stencil_fail = back ? d->back_stencil_fail : d->stencil_fail;
+	const uint8_t depth_fail = back ? d->back_depth_fail : d->depth_fail;
+	const uint8_t depth_pass_op = back ? d->back_depth_pass : d->depth_pass;
 	int y0 = t->y0 > ylo ? t->y0 : ylo, y1 = t->y1 < yhi ? t->y1 : yhi;
 	Depth *dp = scene_depth;
 	/* RECOMP_PIXEL_CENTER: where in the pixel the sample point sits (default 0.5, the GL/D3D10 convention) */
@@ -1918,13 +1933,13 @@ static void raster_rows(const Tri *t, const DrawRec *r, int ylo, int yhi) {
 				if (do_depth) { z = b0 * v0->z + b1 * v1->z + b2 * v2->z + zbias; dz = &dp->z[y * dp->w + x]; }   /* v.z is z/w already */
 				if (do_stencil) sp = &dp->st[y * dp->w + x];
 				uint8_t m = d->stencil_cmask, ref = d->stencil_ref;
-				if (do_stencil && !depth_pass(d->stencil_func, (float)(ref & m), (float)(*sp & m))) {
-					*sp = (*sp & ~d->stencil_wmask) | (stencil_op(d->stencil_fail, *sp, ref) & d->stencil_wmask);
+				if (do_stencil && !depth_pass(stencil_func, (float)(ref & m), (float)(*sp & m))) {
+					*sp = (*sp & ~d->stencil_wmask) | (stencil_op(stencil_fail, *sp, ref) & d->stencil_wmask);
 					ST(r, st_sfail);
 					continue;
 				}
 				if (do_depth && !depth_pass(d->depth_func, z, *dz)) {
-					if (do_stencil) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(d->depth_fail, *sp, ref) & d->stencil_wmask);
+					if (do_stencil) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(depth_fail, *sp, ref) & d->stencil_wmask);
 					ST(r, st_dfail);
 					continue;
 				}
@@ -1948,7 +1963,7 @@ static void raster_rows(const Tri *t, const DrawRec *r, int ylo, int yhi) {
 				if (s->sampler && c[3] <= 0.0f) { ST(r, st_discard); continue; }
 			}
 			if (dz && d->depth_write) *dz = z;
-			if (sp) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(d->depth_pass, *sp, d->stencil_ref) & d->stencil_wmask);
+			if (sp) *sp = (*sp & ~d->stencil_wmask) | (stencil_op(depth_pass_op, *sp, d->stencil_ref) & d->stencil_wmask);
 			if (d->vis_addr) __atomic_fetch_add(&((DrawRec *)r)->vis_count, 1, __ATOMIC_RELAXED);
 			/* sceGxmSetFrontFragmentProgramEnable(..., DISABLED): depth/stencil above still ran
 			 * (matching real hardware: a depth/shadow prepass that writes no colour at all) */
@@ -2035,10 +2050,11 @@ static void record_tri_clipped(const Vert *a, const Vert *b, const Vert *c3) {
 	 * driver's CULL_CW/CULL_CCW name the winding to cull by that same (clip-space, pre-viewport)
 	 * sense (Vita3K's gxm_to_vulkan.cpp maps CULL_CW to culling the winding opposite its own
 	 * CCW-is-front pipeline convention, i.e. literally "cull clockwise"). */
+	float area_ndc = (xn[1] - xn[0]) * (yn[2] - yn[0]) - (xn[2] - xn[0]) * (yn[1] - yn[0]);
 	if (d->cull == 1 || d->cull == 2) {
-		float area_ndc = (xn[1] - xn[0]) * (yn[2] - yn[0]) - (xn[2] - xn[0]) * (yn[1] - yn[0]);
 		if ((d->cull == 1 && area_ndc < 0) || (d->cull == 2 && area_ndc > 0)) { ST(rec, st_culled); return; }
 	}
+	t.back = area_ndc < 0;
 	float area = (t.sx[1] - t.sx[0]) * (t.sy[2] - t.sy[0]) - (t.sx[2] - t.sx[0]) * (t.sy[1] - t.sy[0]);
 	if (area == 0) { ST(rec, st_zero); return; }
 	t.inv_area = 1.0f / area;

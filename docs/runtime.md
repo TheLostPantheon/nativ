@@ -74,6 +74,12 @@ through SDL's GPU API: Metal on macOS, by way of SPIRV-Cross, and Vulkan elsewhe
   (`gfx/usse_spirv.c`) and cached by its content, since the shader patcher moves programs around between frames.
 - **Everything stays on the GPU.** Render targets keep the precision of their Vita format. Guest memory is only
   written when something reads it: a screenshot, a CPU write into a target, or a format pairing without a view.
+- **Packed target words stay exact.** A fragment program that writes U32/S32 payload words into an RGBA16F surface
+  uses an R16G16B16A16 UNORM backing while those draws run. This preserves every bit, including patterns that look
+  like half-float NaNs and would otherwise be canonicalised by a floating-point attachment.
+- **Depth and stencil state stays face-correct.** Front and back faces can use distinct Vita stencil comparisons and
+  operations. Deferred light volumes rely on opposing increment/decrement depth-fail operations to keep their
+  geometry out of the lit image.
 - **Views.** When a game reads a target's memory as a texture in another format, layout or region, the backend
   builds a view on the GPU that holds what the software decoder would have read. A view is rebuilt only when its
   target changes.

@@ -174,10 +174,12 @@ int main(int argc, char **argv) {
 				                                                   d.tex[k].min_filter, d.tex[k].mag_filter, d.tex[k].u_mode, d.tex[k].v_mode);
 				printf("  blend %d %#x %x%x %x%x %x%x", d.blend.present, d.blend.mask, d.blend.color_func, d.blend.alpha_func, d.blend.color_src, d.blend.color_dst, d.blend.alpha_src, d.blend.alpha_dst);
 				if (d.vis_addr) printf("  vis %#x%s", d.vis_addr, d.vis_set ? " set" : "");
-				printf("  cull %d depth %u/%d st %u %u%u%u %#x/%#x ref %u  vp %d/%d %g %g %g %g %g %g  clip %#x %u-%u %u-%u  fpoff %d  pm %u pw %u\n",
+				printf("  cull %d depth %u/%d st %u %u%u%u %#x/%#x ref %u  vp %d/%d %g %g %g %g %g %g  clip %#x %u-%u %u-%u  fpoff %d  pm %u pw %u",
 				       d.cull, d.depth_func, d.depth_write, d.stencil_func, d.stencil_fail, d.depth_fail, d.depth_pass, d.stencil_cmask, d.stencil_wmask, d.stencil_ref,
 				       d.viewport_set, d.viewport_disabled, d.vp_xoff, d.vp_xscale, d.vp_yoff, d.vp_yscale, d.vp_zoff, d.vp_zscale,
 				       d.clip_mode, d.clip_xmin, d.clip_xmax, d.clip_ymin, d.clip_ymax, d.fp_disabled, d.polygon_mode, d.point_line_width);
+				if (d.two_sided_stencil) printf("  back-st %u %u%u%u", d.back_stencil_func, d.back_stencil_fail, d.back_depth_fail, d.back_depth_pass);
+				putchar('\n');
 				continue;
 			}
 			if (getenv("RECOMP_REPLAY_INFO") && atol(getenv("RECOMP_REPLAY_INFO")) == draws + 1) {   /* what draw k's programs declare */

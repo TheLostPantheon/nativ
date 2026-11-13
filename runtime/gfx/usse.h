@@ -107,6 +107,7 @@ int usse_is_fragment(const UsseProgram *p);
 int usse_supported(const UsseProgram *p);                 /* false: hit an unimplemented instruction; caller should fall back */
 const UsseVertexLayout *usse_vertex_layout(const UsseProgram *p);     /* only valid if !is_fragment */
 const UsseFragLayout *usse_fragment_layout(const UsseProgram *p);     /* only valid if is_fragment */
+int usse_fragment_raw_color(const UsseFragLayout *fl);                /* U32/S32 words whose bytes are the target payload */
 /* find the attribute declaration (type/comps/untyped) covering PA register reg (array-aware) */
 const UsseAttrSlot *usse_find_attr(const UsseVertexLayout *vl, int reg);
 

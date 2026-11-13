@@ -197,10 +197,15 @@ static void draw_features(const GfxDraw *d, uint32_t units) {
 		feat("depth_bias", v, YES, YES, 0);
 	}
 	if (d->stencil_func != 7 || d->stencil_wmask) {
-		feat("stencil_func", cmp[d->stencil_func & 7], YES, YES, "front faces only");
+		feat("stencil_func", cmp[d->stencil_func & 7], YES, YES, 0);
 		static const char *const op[] = {"KEEP", "ZERO", "REPLACE", "INCR", "DECR", "INVERT", "INCR_WRAP", "DECR_WRAP"};
 		const uint8_t ops[3] = {d->stencil_fail, d->depth_fail, d->depth_pass};
 		for (int i = 0; i < 3; i++) feat("stencil_op", op[ops[i] & 7], YES, YES, 0);
+		if (d->two_sided_stencil) {
+			feat("back_stencil_func", cmp[d->back_stencil_func & 7], YES, YES, 0);
+			const uint8_t back_ops[3] = {d->back_stencil_fail, d->back_depth_fail, d->back_depth_pass};
+			for (int i = 0; i < 3; i++) feat("back_stencil_op", op[back_ops[i] & 7], YES, YES, 0);
+		}
 	}
 	/* SceGxmAttributeFormat: gfx_soft.c's attr_comp/attr_byte_size (shared with gfx_gpu.c) */
 	static const char *const af[] = {"U8", "S8", "U16", "S16", "U8N", "S8N", "U16N", "S16N", "F16", "F32", "UNTYPED"};

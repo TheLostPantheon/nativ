@@ -273,9 +273,12 @@ static void check_draw(uint32_t cx, const GfxDraw *d, uint32_t vp, uint32_t fp, 
 static void decode_gaps(uint32_t cx, uint32_t vgxp, uint32_t fp, uint32_t front, uint32_t cull, uint32_t prim) {
 	char v[64];
 	if (front & 0x800) {   /* +0x1c4 bit 11 two-sided: back faces use +0x1d0 (ISP word), +0x1d4 (bias), +0x1d8 (stencil) */
-		uint32_t back = RD32(cx + 0x1d0), diff = (back ^ front) & 0x01f001ffu;   /* stencil ref/enable, depth write, depth func */
-		int same = !diff && RD32(cx + 0x1d8) == RD32(cx + CX_FRONT_STENCIL) && ((RD32(cx + 0x1d4) ^ RD32(cx + CX_FRONT_VIS)) & 0x03ff0000u) == 0;
-		gfxcov_gap("two_sided", same ? "back state = front" : "back state differs", same, "back faces drawn with the front state");
+		uint32_t back = RD32(cx + 0x1d0), bst = RD32(cx + 0x1d8), fst = RD32(cx + CX_FRONT_STENCIL);
+		uint32_t diff = (back ^ front) & 0x01f001ffu;   /* stencil ref/enable, fragment/depth enable, depth func */
+		int shared = !diff && !((bst ^ fst) & 0x0000ffffu) && !((RD32(cx + 0x1d4) ^ RD32(cx + CX_FRONT_VIS)) & 0x03ff0000u);
+		int same = shared && bst == fst;
+		gfxcov_gap("two_sided", same ? "back state = front" : shared ? "back stencil operations differ" : "back state differs",
+		           same || shared, shared ? "front/back stencil operations modelled" : "back faces drawn with the front state");
 	}
 	uint32_t pm = (front >> 15) & 7;   /* SceGxmPolygonMode >> 15 (gfx.h GfxDraw.polygon_mode) */
 	int kind = gfx_prim_kind(prim);
@@ -401,7 +404,7 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		}
 	}
 	d.prim = prim; d.index_format = index_format; d.indices = indices; d.count = count;
-	/* fixed function: the front ISP and stencil words (the renderer has no separate back-face state) */
+	/* fixed function: the front ISP and stencil words, plus the compatible subset of two-sided state */
 	uint32_t front = RD32(cx + CX_FRONT), st = RD32(cx + CX_FRONT_STENCIL), cull = RD32(cx + CX_CULL);
 	d.cull = (int)(cull & 3);
 	d.polygon_mode = (uint8_t)((front >> 15) & 7); d.point_line_width = (uint8_t)((front >> 28) + 1);
@@ -414,6 +417,18 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		d.stencil_func = 7; d.stencil_cmask = d.stencil_wmask = 0xff;   /* ALWAYS, KEEP */
 	}
 	d.stencil_ref = front & 0xff;
+	if (front & 0x800) {
+		uint32_t back = RD32(cx + 0x1d0), bst = RD32(cx + 0x1d8);
+		int shared = !((back ^ front) & 0x01f001ffu) && !((bst ^ st) & 0x0000ffffu)
+		          && !((RD32(cx + 0x1d4) ^ RD32(cx + CX_FRONT_VIS)) & 0x03ff0000u);
+		if (shared && ((bst ^ st) & 0xffff0000u)) {
+			d.two_sided_stencil = 1;
+			if (back & 0x100) {
+				d.back_stencil_func = (bst >> 25) & 7; d.back_stencil_fail = (bst >> 22) & 7;
+				d.back_depth_fail = (bst >> 19) & 7; d.back_depth_pass = (bst >> 16) & 7;
+			} else d.back_stencil_func = 7;   /* ALWAYS, KEEP */
+		}
+	}
 	d.fp_disabled = (front & 0x200000) != 0;
 	d.viewport_set = 1; d.viewport_disabled = (cull & 0x10000) != 0;
 	float v[6]; memcpy(v, G(cx + CX_VIEWPORT), sizeof v);

@@ -953,6 +953,114 @@ static void imad_offsets(Gen *g, const UOp *op, int r, int off[4], int *ok) {
  * whether I8MAD should see the full packed word is a question for it, not this port) */
 static uint32_t read_word(Gen *g, const UOperand *o, int off, int *ok) { return read_raw_comp(g, o, off, 0, ok); }
 static void write_word(Gen *g, const UOperand *o, int off, uint32_t v, int *ok) { write_raw_comp(g, o, off, 0, v, ok); }
+static uint32_t sop_read_word(Gen *g, const UOperand *o, int off, int *ok) {
+	UOperand w = *o; w.type = TY_U32; w.negabs = 0;
+	return read_word(g, &w, off, ok);
+}
+static void sop_write_word(Gen *g, const UOperand *o, int off, uint32_t v, int *ok) {
+	UOperand w = *o; w.type = TY_U32;
+	write_word(g, &w, off, v, ok);
+}
+static uint32_t sop_unpack(Spv *s, uint32_t w, int lane) {
+	return fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertUToF, t_float(s), ubits(s, w, lane * 8, 8)), c_float(s, 255.0f));
+}
+static uint32_t sop_pack(Spv *s, uint32_t v) {
+	return result1(s, &s->func, SpvOpConvertFToU, t_uint(s),
+	               fop2(s, SpvOpFAdd, fop2(s, SpvOpFMul, fclamp(s, v, 0.0f, 1.0f), c_float(s, 255.0f)), c_float(s, 0.5f)));
+}
+static uint32_t sop_op(Spv *s, int op, uint32_t a, uint32_t b) {
+	switch (op) {
+	case 0: return fop2(s, SpvOpFAdd, a, b);
+	case 1: return fop2(s, SpvOpFSub, a, b);
+	case 2: return glsl2(s, GLSLFMin, a, b);
+	default: return glsl2(s, GLSLFMax, a, b);
+	}
+}
+static uint32_t sop_insert(Spv *s, uint32_t word, int lane, uint32_t v) {
+	return bitfield_insert(s, word, sop_pack(s, v), c_uint(s, (uint32_t)(lane * 8)), c_uint(s, 8));
+}
+static void emit_sop2(Gen *g, const UOp *op, int *ok) {
+	static const int unit[4] = {1, 1, 1, 1};
+	Spv *s = &g->s;
+	for (int r = 0; r < op->reps; r++) {
+		int off1 = slot_off(g, op->repmode, op->s1.bank, r, unit, 1, ok);
+		int off2 = slot_off(g, op->repmode, op->s2.bank, r, unit, 2, ok);
+		int offd = slot_off(g, op->repmode, op->dst.bank, r, unit, 3, ok);
+		uint32_t w1 = sop_read_word(g, &op->s1, off1, ok), w2 = sop_read_word(g, &op->s2, off2, ok);
+		if (!*ok) return;
+		uint32_t s1[4], s2[4];
+		for (int k = 0; k < 4; k++) {
+			s1[k] = sop_unpack(s, w1, k); s2[k] = sop_unpack(s, w2, k);
+			if (op->s1.negabs & 1) s1[k] = fop2(s, SpvOpFSub, c_float(s, 1.0f), s1[k]);
+		}
+		uint32_t out = c_uint(s, 0);
+		for (int k = 0; k < 4; k++) {
+			int sel1 = k < 3 ? op->args[0] & 0xff : op->args[2] & 0xff;
+			int sel2 = k < 3 ? op->args[1] & 0xff : op->args[3] & 0xff;
+			int mod1 = k < 3 ? op->args[0] & 0x100 : op->args[2] & 0x100;
+			int mod2 = k < 3 ? op->args[1] & 0x100 : op->args[3] & 0x100;
+			uint32_t f1, f2;
+			if (k < 3) {
+				f1 = sel1 == 1 ? s1[k] : sel1 == 2 ? s2[k] : sel1 == 3 ? s1[3] : sel1 == 4 ? s2[3] : c_float(s, 0.0f);
+				f2 = sel2 == 1 ? s1[k] : sel2 == 2 ? s2[k] : sel2 == 3 ? s1[3] : sel2 == 4 ? s2[3] : c_float(s, 0.0f);
+			} else {
+				f1 = sel1 == 1 ? s1[3] : sel1 == 2 ? s2[3] : c_float(s, 0.0f);
+				f2 = sel2 == 1 ? s1[3] : sel2 == 2 ? s2[3] : c_float(s, 0.0f);
+			}
+			if (mod1) f1 = fop2(s, SpvOpFSub, c_float(s, 1.0f), f1);
+			if (mod2) f2 = fop2(s, SpvOpFSub, c_float(s, 1.0f), f2);
+			uint32_t v = sop_op(s, k < 3 ? op->sub : op->sub2,
+			                    fop2(s, SpvOpFMul, f1, s1[k]), fop2(s, SpvOpFMul, f2, s2[k]));
+			out = sop_insert(s, out, k, v);
+		}
+		sop_write_word(g, &op->dst, offd, out, ok);
+	}
+}
+static void emit_sop2m(Gen *g, const UOp *op, int *ok) {
+	Spv *s = &g->s;
+	uint32_t w1 = sop_read_word(g, &op->s1, 0, ok), w2 = sop_read_word(g, &op->s2, 0, ok);
+	uint32_t out = sop_read_word(g, &op->dst, 0, ok);
+	if (!*ok) return;
+	uint32_t s1[4], s2[4];
+	for (int k = 0; k < 4; k++) { s1[k] = sop_unpack(s, w1, k); s2[k] = sop_unpack(s, w2, k); }
+	for (int k = 0; k < 4; k++) if (op->mask & (1 << k)) {
+		int sel1 = op->args[0] & 0xff, sel2 = op->args[1] & 0xff;
+		uint32_t f1 = sel1 == 2 ? s1[k] : sel1 == 3 ? s1[3] : sel1 == 6 ? s2[k] : sel1 == 7 ? s2[3] : c_float(s, 0.0f);
+		uint32_t f2 = sel2 == 2 ? s1[k] : sel2 == 3 ? s1[3] : sel2 == 6 ? s2[k] : sel2 == 7 ? s2[3] : c_float(s, 0.0f);
+		if (op->args[0] & 0x100) f1 = fop2(s, SpvOpFSub, c_float(s, 1.0f), f1);
+		if (op->args[1] & 0x100) f2 = fop2(s, SpvOpFSub, c_float(s, 1.0f), f2);
+		uint32_t v = sop_op(s, k < 3 ? op->sub : op->sub2,
+		                    fop2(s, SpvOpFMul, f1, s1[k]), fop2(s, SpvOpFMul, f2, s2[k]));
+		out = sop_insert(s, out, k, v);
+	}
+	sop_write_word(g, &op->dst, 0, out, ok);
+}
+static void emit_sop3(Gen *g, const UOp *op, int *ok) {
+	Spv *s = &g->s;
+	uint32_t w0 = sop_read_word(g, &op->s0, 0, ok), w1 = sop_read_word(g, &op->s1, 0, ok), w2 = sop_read_word(g, &op->s2, 0, ok);
+	if (!*ok) return;
+	uint32_t s0[4], s1[4], s2[4];
+	for (int k = 0; k < 4; k++) { s0[k] = sop_unpack(s, w0, k); s1[k] = sop_unpack(s, w1, k); s2[k] = sop_unpack(s, w2, k); }
+	uint32_t out = c_uint(s, 0);
+	for (int k = 0; k < 4; k++) {
+		int sel1 = k < 3 ? op->args[0] & 0xff : op->args[2] & 0xff;
+		int sel2 = op->args[1] & 0xff;
+		uint32_t f1, f2;
+		if (k < 3) {
+			f1 = sel1 == 2 ? s1[k] : sel1 == 3 ? s1[3] : sel1 == 4 ? s0[k] : sel1 == 5 ? s0[3] : sel1 == 6 ? s2[k] : sel1 == 7 ? s2[3] : c_float(s, 0.0f);
+			f2 = sel2 == 2 ? s1[k] : sel2 == 3 ? s1[3] : sel2 == 4 ? s0[k] : sel2 == 5 ? s0[3] : sel2 == 6 ? s2[k] : sel2 == 7 ? s2[3] : c_float(s, 0.0f);
+		} else {
+			f1 = sel1 == 1 ? s0[3] : sel1 == 2 ? s1[3] : sel1 == 3 ? s2[3] : c_float(s, 0.0f);
+			f2 = sel2 == 2 || sel2 == 3 ? s1[3] : sel2 == 4 || sel2 == 5 ? s0[3] : sel2 == 6 || sel2 == 7 ? s2[3] : c_float(s, 0.0f);
+		}
+		if (k < 3 ? op->args[0] & 0x100 : op->args[2] & 0x100) f1 = fop2(s, SpvOpFSub, c_float(s, 1.0f), f1);
+		if (op->args[1] & 0x100) f2 = fop2(s, SpvOpFSub, c_float(s, 1.0f), f2);
+		uint32_t v = sop_op(s, k < 3 ? op->sub : op->sub2,
+		                    fop2(s, SpvOpFMul, f1, s1[k]), fop2(s, SpvOpFMul, f2, s2[k]));
+		out = sop_insert(s, out, k, v);
+	}
+	sop_write_word(g, &op->dst, 0, out, ok);
+}
 static void emit_i8mad(Gen *g, const UOp *op, int *ok) {
 	Spv *s = &g->s;
 	for (int r = 0; r < op->reps; r++) {
@@ -1043,7 +1151,8 @@ void usse_spirv_key(const UsseProgram *prog, const UsseFragLayout *fl, const uin
 	if (fl) for (int i = 0; i < fl->niters; i++) if (fl->iters[i].is_tex && fl->iters[i].tex_unit >= 0 && fl->iters[i].tex_unit < 16) used |= 1u << fl->iters[i].tex_unit;
 	if (cube_mask) *cube_mask &= used;
 	if (snap_mask) *snap_mask &= used;
-	if (color_kind && *color_kind >= 0) *color_kind = fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes) */
+	if (color_kind && *color_kind >= 0) *color_kind = fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32)
+		&& (*color_kind == 1 || *color_kind == 2 || *color_kind == USSE_COLOR_KIND_F16_RAW) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by target storage) */
 }
 uint32_t usse_spirv_predict_cube(const UsseProgram *prog, const UsseFragLayout *fl, const uint32_t sa_tex_unit[256]) {
 	uint32_t m = 0; int n = 0; const UOp *code = usse_program_code(prog, 0, &n);
@@ -1706,6 +1815,7 @@ static void emit_frag_epilogue(Gen *g, int *ok) {
 		for (int c = 0; c < 4; c++) {
 			if (g->color_kind == 2) comp[c] = result1(s, &s->func, SpvOpBitcast, t_float(s), w[c]);                 /* RGBA32F: a word a channel */
 			else if (g->color_kind == 1) comp[c] = half_to_float_spv(s, extract_lane_spv(s, w[c / 2], TY_F16, c & 1));   /* RGBA16F: halves */
+			else if (g->color_kind == USSE_COLOR_KIND_F16_RAW) comp[c] = fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertUToF, t_float(s), extract_lane_spv(s, w[c / 2], TY_U16, c & 1)), c_float(s, 65535.0f));   /* RGBA16_UNORM: halves as exact integers */
 			else comp[c] = fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertUToF, t_float(s), extract_lane_spv(s, w[0], TY_U8, c)), c_float(s, 255.0f));   /* RGBA8: bytes */
 		}
 		if (!*ok) return;
@@ -2216,9 +2326,9 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	}
 
 	/* walk the program. Predicated forward branches ("(!p0) BR +k": skip the next k-1 instructions
-	 * unless p0) become a structured if around the skipped range; ranges nest, each closed when the
-	 * walk reaches its target. Backward branches, unconditional ones and link-saving calls aren't
-	 * translated (usse.c runs them; none of the three games' programs seen so far use them). */
+	 * unless p0) become structured selections. The common if/else form ends that fall-through range
+	 * with an unconditional forward branch over the other arm; both labels and the merge are emitted
+	 * here. Ranges nest. Backward branches and link-saving calls aren't translated. */
 	/* filtered shadows (usse_spirv_set_pcf): the walk and the epilogue below run once per tap, each from the
 	 * register file as the prologue left it and with the shadow map's SMPs moved by its grid step, and the
 	 * colours they write are averaged. The game's own compare and everything after it run per tap, so the
@@ -2264,23 +2374,35 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 				g.pcf_dv = fop2(s, SpvOpFMul, pcf_step[1], c_float(s, (float)(tap / side) - (float)(side - 1) * 0.5f));
 			}
 		}
-		struct { int end; uint32_t merge; } brstack[8]; int nbr = 0;
+		struct { int end, else_at; uint32_t merge, else_label; } brstack[8]; int nbr = 0;
 		for (int i = 0; i < n && ok; i++) {
 			const UOp *op = &code[i];
 			while (nbr && brstack[nbr - 1].end <= i) { INS(&s->func, SpvOpBranch, brstack[nbr - 1].merge); INS(&s->func, SpvOpLabel, brstack[nbr - 1].merge); nbr--; }
+			if (nbr && brstack[nbr - 1].else_at == i) {
+				INS(&s->func, SpvOpBranch, brstack[nbr - 1].merge);
+				INS(&s->func, SpvOpLabel, brstack[nbr - 1].else_label);
+				brstack[nbr - 1].else_at = -1;
+				continue;
+			}
 			if (op->op == OP_BR) {
 				int target = i + (int)op->imm;
-				if (op->pred_kind == 0 || op->imm <= 0 || op->args[0] || target > n || (nbr && target > brstack[nbr - 1].end) || nbr >= 8) {
+				int end = target, else_at = -1;
+				const UOp *tail = target > i + 1 && target <= n ? &code[target - 1] : 0;
+				if (op->pred_kind && tail && tail->op == OP_BR && !tail->pred_kind && !tail->args[0] && tail->imm > 1) {
+					int merge = target - 1 + (int)tail->imm;
+					if (merge > target && merge <= n) { end = merge; else_at = target - 1; }
+				}
+				if (op->pred_kind == 0 || op->imm <= 0 || op->args[0] || target > n || (nbr && end > brstack[nbr - 1].end) || nbr >= 8) {
 					snprintf(m.err, sizeof m.err, "branch at instruction %d (%s, offset %d) outside the structured forms translated", i, op->pred_kind ? "predicated" : "unconditional", (int)op->imm); ok = 0; break;
 				}
 				uint32_t p = load(s, t_bool(s), pred_ptr(&g, op->pred_reg));
 				uint32_t taken = op->pred_kind == 1 ? p : result1(s, &s->func, SpvOpLogicalNot, t_bool(s), p);
 				uint32_t run = result1(s, &s->func, SpvOpLogicalNot, t_bool(s), taken);   /* the skipped range runs when the branch is NOT taken */
-				uint32_t then = nid(s), merge = nid(s);
+				uint32_t then = nid(s), other = else_at >= 0 ? nid(s) : 0, merge = nid(s);
 				INS(&s->func, SpvOpSelectionMerge, merge, 0 /*None*/);
-				INS(&s->func, SpvOpBranchConditional, run, then, merge);
+				INS(&s->func, SpvOpBranchConditional, run, then, other ? other : merge);
 				INS(&s->func, SpvOpLabel, then);
-				brstack[nbr].end = target; brstack[nbr].merge = merge; nbr++;
+				brstack[nbr].end = end; brstack[nbr].else_at = else_at; brstack[nbr].merge = merge; brstack[nbr].else_label = other; nbr++;
 				continue;
 			}
 			/* (pN) / (!pN) predication: the instruction runs inside a structured if on the predicate
@@ -2318,6 +2440,9 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 			case OP_VTST: emit_vtst(&g, op, &ok); break;
 			case OP_VTSTMSK: emit_vtstmsk(&g, op, &ok); break;
 			case OP_VBW: emit_vbw(&g, op, &ok); break;
+			case OP_SOP2: emit_sop2(&g, op, &ok); break;
+			case OP_SOP2M: emit_sop2m(&g, op, &ok); break;
+			case OP_SOP3: emit_sop3(&g, op, &ok); break;
 			case OP_I8MAD: emit_i8mad(&g, op, &ok); break;
 			case OP_I16MAD: emit_i16mad(&g, op, &ok); break;
 			case OP_I32MAD: emit_i32mad(&g, op, &ok); break;
