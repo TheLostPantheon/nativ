@@ -28,6 +28,7 @@ copy of each game and Sony's firmware update file, and the tools decrypt and rec
 | Game | Release | Title ID | Versions |
 |---|---|---|---|
 | Killzone: Mercenary | US | PCSA00107 | 1.00, 1.12 (recommended: Botzone and online play) |
+| Resistance: Burning Skies | EU | PCSF00141 | 1.02 |
 | Uncharted: Golden Abyss | US | PCSA00029 | 1.00 |
 | Unit 13 | US | PCSA00014 | 1.00 |
 | Shovel Knight | US | PCSE00640 | 1.00 |
@@ -36,10 +37,10 @@ Each game's pack supports exact releases, recognised by the SHA-256 of the game'
 such as Killzone's physics fix or the widescreen cameras, patch code at fixed addresses, so they only fit the build
 they were written for. Your game data doesn't need to match; the main program does.
 
-Not supported yet: other regions (EU, JP, Asia) and the later updates of Uncharted (1.03), Unit 13 (1.01) and Shovel
-Knight (1.08, Treasure Trove). The launcher recognises them and tells you which release it supports. It keeps an
-unsupported update, and the game runs without it. Porting a new release starts with `dev/hookmap.py`, which carried
-43 of Killzone 1.12's 46 hooks over from 1.00 by matching code.
+Other regional editions and versions need their own exact pack entries. The later updates of Uncharted (1.03), Unit
+13 (1.01) and Shovel Knight (1.08, Treasure Trove) are not supported yet. The launcher recognises them and tells you
+which release it supports. It keeps an unsupported update, and the game runs without it. Porting a new release starts
+with `dev/hookmap.py`, which carried 43 of Killzone 1.12's 46 hooks over from 1.00 by matching code.
 
 ## Getting started
 
