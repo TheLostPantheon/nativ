@@ -90,7 +90,8 @@ for os in "$@"; do
           xcrun notarytool submit "$Z" --keychain-profile "$NATIV_NOTARY_PROFILE" --wait | tail -2
           xcrun stapler staple -q "$Z"; spctl --assess --type open --context context:primary-signature -v "$Z" 2>&1 | tail -1
         fi
-      fi;;
+      fi
+      bash "$H/macos-smoke.sh" "$Z";;
     windows)
       bash "$H/windows-install.sh" "$I"
       # every file with its size: the launcher checks them at start (a zip unpacked part way lost a player Python's modules)
