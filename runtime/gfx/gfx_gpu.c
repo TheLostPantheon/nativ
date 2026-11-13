@@ -2205,7 +2205,7 @@ static void pipe_create_info(const GfxDraw *d, const ShaderEntry *vs, const Shad
 	 * gradient, specifically) -- so the winding convention this pipeline's CCW front_face implies
 	 * isn't pinned down yet; left off (as before) rather than guessed at. */
 	ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl;   /* resolved by the caller from SceGxmCullMode and the viewport's y flip (see gfx_gpu_draw) */
-	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
 	ci.rasterizer_state.enable_depth_clip = false;   /* clamp, not clip: gfx_soft.c (the reference) never discards a fragment for its z being outside [0,w], only for failing the depth test */
 	if (d->depth_bias_factor || d->depth_bias_units) {   /* polygon offset (GfxDraw.depth_bias_*): units in the depth format's steps, factor on the slope */
 		ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor = (float)d->depth_bias_units;
@@ -3755,6 +3755,11 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	static const uint8_t sw1[8][4] = { {0,4,4,5}, {0,4,4,4}, {0,5,5,5}, {0,0,0,0}, {0,0,0,4}, {0,0,0,5}, {4,4,4,0}, {5,5,5,0} };
 	int ncomp = xb == 0x0c000000u || xb == 0x0d000000u || xb == 0x1b000000u ? 4 : xb == 0x00000000u || xb == 0x12000000u ? 1 : 0;
 	for (int k = 0; k < 4; k++) swz[k] = ncomp == 4 ? sw4[sw][k] : ncomp == 1 ? sw1[sw][k] : (uint32_t)k;
+	if (tb == 0x01000000u) {
+		static const uint8_t inv_order[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
+		uint32_t order = (tgt_fmt >> 20) & 3;
+		for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = inv_order[order][swz[k]];
+	}
 	switch (tb) {
 	case 0x80800000u: *tex_bpp = 1; return xb == 0x00000000u ? 5 : -1;                          /* U8 as U8 */
 	case 0xB0800000u: *tex_bpp = 2; if (xb != 0x07000000u) return -1;                         /* U8U8 as U8U8: the RGBA8 target's r, g (gfx_soft.c stores R in the
@@ -5720,16 +5725,12 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	/* ds_format 0 (an old capture, or a surface we never saw ourselves): both planes present, as before */
 	int ds_depth_ok = !scene_target.ds_data || (scene_target.ds_format & 0x00044000u) != 0;
 	int ds_stencil_ok = !scene_target.ds_data || (scene_target.ds_format & 0x00022000u) != 0;
-	/* SceGxmCullMode against the NDC winding (gfx_soft.c's record_tri: CW culls a negative NDC
-	 * area, CCW a positive one). SDL_GPU's front face is in its NDC too (y up, as Metal evaluates
-	 * it; its Vulkan backend flips the viewport and the winding itself), and the game's clip
-	 * position goes to gl_Position untouched, so CW is simply the back face of a CCW-front
-	 * pipeline, whatever the viewport does with y. Checked on Unit 13's frame 1200: the other
-	 * convention culls the full-screen ambient pass entirely. RECOMP_GPU_CULL_SWAP=1: that other
-	 * convention, for diagnosis. */
+	/* SceGxmCullMode names the NDC winding to cull. The pipeline's clockwise front face instead
+	 * matches GXM's post-viewport front/back stencil sense, so the corresponding SDL cull face is
+	 * inverted here. RECOMP_GPU_CULL_SWAP=1 keeps the opposite mapping for diagnosis. */
 	static int swap = -1; if (swap < 0) swap = getenv("RECOMP_GPU_CULL_SWAP") != 0;
-	int cull_sdl = g_points_draw ? SDL_GPU_CULLMODE_NONE : d->cull == 1 ? (swap ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK)
-	             : d->cull == 2 ? (swap ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT) : SDL_GPU_CULLMODE_NONE;
+	int cull_sdl = g_points_draw ? SDL_GPU_CULLMODE_NONE : d->cull == 1 ? (swap ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT)
+	             : d->cull == 2 ? (swap ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK) : SDL_GPU_CULLMODE_NONE;
 	uint64_t tp0 = us_now();
 	PipeEntry *pipe = get_pipeline(d, vs, fs, scene_target.depth != 0, scene_entry->kind, ds_depth_ok, ds_stencil_ok, cull_sdl, -1, 0);
 	t_pipe += us_now() - tp0;

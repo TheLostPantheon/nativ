@@ -43,6 +43,15 @@
 
 uint8_t *recomp_mem;
 
+static void env_default(const char *name, const char *value) {
+	if (getenv(name)) return;
+#ifdef _WIN32
+	_putenv_s(name, value);
+#else
+	setenv(name, value, 0);
+#endif
+}
+
 /* what the graphics code expects from the rest of the host */
 int guest_mem_ranges(uint32_t lo[], uint32_t hi[], int max) { (void)lo; (void)hi; (void)max; return 0; }   /* no capturing a replay */
 /* metrics.c links in for gfx_dispatch.c's hooks (render time, scene/draw counts) and references
@@ -54,6 +63,7 @@ uint32_t guest_alloc(uint32_t size, uint32_t align) { (void)size; (void)align; r
 uint64_t guest_time_us_peek(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch) { (void)base; (void)w; (void)h; (void)pitch; }
 int window_active(void) { return 0; }   /* no window: gfx_gpu.c presents through guest memory, as the shots need */
+int window_gpu_direct_present(void) { return 0; }
 void window_present_gpu(void *tex, uint32_t w, uint32_t h, int raw) { (void)tex; (void)w; (void)h; (void)raw; }
 void *window_gpu_device(void) {
 	static SDL_GPUDevice *dev; static int tried;
@@ -79,7 +89,9 @@ static void write_frame(const char *path, uint32_t base, uint32_t w, uint32_t h,
 
 int main(int argc, char **argv) {
 	if (argc < 2) { fprintf(stderr, "usage: gfxreplay <capture.vfc> [out.ppm]\n"); return 1; }
-	setenv("RECOMP_SHADER_CACHE", "0", 0);   /* gfx_gpu.c's MSL cache is opt-in here (RECOMP_SHADER_CACHE=dir): a replay run from any directory leaves no shader_cache/ behind, and RECOMP_GPU_STATS times real translations */
+	/* gfx_gpu.c's MSL cache is opt-in here (RECOMP_SHADER_CACHE=dir): a replay run from any
+	 * directory leaves no shader_cache/ behind, and RECOMP_GPU_STATS times real translations. */
+	env_default("RECOMP_SHADER_CACHE", "0");
 	const char *outp = argc > 2 ? argv[2] : "replay.ppm";
 	recomp_mem = plat_reserve(1ull << 32);
 	if (!recomp_mem) { fprintf(stderr, "can't reserve the 4 GiB guest address space\n"); return 1; }
@@ -294,6 +306,6 @@ int main(int argc, char **argv) {
 }
 /* gfx_gpu.c asks the window how much wider than native to render (window.c); a replay renders native */
 /* replays compare against the software path: no anisotropic filtering unless RECOMP_ANISO asks (gfx_gpu.c aniso_want) */
-__attribute__((constructor)) static void replay_aniso_default(void) { setenv("RECOMP_ANISO", "1", 0); setenv("RECOMP_SHADOW_FILTER", "0", 0); }   /* (replays compare against the software path: no anisotropy, the game's own one-tap shadows, unless asked) */
+__attribute__((constructor)) static void replay_aniso_default(void) { env_default("RECOMP_ANISO", "1"); env_default("RECOMP_SHADOW_FILTER", "0"); }   /* (replays compare against the software path: no anisotropy, the game's own one-tap shadows, unless asked) */
 float window_aspect_widen(void) { const char *e = getenv("RECOMP_REPLAY_WIDEN"); return e ? (float)atof(e) : 1.0f; }   /* RECOMP_REPLAY_WIDEN=k: test the wider-x paths */
 void overlay_toast(const char *msg, double seconds) { (void)msg; (void)seconds; }   /* (F4's FSR toggle says so on screen: no window here) */

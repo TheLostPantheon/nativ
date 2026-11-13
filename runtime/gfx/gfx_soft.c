@@ -1227,10 +1227,8 @@ static uint32_t target_index(const GfxTarget *t, int x, int y) {
 	}
 	return (uint32_t)y * t->stride + (uint32_t)x;
 }
-/* U4U4U4U4 targets: output channel k (R, G, B, A) is nibble u4_order[swizzle][k] -- ABGR, ARGB,
- * RGBA, BGRA, the byte orders of the 8-bit default case (R in the low nibble, as the texture
- * decode reads the format) */
-static const uint8_t u4_order[4][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {3, 2, 1, 0}, {1, 2, 3, 0}};
+/* Output channel k (R, G, B, A) occupies color_order[order][k] in the surface. */
+static const uint8_t color_order[4][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {3, 2, 1, 0}, {1, 2, 3, 0}};
 static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]);
 /* an sRGB colour surface (gfx.h GFX_TGT_GAMMA; U8U8U8U8, the one family the GPU's sRGB targets
  * cover): reads decode the colour channels to linear -- blending and FRAGCOLOR preloads see what
@@ -1244,7 +1242,12 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 	uint32_t a = t->data + target_bpp_of(t) * target_index(t, x, y);
 	switch (target_base_of(t)) {
 	case 0x30000000u: { uint16_t p = RD16(a); c[0] = (p >> 11) / 31.f; c[1] = ((p >> 5) & 63) / 63.f; c[2] = (p & 31) / 31.f; c[3] = 1; return; }
-	case 0x01000000u: for (int k = 0; k < 4; k++) c[k] = half_to_float_soft(RD16(a + 2 * k)); return;
+	case 0x01000000u: {
+		float p[4]; const uint8_t *o = color_order[(t->format >> 20) & 3];
+		for (int k = 0; k < 4; k++) p[k] = half_to_float_soft(RD16(a + 2 * k));
+		for (int k = 0; k < 4; k++) c[k] = p[o[k]];
+		return;
+	}
 	case 0x00800000u: c[0] = half_to_float_soft(RD16(a)); c[1] = half_to_float_soft(RD16(a + 2)); c[2] = 0; c[3] = 1; return;
 	case 0x11000000u: { uint32_t r = RD32(a), g = RD32(a + 4); memcpy(&c[0], &r, 4); memcpy(&c[1], &g, 4); c[2] = 0; c[3] = 1; return; }
 	case 0x10800000u: { uint32_t r = RD32(a); memcpy(&c[0], &r, 4); c[1] = c[2] = 0; c[3] = 1; return; }
@@ -1265,7 +1268,7 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 	case 0x50000000u: {   /* U4U4U4U4: four nibbles in the 8-bit case's channel orders (ABGR: R lowest). Killzone:
 	                       * Mercenary renders a few small masks into one; the 4-byte default below read and
 	                       * wrote two pixels at a time at this format's 2-byte stride */
-		uint16_t p = RD16(a); const uint8_t *o = u4_order[(t->format >> 20) & 3];
+		uint16_t p = RD16(a); const uint8_t *o = color_order[(t->format >> 20) & 3];
 		for (int k = 0; k < 4; k++) c[k] = ((p >> (4 * o[k])) & 15) / 15.f;
 		return;
 	}
@@ -1296,7 +1299,12 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	uint32_t a = t->data + target_bpp_of(t) * target_index(t, x, y);
 	switch (target_base_of(t)) {
 	case 0x30000000u: { uint32_t r = to8(c[0]) >> 3, g = to8(c[1]) >> 2, b = to8(c[2]) >> 3; WR16(a, (uint16_t)(r << 11 | g << 5 | b)); return; }
-	case 0x01000000u: for (int k = 0; k < 4; k++) WR16(a + 2 * k, float_to_half_soft(c[k])); return;
+	case 0x01000000u: {
+		float p[4]; const uint8_t *o = color_order[(t->format >> 20) & 3];
+		for (int k = 0; k < 4; k++) p[o[k]] = c[k];
+		for (int k = 0; k < 4; k++) WR16(a + 2 * k, float_to_half_soft(p[k]));
+		return;
+	}
 	case 0x00800000u: WR16(a, float_to_half_soft(c[0])); WR16(a + 2, float_to_half_soft(c[1])); return;
 	case 0x11000000u: { uint32_t r, g; memcpy(&r, &c[0], 4); memcpy(&g, &c[1], 4); WR32(a, r); WR32(a + 4, g); return; }
 	case 0x10800000u: { uint32_t r; memcpy(&r, &c[0], 4); WR32(a, r); return; }
@@ -1313,7 +1321,7 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	case 0x20800000u: WR16(a, (uint16_t)to16s(c[0])); return;                          /* S16 */
 	case 0x50000000u: {   /* U4U4U4U4 (target_read_of's layout), quantised from the 8-bit value so the GPU path's
 	                       * RGBA8 round trip (gfx_encode_target_rgba8) stores exactly the nibbles this path does */
-		const uint8_t *o = u4_order[(t->format >> 20) & 3]; uint32_t p = 0;
+		const uint8_t *o = color_order[(t->format >> 20) & 3]; uint32_t p = 0;
 		for (int k = 0; k < 4; k++) p |= ((to8(c[k]) * 15 + 127) / 255) << (4 * o[k]);
 		WR16(a, (uint16_t)p); return;
 	}
@@ -2054,9 +2062,11 @@ static void record_tri_clipped(const Vert *a, const Vert *b, const Vert *c3) {
 	if (d->cull == 1 || d->cull == 2) {
 		if ((d->cull == 1 && area_ndc < 0) || (d->cull == 2 && area_ndc > 0)) { ST(rec, st_culled); return; }
 	}
-	t.back = area_ndc < 0;
 	float area = (t.sx[1] - t.sx[0]) * (t.sy[2] - t.sy[0]) - (t.sx[2] - t.sx[0]) * (t.sy[1] - t.sy[0]);
 	if (area == 0) { ST(rec, st_zero); return; }
+	/* Front/back stencil state follows the post-viewport winding. Screen y grows downward, so a
+	 * positive area is the Vita's clockwise front face. Culling above stays in the API's NDC sense. */
+	t.back = area < 0;
 	t.inv_area = 1.0f / area;
 	t.x0 = (int)fminf(fminf(t.sx[0], t.sx[1]), t.sx[2]); t.x1 = (int)fmaxf(fmaxf(t.sx[0], t.sx[1]), t.sx[2]) + 1;
 	t.y0 = (int)fminf(fminf(t.sy[0], t.sy[1]), t.sy[2]); t.y1 = (int)fmaxf(fmaxf(t.sy[0], t.sy[1]), t.sy[2]) + 1;
