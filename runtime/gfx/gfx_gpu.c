@@ -2539,9 +2539,13 @@ static void target_alias_sync(TargetEntry *e) {
  * target seen read that way (TargetEntry.self_read), the target goes to guest memory once, and memory holds the scene's
  * starting pixels for all its draws. Reads of other parts of the target keep the target as rendered so far, as the
  * tile order makes them on the console for regions finished earlier (Killzone's bloom atlas reads its earlier levels
- * in the same scene). "The part it is drawing": the texture's rectangle covers at least half of the draw's clip rect. */
+ * in the same scene). "The part it is drawing": the sampled surface and the draw's actual vertex extent overlap by at
+ * least half of each. Requiring overlap in both directions distinguishes an in-place strip from a small level written
+ * into a texture descriptor spanning a whole post-processing atlas. */
 static int scene_snap;                               /* the current scene's starting pixels: 1 in guest memory, 2 in its GPU snapshot (target_snapshot) */
 static int cur_wx0, cur_wy0, cur_wx1, cur_wy1;       /* the draw being recorded: its clip rect, target pixels */
+static const GfxDraw *cur_bounds_draw;
+static int cur_bounds_state, cur_bx0, cur_by0, cur_bx1, cur_by1;
 /* The starting pixels on the GPU instead (RECOMP_GPU_SNAP=0|1; on by default with Vulkan, as RECOMP_GPU_TRANSFER): a copy of the target taken as
  * the scene begins, which those reads sample (target_view: a view or mip_view of the snapshot). The download made Killzone's
  * strip scene a fence wait on the GPU every frame, 4.3 ms on the RTX laptop. Anything that can only read the starting pixels
@@ -2572,17 +2576,52 @@ static void snap_to_guest(TargetEntry *e) {   /* the guest-memory path needs the
 	e->gpu_dirty = 1;   /* (the target itself has drawn on since) */
 	scene_snap = 1;
 }
-static int same_region_read(const GfxTexture *tex) {
-	if (!scene_entry || scene_entry == &scratch_entry || !tex || !tex->data) return 0;
+static void current_write_bounds(int *x0, int *y0, int *x1, int *y1) {
+	if (!cur_bounds_state) {
+		static GfxBoundsJob *job;
+		float b[6];
+		cur_bx0 = cur_wx0; cur_by0 = cur_wy0; cur_bx1 = cur_wx1; cur_by1 = cur_wy1;
+		int r = cur_bounds_draw && (job || (job = gfx_bounds_job_new())) ? gfx_bounds_prepare(job, cur_bounds_draw) : 0;
+		if (r == 1) gfx_bounds_run(job);
+		if (r && gfx_bounds_result(job, b)) {
+			float px[2], py[2];
+			for (int k = 0; k < 2; k++) {
+				float nx = b[k], ny = b[2 + k];
+				if (cur_bounds_draw->viewport_set && cur_bounds_draw->viewport_disabled) { px[k] = nx; py[k] = ny; }
+				else if (cur_bounds_draw->viewport_set) {
+					px[k] = cur_bounds_draw->vp_xoff + cur_bounds_draw->vp_xscale * nx;
+					py[k] = cur_bounds_draw->vp_yoff + cur_bounds_draw->vp_yscale * ny;
+				} else {
+					uint32_t vw = scene_target.width && scene_target.width <= scene_entry->width ? scene_target.width : scene_entry->width;
+					px[k] = (nx + 1) * 0.5f * (float)vw;
+					py[k] = (1 - ny) * 0.5f * (float)scene_entry->height;
+				}
+			}
+			float fx0 = floorf(fminf(px[0], px[1])) - 1, fx1 = ceilf(fmaxf(px[0], px[1])) + 1;
+			float fy0 = floorf(fminf(py[0], py[1])) - 1, fy1 = ceilf(fmaxf(py[0], py[1])) + 1;
+			if (fx0 < fx1 && fy0 < fy1) {
+				if (fx0 > cur_bx0) cur_bx0 = (int)fx0; if (fy0 > cur_by0) cur_by0 = (int)fy0;
+				if (fx1 < cur_bx1) cur_bx1 = (int)fx1; if (fy1 < cur_by1) cur_by1 = (int)fy1;
+			}
+		}
+		cur_bounds_state = 1;
+	}
+	*x0 = cur_bx0; *y0 = cur_by0; *x1 = cur_bx1; *y1 = cur_by1;
+}
+enum { SCENE_READ_NONE, SCENE_READ_SNAPSHOT, SCENE_READ_LIVE };
+static int scene_region_read(const GfxTexture *tex) {
+	if (!scene_entry || scene_entry == &scratch_entry || !tex || !tex->data) return SCENE_READ_NONE;
 	GfxTarget tg = target_entry_as_gfx(scene_entry);
 	uint32_t bpp = (uint32_t)gfx_target_bpp(&tg), pitch = bpp * scene_entry->width;
-	if (!bpp || !pitch || tex->data < scene_entry->addr || tex->data >= scene_entry->addr + pitch * scene_entry->height) return 0;
+	if (!bpp || !pitch || tex->data < scene_entry->addr || tex->data >= scene_entry->addr + pitch * scene_entry->height) return SCENE_READ_NONE;
 	uint32_t off = tex->data - scene_entry->addr;
 	int ty0 = (int)(off / pitch), tx0 = (int)((off % pitch) / bpp), tx1 = tx0 + tex->width, ty1 = ty0 + tex->height;
-	int ix0 = tx0 > cur_wx0 ? tx0 : cur_wx0, iy0 = ty0 > cur_wy0 ? ty0 : cur_wy0, ix1 = tx1 < cur_wx1 ? tx1 : cur_wx1, iy1 = ty1 < cur_wy1 ? ty1 : cur_wy1;
-	if (ix1 <= ix0 || iy1 <= iy0) return 0;
-	long inter = (long)(ix1 - ix0) * (iy1 - iy0), warea = (long)(cur_wx1 - cur_wx0) * (cur_wy1 - cur_wy0);
-	return warea > 0 && 2 * inter >= warea;
+	int wx0, wy0, wx1, wy1; current_write_bounds(&wx0, &wy0, &wx1, &wy1);
+	int ix0 = tx0 > wx0 ? tx0 : wx0, iy0 = ty0 > wy0 ? ty0 : wy0, ix1 = tx1 < wx1 ? tx1 : wx1, iy1 = ty1 < wy1 ? ty1 : wy1;
+	if (ix1 <= ix0 || iy1 <= iy0) return SCENE_READ_LIVE;
+	long inter = (long)(ix1 - ix0) * (iy1 - iy0);
+	long warea = (long)(wx1 - wx0) * (wy1 - wy0), tarea = (long)(tx1 - tx0) * (ty1 - ty0);
+	return warea > 0 && tarea > 0 && 2 * inter >= warea && 2 * inter >= tarea ? SCENE_READ_SNAPSHOT : SCENE_READ_LIVE;
 }
 /* ---- the HUD at its native shape on a wider aspect ratio (settings "hud_layout": edges | 16:9 | stretch). The game's camera
  * hook widens the 3D view k times (window_aspect_widen), but its 2D elements are still laid out for 960 x 544 and the wider
@@ -3492,8 +3531,10 @@ static const char *view_msl =
 	"  if (u.mode == 5u || u.mode == 6u) return swizzle(float4(c.r, 0.0, 0.0, 1.0), u.swz);\n"                   /* U8, F32 (one component) */
 	"  if (u.mode == 1u) return float4(q(c.r, 6u), q(c.g, 6u), q(c.b, 5u), 1.0);\n"                          /* F11F11F10 */
 	"  if (u.mode == 2u) { float al = c.a <= 0.0 ? 0.0 : c.a >= 1.0 ? 3.0 : floor(c.a * 3.0 + .5); return float4(q(c.r, 5u), q(c.g, 5u), q(c.b, 5u), al / 3.0); }\n"   /* U2F10F10F10 */
-	"  if (u.mode == 3u || u.mode == 4u) { uint w = as_type<uint>(sub == 1u ? c.g : sub == 2u ? c.b : sub == 3u ? c.a : c.r); float4 o;\n"   /* the pixel's words as U8U8U8U8 / S8S8S8S8 bytes */
-	"    for (uint k = 0u; k < 4u; k++) { uint bb = (w >> (8u * k)) & 255u; o[k] = u.mode == 3u ? float(bb) / 255.0 : s8(bb); } return swizzle(o, u.swz); }\n"
+	"  if (u.mode == 3u || u.mode == 4u || u.mode == 9u || u.mode == 10u) { uint w;\n"   /* the pixel's words as U8U8U8U8 / S8S8S8S8 bytes; modes 9/10 rebuild them from exact R16G16B16A16_UNORM halves */
+	"    if (u.mode >= 9u) { uint lo = uint(saturate(sub == 0u ? c.r : c.b) * 65535.0 + 0.5), hi = uint(saturate(sub == 0u ? c.g : c.a) * 65535.0 + 0.5); w = lo | (hi << 16); }\n"
+	"    else w = as_type<uint>(sub == 1u ? c.g : sub == 2u ? c.b : sub == 3u ? c.a : c.r); float4 o; bool unorm = u.mode == 3u || u.mode == 9u;\n"
+	"    for (uint k = 0u; k < 4u; k++) { uint bb = (w >> (8u * k)) & 255u; o[k] = unorm ? float(bb) / 255.0 : s8(bb); } return swizzle(o, u.swz); }\n"
 	"  return swizzle(c, u.swz); }\n"                                                                                           /* 0: the same values (F16x4, U8x4) */
 	"fragment float4 main0_view_depth(VOut in [[stage_in]], depth2d<float> src [[texture(0)]], sampler s [[sampler(0)]], constant ViewU &u [[buffer(0)]]) {\n"
 	"  uint sub; uint2 sp = srcpix(uint2(in.position.xy), u, sub); float d = src.read(sp); float m = u.mode == 1u ? 65535.0 : 16777215.0; float qd = floor(d * m + .5) / m; return float4(qd, qd, qd, 1.0); }\n";   /* X8U24: 24-bit depth, as the software path stores and reads it; mode 1, D16 read as U16: 16-bit */
@@ -3501,7 +3542,7 @@ static const char *view_msl =
  * Two independent changes to the view pass above, both off at RECOMP_GPU_VIEW_FAST=0 (the view_msl /
  * view_pipeline / RGBA32F-only pass just above, unchanged):
  * 1. Narrow view textures. view_entry's RGBA32F texture is wider than most decodes need: a byte view
- *    (mode 3/4) only ever writes n/255 or v/127 per channel, an identity view of an F16 target (mode 0)
+ *    (mode 3/4/9/10) only ever writes n/255 or v/127 per channel, an identity view of an F16 target (mode 0)
  *    only ever holds f16-exact values, F11F11F10 tiles (mode 1) decode to exactly the f11/f10 grid. view_format
  *    picks the narrowest exact format for those (point-sampled only: a linear-filtered view keeps RGBA32F,
  *    since filtering a narrow format isn't the same arithmetic as filtering floats); the HDR view (mode 2,
@@ -3539,8 +3580,8 @@ static SDL_GPUTextureFormat view_format(int from_depth, int mode, int src_kind, 
 	SDL_GPUTextureFormat f = SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT;
 	if (!view_fast_on() || from_depth || filtered) return f;
 	switch (mode) {
-	case 3: case 5: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM; break;
-	case 4: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_SNORM; break;
+	case 3: case 5: case 9: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM; break;
+	case 4: case 10: f = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_SNORM; break;
 	case 0: f = src_kind == TK_F32 ? SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT : kind_format(src_kind); break;
 	case 1: f = SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT; break;
 	/* mode 2 (HDR, U2F10F10F10): stays RGBA32F -- the 2-bit alpha is not f16-exact */
@@ -3749,7 +3790,7 @@ static TexEntry views[MAXVIEW]; static int nviews;
 static void views_release_samplers(void) { for (int i = 0; i < nviews; i++) tex_release_samplers(&views[i]); }
 static int no_views(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_VIEWS") != 0; return v; }   /* RECOMP_GPU_NO_VIEWS=1: the guest-memory path for every render-target read (an A/B check) */
 /* which decode the view shader runs for a target's format read by a texture's base format (-1: none known); tex_bpp: the texture's bytes per texel */
-static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp, uint32_t swz[4]) {
+static int view_mode(uint32_t tgt_fmt, int tgt_kind, const GfxTexture *tex, uint32_t *tex_bpp, uint32_t swz[4]) {
 	uint32_t tb = tgt_fmt & 0xF1800000u, xb = tex->format & 0xff000000u, sw = (tex->format >> 12) & 7;
 	*tex_bpp = 4;
 	/* gfx_soft.c's apply_swizzle, as component selectors: four-component formats permute, one-component
@@ -3758,7 +3799,7 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	static const uint8_t sw1[8][4] = { {0,4,4,5}, {0,4,4,4}, {0,5,5,5}, {0,0,0,0}, {0,0,0,4}, {0,0,0,5}, {4,4,4,0}, {5,5,5,0} };
 	int ncomp = xb == 0x0c000000u || xb == 0x0d000000u || xb == 0x1b000000u ? 4 : xb == 0x00000000u || xb == 0x12000000u ? 1 : 0;
 	for (int k = 0; k < 4; k++) swz[k] = ncomp == 4 ? sw4[sw][k] : ncomp == 1 ? sw1[sw][k] : (uint32_t)k;
-	if (tb == 0x01000000u) {
+	if (tb == 0x01000000u && tgt_kind != TK_F16RAW) {
 		static const uint8_t inv_order[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
 		uint32_t order = (tgt_fmt >> 20) & 3;
 		for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = inv_order[order][swz[k]];
@@ -3772,7 +3813,9 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	case 0x10800000u: return xb == 0x12000000u ? 6 : -1;                                        /* F32 as F32 (mode 5's decode at full precision: Uncharted's
 	                                                                                               * shadow mask went through guest memory, its lighting read
 	                                                                                               * it at 1x and every lit silhouette got a 1x-pixel halo) */
-	case 0x01000000u: *tex_bpp = 8; return xb == 0x1b000000u ? 0 : -1;                          /* F16F16F16F16 as F16F16F16F16 */
+	case 0x01000000u:
+		if (tgt_kind == TK_F16RAW) return xb == 0x0c000000u ? 9 : xb == 0x0d000000u ? 10 : -1; /* exact packed halves as U8U8U8U8 / S8S8S8S8 */
+		*tex_bpp = 8; return xb == 0x1b000000u ? 0 : -1;                                      /* F16F16F16F16 as F16F16F16F16 */
 	case 0x21000000u: return xb == 0x1a000000u ? 1 : -1;                                        /* F11F11F10 as F11F11F10 */
 	case 0x41000000u: return xb == 0x9a000000u ? 2 : -1;                                        /* U2F10F10F10 as U2F10F10F10 */
 	case 0x11000000u: return xb == 0x0c000000u ? 3 : xb == 0x0d000000u ? 4 : -1;                /* F32F32 as U8U8U8U8 / S8S8S8S8 bytes */
@@ -3898,9 +3941,10 @@ static TexEntry *mip_view(const GfxTexture *tex, TargetEntry *best, SDL_GPUTextu
 static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 	*exact = 0;
 	int snap = 0;   /* the scene's own pixels under the draw: as the scene began (same_region_read) */
-	if (same_region_read(tex)) {
+	int scene_read = scene_region_read(tex);
+	if (scene_read == SCENE_READ_SNAPSHOT) {
 		if (scene_snap) snap = 1;
-		else if (!scene_entry->self_read) { scene_entry->self_read = 1; fprintf(stderr, "    gpu: target %#x %ux%u read under its own draw (texture %#x %ux%u, draw clip %d,%d-%d,%d): its scenes start from guest memory\n", scene_entry->addr, scene_entry->width, scene_entry->height, tex->data, tex->width, tex->height, cur_wx0, cur_wy0, cur_wx1, cur_wy1); }
+		else if (!scene_entry->self_read) { scene_entry->self_read = 1; fprintf(stderr, "    gpu: target %#x %ux%u read under its own draw (texture %#x %ux%u, draw bounds %d,%d-%d,%d): its scenes start from guest memory\n", scene_entry->addr, scene_entry->width, scene_entry->height, tex->data, tex->width, tex->height, cur_bx0, cur_by0, cur_bx1, cur_by1); }
 	}
 	uint32_t span = tex_span(tex), xhi = tex->data + (span ? span : 4u * tex->width * tex->height);   /* the bytes it reads (a generous 16 a texel, as before, reached past small textures into the next target) */
 	TargetEntry *best = 0; DepthEntry *dbest = 0;
@@ -3939,7 +3983,7 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 	const int snap2 = snap && scene_snap == 2 && best == scene_entry && best->snap && !dbest;   /* the starting pixels in the GPU snapshot */
 	if (snap && !snap2) { if (scene_snap == 2) snap_to_guest(scene_entry); goto guest; }
 	if (best && !dbest && gfx_texture_levels(tex) > 1 && !no_views()) { TexEntry *mv = mip_view(tex, best, snap2 ? best->snap : 0, snap2 ? best->snap_gen : 0); if (mv) return mv; }   /* every level a GPU target (the transfer chain's) */
-	if (ex && !snap2 && (!dbest || best->gen > dbest->gen) && !getenv("RECOMP_GPU_DEBUG_NO_RTT")) {
+	if (ex && scene_read != SCENE_READ_LIVE && !snap2 && (!dbest || best->gen > dbest->gen) && !getenv("RECOMP_GPU_DEBUG_NO_RTT")) {
 		if (best == scene_entry) batch_flush("scene target sampled");   /* sampled while it is the attachment (undefined either way): at least after the draws before it */
 		*exact = best; return 0;
 	}
@@ -3961,13 +4005,14 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 			}
 			if (trace_sync()) fprintf(stderr, "gpu trace: no view of depth %#x %ux%u (gpu newer %d, gen %llu) for texture %#x fmt %#x %ux%u u%#x: decoded from guest memory\n", dbest->key, dbest->w, dbest->h, dbest->gpu_newer, (unsigned long long)dbest->gen, tex->data, tex->format, tex->width, tex->height, tex->u_mode);
 		} else if (best) {
-			uint32_t tex_bpp; int mode = view_mode(best->format, tex, &tex_bpp, u.swz);
+			uint32_t tex_bpp; int mode = view_mode(best->format, best->kind, tex, &tex_bpp, u.swz);
 			GfxTarget tg = target_entry_as_gfx(best);
 			/* an sRGB target: the view pass reads decoded values. Mode 0 (U8U8U8U8 as U8U8U8U8, a sub-rectangle) passes them on
 			 * -- into an sRGB view texture (re-encoded to the same bytes) or RGBA32F (kept decoded) -- and the draw's shader treats
-			 * the view as it treats the target bound directly (bind_unit's sRGB masks). The other reinterpretations read raw bytes:
-			 * guest memory. Killzone's streak strip (the bottom 384x64 of an sRGB 384x192 target) went down twice a frame. */
-			if (best->kind == TK_F16RAW || (best->kind == TK_U8S && mode != 0)) mode = -1;
+			 * the view as it treats the target bound directly (bind_unit's sRGB masks). Other reinterpretations read raw bytes,
+			 * which an sRGB target cannot provide directly: guest memory. TK_F16RAW's exact UNORM lanes use modes 9/10.
+			 * Killzone's streak strip (the bottom 384x64 of an sRGB 384x192 target) went down twice a frame. */
+			if (best->kind == TK_U8S && mode != 0) mode = -1;
 			if (mode >= 0 && view_mapping(best->addr, best->width, best->width, best->height, best->type, (uint32_t)gfx_target_bpp(&tg), tex, tex_bpp, best->sx, best->sy, &u)) {   /* a TargetEntry's width is the surface stride */
 				u.mode = (uint32_t)mode;
 				int vfilt = tex->min_filter || tex->mag_filter;
@@ -5688,13 +5733,17 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	/* fetch mode 1 (no framebuffer read: Vulkan) and a FRAGCOLOR program whose use of the colour it reads is a
 	 * blend the blend unit can do (usse_fragment_fb_blend -- Uncharted's deferred lights add into the HDR target,
 	 * its particles alpha-blend into it in the shader): that variant and blend, instead of a copy of the whole
-	 * target before the draw. A float target only (an 8-bit one clamps the source before blending, the Vita
-	 * clamps the result) and no GXM blend of the draw's own. The Vita rounds each result to the target's format
+	 * target before the draw. Additive blends stay on float targets (an 8-bit one clamps the source before
+	 * blending, while the Vita clamps the result); alpha lerps can also use linear U8 targets and need the blend
+	 * unit so overlapping primitives in one draw see each other's results. No GXM blend of the draw's own.
+	 * The Vita rounds each result to the target's format
 	 * (U2F10F10F10's 5-bit mantissas), the blend unit keeps F16 between draws: a little more precise.
 	 * RECOMP_GPU_NO_ADDITIVE=1: the copies. */
 	static int no_additive = -1; if (no_additive < 0) no_additive = getenv("RECOMP_GPU_NO_ADDITIVE") != 0;
-	g_fzero_draw = fl && fl->frag_color_used && fetch_mode() == 1 && !no_additive && (scene_entry->kind == TK_F16 || scene_entry->kind == TK_HDR10)
+	int fb_blend = fl && fl->frag_color_used && fetch_mode() == 1 && !no_additive
 	               && !(d->blend.present && (d->blend.color_func || d->blend.alpha_func)) ? usse_fragment_fb_blend(fp) : 0;
+	g_fzero_draw = (scene_entry->kind == TK_F16 || scene_entry->kind == TK_HDR10
+	                || (scene_entry->kind == TK_U8 && fb_blend >= USSE_FB_LERP_KEEP)) ? fb_blend : 0;
 	if (g_fzero_draw) {
 		static uint32_t told[64]; static int ntold; uint32_t h = usse_program_hash(fp); int seen = 0;
 		static const char *what[5] = { "", "adds to it: ONE/ONE", "adds to it, alpha replaced: ONE/ONE, alpha ONE/ZERO", "blends over it, alpha kept: ONE/ONE_MINUS_SRC_ALPHA", "blends over it: ONE/ONE_MINUS_SRC_ALPHA" };
@@ -5949,6 +5998,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		if (sx1 < sx0) sx1 = sx0; if (sy1 < sy0) sy1 = sy0;
 	}
 	cur_wx0 = sx0; cur_wy0 = sy0; cur_wx1 = sx1; cur_wy1 = sy1;   /* (same_region_read, for the binds below) */
+	cur_bounds_draw = d; cur_bounds_state = 0;
 	SDL_GPUTextureSamplerBinding tsb[25]; int ntsb = 0;
 	if (pipe->fetch && !scene_entry->fetch_copy) {   /* the framebuffer copy this draw's FRAGCOLOR reads (taken in its batch's copy pass) */
 		SDL_GPUTextureCreateInfo fci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(scene_entry->kind), .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | (fetch_blit() ? SDL_GPU_TEXTUREUSAGE_COLOR_TARGET : 0),
