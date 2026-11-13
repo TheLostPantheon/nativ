@@ -886,6 +886,9 @@ static uint64_t rc_shader_text(char *o, size_t n, const ShaderEntry *e, int is_f
 	}
 	return k < (int)n ? hash_bytes(o, (size_t)k) : 0;
 }
+/* The front face of every pipeline that takes a draw's cull_sdl (gfx_gpu_draw resolves it against this convention):
+ * the draw's own, its visibility query's and its motion pass's must agree, or a query counts the faces the draw culls */
+#define GXM_FRONT_FACE SDL_GPU_FRONTFACE_CLOCKWISE
 static int32_t pipe_stencil_face(uint8_t front, uint8_t back, int two_sided) {
 	return two_sided ? (int32_t)front | (int32_t)back << 8 | 1 << 16 : front;
 }
@@ -2205,7 +2208,7 @@ static void pipe_create_info(const GfxDraw *d, const ShaderEntry *vs, const Shad
 	 * gradient, specifically) -- so the winding convention this pipeline's CCW front_face implies
 	 * isn't pinned down yet; left off (as before) rather than guessed at. */
 	ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl;   /* resolved by the caller from SceGxmCullMode and the viewport's y flip (see gfx_gpu_draw) */
-	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
+	ci.rasterizer_state.front_face = GXM_FRONT_FACE;
 	ci.rasterizer_state.enable_depth_clip = false;   /* clamp, not clip: gfx_soft.c (the reference) never discards a fragment for its z being outside [0,w], only for failing the depth test */
 	if (d->depth_bias_factor || d->depth_bias_units) {   /* polygon offset (GfxDraw.depth_bias_*): units in the depth format's steps, factor on the slope */
 		ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor = (float)d->depth_bias_units;
@@ -2812,7 +2815,7 @@ static SDL_GPUGraphicsPipeline *mv_pipeline(PipeEntry *pe) {
 	SDL_GPUGraphicsPipelineCreateInfo ci = {0};
 	ci.vertex_shader = vs->shader; ci.fragment_shader = fs; ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
 	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)pe->cull_sdl;
-	ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE; ci.rasterizer_state.enable_depth_clip = false;
+	ci.rasterizer_state.front_face = GXM_FRONT_FACE; ci.rasterizer_state.enable_depth_clip = false;
 	if (pe->dbf || pe->dbu) { ci.rasterizer_state.enable_depth_bias = true; ci.rasterizer_state.depth_bias_constant_factor = (float)pe->dbu; ci.rasterizer_state.depth_bias_slope_factor = (float)(pe->dbf * pe->dbs); }
 	SDL_GPUCompareOp op = conv_cmp(pe->depth_func);
 	op = op == SDL_GPU_COMPAREOP_GREATER || op == SDL_GPU_COMPAREOP_GREATER_OR_EQUAL ? SDL_GPU_COMPAREOP_GREATER_OR_EQUAL
@@ -4826,7 +4829,7 @@ static PipeEntry *query_pipeline(const GfxDraw *d, const ShaderEntry *vs, int ha
 	SDL_GPUColorTargetDescription ctd = { .format = kind_format(ckind) }; ctd.blend_state.enable_color_write_mask = true; ctd.blend_state.color_write_mask = 0;
 	SDL_GPUGraphicsPipelineCreateInfo ci = {0};
 	ci.vertex_shader = vs->shader; ci.fragment_shader = fs; ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
-	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl; ci.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE; ci.rasterizer_state.enable_depth_clip = false;
+	ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = (SDL_GPUCullMode)cull_sdl; ci.rasterizer_state.front_face = GXM_FRONT_FACE; ci.rasterizer_state.enable_depth_clip = false;
 	ci.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
 	ci.depth_stencil_state.enable_depth_test = has_depth && depth_ok; ci.depth_stencil_state.enable_depth_write = false; ci.depth_stencil_state.compare_op = conv_cmp(d->depth_func);
 	ci.depth_stencil_state.enable_stencil_test = sf != 7 || bsf != 7;   /* the test only: KEEP everywhere, nothing written */
