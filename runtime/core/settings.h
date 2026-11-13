@@ -5,7 +5,7 @@
  *    The launcher's Settings page edits it, and every game's menu.
  *  - the game's own, in the directory it runs from (vitarecomp run: dump/decrypted/<title>/recomp/settings.ini --
  *    the player's, never committed): its own options (game_key in settings.c: fov, view_distance, scenery_detail,
- *    character_detail, private_server, net_redirect, menu_hint_shown), and any shared key it overrides.
+ *    character_detail, skip_mission_intros, private_server, net_redirect, menu_hint_shown), and any shared key it overrides.
  * A key reads from the game's file first, then the shared one, then its consumer's default. Setting a shared key
  * (any game's menu) writes the shared file and drops the game's override of it; a save merges with the file as it
  * is on disk. A scripted run (RECOMP_HEADLESS: test, capture, verify) or RECOMP_SETTINGS reads no shared file. An
@@ -49,6 +49,8 @@
  *                             menu's slider applies at once)
  *   frame_rate    display.c   30 | 60                   60: the swap interval capped at one vblank
  *                             (experimental; RECOMP_FRAME_RATE wins; read every frame)
+ *   skip_mission_intros io.c  0 | 1 (default 0)         skip a game's replayed chapter_##.bik briefings when its pack offers
+ *                                                       the option (RECOMP_SKIP_MISSION_INTROS wins; read at each file open)
  *   touch_cursor_speed  window.c  a multiplier, 1.0 default   the bumper touch cursor's speed (either stick)
  *   gyro          motion.c    0 | 1 (default 1)         a DS4/DualSense gyro as the Vita's motion sensor
  *   gyro_pose     motion.c    upright | flat            which Vita pose a pad held level stands for

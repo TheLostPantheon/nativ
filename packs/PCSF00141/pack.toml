@@ -3,7 +3,7 @@ NAME = "Resistance: Burning Skies"
 REGION = "EU"
 SPLIT = 24
 MODULES = "libc libgxm_es4 libgpu_es4 libfios2 np_matching2 libssl np_common librudp"
-RUN_ENV = "RECOMP_RENDER_SCALE=1 RECOMP_FRAME_RATE=30 RECOMP_PRESENT_BACKEND=renderer RECOMP_FSR1_SUPPORTED=1 RECOMP_NGS_REVERB=0"
+RUN_ENV = "RECOMP_RENDER_SCALE=1 RECOMP_FRAME_RATE=30 RECOMP_PRESENT_BACKEND=renderer RECOMP_FSR1_SUPPORTED=1 RECOMP_NGS_REVERB=0 RECOMP_GAME_OPTIONS=skip_mission_intros"
 TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed"
 TEST_FRAMES = 600 # title screen; FMOD's ATRAC9 streams are active before this frame
 TEST_TIMEOUT = 360
@@ -11,4 +11,4 @@ TEST_TIMEOUT = 360
 [versions."1.02"]
 sha256 = "33bc05af97ddadb1d73f83175eea890b80d5f38258aac4425583b220e5b5f928"
 status = "recommended"
-FUNCTION_SEEDS = "0x8104b0cc:thumb 0x8104b138:thumb 0x8104b22a:thumb 0x8104b236:thumb 0x81151648:thumb"
+FUNCTION_SEEDS = "0x8104b0cc:thumb 0x8104b138:thumb 0x8104b22a:thumb 0x8104b236:thumb 0x8107109c:thumb 0x81071108:thumb 0x81071200:thumb 0x8107120c:thumb 0x81151648:thumb"

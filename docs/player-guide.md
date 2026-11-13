@@ -129,6 +129,8 @@ has a menu with that game's own options. Some worth knowing:
 - **Aspect ratio**: native, 21:9, 32:9 or your window's shape. The HUD keeps its own shape on wide screens.
 - **Frame rate**: 30 or 60. 60 is experimental: parts of a game timed in fixed 1/30 second steps can run fast.
 - **Field of view** (Killzone, Unit 13 and Uncharted).
+- **Skip mission introductions** (Resistance: Burning Skies): turn this on in the in-game menu's Game page to skip
+  chapter briefing videos, including after Continue. Other cinematics and weapon tutorials still play. Off by default.
 
 ## Online play
 

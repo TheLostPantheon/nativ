@@ -397,6 +397,11 @@ static void page_game(void) {
 		ui::row("Character detail", "How far characters and props keep their full detail. 1.00× is the game's own.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1f×")) set_chr(P.chr);
 	}
+	if (game_option("skip_mission_intros")) {
+		ui::row("Skip mission introductions", "Skips chapter briefing videos whenever the game tries to replay them, including after Continue. Other cinematics and weapon tutorials still play.");
+		bool on = settings_int("skip_mission_intros", 0) != 0;
+		if (ui::toggle("skip_mission_intros", &on)) { settings_set_int("skip_mission_intros", on ? 1 : 0); settings_save(); }
+	}
 	if (display_pstv_looked()) {   /* (display.c's PS TV mode: a game with a PS TV layout of its own) */
 		ui::row("Controller layout", "How the touch screen's actions are done, chosen as the game starts and kept until you quit. Standard: the game as on a handheld, with keyboard, mouse or a controller (its touch cursor). PS TV: the game's own PS TV layout, every action on buttons and sticks, a controller only. Ask: a choice at each start while a controller is connected, Standard otherwise. Applies the next time the game starts.");
 		static const char *const names[3] = {"Ask at start##cl", "Standard##cl", "PS TV##cl"};
