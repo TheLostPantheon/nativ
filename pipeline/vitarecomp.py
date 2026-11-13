@@ -505,20 +505,62 @@ def tools_version():
     return head + ("+" + hashlib.sha1(diff).hexdigest()[:10] if head and diff else "")
 
 
+BUILD_IDENTITY_STAMP = ".build_identity"
+BUILD_IDENTITY_FIELDS = ("os", "architecture", "cpu_mode", "requested_cpu", "target_cpu",
+                         "compiler_target", "deployment_target")
+
+
+def play_build_identity(g):
+    """the identity runtime/build.py will use for this title's normal play binary"""
+    e = env_with({"TARGET": "windows"} if g.windows else {})
+    r = run([PY, os.path.join(RUNTIME, "build.py"), "--identity"], env=e, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode:
+        detail = (r.stderr or r.stdout).strip()
+        die(f"{g.T}: cannot determine this machine's build target" + (f": {detail}" if detail else ""))
+    try: identity = json.loads(r.stdout)
+    except json.JSONDecodeError as ex: die(f"{g.T}: runtime/build.py returned an invalid build identity: {ex}")
+    if not isinstance(identity, dict) or identity.get("schema") != 1 or any(not isinstance(identity.get(k), str) for k in BUILD_IDENTITY_FIELDS):
+        die(f"{g.T}: runtime/build.py returned an incomplete build identity")
+    return identity
+
+
+def read_build_identity(path):
+    try:
+        with open(path, encoding="utf-8") as f: identity = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return identity if isinstance(identity, dict) else None
+
+
+def write_stamp(path, text):
+    tmp = path + f".new{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f: f.write(text)
+    os.replace(tmp, path)
+
+
 def cmd_ready(g):
     # the stamps recompile and build write: what the code was made from (.recompile_inputs), which tools built the program
-    # (.built_version). A pack's hooks only take effect in regenerated code (Killzone's new hooks built fine and never ran
-    # until a recompile, 2026-10-25); a runtime change only in a rebuilt program
+    # (.built_version), and the target it was built for (.build_identity). A pack's hooks only take effect in regenerated
+    # code (Killzone's new hooks built fine and never ran until a recompile, 2026-10-25); a runtime change only in a rebuilt
+    # program
     def stamp(n):
         f = os.path.join(g.OUT, n)
-        return open(f, encoding="utf-8").read().strip() if os.path.isfile(f) else ""
+        if not os.path.isfile(f): return ""
+        with open(f, encoding="utf-8") as stamp_file: return stamp_file.read().strip()
     if not os.path.isfile(os.path.join(g.W, "elf", g.ELF)): die(f"{g.T}: not added yet (vitarecomp add, or + Add game in the launcher)")
     remade = False
     if stamp(".recompile_inputs") != recompile_inputs(g):
         say(f"{g.T}: the recompiler or the game's pack changed since its code was made: making it again")
         run(SELF + ["analyze", g.T]); run(SELF + ["recompile", g.T]); remade = True
     ver = tools_version()
-    if remade or not ver or stamp(".built_version") != ver or not os.path.isfile(os.path.join(g.OUT, g.EXE)):
+    rebuild = remade or not ver or stamp(".built_version") != ver or not os.path.isfile(os.path.join(g.OUT, g.EXE))
+    target_changed = False
+    if not rebuild:
+        target_changed = read_build_identity(os.path.join(g.OUT, BUILD_IDENTITY_STAMP)) != play_build_identity(g)
+        rebuild = target_changed
+    if rebuild:
+        if target_changed: say(f"{g.T}: its build target changed since the program was linked: rebuilding it")
         say(f"{g.T}: building it with these tools ({ver or 'a checkout without git'})")
         run(SELF + ["build", g.T])
     else: say(f"{g.T}: up to date")
@@ -540,9 +582,13 @@ def cmd_build(g, mode):
     out, extra = {"verify": (base + "_verify", {"VERIFY": "1"}), "profile": (base + "_prof", {"PROFILE": "1"})}.get(mode, (os.path.join(g.OUT, g.EXE.removesuffix(".exe")), {}))
     if g.windows: extra["TARGET"] = "windows"
     mods = [os.path.join(g.OUT, "mod_" + m) for m in g.MODS]
+    stamped = mode not in ("verify", "profile") and not ENV.get("RECOMP_BIN")
+    identity = play_build_identity(g) if stamped else None
     run([PY, os.path.join(RUNTIME, "build.py"), base, out] + mods, env=env_with(e, extra))
-    if mode not in ("verify", "profile") and not ENV.get("RECOMP_BIN"):   # (ready's: which tools built the play program)
-        with open(os.path.join(g.OUT, ".built_version"), "w", newline="\n") as f: f.write(tools_version() + "\n")
+    if stamped:   # ready's: which tools and target built the play program; only after the link succeeded
+        write_stamp(os.path.join(g.OUT, ".built_version"), tools_version() + "\n")
+        write_stamp(os.path.join(g.OUT, BUILD_IDENTITY_STAMP),
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n")
 
 
 def game_env(g, words, extra):

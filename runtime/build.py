@@ -22,6 +22,7 @@ for; objects per processor in obj_<name>/ (obj_apple-m4, obj_win_znver5). RECOMP
 import concurrent.futures
 import glob
 import hashlib
+import json
 import os
 import platform
 import re
@@ -71,12 +72,92 @@ def pkg_exists(*mods):
     except OSError: return False
 
 
+def compiler_probe(cc, flags, fallback_cpu, env=None):
+    """the compiler target and CPU after driver defaults and flags have been resolved"""
+    try:
+        r = subprocess.run([cc] + flags + ["-###", "-x", "c", "-c", os.devnull, "-o", os.devnull],
+                           capture_output=True, text=True, env=env)
+    except OSError as e:
+        raise RuntimeError(f"cannot run {cc}: {e}") from e
+    if r.returncode:
+        raise RuntimeError(f"{cc} could not resolve its build target (exit {r.returncode})")
+    text = r.stdout + r.stderr
+    m = re.search(r'"-triple" "([^"]+)"', text)
+    if not m:
+        m = re.search(r"(?m)^Target:\s+(\S+)", text)
+    target = m[1] if m else ""
+    if not target:
+        try:
+            d = subprocess.run([cc, "-dumpmachine"], capture_output=True, text=True, env=env)
+        except OSError as e:
+            raise RuntimeError(f"cannot query {cc}'s target: {e}") from e
+        if d.returncode == 0: target = d.stdout.strip()
+    if not target:
+        raise RuntimeError(f"{cc} did not report a compiler target")
+    m = re.search(r'"-target-cpu" "([\w.-]+)"', text)
+    return target, m[1] if m else fallback_cpu
+
+
 def resolved_cpu(cc, flag):
     """the processor a native flag means to this compiler (clang's -target-cpu), or "native" when it doesn't say"""
-    try: err = subprocess.run([cc, flag, "-###", "-x", "c", "-c", os.devnull, "-o", os.devnull], capture_output=True, text=True).stderr
-    except OSError: return "native"
-    m = re.search(r'"-target-cpu" "([\w.-]+)"', err)
-    return m[1] if m else "native"
+    try: return compiler_probe(cc, [flag], "native")[1]
+    except RuntimeError: return "native"
+
+
+def build_target(env=None):
+    """the target selection shared by a build and its persisted compatibility identity"""
+    env = ENV if env is None else env
+    win = HOSTED_WINDOWS or env.get("TARGET") == "windows"
+    cross = win and not HOSTED_WINDOWS
+    cpu = "generic" if cross else (env.get("RECOMP_CPU") or "native")
+    machine = platform.machine().lower()
+    cpu_flags = [] if cpu == "generic" else [("-mcpu=" if machine in ("arm64", "aarch64") else "-march=") + cpu]
+    extra = (env.get("RECOMP_CFLAGS") or "").split()
+    cc, cxx = env.get("CC"), env.get("CXX")
+    lt = None if win or DARWIN else (env.get("ATIV_LINUX_TOOLCHAIN") or next(
+        (d for d in (os.path.join(ROOT, "toolchain"),) if os.path.isfile(os.path.join(d, "bin", "cc"))), None))
+    mt = (env.get("ATIV_MAC_TOOLCHAIN") or next(
+        (d for d in (os.path.join(ROOT, "toolchain"),) if os.path.isfile(os.path.join(d, "SDL3", "lib", "libSDL3.0.dylib"))), None)) if DARWIN and not win else None
+    wt = None
+    if win:
+        wt = env.get("ATIV_WIN_TOOLCHAIN") or next(
+            (d for d in (os.path.join(ROOT, "toolchain"),) if os.path.isdir(d)),
+            os.path.join(os.path.expanduser("~"), "toolchains", "ativ-win"))
+        exe = ".exe" if HOSTED_WINDOWS else ""
+        cc = os.path.join(wt, "llvm-mingw", "bin", "x86_64-w64-mingw32-clang" + exe)
+        cxx = os.path.join(wt, "llvm-mingw", "bin", "x86_64-w64-mingw32-clang++" + exe)
+    elif lt:
+        cc = cc or os.path.join(lt, "bin", "cc")
+        cxx = cxx or os.path.join(lt, "bin", "c++")
+    cc = cc or ("clang" if shutil.which("clang") else "cc")
+    cxx = cxx or ("clang++" if shutil.which("clang++") else "c++")
+    target_os = "windows" if win else ("macos" if DARWIN else platform.system().lower())
+    return {"win": win, "cpu": cpu, "cpu_flags": cpu_flags, "extra": extra,
+            "cc": cc, "cxx": cxx, "lt": lt, "mt": mt, "wt": wt, "target_os": target_os}
+
+
+def build_identity(target=None, env=None):
+    """the ABI/CPU identity a successful play build records for `vitarecomp ready`"""
+    env = ENV if env is None else env
+    target = build_target(env) if target is None else target
+    fallback_cpu = "generic" if target["cpu"] == "generic" else target["cpu"]
+    compiler_target, target_cpu = compiler_probe(
+        target["cc"], target["cpu_flags"] + target["extra"], fallback_cpu, env)
+    arch = compiler_target.split("-", 1)[0].lower()
+    arch = {"aarch64": "arm64", "amd64": "x86_64"}.get(arch, arch)
+    m = re.search(r"-macosx(\d+(?:\.\d+)*)", compiler_target)
+    deployment = m[1] if m else (env.get("MACOSX_DEPLOYMENT_TARGET", "") if target["target_os"] == "macos" else "")
+    mode = target["cpu"] if target["cpu"] in ("native", "generic") else "specific"
+    return {
+        "schema": 1,
+        "os": target["target_os"],
+        "architecture": arch,
+        "cpu_mode": mode,
+        "requested_cpu": target["cpu"],
+        "target_cpu": target_cpu,
+        "compiler_target": compiler_target,
+        "deployment_target": deployment,
+    }
 
 
 def memory_gb():
@@ -95,10 +176,18 @@ def memory_gb():
 
 
 def main(argv):
+    if argv == ["--identity"]:
+        try: identity = build_identity()
+        except RuntimeError as e: die(f"build identity: {e}")
+        print(json.dumps(identity, sort_keys=True, separators=(",", ":")))
+        return 0
     if len(argv) < 2: sys.stdout.write(__doc__); return 1
     BASE = os.path.abspath(argv[0]); OUT = os.path.abspath(argv[1])
     mods = argv[2:] or (ENV.get("RECOMP_MODULE_BASES") or "").split()
-    WIN = HOSTED_WINDOWS or ENV.get("TARGET") == "windows"
+    target = build_target()
+    WIN, cpu = target["win"], target["cpu"]
+    CPUFLAGS, extra = target["cpu_flags"], target["extra"]
+    CC, CXX, LT, MT, WT = (target[k] for k in ("cc", "cxx", "lt", "mt", "wt"))
     PROFILE, VERIFY = ENV.get("PROFILE"), ENV.get("VERIFY")
     # RECOMP_CPU: the processor the code is compiled for. native (the default when a machine builds for itself): its own,
     # every instruction it has. Each player compiles their own copy, so nothing has to run anywhere else; on x86-64 the
@@ -108,24 +197,12 @@ def main(argv):
     # RECOMP_CFLAGS: more code generation flags (experiments: -O3, -flto=thin). Each set keeps its own objects.
     # The objects are kept per processor, by the name the compiler resolves native to (apple-m4, znver5): an install moved
     # to another machine rebuilds rather than running instructions its processor may not have.
-    cross = WIN and not HOSTED_WINDOWS
-    cpu = "generic" if cross else (ENV.get("RECOMP_CPU") or "native")
-    machine = platform.machine().lower()
-    CPUFLAGS = [] if cpu == "generic" else [("-mcpu=" if machine in ("arm64", "aarch64") else "-march=") + cpu]
-    extra = (ENV.get("RECOMP_CFLAGS") or "").split()
     FLAGS = ["-O2", "-ffp-contract=off"] + CPUFLAGS + extra + ["-w"] + INCLUDES
     PLATFORM = [part("platform_posix")]
-    exe = ".exe" if HOSTED_WINDOWS else ""
-    CC, CXX = ENV.get("CC"), ENV.get("CXX")
-    LT = None if WIN or DARWIN else (ENV.get("ATIV_LINUX_TOOLCHAIN") or next((d for d in (os.path.join(ROOT, "toolchain"),) if os.path.isfile(os.path.join(d, "bin", "cc"))), None))
-    MT = (ENV.get("ATIV_MAC_TOOLCHAIN") or next((d for d in (os.path.join(ROOT, "toolchain"),) if os.path.isfile(os.path.join(d, "SDL3", "lib", "libSDL3.0.dylib"))), None)) if DARWIN and not WIN else None
     if WIN:
         # (an install's own, beside the tools -- <root>/toolchain -- else the developer's)
-        WT = ENV.get("ATIV_WIN_TOOLCHAIN") or next((d for d in (os.path.join(ROOT, "toolchain"),) if os.path.isdir(d)), os.path.join(os.path.expanduser("~"), "toolchains", "ativ-win"))
-        cc = os.path.join(WT, "llvm-mingw", "bin", "x86_64-w64-mingw32-clang" + exe)
-        if not os.path.isfile(cc): die(f"no Windows toolchain at {WT}: run runtime/platform/win/setup-toolchain.sh")
+        if not os.path.isfile(CC): die(f"no Windows toolchain at {WT}: run runtime/platform/win/setup-toolchain.sh")
         if VERIFY or PROFILE: die("VERIFY/PROFILE builds: macOS and Linux only")
-        CC = cc; CXX = os.path.join(WT, "llvm-mingw", "bin", "x86_64-w64-mingw32-clang++" + exe)
         SDLW = os.path.join(WT, "SDL3", "x86_64-w64-mingw32")
         # win32_compat.h: the POSIX names Windows spells differently (mkdir's mode, pread, realpath); 64-bit off_t;
         # mingw-w64's localtime_r/gmtime_r
@@ -137,7 +214,6 @@ def main(argv):
     elif LT:
         if not os.path.isfile(os.path.join(LT, "bin", "cc")): die(f"no Linux toolchain at {LT}: run runtime/platform/linux/setup-toolchain.sh")
         if VERIFY or PROFILE: die("VERIFY/PROFILE builds: the machine's own compiler (no ATIV_LINUX_TOOLCHAIN)")
-        CC = CC or os.path.join(LT, "bin", "cc"); CXX = CXX or os.path.join(LT, "bin", "c++")
         FLAGS += ["-I", os.path.join(LT, "zlib", "include")]
         sdl_cflags = ["-I" + os.path.join(LT, "SDL3", "include")]
         sdl_libs = ["-L" + os.path.join(LT, "SDL3", "lib"), "-lSDL3", "-Wl,-rpath,$ORIGIN", "-Wl,--strip-debug"]   # (found beside the binary: copied there below; zig's own debug info, ~150 MB of it, left out -- the symbols crash reports name stay)
@@ -150,8 +226,6 @@ def main(argv):
     # CC/CXX: clang where it's installed -- macOS's compiler and the Android NDK's, so every platform builds
     # the generated C the same way; on a part file it is also ~5x faster than GCC 16 at half the memory
     # (Uncharted's game_part6.c: clang 15 s / 1.1 GB, gcc 70+ s / 2.3 GB)
-    CC = CC or ("clang" if shutil.which("clang") else "cc")
-    CXX = CXX or ("clang++" if shutil.which("clang++") else "c++")
     tag = "" if not CPUFLAGS else "_" + (resolved_cpu(CC, CPUFLAGS[0]) if cpu == "native" else cpu)
     if extra: tag += "_" + hashlib.sha1(" ".join(extra).encode()).hexdigest()[:8]
     OBJ = os.path.join(os.path.dirname(BASE), "obj" + ("_prof" if PROFILE else "") + ("_verify" if VERIFY else "") + ("_win" if WIN else "") + ("_lt" if LT else "") + ("_mt" if MT else "") + tag)
