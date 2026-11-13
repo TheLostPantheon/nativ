@@ -67,7 +67,8 @@ The runtime implements the system calls the game and Sony's libraries make. Each
 - **Files** (`core/io.c`). Reads and writes go to the player's game folder and saves. Sony's libfios2 runs as recompiled
   code on top, so its archive reading and overlays are Sony's own; the runtime supplies the kernel's overlay table
   under it.
-- **Audio** (`audio/ngs.c`): the Vita's NGS audio engine, with ATRAC9 decoding through LibAtrac9.
+- **Audio** (`audio/ngs.c`, `audio/audiodec.c`): the Vita's NGS audio engine and direct `SceAudiodec` ATRAC9
+  interface, both decoded through LibAtrac9.
 - **Video** (`media/video.c`): Sony's video player libraries run as recompiled code over an H.264 decoder provided
   by FFmpeg.
 - **Input** (`ui/window.c`, `input/`): keyboard, mouse, gamepads, touchpads and touchscreens, mapped onto the Vita's

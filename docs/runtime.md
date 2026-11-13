@@ -48,7 +48,8 @@ instead of every second one. It's experimental and per game, because games assum
 
 `runtime/audio/ngs.c` implements NGS, the Vita's voice engine (a DSP on the hardware): racks, voices (simple, Scream
 PCM and ATRAC9), patches and buses. ATRAC9 is decoded by LibAtrac9 (MIT, in `third_party/libatrac9`), and output goes
-through SDL. Reverb sends are dropped for now.
+through SDL. `runtime/audio/audiodec.c` provides the direct `SceAudiodec` ATRAC9 interface used by middleware such as
+FMOD. Reverb sends are dropped for now.
 
 ## Graphics
 
