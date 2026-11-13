@@ -82,6 +82,7 @@ int gfx_gpu_hud_supported(void);   /* the game names its HUD draws (RECOMP_HUD_D
 int gfx_gpu_ssao_supported(void);   /* the game names its main 3D scene (RECOMP_SSAO): the ambient occlusion rows apply */
 int gfx_gpu_fsr_supported(void);   /* the game's pack verified FSR 3.1 (RECOMP_FSR_SUPPORTED): the anti-aliasing row offers it */
 int gfx_gpu_target_scale_supported(void);   /* the game names buffers it draws below the screen's resolution (RECOMP_TARGET_SCALE) */
+int window_fsr1_supported(void);   /* renderer-path spatial upscaling verified by the game's pack */
 int gfx_gpu_shader_prep(int *done, int *total, double *eta_s); void gfx_gpu_shader_prep_skip(void);   /* the shader prep card's state (build_prep) */
 int display_pstv_looked(void);   /* display.c: the game asked for a PS TV's pad (the controller layout row applies) */
 /* window.c: the swapchain's size in pixels (0 x 0 before the first frame); wider aspect support */
@@ -347,7 +348,11 @@ static void page_display(void) {
 		ui::row("Anti-aliasing", "Smooths jagged edges (FXAA).");
 		{ bool aa = settings_int("post_aa", 1) != 0; if (ui::toggle("aa", &aa)) { settings_set_int("post_aa", aa ? 1 : 0); settings_save(); } }
 	}
-	ui::row("Sharpening", "Brings back detail lost to scaling and anti-aliasing.");
+	if (window_fsr1_supported()) {
+		ui::row("Spatial upscaling", "AMD FidelityFX FSR1 reconstructs the finished game frame at the window's resolution before presentation. The menu and touch markers remain at native output resolution.");
+		{ bool on = settings_int("fsr1", 1) != 0; if (ui::toggle("fsr1", &on)) { settings_set_int("fsr1", on ? 1 : 0); settings_save(); } }
+	}
+	ui::row("Sharpening", window_fsr1_supported() ? "Brings back detail after FSR1 scaling (RCAS)." : "Brings back detail lost to scaling and anti-aliasing.");
 	{	float sh = (float)settings_float("sharpen", 0.35) * 100.0f;
 		ImGui::SetNextItemWidth(-FLT_MIN);
 		if (ImGui::SliderFloat("##sharp", &sh, 0.0f, 100.0f, sh <= 0.0f ? "Off" : "%.0f%%")) { settings_set_float("sharpen", sh / 100.0f); settings_save(); }

@@ -16,7 +16,8 @@
  *   render_scale  gfx_gpu.c   1..6                      internal resolution (5760x3264 at 6)
  *   aspect        window.c    fit | stretch | fill      how the 960x544 picture meets the window
  *   post_aa       post.c      0 | 1 (default 1)         FXAA on the finished frame (RECOMP_POST_AA wins)
- *   sharpen       post.c      0..1 (default 0.35)       CAS sharpening at output resolution, 0 off (RECOMP_SHARPEN wins)
+ *   sharpen       post.c/fsr1.c  0..1 (default 0.35)    CAS/RCAS sharpening at output resolution, 0 off (RECOMP_SHARPEN wins)
+ *   fsr1          window.c    0 | 1 (default 1)         FSR1 EASU spatial upscaling in a supported renderer-path game (RECOMP_FSR1 wins)
  *   anisotropy    gfx_gpu.c   1 | 2 | 4 | 8 | 16 (default 16)   anisotropic texture filtering (RECOMP_ANISO wins)
  *   input_mode    window.c    auto | pad | kbm (default auto)   keyboard+mouse or the pad; auto: the device last used
  *   mouse_look    window.c    0 | 1 (default 1)          keyboard+mouse: the mouse captured as the look (Alt frees it)

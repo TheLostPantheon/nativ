@@ -3,7 +3,7 @@ NAME = "Resistance: Burning Skies"
 REGION = "EU"
 SPLIT = 24
 MODULES = "libc libgxm_es4 libgpu_es4 libfios2 np_matching2 libssl np_common librudp"
-RUN_ENV = "RECOMP_RENDER_SCALE=1 RECOMP_FRAME_RATE=30 RECOMP_PRESENT_BACKEND=renderer"
+RUN_ENV = "RECOMP_RENDER_SCALE=1 RECOMP_FRAME_RATE=30 RECOMP_PRESENT_BACKEND=renderer RECOMP_FSR1_SUPPORTED=1"
 TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed"
 TEST_FRAMES = 600 # title screen; FMOD's ATRAC9 streams are active before this frame
 TEST_TIMEOUT = 360

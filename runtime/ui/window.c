@@ -5,7 +5,8 @@
  * normally goes through SDL's GPU API (SDL_GPU): the software backend's frame is uploaded as a
  * sampled texture and blitted to the swapchain, while gfx_gpu.c can hand its finished texture over
  * directly. RECOMP_PRESENT_BACKEND=renderer instead synchronises the final Vita frame to the CPU
- * and presents it through SDL_Renderer (Direct3D 11 on Windows).
+ * and presents it through SDL_Renderer (Direct3D 11 on Windows). A supported title can run FSR1
+ * on the finished Vulkan texture first, then read back that output instead.
  *
  * keys: arrows d-pad, Z cross, X circle, A square, S triangle, Enter start, Backspace select,
  *       Q/W L/R triggers; any SDL gamepad (A/B/X/Y as cross/circle/square/triangle); F1 cycles the
@@ -20,6 +21,7 @@
  * env:  RECOMP_HEADLESS=1   no window (tests, the checker); RECOMP_SCALE=n window scale (default 1)
  *       RECOMP_RENDER_SCALE=n the GPU backend's internal resolution (1-6, default 1; F2 cycles them: gfx_gpu.c)
  *       RECOMP_PRESENT_BACKEND=renderer present the CPU-synchronised final frame through SDL_Renderer
+ *       RECOMP_FSR1=0|1     override FSR1 spatial upscaling for a supported renderer-path game
  *       RECOMP_OSD=0|1|2    the overlay's level at start-up (default 0: see metrics.c and window_present_gpu's own comment on why the GPU path doesn't default it on)
  *       RECOMP_METRICS=1    one performance line to stderr a second (metrics.c), with or without a window
  *       RECOMP_OSD_DUMP=f   writes the overlay's own bitmap to f once, to check the font (see metrics.c)
@@ -43,6 +45,7 @@
 #include "metrics.h"
 #include "settings.h"
 #include "overlay.h"
+#include "fsr1/fsr1.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
        TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
@@ -474,9 +477,23 @@ static SDL_GPUDevice *gpu;
 static SDL_Renderer *present_renderer;
 static SDL_Texture *present_texture;
 static uint32_t present_tw, present_th;
+static SDL_GPUTransferBuffer *present_download;
+static uint32_t present_download_bytes;
 void *window_gpu_device(void) { return gpu; }   /* for a future gfx_gpu.c */
 void *window_handle(void) { return win; }
-int window_gpu_direct_present(void) { return present_renderer == 0; }
+int window_fsr1_supported(void) {
+	static int supported = -1;
+	if (supported < 0) { const char *e = getenv("RECOMP_FSR1_SUPPORTED"); supported = e && *e == '1'; }
+	return supported && present_renderer != 0;
+}
+static int window_fsr1_enabled(void) {
+	if (!window_fsr1_supported()) return 0;
+	const char *e = getenv("RECOMP_FSR1");
+	return e ? *e != '0' : settings_int("fsr1", 1) != 0;
+}
+/* The GPU swapchain consumes a texture directly. The renderer path can do the same when FSR1
+ * is enabled: it spatially upscales that texture, then performs its single readback. */
+int window_gpu_direct_present(void) { return present_renderer == 0 || window_fsr1_enabled(); }
 
 /* ---- audio: an SDL audio stream per Vita output port, bound to the default playback device.
  * Output queues the samples and blocks while more than a few buffers wait, so the game is paced
@@ -640,8 +657,95 @@ static int osd_round_trip(SDL_GPUTexture *src, SDL_GPUTexture *dst, uint32_t w, 
 	return 1;
 }
 static int osd_cpu(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_OSD_CPU") != 0; return v; }   /* RECOMP_OSD_CPU=1: the overlay composited into the frame's pixels on the CPU, as before the ImGui HUD */
+static void renderer_present_gpu(SDL_GPUTexture *src, uint32_t w, uint32_t h, int raw) {
+	uint32_t tw = w, th = h;
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
+	if (!cmd) { fprintf(stderr, "    window: cannot acquire FSR1 command buffer (%s)\n", SDL_GetError()); return; }
+	if (window_fsr1_enabled()) {
+		const uint32_t ww = win_pw ? win_pw : w, wh = win_ph ? win_ph : h;
+		float sx, sy, sw, sh, dx, dy, dw, dh;
+		present_rect((float)ww, (float)wh, (float)w, (float)h, &sx, &sy, &sw, &sh, &dx, &dy, &dw, &dh);
+		uint32_t ow = (uint32_t)(dw * (float)w / sw + 0.5f);
+		uint32_t oh = (uint32_t)(dh * (float)h / sh + 0.5f);
+		if (ow >= w && oh >= h && ow <= 16384 && oh <= 16384) {
+			const char *se = getenv("RECOMP_SHARPEN");
+			Fsr1Frame f = {
+				.color = src, .input_w = w, .input_h = h, .output_w = ow, .output_h = oh,
+				.sharpness = se ? (float)atof(se) : (float)settings_float("sharpen", 0.35),
+				.srgb = raw,
+			};
+			SDL_GPUTexture *upscaled = fsr1_dispatch(gpu, cmd, &f);
+			if (upscaled) {
+				src = upscaled; tw = ow; th = oh;
+				static int said;
+				if (!said) { fprintf(stderr, "    window: FSR1 EASU+RCAS %ux%u -> %ux%u\n", w, h, tw, th); said = 1; }
+			}
+		}
+	}
+	const uint64_t bytes64 = 4ull * tw * th;
+	if (!tw || !th || tw > 16384 || th > 16384 || bytes64 > UINT32_MAX) {
+		fprintf(stderr, "    window: renderer frame %ux%u is too large\n", tw, th);
+		SDL_CancelGPUCommandBuffer(cmd);
+		return;
+	}
+	const uint32_t bytes = (uint32_t)bytes64;
+	if (!present_download || present_download_bytes != bytes) {
+		if (present_download) SDL_ReleaseGPUTransferBuffer(gpu, present_download);
+		SDL_GPUTransferBufferCreateInfo ci = {.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = bytes};
+		present_download = SDL_CreateGPUTransferBuffer(gpu, &ci);
+		present_download_bytes = present_download ? bytes : 0;
+	}
+	if (!present_download) {
+		fprintf(stderr, "    window: cannot create renderer download buffer (%s)\n", SDL_GetError());
+		SDL_CancelGPUCommandBuffer(cmd);
+		return;
+	}
+	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	if (!cp) {
+		fprintf(stderr, "    window: cannot begin renderer download (%s)\n", SDL_GetError());
+		SDL_CancelGPUCommandBuffer(cmd);
+		return;
+	}
+	SDL_GPUTextureRegion source = {.texture = src, .w = tw, .h = th, .d = 1};
+	SDL_GPUTextureTransferInfo destination = {.transfer_buffer = present_download, .pixels_per_row = tw, .rows_per_layer = th};
+	SDL_DownloadFromGPUTexture(cp, &source, &destination);
+	SDL_EndGPUCopyPass(cp);
+	const uint64_t t0 = now_us();
+	SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+	if (!fence) { fprintf(stderr, "    window: cannot submit renderer download (%s)\n", SDL_GetError()); return; }
+	const bool waited = SDL_WaitForGPUFences(gpu, true, &fence, 1);
+	SDL_ReleaseGPUFence(gpu, fence);
+	if (!waited) { fprintf(stderr, "    window: renderer download wait failed (%s)\n", SDL_GetError()); return; }
+	const uint8_t *pixels = SDL_MapGPUTransferBuffer(gpu, present_download, false);
+	if (!pixels) { fprintf(stderr, "    window: cannot map renderer download (%s)\n", SDL_GetError()); return; }
+	pthread_mutex_lock(&lock);
+	if (!frame || fw != tw || fh != th) {
+		uint8_t *replacement = malloc(bytes);
+		if (replacement) { free(frame); frame = replacement; fw = tw; fh = th; }
+		else fprintf(stderr, "    window: cannot allocate %u bytes for the renderer frame\n", bytes);
+	}
+	if (frame && fw == tw && fh == th) {
+		memcpy(frame, pixels, bytes);
+		gnew = 0; gshow = -1;
+		new_frame = 1;
+	}
+	pthread_mutex_unlock(&lock);
+	SDL_UnmapGPUTransferBuffer(gpu, present_download);
+	static int time_on = -1;
+	static uint64_t total_us;
+	static uint32_t samples;
+	if (time_on < 0) time_on = getenv("RECOMP_FSR1_TIME") != 0;
+	if (time_on) {
+		total_us += now_us() - t0;
+		if (++samples == 60) {
+			fprintf(stderr, "    fsr1: dispatch + %ux%u readback %.2f ms average\n", tw, th, (double)total_us / 60000.0);
+			total_us = 0; samples = 0;
+		}
+	}
+}
 void window_present_gpu(void *src, uint32_t w, uint32_t h, int raw) {
 	if (!active || !gpu || !w || !h || w > 16384 || h > 16384) return;
+	if (present_renderer) { renderer_present_gpu(src, w, h, raw); return; }
 	pthread_mutex_lock(&lock);
 	int n = (gidx + 1) % 3; if (n == gshow) n = (n + 1) % 3;
 	/* a frame over twice the window's size (render scale 4x and up on most displays) carries mip levels,

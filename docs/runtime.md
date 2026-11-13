@@ -108,6 +108,12 @@ and ImGui menu, HUD and touch markers. On Windows this uses SDL's Direct3D 11 re
 whose Vulkan/D3D12 SDL GPU swapchain cannot sustain the title's frame rate. The extra final-surface readback makes this
 a per-title compatibility path rather than the global default.
 
+A renderer-path title verified with `RECOMP_FSR1_SUPPORTED=1` also offers AMD FidelityFX FSR1 spatial upscaling. With
+it enabled (`fsr1=1`, or `RECOMP_FSR1=1`), EASU reconstructs the finished Vulkan frame at the visible output size and
+RCAS sharpens it before the path's single readback. SDL Renderer then uploads that larger image to Direct3D 11; ImGui
+and touch markers are still drawn afterward at output resolution. This improves native 960x544 scaling rather than
+lowering the game's internal render resolution.
+
 ### The shader archive (macOS)
 
 `runtime/gfx/mtl_archive.m` keeps this machine's own copy of what Metal compiled for a game, in the game's
