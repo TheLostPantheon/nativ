@@ -93,6 +93,15 @@ A read that reinterprets a target's bytes at another texel size takes its word f
 (`snap_fetch` in `usse_spirv.c`). `RECOMP_RENDER_SCALE_SWITCH=frame:n,...` changes the scale in a headless run, which
 is how to test that path. `RECOMP_GPU_DUMP_PRESENT=path` writes the presented frame at the render scale.
 
+### Window presentation
+
+The normal window path hands the completed GPU texture to SDL's GPU swapchain without downloading it. A title can
+instead set `RECOMP_PRESENT_BACKEND=renderer`: the GPU backend synchronises the final Vita-sized surface to guest
+memory, `runtime/ui/window.c` uploads it to a streaming texture, and SDL Renderer presents it with the same aspect mode
+and ImGui menu, HUD and touch markers. On Windows this uses SDL's Direct3D 11 renderer and is available for drivers
+whose Vulkan/D3D12 SDL GPU swapchain cannot sustain the title's frame rate. The extra final-surface readback makes this
+a per-title compatibility path rather than the global default.
+
 ### The shader archive (macOS)
 
 `runtime/gfx/mtl_archive.m` keeps this machine's own copy of what Metal compiled for a game, in the game's

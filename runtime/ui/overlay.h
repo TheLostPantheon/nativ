@@ -36,6 +36,7 @@ int overlay_dialog_active(void);
  * SDLGPU3 backend failed to initialise (no device, out of memory): every other call below is then a
  * safe no-op, so a failure here never takes the game down with it. */
 int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt);
+int overlay_init_renderer(SDL_Renderer *renderer, SDL_Window *window);
 void overlay_shutdown(void);
 
 /* open/close state of the FULL menu. While open, window.c must: route keyboard/mouse/gamepad to
@@ -84,6 +85,7 @@ void overlay_process_event(const SDL_Event *event);
  * own blit, before SDL_SubmitGPUCommandBuffer) -- see window.c's present loop and its own comment on
  * why both the GPU-presented and the software path's blit land in the same swapchain texture first. */
 void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s);
+void overlay_frame_renderer(uint32_t w, uint32_t h, double dt_s);
 
 /* the gamepad-touch markers (window.c): where the bumper cursor and the touchpad's fingers touch, on
  * the picture, while the menu is closed -- x, y in window points; rear (orange) or front (blue);
@@ -94,6 +96,7 @@ typedef struct { float x, y; int rear, pressed, cursor; } OverlayMark;
 /* window.c: the free pointer is a touch cursor this frame (drawn as a mark): the OS arrow is hidden over the picture */
 void overlay_touch_cursor(int on);
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]);
+void overlay_marks_renderer(uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]);
 /* overlay_marks also draws the performance overlay (metrics.c's F1 lines, metrics_osd_lines) when its level is
  * on: the HUD. overlay_draws_hud says whether it will (ImGui up, with a window), so window.c can skip the
  * CPU composite of the same overlay into the frame -- on the GPU path a fence wait + download + re-upload

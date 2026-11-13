@@ -45,6 +45,7 @@
 #include "imgui_internal.h"   /* ClosePopupsExceptModals (Escape with a bar menu open: overlay_bar_dismiss below); ImFontAtlasTextureBlockConvert (prompts_load) */
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlgpu3.h"
+#include "backends/imgui_impl_sdlrenderer3.h"
 #include "gpulock.h"   /* the SDL submit below is the locked one, and ImGui's own submits run under the same lock (render_frame): Homebrew SDL 3.4.16's Metal fence race, see that header */
 #include "overlay.h"
 #include "savedlg.h"
@@ -104,6 +105,8 @@ void settings_save(void);
 
 static ImGuiContext *g_ctx;
 static bool g_has_window;      /* overlay_init was given a real SDL_Window: the platform backend is live */
+static bool g_renderer_backend;
+static SDL_Renderer *g_renderer;
 /* written by the window thread, read by the game thread (display.c's pause, window.c's audio): atomic,
  * like every other flag that crosses those threads (rscale_req, osd_level_v). g_paused: Game > Pause
  * in the menu bar -- the game held (display.c, as for the menu) with nothing but a banner on screen */
@@ -117,9 +120,8 @@ static std::atomic<bool> g_quit_card;             /* the quit card is (overlay_q
 static std::atomic<int> g_layout_ask, g_layout_answer;   /* the layout card: asked, and its answer (1 touch, 2 PS TV) */
 static bool g_layout_card, g_layout_remember;
 
-int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt) {
-	if (!device) return 0;
-	if (g_ctx) return 1;   /* window.c calls this once at start-up; a repeat (shouldn't happen) is harmless */
+static int context_init(SDL_Window *window, bool renderer_backend) {
+	if (g_ctx) return g_renderer_backend == renderer_backend;
 	IMGUI_CHECKVERSION();
 	g_ctx = ImGui::CreateContext();
 	ImGui::SetCurrentContext(g_ctx);
@@ -130,7 +132,13 @@ int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat
 		depends on a DPI scale the headless path never sets, and picks a degenerate (zero-size) one */
 	ui::apply(15.0f, 1.0f);     /* the launcher's look (ui_theme.h), a point smaller: the menu sits over a 960x544 game */
 	g_has_window = window != nullptr;
-	if (g_has_window && !ImGui_ImplSDL3_InitForSDLGPU(window)) { ImGui::DestroyContext(g_ctx); g_ctx = nullptr; return 0; }
+	g_renderer_backend = renderer_backend;
+	const bool platform_ok = !g_has_window || (renderer_backend ? ImGui_ImplSDL3_InitForSDLRenderer(window, g_renderer) : ImGui_ImplSDL3_InitForSDLGPU(window));
+	if (!platform_ok) { ImGui::DestroyContext(g_ctx); g_ctx = nullptr; return 0; }
+	return 1;
+}
+int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat color_fmt) {
+	if (!device || !context_init(window, false)) return 0;
 	ImGui_ImplSDLGPU3_InitInfo info = {};
 	info.Device = device; info.ColorTargetFormat = color_fmt; info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
 	if (!ImGui_ImplSDLGPU3_Init(&info)) {
@@ -140,13 +148,26 @@ int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat
 	}
 	return 1;
 }
+int overlay_init_renderer(SDL_Renderer *renderer, SDL_Window *window) {
+	if (!renderer) return 0;
+	g_renderer = renderer;
+	if (!context_init(window, true) || !ImGui_ImplSDLRenderer3_Init(renderer)) {
+		if (g_ctx) {
+			if (g_has_window) ImGui_ImplSDL3_Shutdown();
+			ImGui::DestroyContext(g_ctx);
+		}
+		g_ctx = nullptr; g_renderer = nullptr; g_renderer_backend = false;
+		return 0;
+	}
+	return 1;
+}
 void overlay_shutdown(void) {
 	if (!g_ctx) return;
 	ImGui::SetCurrentContext(g_ctx);
-	ImGui_ImplSDLGPU3_Shutdown();
+	if (g_renderer_backend) ImGui_ImplSDLRenderer3_Shutdown(); else ImGui_ImplSDLGPU3_Shutdown();
 	if (g_has_window) ImGui_ImplSDL3_Shutdown();
 	ImGui::DestroyContext(g_ctx);
-	g_ctx = nullptr; g_has_window = false; g_open = false; g_want_quit = false; g_want_capture = false; g_paused = false;
+	g_ctx = nullptr; g_has_window = false; g_renderer_backend = false; g_renderer = nullptr; g_open = false; g_want_quit = false; g_want_capture = false; g_paused = false;
 }
 
 int overlay_is_open(void) { return g_ctx && g_open; }
@@ -1052,7 +1073,7 @@ static void render_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint
 	 * it's closed a game's keys and pad are the game's (window.c forwards only mouse events then) */
 	io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
 	if (g_open) io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-	ImGui_ImplSDLGPU3_NewFrame();
+	if (g_renderer_backend) ImGui_ImplSDLRenderer3_NewFrame(); else ImGui_ImplSDLGPU3_NewFrame();
 	if (have_window) {
 		ImGui_ImplSDL3_NewFrame();
 	} else {
@@ -1089,6 +1110,10 @@ static void render_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint
 					(void *)pc.TexRef._TexData, pc.TexRef._TexData ? (int)pc.TexRef._TexData->Status : -1, pc.TexRef._TexData ? pc.TexRef._TexData->Width : 0, pc.TexRef._TexData ? pc.TexRef._TexData->Height : 0);
 			}
 		}
+	}
+	if (g_renderer_backend) {
+		ImGui_ImplSDLRenderer3_RenderDrawData(dd, g_renderer);
+		return;
 	}
 	/* mandatory before the render pass below: uploads the vertex/index buffers. It also acquires and
 	 * submits a command buffer of its own whenever ImGui has a texture to create or update (the font
@@ -1399,6 +1424,7 @@ void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w
 	if (!overlay_is_open()) return;
 	render_frame(cmd, target, w, h, dt_s, g_has_window, g_quit_card ? build_quit : g_layout_card ? build_layout : g_prep_card ? build_prep : build_ui);
 }
+void overlay_frame_renderer(uint32_t w, uint32_t h, double dt_s) { overlay_frame(nullptr, nullptr, w, h, dt_s); }
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
 	g_nosd = metrics_osd_lines(g_osd, 6);
@@ -1409,6 +1435,9 @@ void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w
 	g_marks = marks; g_nmarks = n;
 	for (int i = 0; i < 4; i++) g_rear[i] = rear_rect ? rear_rect[i] : 0;
 	render_frame(cmd, target, w, h, dt_s, g_has_window, build_closed);
+}
+void overlay_marks_renderer(uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
+	overlay_marks(nullptr, nullptr, w, h, dt_s, marks, n, rear_rect);
 }
 /* RECOMP_OVERLAY_DUMP (window.c): deliberately bypasses overlay_is_open() -- this must never be the
  * thing that makes the rest of the host think the menu is open (display.c's pause gate, window.c's
@@ -1427,7 +1456,7 @@ static void forced_frame(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t
 	g_skip_draw = false;
 }
 void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32_t w, uint32_t h, const char *ui) {
-	if (!g_ctx || !device) return;
+	if (!g_ctx || g_renderer_backend || !device) return;
 	g_nmarks = 0; g_rear[2] = 0; g_nosd = 0;
 	if (!ui || !*ui || !strncmp(ui, "menu", 4)) {
 		/* "menu:<tab>" opens the full menu on that page (the tab bar applies a selection on its next layout) */
