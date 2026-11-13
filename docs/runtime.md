@@ -107,6 +107,8 @@ none.
 - Past 48 segments, the next session gathers every pipeline it uses into new segments and drops the old ones when it
   exits.
 - An OS update makes the folder stale, and it's deleted.
+- Metal's `com.apple.gpuarchiver` scratch cache is shared by every program and exposes no ownership information, so
+  Nativ leaves its cleanup to macOS rather than risk deleting another program's directory.
 - Every pipeline is kept except the prediction pass's guesses. `RECOMP_MTL_ARCHIVE=0` turns the archive off.
 
 Linux and Windows rely on the Vulkan drivers' own caches.
