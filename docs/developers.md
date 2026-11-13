@@ -111,7 +111,10 @@ its SHA-256.
 1. Tag the commit (`git tag v0.1.0`) and check it out with nothing uncommitted.
 2. On the Mac: `NATIV_RELEASES=<owner>/<repo> dev/release.sh v0.1.0 mac windows`; on Linux the same with `linux`.
    Copy the Linux zip into the Mac's `build/release/v0.1.0/` and run `dev/release.sh v0.1.0` there once more to write
-   `SHA256SUMS` over all three.
+   `SHA256SUMS` over all three. Before the Mac package is accepted, the release script mounts its DMG, copies the app
+   to a writable folder, checks every Mach-O and static library for arm64 and the advertised deployment target, rejects
+   non-relocatable load paths, imports the bundled Python modules, and compiles and runs a fixture against the shipped
+   SDL, SPIRV-Cross, and FFmpeg toolchain.
 3. Publish: the script prints the `gh release create` command.
 
 `NATIV_RELEASES` names the GitHub repository whose releases are the installs' updates: `vitarecomp dist` writes it to
