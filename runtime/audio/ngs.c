@@ -171,6 +171,11 @@ static int reverb_bypassed(const Voice *v) {
 	for (int m = 0; m < MAX_MODULES; m++) if (v->params[m] && (RD32(v->params[m]) & 0xffff) == REVERB_PARAMS_ID) return v->bypass[m] != 0;
 	return v->bypass[1] != 0;   /* no parameters yet: a reverb bus's reverb is its module 1 */
 }
+static int reverb_off(void) {
+	static int off = -1;
+	if (off < 0) { const char *e = getenv("RECOMP_NGS_REVERB"); off = e && !strcmp(e, "0"); }
+	return off;
+}
 /* the early reflections as a dense cluster: twelve taps per channel over the 28 ms after the reflections delay, uneven,
  * signed and fading (the channels' patterns differ), through two short allpasses per channel that smear them; their
  * energy together is the input's at er_gain. Four close taps of one sign before (2026-10-17 .. 10-28) summed to a copy
@@ -670,19 +675,21 @@ static void rs_read(const Voice *v, double step, float *l, float *r) {
 /* the next source sample of an ADPCM player into *l, *r: 1, or 0 when its data ends */
 static int fetch_adpcm(Voice *v, uint32_t pp, int ch, float rate, float *l, float *r) {
 	uint32_t frame_bytes = 16u * (uint32_t)ch;
+	int transitions = 0;
 	for (;;) {
 		if (v->buffer > 3) return 0;
 		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
-		if (!data || bytes < frame_bytes) return 0;
+		if (!data) return 0;
 		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next (as the PCM path) */
 			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
 			v->byte_pos = 0; v->ad_idx = 0; v->ad_valid = 0;
-			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
+			if (bytes >= frame_bytes && loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
 			else {
 				uint32_t prev = v->buffer;
 				v->loops_done = 0; if (next < 0 || next > 3) return 0; v->buffer = next;
 				player_event(v, EV_SWAPPED, prev, RD32(pp + P_BUF(next)));
 			}
+			if (++transitions > 4) return 0;
 			continue;
 		}
 		if (!v->ad_valid || v->ad_frame_buf != v->buffer || v->ad_frame_pos != v->byte_pos) {
@@ -711,19 +718,21 @@ static int fetch_adpcm(Voice *v, uint32_t pp, int ch, float rate, float *l, floa
 /* the next source sample of a PCM player: 1, or 0 when its data ends */
 static int fetch_pcm(Voice *v, uint32_t pp, int ch, float rate, float *l, float *r) {
 	uint32_t frame_bytes = 2u * (uint32_t)ch;
+	int transitions = 0;
 	for (;;) {
 		if (v->buffer > 3) return 0;
 		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
-		if (!data || bytes < frame_bytes) return 0;
+		if (!data) return 0;
 		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next */
 			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
 			v->byte_pos = 0;
-			if (loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
+			if (bytes >= frame_bytes && loops != 0 && (loops < 0 || v->loops_done < (uint32_t)loops)) { v->loops_done++; player_event(v, EV_LOOPED(v), v->loops_done, data); }
 			else {
 				uint32_t prev = v->buffer;
 				v->loops_done = 0; if (next < 0 || next > 3) return 0; v->buffer = next;
 				player_event(v, EV_SWAPPED, prev, RD32(pp + P_BUF(next)));
 			}
+			if (++transitions > 4) return 0;
 			continue;
 		}
 		int16_t a = (int16_t)RD16(data + v->byte_pos), b = ch == 2 ? (int16_t)RD16(data + v->byte_pos + 2) : a;
@@ -1116,6 +1125,7 @@ static void h_system_update(Cpu *c) {
 			if (wait && !cycle) continue;
 			Voice *v = &voices[bus[b]];
 			if (PASS_BUS(v->def)) route(v, v->acc, gn);
+			else if (v->rv && reverb_off()) memset(v->rv, 0, sizeof *v->rv);
 			else if (v->rv && reverb_bypassed(v)) { memset(v->rv, 0, sizeof *v->rv); route(v, v->acc, gn); }   /* (its tail cleared: nothing stale when the game turns it back on) */
 			else if (v->rv) {
 				if (dump_dir) { char path[1024]; snprintf(path, sizeof path, "%s/rv%d_in_pass0.wav", dump_dir, bus[b]); static Wav rin[512]; wav_put(&rin[bus[b]], path, sample_rate, 2, 3, v->acc, 2 * gn * 4); }
