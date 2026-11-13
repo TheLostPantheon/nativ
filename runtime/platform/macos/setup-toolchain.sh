@@ -10,6 +10,8 @@
 #   setup-toolchain.sh            on a Mac with the Command Line Tools, cmake and ninja (Homebrew's); built here once and
 #                                 copied into installs, nothing of this is needed where they run
 set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+source "$HERE/checksum.sh"
 SDL=3.4.16
 SDL_SHA=7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68
 SPIRV_CROSS=vulkan-sdk-1.4.363.0
@@ -21,7 +23,6 @@ ARCH=arm64
 D=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
 mkdir -p "$D/dl"; cd "$D/dl"
 # a download's sha256 against its pin above, so a tampered or changed archive stops the script
-verify() { local h; h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}'); [[ -n $h ]] || h=$(shasum -a 256 "$1" | awk '{print $1}'); [[ $h == "$2" ]] && return; echo "checksum mismatch: $1 (expected $2, got $h)"; rm -f "$1"; exit 1; }
 fetch() { [[ -f $2 ]] || { curl -fL --retry 3 -o "$2.part" "$1" && verify "$2.part" "$3" && mv -f "$2.part" "$2"; }; }
 fetch "https://github.com/libsdl-org/SDL/releases/download/release-$SDL/SDL3-$SDL.tar.gz" "SDL3-$SDL.tar.gz" "$SDL_SHA"
 fetch "https://github.com/KhronosGroup/SPIRV-Cross/archive/refs/tags/$SPIRV_CROSS.tar.gz" "SPIRV-Cross-$SPIRV_CROSS.tar.gz" "$SPIRV_CROSS_SHA"

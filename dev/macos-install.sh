@@ -19,6 +19,7 @@ PY_VER=3.13.17
 PY_REL=20261021
 PY_SHA=9c985cbf327425873469896ce748c7134b6deca8edb81e93c589ad2fc5aff445   # aarch64-apple-darwin-install_only
 H=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$H")
+source "$ROOT/runtime/platform/macos/checksum.sh"
 DEST=${1:?usage: macos-install.sh <folder>}; mkdir -p "$DEST"; DEST=$(cd "$DEST" && pwd)
 APP="$DEST/Project Nativ.app"; OUT="$APP/Contents/Resources"; mkdir -p "$OUT" "$APP/Contents/MacOS"
 MT=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
@@ -35,7 +36,6 @@ for d in SDL3 spirv-cross ffmpeg; do rsync -a --delete --exclude cmake --exclude
 # Python
 if [[ ! -x $OUT/python/bin/python3 || "$("$OUT/python/bin/python3" -c 'import platform; print(platform.python_version())')" != "$PY_VER" ]]; then
   DL=$MT/dl; A=cpython-$PY_VER+$PY_REL-aarch64-apple-darwin-install_only.tar.gz
-  verify() { local h; h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}'); [[ -n $h ]] || h=$(shasum -a 256 "$1" | awk '{print $1}'); [[ $h == "$2" ]] && return; echo "checksum mismatch: $1 (expected $2, got $h)"; rm -f "$1"; exit 1; }
   [[ -f $DL/$A ]] || { curl -fL --retry 3 -o "$DL/$A.part" "https://github.com/astral-sh/python-build-standalone/releases/download/$PY_REL/$A" && verify "$DL/$A.part" "$PY_SHA" && mv -f "$DL/$A.part" "$DL/$A"; }
   rm -rf "$OUT/python"; tar xzf "$DL/$A" -C "$OUT"   # (unpacks as python/)
 fi
