@@ -15,6 +15,7 @@
 #include <sched.h>   /* sched_yield: vb_sleep_until */
 #include <math.h>
 #include "hle.h"
+#include "ctrl_v2.h"
 #include "gfx.h"
 #include "metrics.h"
 #include "settings.h"
@@ -663,8 +664,9 @@ static int play_motion(float a[3], float g[3], float q[4]) {   /* the latest rec
 	memcpy(a, motion_recs[motion_cur].a, 12); memcpy(g, motion_recs[motion_cur].g, 12); memcpy(q, motion_recs[motion_cur].q, 16); return 1;
 }
 /* pad2: a PS TV's paired pad (the "2" reads of port 1): a DualShock's buttons, L1/R1 and L2/R2 apart and the stick clicks
- * (window_input_pad2); every other read gets the handheld's (window_input) */
-static void ctrl_peek(Cpu *c, int pad2) {   /* (port, SceCtrlData *, count): timestamp, buttons, sticks centred */
+ * (window_input_pad2); every other read gets the handheld's (window_input). v2: a "2" read -- on port 0 the handheld's
+ * buttons with the shoulders as L1 / R1, as the "2" reads report them (ctrl_v2.h) */
+static void ctrl_peek(Cpu *c, int pad2, int v2) {   /* (port, SceCtrlData *, count): timestamp, buttons, sticks centred */
 	input_rec_init();
 	for (uint32_t i = 0; i < A2; i++) {
 		uint32_t p = A1 + 64 * i;
@@ -674,6 +676,7 @@ static void ctrl_peek(Cpu *c, int pad2) {   /* (port, SceCtrlData *, count): tim
 		uint32_t b; uint8_t st[4];
 		int played = play_loaded && play_ctrl(&b, st);
 		if (!played) (pad2 ? window_input_pad2 : window_input)(&b, st);
+		if (v2 && !pad2) b = ctrl_v2_buttons(b);
 		WR32(p + 8, b);
 		WR8(p + 12, st[0]); WR8(p + 13, st[1]); WR8(p + 14, st[2]); WR8(p + 15, st[3]);
 		/* RECOMP_INPUT="from-to:mask,...": buttons held over frame ranges (hex Vita masks: 4000
@@ -716,7 +719,7 @@ static void ctrl_peek(Cpu *c, int pad2) {   /* (port, SceCtrlData *, count): tim
 	}
 	RET(A2);
 }
-static void h_ctrl_peek(Cpu *c) { ctrl_peek(c, 0); }
+static void h_ctrl_peek(Cpu *c) { ctrl_peek(c, 0, 0); }
 /* the Read forms block until a sample this thread hasn't seen exists -- the hardware samples the
  * controller and the panels once per vblank edge and Read waits for the next one -- while Peek
  * returns the latest sample at once. A thread that waits for vblank then reads once a frame never
@@ -735,7 +738,7 @@ static void read_wait(uint64_t *last) {
 	if (*last == now) { vb_wait_until(now + 1, 0); now = vb_now(); }   /* count 0: paces the thread, doesn't advance the fixed clock (a polling pad thread made guest time run 8x fast) */
 	*last = now;
 }
-static void h_ctrl_read(Cpu *c) { read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(c, 0); }
+static void h_ctrl_read(Cpu *c) { read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(c, 0, 0); }
 static void h_audio_adopt(Cpu *c) { RET(1); }
 #define SCE_CTRL_ERROR_INVALID_ARG 0x80340001u
 /* PS TV mode. A game that reads pad port 1 and gets an answer takes itself for a PS TV with a paired pad: no touch screen
@@ -767,9 +770,9 @@ static int pstv_mode(void) {   /* the game's look at boot, answered once */
 	return v;
 }
 static int pstv_port_ok(uint32_t port) { if (!port) return 1; __atomic_store_n(&pstv_looked, 1, __ATOMIC_RELAXED); return port == 1 && pstv_mode(); }
-/* port 0 of the "2" reads is the handheld's own buttons, as the other reads have them; port 1 is the PS TV's pad */
-static void h_ctrl_read2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(c, A0 != 0); }
-static void h_ctrl_peek2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } ctrl_peek(c, A0 != 0); }
+/* port 0 of the "2" reads is the handheld's own buttons with the shoulders as L1 / R1 (ctrl_v2.h); port 1 is the PS TV's pad */
+static void h_ctrl_read2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } read_wait(&ctrl_read_edge[A0 & 3]); ctrl_peek(c, A0 != 0, 1); }
+static void h_ctrl_peek2(Cpu *c) { if (!pstv_port_ok(A0)) { RET(SCE_CTRL_ERROR_INVALID_ARG); return; } ctrl_peek(c, A0 != 0, 1); }
 /* SceTouchData (0x90 bytes, VitaSDK psp2/touch.h): u64 timestamp, u32 status, u32 report count, 8
  * reports {u8 id, u8 force, s16 x, s16 y, u8 reserved[8], u16 info}. RECOMP_TOUCH="from-to:x,y;..."
  * (frame ranges, front panel coordinates 1920x1088) touches the front panel in scripted runs.
