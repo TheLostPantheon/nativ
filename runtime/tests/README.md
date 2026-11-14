@@ -101,3 +101,15 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## USSE subroutine calls: `usse_call_test.c`
+
+Checks that `runtime/gfx/usse.c` inlines a shader's subroutine calls: a subroutine at the start of the code ending in a
+return, called by branches to instruction 0 after it. The programs are hand-encoded control-group words, decoded by the
+real decoder: the decoded order must be the straight one (main, the subroutine at each call, the rest), a skip in the
+main body over a call is re-aimed, and `usse_spirv_translate` must make a module from it. A predicated call and a return
+that ends the program stay as decoded. With `SPIRV_VAL=<spirv-val>` every module is also validated.
+
+    cc -O1 -g -Wall -D_GNU_SOURCE -I ../gfx -I ../core -I ../../recompiler -I ../.. usse_call_test.c ../gfx/usse.c ../gfx/usse_spirv.c -o /tmp/usse_call_test -lm && /tmp/usse_call_test
+
+It prints `all passed`.
