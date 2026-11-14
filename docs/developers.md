@@ -106,7 +106,9 @@ link to Applications (the tools in its `Contents/Resources`, the launcher as its
 `release.sh`). `dev/macos-install.sh`,
 `dev/windows-install.sh` (made on macOS or Linux) and `dev/linux-install.sh` (made on Linux) build them, each from a
 toolchain built first by `runtime/platform/<os>/setup-toolchain.sh`. Every download those scripts make is pinned by
-its SHA-256.
+its SHA-256. The Mac toolchain keeps a manifest with each installed component and rebuilds it when a source pin,
+target, compiler, SDK, build flag, or recipe changes; replacements are validated and atomically swapped with the
+previous component.
 
 1. Tag the commit (`git tag v0.1.0`) and check it out with nothing uncommitted.
 2. On the Mac: `NATIV_RELEASES=<owner>/<repo> dev/release.sh v0.1.0 mac windows`; on Linux the same with `linux`.
