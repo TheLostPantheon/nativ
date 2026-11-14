@@ -89,6 +89,26 @@ format. The behaviour follows Vita3K's SceCamera module; there's no console refe
 
 It prints `all passed`.
 
+## Synthetic Metal scene: `metal_smoke_test.c` (macOS)
+
+Checks the renderer's Apple-only building blocks without a game or window. Three tiny test shaders are translated
+from committed SPIR-V to MSL and compiled concurrently, then two full-screen draws share one render pass: the first
+uses SPIR-V half packing to write a known colour, and the second reads it through Metal framebuffer fetch and adds a
+known offset. The result is submitted through the runtime's locked fence path, downloaded, and checked pixel by
+pixel. The GLSL fixtures are under `runtime/tests/shaders/`; run `zsh shaders/build.sh` only when changing them.
+
+Build the Mac toolchain first (`runtime/platform/macos/setup-toolchain.sh`), then:
+
+```
+MT=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
+clang -O1 -g -Wall -Wextra $INC -I "$MT/SDL3/include" -I "$MT/spirv-cross/include" \
+  ../gfx/gpulock.c metal_smoke_test.c "$MT/SDL3/lib/libSDL3.0.dylib" \
+  "$MT"/spirv-cross/lib/libspirv-cross-{c,msl,glsl,hlsl,reflect,cpp,core,util}.a \
+  -lc++ -lpthread -Wl,-rpath,"$MT/SDL3/lib" -o /tmp/metal_smoke_test && /tmp/metal_smoke_test
+```
+
+It names the Metal device, prints the downloaded pixel, and exits with `N checks, 0 failed`.
+
 ## Metal's scratch folders: `mtl_archive_test.m` (macOS)
 
 Checks the sweep in `runtime/gfx/mtl_archive.m`. Metal gives every binary archive a pipeline is added to a scratch
