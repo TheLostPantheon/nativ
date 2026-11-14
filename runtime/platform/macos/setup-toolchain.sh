@@ -10,14 +10,16 @@
 #   setup-toolchain.sh            on a Mac with the Command Line Tools, cmake and ninja (Homebrew's); built here once and
 #                                 copied into installs, nothing of this is needed where they run
 set -euo pipefail
+H=$(cd "$(dirname "$0")" && pwd)
+source "$H/target.sh"
 SDL=3.4.16
 SDL_SHA=7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68
 SPIRV_CROSS=vulkan-sdk-1.4.363.0
 SPIRV_CROSS_SHA=f708982e88b763ef5b0394ed468fc2c3628f68cdab89f2e7a946cd628c04e721
 FFMPEG=7.1.1
 FFMPEG_SHA=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
-MIN=11.0   # macOS Big Sur, the first on Apple silicon: every M-series Mac (the shaders are MSL 2.3, the pipeline archive MTLBinaryArchive: both 11.0)
-ARCH=arm64
+MIN=$NATIV_MACOS_MIN   # macOS Big Sur, the first on Apple silicon: every M-series Mac (the shaders are MSL 2.3, the pipeline archive MTLBinaryArchive: both 11.0)
+ARCH=$NATIV_MACOS_ARCH
 D=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
 mkdir -p "$D/dl"; cd "$D/dl"
 # a download's sha256 against its pin above, so a tampered or changed archive stops the script

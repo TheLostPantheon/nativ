@@ -10,7 +10,7 @@
 set -e
 H=${0:A:h}; ROOT=${H:h}
 IMGUI=$ROOT/third_party/imgui; IMGUIOBJ=$ROOT/build/imgui/obj
-CXX=c++; SDL_CFLAGS=($(pkg-config --cflags sdl3 2>/dev/null)); SDL_LIBS=($(pkg-config --libs sdl3 2>/dev/null)); IMFLAGS=()
+CXX=c++; SDL_CFLAGS=($(pkg-config --cflags sdl3 2>/dev/null)); SDL_LIBS=($(pkg-config --libs sdl3 2>/dev/null)); IMFLAGS=(); QUIET=(-w)
 LINK=(-lpthread); ROOTDEF=$ROOT
 if [[ $TARGET == windows ]]; then
   WT=${ATIV_WIN_TOOLCHAIN:-$HOME/toolchains/ativ-win}; SDLW=$WT/SDL3/x86_64-w64-mingw32; BIN=$WT/llvm-mingw/bin
@@ -42,13 +42,18 @@ else
   # an install's Mac toolchain (runtime/platform/macos/setup-toolchain.sh; ATIV_MAC_TOOLCHAIN, else <root>/toolchain when it holds
   # SDL3): Apple's clang from the Command Line Tools, SDL3 copied beside the launcher (found through @executable_path)
   if [[ $(uname) == Darwin ]]; then
+    source "$ROOT/runtime/platform/macos/target.sh"
+    MACOS_FLAGS=(-arch "$NATIV_MACOS_ARCH" "-mmacosx-version-min=$NATIV_MACOS_MIN" -Werror=unguarded-availability-new)
+    MACOS_TAG=${NATIV_MACOS_ARCH}_macos${NATIV_MACOS_MIN//./_}
+    QUIET=(-Wno-everything)
+    SDL_CFLAGS+=($MACOS_FLAGS); IMGUIOBJ=$ROOT/build/imgui/obj_$MACOS_TAG
     MT=${ATIV_MAC_TOOLCHAIN:-}; [[ -z $MT && -f $ROOT/toolchain/SDL3/lib/libSDL3.0.dylib ]] && MT=$ROOT/toolchain
-    # (built for macOS 11, as the toolchain: an install runs on every Apple silicon Mac, not only the build machine's macOS)
-    if [[ -n $MT ]]; then SDL_CFLAGS=(-I$MT/SDL3/include -mmacosx-version-min=11.0); SDL_LIBS=(-L$MT/SDL3/lib -lSDL3 -Wl,-rpath,@executable_path -mmacosx-version-min=11.0); IMGUIOBJ=$ROOT/build/imgui/obj_mt11; ROOTDEF=.; fi
+    # The configured target, rather than the build machine, determines where an install can run.
+    if [[ -n $MT ]]; then SDL_CFLAGS=(-I$MT/SDL3/include $MACOS_FLAGS); SDL_LIBS=(-L$MT/SDL3/lib -lSDL3 -Wl,-rpath,@executable_path); IMGUIOBJ=$ROOT/build/imgui/obj_mt_$MACOS_TAG; ROOTDEF=.; fi
   fi
 fi
 mkdir -p $IMGUIOBJ
-CXXFLAGS=(-O2 -std=c++17 -w -I $IMGUI -I $IMGUI/backends -I $ROOT/runtime/ui -I $ROOT/runtime/platform $SDL_CFLAGS)
+CXXFLAGS=(-O2 -std=c++17 $QUIET -I $IMGUI -I $IMGUI/backends -I $ROOT/runtime/ui -I $ROOT/runtime/platform $SDL_CFLAGS)
 objs=()
 for s in $IMGUI/imgui.cpp $IMGUI/imgui_draw.cpp $IMGUI/imgui_tables.cpp $IMGUI/imgui_widgets.cpp $IMGUI/backends/imgui_impl_sdl3.cpp $IMGUI/backends/imgui_impl_sdlgpu3.cpp; do
   o=$IMGUIOBJ/${s:t:r}.o; objs+=($o)
