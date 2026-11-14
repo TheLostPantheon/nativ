@@ -12,7 +12,8 @@ ATIV_LINUX_TOOLCHAIN, default <root>/toolchain when there is one): nothing of th
 no compiler or development files; libSDL3.so.0 copied beside the binary, objects in obj_lt*/. Without one: the machine's
 compiler and pkg-config's libraries, as before.
 
-macOS with an install's toolchain (runtime/platform/macos/setup-toolchain.sh: SDL3, SPIRV-Cross, FFmpeg built for macOS 13;
+macOS with an install's toolchain (runtime/platform/macos/setup-toolchain.sh: SDL3, SPIRV-Cross, FFmpeg built for the
+shared architecture and deployment target in runtime/platform/macos/target.sh;
 ATIV_MAC_TOOLCHAIN, default <root>/toolchain when there is one): the libraries from there, Apple's clang and SDK from the Command
 Line Tools, libSDL3.0.dylib copied beside the binary; objects in obj_mt*/. Without one: Homebrew's, through pkg-config, as before.
 
@@ -35,6 +36,7 @@ SUBDIRS = ("core", "gfx", "audio", "media", "input", "net", "ui", "platform", "d
 # every part's folder on the include path, so a source names another's header plainly ("hle.h"); the repository root for
 # third_party/<library>/...; the recompiler's folder for rt.h
 INCLUDES = [f for d in SUBDIRS for f in ("-I", os.path.join(RT, d))] + ["-I", RECOMPILER, "-I", ROOT]
+MACOS_TARGET = os.path.join(RT, "platform", "macos", "target.sh")
 
 
 def part(name):   # a runtime source by its name ("kernel", "online/stun"): the file in whichever part holds it
@@ -54,6 +56,26 @@ def say(s):
 
 def die(s):
     say(s); sys.exit(1)
+
+
+def macos_target(path=MACOS_TARGET):
+    names = {"NATIV_MACOS_MIN", "NATIV_MACOS_ARCH"}
+    values = {}
+    with open(path, encoding="ascii") as f:
+        for line_number, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"): continue
+            match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([A-Za-z0-9_.+-]+)", line)
+            if not match or match.group(1) not in names:
+                raise ValueError(f"{path}:{line_number}: invalid macOS target assignment")
+            name, value = match.groups()
+            if name in values: raise ValueError(f"{path}:{line_number}: duplicate {name}")
+            values[name] = value
+    missing = names - values.keys()
+    if missing: raise ValueError(f"{path}: missing {', '.join(sorted(missing))}")
+    if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", values["NATIV_MACOS_MIN"]):
+        raise ValueError(f"{path}: invalid NATIV_MACOS_MIN")
+    return values["NATIV_MACOS_ARCH"], values["NATIV_MACOS_MIN"]
 
 
 def newer(a, b):   # zsh's a -nt b
@@ -100,6 +122,12 @@ def main(argv):
     mods = argv[2:] or (ENV.get("RECOMP_MODULE_BASES") or "").split()
     WIN = HOSTED_WINDOWS or ENV.get("TARGET") == "windows"
     PROFILE, VERIFY = ENV.get("PROFILE"), ENV.get("VERIFY")
+    MACOS_ARCH = MACOS_MIN = None
+    MACOS_FLAGS = []
+    if DARWIN and not WIN:
+        try: MACOS_ARCH, MACOS_MIN = macos_target()
+        except (OSError, ValueError) as e: die(f"build: {e}")
+        MACOS_FLAGS = ["-arch", MACOS_ARCH, f"-mmacosx-version-min={MACOS_MIN}", "-Werror=unguarded-availability-new"]
     # RECOMP_CPU: the processor the code is compiled for. native (the default when a machine builds for itself): its own,
     # every instruction it has. Each player compiles their own copy, so nothing has to run anywhere else; on x86-64 the
     # toolchain's default is otherwise the 2003 baseline (SSE2). generic: the toolchain's default, for a binary that runs on
@@ -113,7 +141,8 @@ def main(argv):
     machine = platform.machine().lower()
     CPUFLAGS = [] if cpu == "generic" else [("-mcpu=" if machine in ("arm64", "aarch64") else "-march=") + cpu]
     extra = (ENV.get("RECOMP_CFLAGS") or "").split()
-    FLAGS = ["-O2", "-ffp-contract=off"] + CPUFLAGS + extra + ["-w"] + INCLUDES
+    QUIET = ["-Wno-everything"] if MACOS_FLAGS else ["-w"]
+    FLAGS = ["-O2", "-ffp-contract=off"] + CPUFLAGS + extra + QUIET + MACOS_FLAGS + INCLUDES
     PLATFORM = [part("platform_posix")]
     exe = ".exe" if HOSTED_WINDOWS else ""
     CC, CXX = ENV.get("CC"), ENV.get("CXX")
@@ -154,7 +183,8 @@ def main(argv):
     CXX = CXX or ("clang++" if shutil.which("clang++") else "c++")
     tag = "" if not CPUFLAGS else "_" + (resolved_cpu(CC, CPUFLAGS[0]) if cpu == "native" else cpu)
     if extra: tag += "_" + hashlib.sha1(" ".join(extra).encode()).hexdigest()[:8]
-    OBJ = os.path.join(os.path.dirname(BASE), "obj" + ("_prof" if PROFILE else "") + ("_verify" if VERIFY else "") + ("_win" if WIN else "") + ("_lt" if LT else "") + ("_mt" if MT else "") + tag)
+    mac_tag = f"_{MACOS_ARCH}_macos{MACOS_MIN.replace('.', '_')}" if MACOS_FLAGS else ""
+    OBJ = os.path.join(os.path.dirname(BASE), "obj" + ("_prof" if PROFILE else "") + ("_verify" if VERIFY else "") + ("_win" if WIN else "") + ("_lt" if LT else "") + ("_mt" if MT else "") + mac_tag + tag)
     os.makedirs(OBJ, exist_ok=True)
     # PROFILE=1: compile the guest code with its per-instruction hook (the host's profiler); objects in obj_prof/
     if PROFILE: FLAGS.append("-DRECOMP_TRACE")
@@ -190,7 +220,7 @@ def main(argv):
     # would no longer match its signature). Each object is written to a temporary and renamed into place (whole or not
     # at all), so two builds of one title never see a half-written .o.
     IMGUI = os.path.join(ROOT, "third_party", "imgui"); IMGUIOBJ = os.path.join(OBJ, "imgui"); os.makedirs(IMGUIOBJ, exist_ok=True)
-    CXXFLAGS = ["-O2", "-std=c++17", "-w", "-I", IMGUI, "-I", os.path.join(IMGUI, "backends")] + INCLUDES + sdl_cflags
+    CXXFLAGS = ["-O2", "-std=c++17"] + QUIET + MACOS_FLAGS + ["-I", IMGUI, "-I", os.path.join(IMGUI, "backends")] + INCLUDES + sdl_cflags
     if WIN: CXXFLAGS += ["-D_FILE_OFFSET_BITS=64", "-include", os.path.join(RT, "platform", "win32_compat.h")]
     imgui_srcs = [os.path.join(IMGUI, f) for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", os.path.join("backends", "imgui_impl_sdl3.cpp"), os.path.join("backends", "imgui_impl_sdlgpu3.cpp"))] + [os.path.join(RT, "ui", "overlay.cpp")]
     # the touch card's input icons (third_party/kenney-prompts/prompts.png) as bytes overlay.cpp includes: a game's binary

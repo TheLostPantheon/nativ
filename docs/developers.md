@@ -108,6 +108,12 @@ link to Applications (the tools in its `Contents/Resources`, the launcher as its
 toolchain built first by `runtime/platform/<os>/setup-toolchain.sh`. Every download those scripts make is pinned by
 its SHA-256.
 
+The packaged Mac's architecture and oldest supported macOS are defined together in
+`runtime/platform/macos/target.sh`. Dependency builds, launcher and game compiler invocations, object-cache names,
+and the app's `LSMinimumSystemVersion` all consume that file. After changing it, run
+`python3 dev/tests/macos_target_test.py` on a Mac; the test checks compiler arguments, Mach-O metadata, availability
+warnings, cache separation, and the generated property list.
+
 1. Tag the commit (`git tag v0.1.0`) and check it out with nothing uncommitted.
 2. On the Mac: `NATIV_RELEASES=<owner>/<repo> dev/release.sh v0.1.0 mac windows`; on Linux the same with `linux`.
    Copy the Linux zip into the Mac's `build/release/v0.1.0/` and run `dev/release.sh v0.1.0` there once more to write

@@ -12,13 +12,18 @@
 # Nothing writes inside the app once it's made (a signed one must match its signature): games, builds and settings live
 # in the player's library and settings folders, compiled Python in the settings folder (PYTHONPYCACHEPREFIX).
 # Run again over the same folder to update it (dist removes only what it wrote; python is kept when current). Apple
-# silicon (arm64), macOS 11 (Big Sur) and later: every M-series Mac. Needs the toolchain built here first ($ATIV_MAC_TOOLCHAIN, default
-# ~/toolchains/ativ-mac). Signing, notarising and the .dmg: dev/release.sh.
+# The architecture and oldest supported macOS live in runtime/platform/macos/target.sh. Needs the toolchain built here
+# first ($ATIV_MAC_TOOLCHAIN, default ~/toolchains/ativ-mac). Signing, notarising and the .dmg: dev/release.sh.
 set -euo pipefail
 PY_VER=3.13.17
 PY_REL=20261021
 PY_SHA=9c985cbf327425873469896ce748c7134b6deca8edb81e93c589ad2fc5aff445   # aarch64-apple-darwin-install_only
 H=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$H")
+source "$ROOT/runtime/platform/macos/target.sh"
+case "$NATIV_MACOS_ARCH" in
+  arm64) PY_ARCH=aarch64 ;;
+  *) echo "no standalone Python archive configured for macOS architecture $NATIV_MACOS_ARCH"; exit 1 ;;
+esac
 DEST=${1:?usage: macos-install.sh <folder>}; mkdir -p "$DEST"; DEST=$(cd "$DEST" && pwd)
 APP="$DEST/Project Nativ.app"; OUT="$APP/Contents/Resources"; mkdir -p "$OUT" "$APP/Contents/MacOS"
 MT=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
@@ -34,7 +39,7 @@ for d in SDL3 spirv-cross ffmpeg; do rsync -a --delete --exclude cmake --exclude
 
 # Python
 if [[ ! -x $OUT/python/bin/python3 || "$("$OUT/python/bin/python3" -c 'import platform; print(platform.python_version())')" != "$PY_VER" ]]; then
-  DL=$MT/dl; A=cpython-$PY_VER+$PY_REL-aarch64-apple-darwin-install_only.tar.gz
+  DL=$MT/dl; A=cpython-$PY_VER+$PY_REL-$PY_ARCH-apple-darwin-install_only.tar.gz
   verify() { local h; h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}'); [[ -n $h ]] || h=$(shasum -a 256 "$1" | awk '{print $1}'); [[ $h == "$2" ]] && return; echo "checksum mismatch: $1 (expected $2, got $h)"; rm -f "$1"; exit 1; }
   [[ -f $DL/$A ]] || { curl -fL --retry 3 -o "$DL/$A.part" "https://github.com/astral-sh/python-build-standalone/releases/download/$PY_REL/$A" && verify "$DL/$A.part" "$PY_SHA" && mv -f "$DL/$A.part" "$DL/$A"; }
   rm -rf "$OUT/python"; tar xzf "$DL/$A" -C "$OUT"   # (unpacks as python/)
@@ -58,7 +63,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key><string>$BV</string>
   <key>CFBundleVersion</key><string>$BV</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSMinimumSystemVersion</key><string>$NATIV_MACOS_MIN</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSCameraUsageDescription</key><string>Some games use the Vita's rear camera; Nativ can use this Mac's camera for it.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Online play finds other players on your network.</string>
