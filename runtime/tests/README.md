@@ -89,6 +89,18 @@ format. The behaviour follows Vita3K's SceCamera module; there's no console refe
 
 It prints `all passed`.
 
+## Guest-memory write tracking: `guestwatch_test.c`
+
+Checks `runtime/gfx/guestwatch.c` with the production POSIX fault handler and a real 4 GiB guest reservation. It
+protects overlapping, unaligned ranges; takes direct write and read-watch faults; verifies per-page write clocks;
+and proves that a kernel write into protected memory fails with `EFAULT` until
+`gwatch_write_begin`/`gwatch_write_end` brackets it. On Apple Silicon it additionally requires 16 KiB pages and
+observes that the handled protection faults arrive as `SIGBUS`.
+
+    cc -O1 -g -Wall $INC ../platform/platform_posix.c ../gfx/guestwatch.c guestwatch_test.c -o /tmp/guestwatch_test -lpthread && /tmp/guestwatch_test
+
+It prints `N checks, 0 failed (page size 16384)` on Apple Silicon and exits nonzero on any invariant failure.
+
 ## Metal's scratch folders: `mtl_archive_test.m` (macOS)
 
 Checks the sweep in `runtime/gfx/mtl_archive.m`. Metal gives every binary archive a pipeline is added to a scratch
