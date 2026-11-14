@@ -555,7 +555,7 @@ static UOp decode_one(uint64_t w, int secondary) {
 			uint32_t fc = BITS(w, 40, 38);
 			if (fc == 5) { op.op = OP_NOP; return op; }               /* NOP */
 			if (fc == 0 || fc == 1) { dec_br(w, &op); return op; }    /* BR */
-			if (fc == 2) { op.op = OP_NOP; return op; }               /* return: treated as end-of-program (interpreter stops at instr_count) */
+			if (fc == 2) { op.op = OP_NOP; op.sub = USSE_NOP_RET; return op; }   /* return: a no-op where it ends the program; a subroutine's end is resolved by inline_calls */
 			op.op = OP_UNSUPPORTED; return op;
 		}
 		if (opcat == 1 && op2 == 2) { dec_smlsi(w, &op); return op; }
@@ -1564,6 +1564,55 @@ static void parse_fragment_layout(uint32_t p, UsseFragLayout *fl) {
 		}
 	}
 }
+/* Subroutine calls, inlined. A compiler puts a subroutine at the start of the code -- instructions 0..r ending in a
+ * return (flow-control function 2, decoded as USSE_NOP_RET) -- and the main body after it; each call is a branch to
+ * instruction 0 (save_link set) placed after the return. The body runs from r + 1, and each call runs 0..r-1 and goes on
+ * after the call (Vita3K's analyser, usse_program_analyzer.cpp: execution starts at the last return, every branch to 0
+ * after a return is a call, the range [0, return] is inlined there). Taken literally, the interpreter looped from each
+ * call back into 0..r and through the main body again until its 100000-branch guard, for every vertex (slow, and the
+ * output wrong), and the GPU translator refused the program ("branch ... outside the structured forms translated"),
+ * so every draw with it fell back to the CPU. Here the code is rewritten into straight order once: main up to call 1,
+ * the subroutine, main up to call 2, the subroutine, ..., the rest of main; every other branch is re-aimed at its
+ * target's new place. Forms it doesn't know (a predicated call, a call before the last return, a branch that can't be
+ * re-aimed) leave the code as decoded, as before. A program with a return and no call is left as decoded too (a
+ * return that ends the program). */
+static UOp *inline_calls(UOp *ops, int *np) {
+	const int n = *np; int r = -1, ncall = 0;
+	for (int i = 1; i < n; i++) if (ops[i].op == OP_NOP && ops[i].sub == USSE_NOP_RET) r = i;
+	if (r < 0) return ops;
+	for (int i = 0; i < n; i++) if (ops[i].op == OP_BR && i + ops[i].imm == 0) {
+		int ret_before = 0; for (int k = 1; k < i; k++) if (ops[k].op == OP_NOP && ops[k].sub == USSE_NOP_RET) ret_before = 1;
+		if (!ret_before) continue;   /* a loop back to 0, not a call */
+		if (i < r || ops[i].pred_kind) return ops;   /* a form this doesn't know */
+		ncall++;
+	}
+	if (!ncall) return ops;
+	const int nn = (n - r - 1 - ncall) + ncall * r;   /* main without its calls, plus r instructions per call */
+	int *at = malloc(sizeof(int) * (size_t)(n + 1)), *src = malloc(sizeof(int) * (size_t)(nn > 0 ? nn : 1)), *base = malloc(sizeof(int) * (size_t)(nn > 0 ? nn : 1));
+	UOp *out = malloc(sizeof(UOp) * (size_t)(nn > 0 ? nn : 1));
+	for (int i = 0; i <= n; i++) at[i] = -1;
+	int o = 0;
+	for (int i = r + 1; i < n; i++) {
+		if (ops[i].op == OP_BR && i + ops[i].imm == 0) {   /* a call: the subroutine's copy (base: where its 0 landed) */
+			at[i] = o;
+			for (int j = 0; j < r; j++) { out[o] = ops[j]; src[o] = j; base[o] = at[i]; o++; }
+			continue;
+		}
+		at[i] = o; out[o] = ops[i]; src[o] = i; base[o] = -1; o++;
+	}
+	at[n] = o;
+	int ok = o == nn;
+	for (int k = 0; k < o && ok; k++) if (out[k].op == OP_BR) {
+		const int t = src[k] + out[k].imm; int nt;
+		if (base[k] >= 0) nt = t >= 0 && t <= r ? base[k] + t : -1;   /* inside a copy: 0..r-1, or the return = just past the copy */
+		else nt = t > r && t <= n ? at[t] : -1;                       /* main: a main instruction, a call (its copy's start) or the end */
+		if (nt < 0) ok = 0; else out[k].imm = nt - k;
+	}
+	free(at); free(src); free(base);
+	if (!ok) { free(out); return ops; }   /* a branch across an inlined subroutine: left as decoded */
+	free(ops); *np = nn;
+	return out;
+}
 static UOp *decode_slice(uint32_t code_base, int n, int secondary, int *supported_out) {
 	if (n <= 0) { if (supported_out) *supported_out &= 1; return 0; }
 	UOp *ops = malloc(sizeof(UOp) * (size_t)n);
@@ -1620,6 +1669,8 @@ static void decode_program(UsseProgram *p, uint32_t prog_addr, uint32_t hash, ui
 	p->nprim = (int)pn; p->nsec = sn;
 	p->prim = decode_slice(pc, (int)pn, 0, &p->supported);
 	p->sec = decode_slice(sc, sn, 1, &p->supported);
+	if (p->prim) p->prim = inline_calls(p->prim, &p->nprim);
+	if (p->sec) p->sec = inline_calls(p->sec, &p->nsec);
 	if (p->is_fragment) parse_fragment_layout(prog_addr, &p->fl); else parse_vertex_layout(prog_addr, &p->vl);
 	{	int n = RD16(prog_addr + H_PRIM_REGS);
 		if (!p->is_fragment) {

@@ -39,12 +39,14 @@ typedef struct {
 	uint8_t pred_kind, pred_reg;    /* 0 always, 1 pN, 2 !pN; reg 0-3 */
 	uint8_t mask;                    /* 4-bit write mask, already bank-rewritten where §2.9 applies */
 	uint8_t reps, repmode;
-	uint8_t sub, sub2, sub3;          /* opcode-specific small selectors (op2, move_type, dim, ...) */
+	uint8_t sub, sub2, sub3;          /* opcode-specific small selectors (op2, move_type, dim, ...); OP_NOP: USSE_NOP_* */
 	UOperand dst, s0, s1, s2;
 	int32_t imm;
 	int32_t args[4];                   /* SMLSI/SMBO tables (packed inc/mode), BR target */
 	uint64_t raw;
 } UOp;
+
+enum { USSE_NOP_PLAIN = 0, USSE_NOP_RET = 3 };   /* OP_NOP kinds; RET: a subroutine's return (usse.c inline_calls) */
 
 /* FPCONSTANT ROM (§2.7): 64 entries, (low word, high word); a translator can emit these as plain
  * SPIR-V constants (the ROM is fixed, not draw state) instead of modelling the bank at all. */
