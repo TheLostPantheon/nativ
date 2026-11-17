@@ -842,8 +842,10 @@ static void test_sched(void) {
 	CHECKEQ(call(h_delay, 1, 30000), 0);   /* P takes the core; main gets it back only by the timer */
 	{ Thread *p = thread_of(pt); CHECK(p && p->s_state == S_EVICTED); }
 	CHECK(p_spins > 0);
+	sched_quantum = 10000000;   /* main now waits for P in host naps, no boundary: on a slow machine (CI) a quantum would pass and the timer
+	                             * would hand the core back to P (an equal) before main looked */
 	p_stop = 1;
-	{ Thread *p = thread_of(pt); for (int k = 0; k < 100 && p->s_state != S_READY; k++) nap(1); CHECK(p->s_state == S_READY); }   /* its boundary: it waits now */
+	{ Thread *p = thread_of(pt); for (int k = 0; k < 2000 && p->s_state != S_READY; k++) nap(1); CHECK(p->s_state == S_READY); }   /* its boundary: it waits now */
 	CHECK(slog_is(""));
 	sc_join(pt); CHECK(slog_is("p"));
 	sched_quantum = 10000000;
