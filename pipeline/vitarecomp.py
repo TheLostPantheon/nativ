@@ -174,13 +174,30 @@ def _is_junction(p):
 
 def link_dir(target, link, relative=None):
     """a folder link (ln -sfn): a symbolic link where the system makes them freely, a junction on Windows (no
-    privilege needed); relative: the link's text where a symbolic link can be relative"""
+    privilege needed); relative: the link's text where a symbolic link can be relative. A drive that holds no links
+    (exFAT or FAT, a handheld's memory card: issue #36) gets <link>.link instead, a text file naming the folder
+    relative to the link's own; the runtime reads it for app0 (io.c host_app0), as do linked_dir and the launcher"""
     rmtree(link) if os.path.lexists(link) else None
-    if WINDOWS:
-        import _winapi
-        _winapi.CreateJunction(os.path.abspath(target), os.path.abspath(link))
-    else:
-        os.symlink(relative or target, link)
+    rmtree(link + ".link") if os.path.lexists(link + ".link") else None
+    if linked_dir(target) != target: target, relative = linked_dir(target), None   # (a link to one named by its .link file: to the folder itself)
+    try:
+        if ENV.get("NATIV_NO_LINKS"): raise OSError(1, "links turned off by NATIV_NO_LINKS")   # (the no-links route, tested on any drive)
+        if WINDOWS:
+            import _winapi
+            _winapi.CreateJunction(os.path.abspath(target), os.path.abspath(link))
+        else:
+            os.symlink(relative or target, link)
+    except OSError as e:
+        real = os.path.realpath(linked_dir(target))
+        with open(link + ".link", "w", encoding="utf-8") as f: f.write(os.path.relpath(real, os.path.realpath(os.path.dirname(link))) + "\n")
+        say(f"{link}: this drive holds no folder links ({e.strerror}): named in {os.path.basename(link)}.link instead")
+
+
+def linked_dir(p):
+    """a folder link_dir made: the folder itself, or where its .link file points"""
+    if os.path.exists(p) or not os.path.isfile(p + ".link"): return p
+    t = head1(p + ".link")
+    return t if os.path.isabs(t) else os.path.normpath(os.path.join(os.path.realpath(os.path.dirname(p)), t))
 
 
 def natkey(s):   # zsh's (n) glob order: numbers inside names compared as numbers

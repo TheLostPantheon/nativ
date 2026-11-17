@@ -570,8 +570,18 @@ static std::string tag_text(const std::string &x, const char *tag, size_t from =
 	size_t s0 = v.find_first_not_of(" \t\r\n"), s1 = v.find_last_not_of(" \t\r\n");
 	return s0 == std::string::npos ? "" : v.substr(s0, s1 - s0 + 1);
 }
+/* a title's app0 (recomp/fs/app0): a folder link, or on a drive that holds none the folder its app0.link names
+ * (vitarecomp's link_dir; io.c host_app0 reads it the same way) */
+static std::string app0_dir(const std::string &id) {
+	std::string fs = g_dump + "/decrypted/" + id + "/recomp/fs", a = fs + "/app0";
+	if (exists(a)) return a;
+	std::string t = read_file(fs + "/app0.link");
+	t = t.substr(0, t.find_first_of("\r\n"));
+	if (t.empty()) return a;
+	return t[0] == '/' || t[0] == '\\' || (t.size() > 1 && t[1] == ':') ? t : fs + "/" + t;
+}
 static void art_paths(Game &g) {
-	std::string sys = g_dump + "/decrypted/" + g.id + "/recomp/fs/app0/sce_sys/", la = sys + "livearea/contents/";
+	std::string sys = app0_dir(g.id) + "/sce_sys/", la = sys + "livearea/contents/";
 	g.icon = exists(sys + "icon0.png") ? sys + "icon0.png" : "";
 	g.cover.clear();
 	if (exists(sys + "pic0.png")) { g.cover = sys + "pic0.png"; return; }
