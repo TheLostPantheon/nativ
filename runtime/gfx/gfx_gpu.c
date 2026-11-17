@@ -5016,7 +5016,8 @@ static void recipes_load(void) {   /* once, on the render thread: the shipped re
 	fprintf(stderr, "    gpu: shader recipes: %d shaders and %d pipelines (%d shaders from %s)%s\n", rc.nr, rc.np, nship, paths[0] ? paths[0] : "no shipped set", rc.fd < 0 ? ", not recording" : "");
 	/* the loader: the recipes' programs out of the game's own files (gxp_index.c), for the warm-up (recipes_warm) */
 	const char *off = getenv("RECOMP_SHADER_LOADER"), *cache = shader_cache_dir();
-	char app0[1024], p[1100]; snprintf(p, sizeof p, "%s/app0", getenv("RECOMP_FS") ? getenv("RECOMP_FS") : "fs");
+	extern const char *host_app0(void);   /* io.c */
+	char app0[4096]; const char *p = host_app0();
 	uint32_t *want = malloc((2 * (size_t)rc.nr + 1) * sizeof *want); int nwant = 0;
 	if (want && (rc.nr || predict_on()) && cache && !(off && *off == '0') && realpath(p, app0) && !(mkdir(cache, 0755) && errno != EEXIST)) {
 		for (int i = 0; i < rc.nr; i++) { want[nwant++] = rc.r[i].hash; if (rc.r[i].is_frag && rc.r[i].hash2) want[nwant++] = rc.r[i].hash2; }

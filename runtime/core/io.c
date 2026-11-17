@@ -45,19 +45,44 @@ void host_path_fold(char *buf, size_t root_len) {
 		*end = save; q = end + 1; while (*q == '/') q++;
 	}
 }
-static const char *host_path_s(const char *p, char *buf, size_t n) {
+/* app0's host folder: <RECOMP_FS>/app0, a link to the game's own copy -- or, on a drive that holds no links (exFAT or
+ * FAT, a handheld's memory card: issue #36), the folder <RECOMP_FS>/app0.link names (vitarecomp's link_dir), relative to
+ * <RECOMP_FS> unless absolute */
+static char app0_dir[PATH_MAX];
+static void app0_find(void) {
 	const char *root = getenv("RECOMP_FS") ? getenv("RECOMP_FS") : "fs";
-	if (*p != '/' && !strchr(p, ':')) { snprintf(buf, n, "%s/app0/%s", root, p); return buf; }
-	while (*p == '/') p++;
-	const char *colon = strchr(p, ':'), *slash = strchr(p, '/');
-	if (colon && (!slash || colon < slash)) {
-		const char *rest = colon + 1; while (*rest == '/') rest++;
-		snprintf(buf, n, "%s/%.*s/%s", root, (int)(colon - p), p, rest);
-	} else snprintf(buf, n, "%s/%s", root, p);
-	for (char *q = buf + strlen(root); *q; q++) if (*q == '\\') *q = '/';   /* a separator on the console (exFAT forbids it in names): Uncharted saves "slot_000/saves\checkpoint.bin" */
-	host_path_fold(buf, strlen(root));
+	snprintf(app0_dir, sizeof app0_dir, "%s/app0", root);
+	struct stat st; char lf[PATH_MAX], t[PATH_MAX]; FILE *f;
+	if (!stat(app0_dir, &st)) return;
+	snprintf(lf, sizeof lf, "%s/app0.link", root);
+	if (!(f = fopen(lf, "r"))) return;
+	if (fgets(t, sizeof t, f) && (t[strcspn(t, "\r\n")] = 0, *t)) {
+		if (t[0] == '/' || t[0] == '\\' || (t[0] && t[1] == ':')) snprintf(app0_dir, sizeof app0_dir, "%s", t);
+		else snprintf(app0_dir, sizeof app0_dir, "%s/%s", root, t);
+		fprintf(stderr, "app0: %s (from %s)\n", app0_dir, lf);
+	}
+	fclose(f);
+}
+const char *host_app0(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, app0_find); return app0_dir; }
+/* a Vita path as the host's (fios.c's too) */
+const char *host_path_str(const char *p, char *buf, size_t n) {
+	const char *root = getenv("RECOMP_FS") ? getenv("RECOMP_FS") : "fs";
+	size_t keep = strlen(root);   /* (the part that is the host's: not folded, its separators kept) */
+	if (*p != '/' && !strchr(p, ':')) { snprintf(buf, n, "%s/%s", host_app0(), p); keep = strlen(host_app0()); }
+	else {
+		while (*p == '/') p++;
+		const char *colon = strchr(p, ':'), *slash = strchr(p, '/');
+		int dl = colon && (!slash || colon < slash) ? (int)(colon - p) : slash ? (int)(slash - p) : (int)strlen(p);
+		const char *rest = p + dl; if (*rest == ':' || *rest == '/') rest++; while (*rest == '/') rest++;
+		if (dl == 4 && !strncmp(p, "app0", 4)) { snprintf(buf, n, "%s/%s", host_app0(), rest); keep = strlen(host_app0()); }
+		else if (colon && (!slash || colon < slash)) snprintf(buf, n, "%s/%.*s/%s", root, dl, p, rest);
+		else snprintf(buf, n, "%s/%s", root, p);
+	}
+	for (char *q = buf + keep; *q; q++) if (*q == '\\') *q = '/';   /* a separator on the console (exFAT forbids it in names): Uncharted saves "slot_000/saves\checkpoint.bin" */
+	host_path_fold(buf, keep);
 	return buf;
 }
+static const char *host_path_s(const char *p, char *buf, size_t n) { return host_path_str(p, buf, n); }
 static const char *host_path(uint32_t gp, char *buf, size_t n) { return host_path_s((char *)G(gp), buf, n); }
 #define SCE_ENOENT 0x80010002u
 #define SCE_EBADF 0x80010009u
@@ -82,7 +107,7 @@ static uint32_t sce_err(int e) {
  * exist yet its folder, resolves under <RECOMP_FS>/app0 -- links and ".." included. */
 int guest_path_readonly(const char *hp) {
 	static char app0[PATH_MAX]; static int have = -1;
-	if (have < 0) { char p[1024]; snprintf(p, sizeof p, "%s/app0", getenv("RECOMP_FS") ? getenv("RECOMP_FS") : "fs"); have = realpath(p, app0) != 0; }
+	if (have < 0) have = realpath(host_app0(), app0) != 0;
 	if (!have) return 0;
 	char rp[PATH_MAX];
 	if (!realpath(hp, rp)) {

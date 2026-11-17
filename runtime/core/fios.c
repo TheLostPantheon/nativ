@@ -33,21 +33,8 @@
 
 static uint64_t fios_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 void io_read_note(int64_t n, uint64_t us, int archive);   /* io.c */
-void host_path_fold(char *buf, size_t root_len);   /* io.c */
-static const char *root(void) { return getenv("RECOMP_FS") ? getenv("RECOMP_FS") : "fs"; }
-static const char *fios_path(uint32_t gp, char *buf, size_t n) {
-	const char *p = (char *)G(gp);
-	if (*p != '/' && !strchr(p, ':')) { snprintf(buf, n, "%s/app0/%s", root(), p); return buf; }   /* relative: the app's folder */
-	while (*p == '/') p++;
-	const char *colon = strchr(p, ':'), *slash = strchr(p, '/');
-	if (colon && (!slash || colon < slash)) {   /* "dev:rest" */
-		const char *rest = colon + 1; while (*rest == '/') rest++;
-		snprintf(buf, n, "%s/%.*s/%s", root(), (int)(colon - p), p, rest);
-	} else snprintf(buf, n, "%s/%s", root(), p);   /* "/dev/rest" */
-	for (char *q = buf + strlen(root()); *q; q++) if (*q == '\\') *q = '/';   /* a separator, as io.c */
-	host_path_fold(buf, strlen(root()));   /* names ignoring case, as io.c */
-	return buf;
-}
+const char *host_path_str(const char *p, char *buf, size_t n);   /* io.c: a Vita path as the host's (app0 included, wherever it is) */
+static const char *fios_path(uint32_t gp, char *buf, size_t n) { return host_path_str((char *)G(gp), buf, n); }
 
 /* ---- handles and operations */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
