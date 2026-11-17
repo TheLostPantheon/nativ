@@ -537,7 +537,7 @@ static void test_msgpipe(void) {
 /* ================= callbacks and the CB waits */
 static volatile int cb_calls; static uint32_t cb_id, cb_count, cb_arg, cb_common, cb_tid, cb_ret;
 static void cb_fn(Cpu *c) { cb_calls++; cb_id = c->r[0]; cb_count = c->r[1]; cb_arg = c->r[2]; cb_common = c->r[3]; cb_tid = cur_tid; c->r[0] = cb_ret; }
-typedef struct { uint32_t name, cb, sema, result, delay_result; volatile int done, ready; uint64_t t_end; } CbJob;
+typedef struct { uint32_t name, cb, sema, result, delay_result; volatile int done, ready; uint64_t t_start, t_end; } CbJob;
 static void cb_owner(void *p) {   /* creates the callback (so it owns it), then waits with callbacks */
 	CbJob *j = p;
 	j->cb = call(h_create_callback, 4, j->name, 0, 0x1018, 0xbeef);
@@ -545,7 +545,7 @@ static void cb_owner(void *p) {   /* creates the callback (so it owns it), then 
 	j->result = call(h_wait_sema_cb, 3, j->sema, 1, 0);
 	j->done = 1;
 }
-static void cb_delayer(void *p) { CbJob *j = p; j->ready = 1; j->delay_result = call(h_delay_cb, 1, 200000); j->t_end = guest_time_us(); j->done = 1; }
+static void cb_delayer(void *p) { CbJob *j = p; j->t_start = guest_time_us(); j->ready = 1; j->delay_result = call(h_delay_cb, 1, 200000); j->t_end = guest_time_us(); j->done = 1; }
 static void cb_end_waiter(void *p) { CbJob *j = p; j->ready = 1; j->result = call(h_wait_thread_end_cb, 3, j->sema /* a thread uid here */, 0, 0); j->done = 1; }
 static void test_callbacks(void) {
 	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "cb");
@@ -593,7 +593,8 @@ static void test_callbacks(void) {
 		Obj *o = new_obj(CALLBACK, name, 0); o->owner = t ? t->uid : 0; o->func = 0x1018; o->common = 0x79; dcb = o->uid; }   /* a callback owned by the delaying thread */
 	uint64_t t0 = guest_time_us(); cb_calls = 0;
 	CHECKEQ(call(h_notify_callback, 2, dcb, 3), 0); nap(30); CHECKEQ((uint32_t)cb_calls, 1); CHECKEQ(cb_common, 0x79); CHECK(!d.done);
-	pthread_join(td, 0); CHECKEQ(d.delay_result, 0); CHECK(d.t_end - t0 >= 140000);
+	pthread_join(td, 0); CHECKEQ(d.delay_result, 0); CHECK(d.t_end - d.t_start >= 199000);   /* (the delay itself, from its start: a slow machine's naps above made t0 late, CI's macOS runner) */
+	(void)t0;
 	/* WaitThreadEndCB likewise */
 	uint32_t s2 = the_sema = call(h_create_sema, 5, name, 0, 0, 1, 0);
 	uint32_t t3 = call(h_create_thread, 7, name, 0x1010, 160, 0x1000, 0, 0, 0);
