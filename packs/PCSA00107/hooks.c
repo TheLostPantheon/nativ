@@ -158,6 +158,35 @@ void recomp_hook_kz_gesture(Cpu *c) {
 	lastw[i] = w;
 	if (w > 0 && mine) { extern void window_touch_gesture_hint(void); window_touch_gesture_hint(); }
 }
+/* 0x8159e834, the window's countdown in 1.12's fn_8159e684 (1.00's 0x815689c2 in fn_81568842; sl = r10, the melee
+ * component; d0 = d1 - d9: the window left less the update's step, both lanes the same; 0 or less ends it, fn_8159e3de).
+ * The player's own windows, the swipes of their takedowns and interrogations, count down in real time instead: the
+ * "qte_time" setting (QTE time in the launcher's Game settings, RECOMP_KZ_QTE_TIME; 1-3) in seconds. One second is what
+ * the game's slow motion makes of its 0.10 s window (an update every tenth of its 1/30 s steps); without the slow
+ * motion a window ran every frame and was gone in 0.1-0.13 s (2026-11-02: at 30 fps one lasted 4 frames, the next 31).
+ * It ends at the update nearest the deadline, and is the same at 30 and 60 fps. Multiplayer's windows (1.00 s, no slow
+ * motion) stay the game's own, and RECOMP_KZ_QTE_TIME=0 keeps them all so. */
+void recomp_ihook_kz_qte_time(Cpu *c, int reg) {
+	(void)reg; const uint32_t m = c->r[10];
+	if (!m || !kz_player || RD32(m + 0x1c) != kz_player) return;
+	static const char *env = (const char *)-1; if (env == (const char *)-1) env = getenv("RECOMP_KZ_QTE_TIME");
+	double k = env && *env ? atof(env) : settings_float("qte_time", 1.0);   /* (read each step: only while a window is open) */
+	if (!(k > 0)) return;
+	if (k < 1.0) k = 1.0; if (k > 3.0) k = 3.0;
+	static uint32_t cur; static int game; static float full, last; static uint64_t t0, prev;
+	const float w = c->vfp.f[2]; const uint64_t now = guest_time_us_peek();
+	if (m != cur || (game ? w > last : w != last)) {   /* a window the game set (each step after the first finds what the last one left) */
+		const uint32_t res = RD32(m + 0x10); uint32_t b = res ? RD32(res + 0x118) : 0; float mp; memcpy(&mp, &b, 4);
+		cur = m; full = w; t0 = prev = now;
+		game = res && w == mp && mp >= 0.5f;   /* multiplayer's */
+	}
+	if (game) { last = c->vfp.f[0]; return; }
+	const double len = 1e6 * k, el = (double)(now - t0), half = (double)(now - prev) / 2;
+	prev = now;
+	const float left = el + half >= len ? 0 : full * (float)(1 - el / len);
+	c->vfp.f[0] = c->vfp.f[1] = last = left;
+	if (left == 0) fprintf(stderr, "    kz gesture: the player's window over after %.2f s (QTE time %.1f)\n", el / 1e6, k);
+}
 /* 1.12's fn_81622b7e (r0 = the other party's component of type 0x81b5889c): half of the takedown's "show the prompt" test in
  * its per-frame update (fn_815a0688: show = fn_81622b7e(c) && !fn_816231bc(c), then HUD message 0x3b). On a handheld it is
  * !c[0x24c] && !c[0x22e]; on a PS TV the partner flags +0x24d/+0x22f and the mode +0x1c4 join in. An enemy's takedown on the
@@ -715,6 +744,16 @@ void recomp_ihook_kz_aim(Cpu *c, int reg) {
 	(void)reg;
 	kz_mouse_yaw = 0;
 	kz_player_mark();
+	{	/* (diagnostic, once a level) the player's melee QTE window lengths and the multiplayer flag that picks among them
+		 * (1.12's 0x815a1652: [[kz_game_settings]+0x178]+0x12c nonzero takes MultiplayerGestureWindow) */
+		static uint32_t seen; const uint32_t mc = kz_player ? RD32(kz_player + 0x4bc) : 0, res = mc ? RD32(mc + 0x10) : 0;
+		if (res && res != seen) {
+			seen = res; float v[4]; for (int k = 0; k < 4; k++) { uint32_t x = RD32(res + 0x10c + 4u * (uint32_t)k); memcpy(&v[k], &x, 4); }
+			static uint32_t gs = 1; if (gs == 1) gs = game_addr("kz_game_settings");
+			const uint32_t o = gs ? RD32(gs + 0x178) : 0; const int mp = o ? (int)RD32(o + 0x12c) : -1;
+			fprintf(stderr, "    kz gesture: the player's windows Easy %.2f Medium %.2f Hard %.2f Multiplayer %.2f s, multiplayer flag %d (frame %llu)\n", v[0], v[1], v[2], v[3], mp, (unsigned long long)display_frames());
+		}
+	}
 	const uint32_t sp = c->r[13];
 	const float lo = kz_rdf(sp + 0x20), hi = kz_rdf(sp + 0x24);
 	static int diag = -1; if (diag < 0) diag = getenv("RECOMP_KZ_AIM_DIAG") != 0;
