@@ -273,7 +273,40 @@ def main(argv):
     host += [f for f in (ENV.get("RECOMP_PACK_SOURCES") or "").split(os.pathsep) if f]
     objs = sorted(glob.glob(os.path.join(glob.escape(OBJ), "*.o"))) + sorted(glob.glob(os.path.join(glob.escape(IMGUIOBJ), "*.o")))
     # (Linux links libm/pthread explicitly; zlib: PSARC archives)
-    link = [CC] + FLAGS + ENVDEF + ["-Wall"] + sdl_cflags + PLATFORM + host + EXTRA + objs + sdl_libs + SPIRV_CROSS + AVCODEC + CURL + CXXLIB + LIBS + ["-o", OUT]
+    # The runtime's own sources (and the pack's): each compiled to an object of its own, in parallel, and kept while its
+    # source, every header it includes (the compiler's -MMD list) and its exact command are unchanged -- a game's rebuild
+    # after an update or a pack change compiles only what changed, where every build compiled all ~70 files one after
+    # another in the link (the idea of contributor PR #73). The game's built-in settings (ENVDEF) go only to the files
+    # that read them, so a change to its RUN_ENV recompiles those alone.
+    extras = SPIRV_CROSS + AVCODEC + CURL + EXTRA
+    srcs_h, cflags_x, link_x, i = [], [], [], 0
+    while i < len(extras):
+        a = extras[i]
+        if a == "-framework": link_x += extras[i:i + 2]; i += 2; continue
+        if a.endswith((".c", ".m")): srcs_h.append(a)
+        elif a.startswith(("-I", "-D")): cflags_x.append(a)
+        else: link_x.append(a)
+        i += 1
+    HOSTOBJ = os.path.join(OBJ, "host"); os.makedirs(HOSTOBJ, exist_ok=True)
+    reads_envdef = {"main.c", "hooks.c", "window.c"}
+    hwork, hobjs = [], []
+    for s in PLATFORM + host + srcs_h:
+        rel = os.path.relpath(s, ROOT) if os.path.abspath(s).startswith(os.path.abspath(ROOT) + os.sep) else os.path.basename(s)
+        o = os.path.join(HOSTOBJ, rel.replace(os.sep, "_").replace("/", "_").rsplit(".", 1)[0] + ".o"); hobjs.append(o)
+        argv = [CC, "-c"] + FLAGS + (ENVDEF if os.path.basename(s) in reads_envdef else []) + ["-Wall"] + sdl_cflags + cflags_x + [s, "-MMD", "-MF", o + ".d", "-o", f"{o}.{os.getpid()}"]
+        cmd = "\0".join(argv[:-1])   # (without the temporary's name)
+        if host_object_current(o, cmd): continue
+        hwork.append((argv, s, o, cmd))
+    def compile_host(w):
+        argv, s, o, cmd = w
+        if subprocess.run(argv).returncode: _rm(argv[-1]); return s
+        os.replace(argv[-1], o)
+        with open(o + ".cmd", "w") as f: f.write(cmd)
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(jobs, 4)) as ex: failed = [f for f in ex.map(compile_host, hwork) if f]
+    if failed: die("build: " + ", ".join(os.path.basename(f) for f in failed) + " did not compile")
+    if hwork: say(f"  {len(hwork)} of the runtime's {len(hobjs)} files compiled")
+    link = [CC] + FLAGS + hobjs + objs + sdl_libs + link_x + CXXLIB + LIBS + ["-o", OUT]
     sys.stdout.flush()
     r = subprocess.run(link)
     if r.returncode: return r.returncode
@@ -285,6 +318,20 @@ def main(argv):
     if MT: beside(os.path.join(MT, "SDL3", "lib", "libSDL3.0.dylib"))   # (what -rpath @executable_path finds)
     say(f"built {OUT}")
     return 0
+
+
+def host_object_current(o, cmd):
+    """o, compiled by exactly cmd, newer than its source and every header in its dependency list (.d)"""
+    try:
+        if open(o + ".cmd").read() != cmd: return False
+        t = os.path.getmtime(o)
+        deps = open(o + ".d").read().replace("\\\n", " ").split(": ", 1)[1]   # (after "target: "; a Windows target has a drive letter's colon)
+    except (OSError, IndexError):
+        return False
+    for d in re.split(r"(?<!\\)\s+", deps.strip()):
+        d = d.replace("\\ ", " ")
+        if d and (not os.path.exists(d) or os.path.getmtime(d) > t): return False
+    return True
 
 
 def _rm(p):

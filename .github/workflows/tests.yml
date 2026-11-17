@@ -1,0 +1,23 @@
+# The tests that need no game and no firmware (dev/tests/run_all.sh), on every push to main and every pull request, on a
+# Mac (Apple silicon) and Linux. The game tests need the player's own copies and stay local.
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements.txt unicorn==2.1.4 pyelftools==0.33
+      - run: CC=clang PYTHON=python bash dev/tests/run_all.sh

@@ -1163,13 +1163,101 @@ class Fn:
         lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
         lines.append("\t}")
         lines.append("}")
-        return lines
+        return reg_locals(lines, 3 if hook else 2) if REG_LOCALS[0] else lines
+
+
+# Registers as C locals (on unless --no-reg-locals): each function keeps the general registers it uses (r0-r14; the pc
+# stays in c, the computed-jump switch reads it) in locals gr0..gr14, loaded after its entry (and entry hook) and written
+# back to c only where something else can see c: before every call out of it (a guest function, an import, an
+# indirect call, a hook, the setjmp stub) and every return, reloaded after each call. In between the C compiler keeps them
+# in host registers: c->r in memory made every instruction a load and a store of the CPU state (62 stores and 53 loads
+# in one of Uncharted's hot functions of 230 instructions, 2026-11-17). The inline helpers that take c (ADDC, SUBC, NZ,
+# COND, SHIFT, VCMP, VMRS_APSR) touch only the flags and the FPSCR. A host longjmp back into a setjmp stub is followed by
+# a reload, so locals that changed after the setjmp don't matter.
+# The flags too: a function that reads or sets N, Z, C, V keeps them in a local Cpu F (its flag fields only: the compiler
+# keeps them as scalars, and drops the ones nothing reads before the next instruction sets them again), synced with c at
+# the same places as the registers. The helpers that take c for the flags (ADDC, SUBC, NZ, SHIFT, COND) get &F; VMRS_APSR
+# (FPSCR's flags into them) becomes VMRS_APSR2(&F, c).
+REG_LOCALS = [True]
+_RREF = re.compile(r"c->r\[(\d+)\]")
+_FLAG_HELPERS = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,")
+_FLAG_FIELDS = re.compile(r"\bc->([nzcv])\b")
+_FLAGS_USED = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,|\bc->[nzcv]\b|VMRS_APSR\(c\)")
+# And the VFP/NEON registers: a function whose every reference to them names a register by a constant (s/f [i], d/fd [k],
+# its address included: a NEON load's memcpy into one) works on a local VfpRegs V, the d registers it touches copied in and
+# out like the others. Float-heavy leaf functions (Uncharted's hottest: five to seven register references an instruction,
+# no calls) then keep their whole computation in host registers.
+_VREF = re.compile(r"c->vfp\.(s|f|d|fd)\[(\d+)\]")
+_VANY = re.compile(r"c->vfp\b")
+# Only in functions that call out a few times at most: each call writes back and reloads every d register the function uses,
+# and Uncharted's biggest functions (4,000 instructions, 180 calls, all 32 d registers) grew to 600 KB of C that the C
+# compiler took over a quarter of an hour on. The hot float code is small and calls little (most of it nothing).
+VFP_MAX_CALLS = 16
+_CALLOUT = re.compile(r"\bfn_[0-9a-f]{8}\(c\);|(?<![\w.])f\(c\);|\brecomp_call_external\(c, |\brecomp_ihook_\w+\(c, |recomp_setjmp_begin\(c\)")
+_CALLS = [   # (the statement that calls out, as the emitter writes it; its replacement around RSO/RSI)
+    (re.compile(r"\b(fn_[0-9a-f]{8}\(c\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"(?<![\w.])(f\(c\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_call_external\(c, [^;]*\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_ihook_\w+\(c, [^;]*\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_hook_\w+\(c\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_unimplemented\(c, [^;]*\);)"), r"{ RSO \1 }"),
+    (re.compile(r"\b(UNIMPL\(c, [^;]*\);)"), r"{ RSO \1 }"),
+    (re.compile(r"(?<![\w])(return;)"), r"{ RSO \1 }"),
+]
+
+
+def reg_locals(lines, head):
+    """lines (one function; its first `head` lines the signature, ENTER and the entry hook) with the registers it uses as
+    locals: see REG_LOCALS"""
+    used = sorted({int(n) for l in lines for n in _RREF.findall(l)} - {15})
+    flags = any(_FLAGS_USED.search(l) for l in lines[head:])
+    vd = set()
+    for l in lines[head:]:
+        for kind, n in _VREF.findall(l): vd.add(int(n) >> 1 if kind in ("s", "f") else int(n))
+    vfp = (bool(vd) and all(len(_VANY.findall(l)) == len(_VREF.findall(l)) for l in lines[head:])   # (only constant register numbers)
+           and sum(len(_CALLOUT.findall(l)) for l in lines[head:]) <= VFP_MAX_CALLS)
+    vd = sorted(vd) if vfp else []
+    if not used and not flags and not vfp: return lines
+    body = []
+    for l in lines[head:]:
+        l = _RREF.sub(lambda m: m.group(0) if m.group(1) == "15" else f"gr{m.group(1)}", l)
+        if flags:
+            l = _FLAG_HELPERS.sub(lambda m: f"{m.group(1)}(&F,", l)
+            l = _FLAG_FIELDS.sub(lambda m: f"F.{m.group(1)}", l)
+            l = l.replace("VMRS_APSR(c)", "VMRS_APSR2(&F, c)")
+        if vfp: l = l.replace("c->vfp.", "V.")
+        if "recomp_setjmp_begin(c)" in l:   # c current for the stub (after the lr just set); its 0, or a longjmp's registers, reloaded
+            l = (l.replace("RecompJmp *rj = recomp_setjmp_begin(c);", "RSO RecompJmp *rj = recomp_setjmp_begin(c);")
+                  .replace("if (!_setjmp(rj->host)) gr0 = 0; }", "if (!_setjmp(rj->host)) c->r[0] = 0; RSI }"))
+            l = _CALLS[-1][0].sub(_CALLS[-1][1], l)
+        else:
+            for pat, sub in _CALLS: l = pat.sub(sub, l)
+        body.append(l)
+    so = " ".join([f"c->r[{n}] = gr{n};" for n in used] + ([f"c->{f} = F.{f};" for f in "nzcv"] if flags else []) + [f"c->vfp.d[{k}] = V.d[{k}];" for k in vd])
+    si = " ".join([f"gr{n} = c->r[{n}];" for n in used] + ([f"F.{f} = c->{f};" for f in "nzcv"] if flags else []) + [f"V.d[{k}] = c->vfp.d[{k}];" for k in vd])
+    decl = ("\tuint32_t " + ", ".join(f"gr{n} = c->r[{n}]" for n in used) + ";" if used else "") + (
+        " Cpu F; F.n = c->n; F.z = c->z; F.c = c->c; F.v = c->v;" if flags else "") + (
+        " VfpRegs V; " + " ".join(f"V.d[{k}] = c->vfp.d[{k}];" for k in vd) if vd else "")
+    return ([f"#define RSO {so}", f"#define RSI {si}", "#undef RECOMP_TR_SYNC", "#define RECOMP_TR_SYNC RSO"] + lines[:head] + [decl] + body
+            + ["#undef RSO", "#undef RSI", "#undef RECOMP_TR_SYNC", "#define RECOMP_TR_SYNC"])
+
+
+def write_if_changed(path, text):
+    """the file written only when its text changed: runtime/build.py recompiles a part file newer than its object, so a
+    recompile that changed a few functions (a pack's new hook) rebuilds only the parts holding them"""
+    try:
+        with open(path) as f:
+            if f.read() == text: return
+    except OSError:
+        pass
+    with open(path, "w") as f: f.write(text)
 
 
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     ORDERED_LOADS[0] = "--unordered-loads" not in sys.argv
+    REG_LOCALS[0] = "--no-reg-locals" not in sys.argv
     for flag, table in (("--hooks", HOOKS), ("--insn-hooks", IHOOKS)):
         if flag in sys.argv:
             for tok in sys.argv[sys.argv.index(flag) + 1].split():
@@ -1186,7 +1274,7 @@ def main():
     entries = sorted({v & ~1 for v in d["functions"].values()})
     # body ranges: [first, last byte] (Ghidra), or [first, last, owner entry] (analyze.py, which knows)
     bodies = sorted(tuple(b) for b in d["bodies"])
-    out = ['#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
+    out = ["#define RECOMP_GENERATED 1", '#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
     fns, total, bad = [], 0, []
     # a function can be several code chunks: each chunk belongs to its owner when the export says,
     # else (Ghidra's ranges) to itself if it's an entry, else the nearest entry before it
@@ -1346,7 +1434,11 @@ def main():
     parts = [[] for _ in range(nsplit)]
     if nsplit:
         base = sys.argv[2][:-2] if sys.argv[2].endswith(".c") else sys.argv[2]
-        open(base + ".h", "w").write("\n".join(out + decls) + "\n")
+        write_if_changed(base + ".h", "\n".join(out + decls) + "\n")
+        # (each part names the header's macros by a hash: a change to them, with no part's own text changed, still
+        # rebuilds every part -- the declarations after them only ever grow with the parts that use them)
+        import hashlib
+        preamble_tag = f"/* header {hashlib.sha1(chr(10).join(out).encode()).hexdigest()[:16]} */"
         out = [f'#include "{os.path.basename(base)}.h"']
     else:
         out += decls
@@ -1364,26 +1456,31 @@ def main():
         else:
             out += body
     for n, part in enumerate(parts):
-        open(f"{base}_part{n}.c", "w").write("\n".join([f'#include "{os.path.basename(base)}.h"'] + part) + "\n")
+        write_if_changed(f"{base}_part{n}.c", "\n".join([f'#include "{os.path.basename(base)}.h"', preamble_tag] + part) + "\n")
     # --module NAME: a module loaded with the main program (a .suprx): its tables are suffixed and
     # register themselves with the host (main.c's module registry) before main() runs
     mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
     sfx = f"_{mod}" if mod else ""
-    out.append(f"const char *recomp_import_name{sfx}(uint32_t a) {{\n\tswitch (a) {{")
-    out += [f'\tcase 0x{a:x}u: return "{names[a]}";' for a in sorted(stubs)]
-    out.append("\tdefault: return 0;\n\t}\n}")
+    # the import stubs and the functions by address: lists hashed before main() (rt.h RecompAddrMap)
+    out.append(f"static const RecompAddrEntry import_list{sfx}[] = {{")
+    out += [f'\t{{0x{a:x}u, "{names[a]}"}},' for a in sorted(stubs)]
+    out.append("\t{0, 0}\n};")
+    out.append(f"static RecompAddrMap import_map{sfx} = {{ import_list{sfx}, {len(stubs)} }};")
+    out.append(f"const char *recomp_import_name{sfx}(uint32_t a) {{ return (const char *)recomp_addr_map_find(&import_map{sfx}, a); }}")
     out.append(f"int recomp_is_arm{sfx}(uint32_t a) {{\n\tswitch (a) {{")
     out += [f"\tcase 0x{f.entry:x}u:" for f in fns if f.arm]
     out.append("\t\treturn 1;" if any(f.arm for f in fns) else "")
     out.append("\tdefault: return 0;\n\t}\n}")
-    out.append(f"GuestFn recomp_lookup{sfx}(uint32_t a) {{")
-    out.append("\tswitch (a) {")
-    out += [f"\tcase 0x{f.entry:x}u: return fn_{f.entry:08x};" for f in fns]
-    out.append("\tdefault: return 0;\n\t}\n}")
+    out.append(f"static const RecompAddrEntry fn_list{sfx}[] = {{")
+    out += [f"\t{{0x{f.entry:x}u, (const void *)fn_{f.entry:08x}}}," for f in fns]
+    out.append("\t{0, 0}\n};")
+    out.append(f"static RecompAddrMap fn_map{sfx} = {{ fn_list{sfx}, {len(fns)} }};")
+    out.append(f"GuestFn recomp_lookup{sfx}(uint32_t a) {{ return (GuestFn)recomp_addr_map_find(&fn_map{sfx}, a); }}")
+    out.append(f"__attribute__((constructor)) static void addr_maps_init{sfx}(void) {{ recomp_addr_map_init(&import_map{sfx}); recomp_addr_map_init(&fn_map{sfx}); }}")
     if mod:
         out.append("void recomp_register_module(const char *name, GuestFn (*lookup)(uint32_t), const char *(*import_name)(uint32_t), int (*is_arm)(uint32_t));")
         out.append(f'__attribute__((constructor)) static void register_{mod}(void) {{ recomp_register_module("{mod}", recomp_lookup{sfx}, recomp_import_name{sfx}, recomp_is_arm{sfx}); }}')
-    open(sys.argv[2], "w").write("\n".join(out) + "\n")
+    write_if_changed(sys.argv[2], "\n".join(out) + "\n")
     print(f"{len(fns)} functions, {len(stubs)} imports, {total} instructions, {len(bad)} unsupported -> {sys.argv[2]}")
     from collections import Counter
     for (k, n) in Counter(u[1].split()[0] for u in bad).most_common(15):

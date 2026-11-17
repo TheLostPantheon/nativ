@@ -104,6 +104,8 @@ int usse_buffer_words(const UsseProgram *p, int c);   /* the words of uniform bu
 int usse_program_pa_words(const UsseProgram *p);    /* vertex: PA words per vertex record (a multiple of 4, at most 160) */
 uint32_t usse_float_to_lane(float v, int type);      /* a float as the lane bits of a register type (UsseAttrSlot.type) */
 int usse_is_fragment(const UsseProgram *p);
+int usse_has_secondary(const UsseProgram *p);   /* a secondary program to run per draw (usse_run_secondary does nothing without) */
+void usse_frame_tick(void);   /* a frame presented: usse_get checks each program's bytes whole again (gfx_dispatch.c) */
 int usse_supported(const UsseProgram *p);                 /* false: hit an unimplemented instruction; caller should fall back */
 const UsseVertexLayout *usse_vertex_layout(const UsseProgram *p);     /* only valid if !is_fragment */
 const UsseFragLayout *usse_fragment_layout(const UsseProgram *p);     /* only valid if is_fragment */
