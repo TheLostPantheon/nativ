@@ -7,6 +7,7 @@
 #ifndef RECOMP_RT_H
 #define RECOMP_RT_H
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <setjmp.h>
@@ -31,12 +32,41 @@ typedef void (*GuestFn)(Cpu *);
  * frame to return to (main.c's recomp_longjmp) */
 typedef struct RecompJmp { uint32_t guest, r[16], fpscr; uint64_t d[8]; jmp_buf host; } RecompJmp;
 extern RecompJmp *recomp_setjmp_begin(Cpu *c);
+/* the guest arena's base. Set once before any guest code runs and never again, so generated code (RECOMP_GENERATED) sees it
+ * const: the compiler keeps it in a register through a function, where a plain global was loaded again before every
+ * guest memory access (a game's own stores might have changed it, as far as the compiler knew: one load in five of
+ * Uncharted's hot code, 2026-11-17). The runtime, which sets it, sees the plain variable. */
+#ifdef RECOMP_GENERATED
+extern uint8_t *const recomp_mem;
+#else
 extern uint8_t *recomp_mem;
+#endif
 /* provided by the host: a call to a guest address that isn't recompiled code (an import) */
 extern void recomp_call_external(Cpu *c, uint32_t addr);
 extern void recomp_unimplemented(Cpu *c, uint32_t addr);
 extern GuestFn recomp_lookup(uint32_t addr);
 extern const char *recomp_import_name(uint32_t addr);   /* the import a stub address stands for */
+/* A module's functions (or import stubs) by guest address: recomp.py's list, hashed once before main() runs
+ * (recomp_addr_map_init, the runtime's). Every indirect call looks its target up here: a switch over a game's tens of
+ * thousands of entries compiled to a binary search, about 5% of Uncharted's main thread (2026-11-17); this is one
+ * multiply and a probe or two. Key 0 marks an empty slot (no function lives at 0). */
+typedef struct { uint32_t a; const void *v; } RecompAddrEntry;
+typedef struct { const RecompAddrEntry *list; uint32_t n, mask, shift; uint32_t *keys; const void **vals; } RecompAddrMap;
+static inline void recomp_addr_map_init(RecompAddrMap *m) {   /* (from each module's constructor, before main()) */
+	uint32_t size = 16, bits = 4; while (size < 2 * m->n) { size *= 2; bits++; }
+	m->mask = size - 1; m->shift = 32 - bits;
+	m->keys = (uint32_t *)calloc(size, sizeof *m->keys); m->vals = (const void **)calloc(size, sizeof *m->vals);
+	if (!m->keys || !m->vals) abort();
+	for (uint32_t k = 0; k < m->n; k++) {
+		uint32_t i = ((m->list[k].a >> 1) * 0x9E3779B1u) >> m->shift;
+		while (m->keys[i] && m->keys[i] != m->list[k].a) i = (i + 1) & m->mask;
+		m->keys[i] = m->list[k].a; m->vals[i] = m->list[k].v;
+	}
+}
+static inline const void *recomp_addr_map_find(const RecompAddrMap *m, uint32_t a) {
+	uint32_t i = ((a >> 1) * 0x9E3779B1u) >> m->shift;
+	for (;;) { const uint32_t k = m->keys[i]; if (k == a) return m->vals[i]; if (!k) return 0; i = (i + 1) & m->mask; }
+}
 
 #define G(a) (recomp_mem + (uint32_t)(a))
 static inline uint32_t RD32(uint32_t a) { uint32_t v; memcpy(&v, G(a), 4); return v; }

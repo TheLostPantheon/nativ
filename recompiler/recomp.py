@@ -1186,7 +1186,7 @@ def main():
     entries = sorted({v & ~1 for v in d["functions"].values()})
     # body ranges: [first, last byte] (Ghidra), or [first, last, owner entry] (analyze.py, which knows)
     bodies = sorted(tuple(b) for b in d["bodies"])
-    out = ['#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
+    out = ["#define RECOMP_GENERATED 1", '#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
     fns, total, bad = [], 0, []
     # a function can be several code chunks: each chunk belongs to its owner when the export says,
     # else (Ghidra's ranges) to itself if it's an entry, else the nearest entry before it
@@ -1369,17 +1369,22 @@ def main():
     # register themselves with the host (main.c's module registry) before main() runs
     mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
     sfx = f"_{mod}" if mod else ""
-    out.append(f"const char *recomp_import_name{sfx}(uint32_t a) {{\n\tswitch (a) {{")
-    out += [f'\tcase 0x{a:x}u: return "{names[a]}";' for a in sorted(stubs)]
-    out.append("\tdefault: return 0;\n\t}\n}")
+    # the import stubs and the functions by address: lists hashed before main() (rt.h RecompAddrMap)
+    out.append(f"static const RecompAddrEntry import_list{sfx}[] = {{")
+    out += [f'\t{{0x{a:x}u, "{names[a]}"}},' for a in sorted(stubs)]
+    out.append("\t{0, 0}\n};")
+    out.append(f"static RecompAddrMap import_map{sfx} = {{ import_list{sfx}, {len(stubs)} }};")
+    out.append(f"const char *recomp_import_name{sfx}(uint32_t a) {{ return (const char *)recomp_addr_map_find(&import_map{sfx}, a); }}")
     out.append(f"int recomp_is_arm{sfx}(uint32_t a) {{\n\tswitch (a) {{")
     out += [f"\tcase 0x{f.entry:x}u:" for f in fns if f.arm]
     out.append("\t\treturn 1;" if any(f.arm for f in fns) else "")
     out.append("\tdefault: return 0;\n\t}\n}")
-    out.append(f"GuestFn recomp_lookup{sfx}(uint32_t a) {{")
-    out.append("\tswitch (a) {")
-    out += [f"\tcase 0x{f.entry:x}u: return fn_{f.entry:08x};" for f in fns]
-    out.append("\tdefault: return 0;\n\t}\n}")
+    out.append(f"static const RecompAddrEntry fn_list{sfx}[] = {{")
+    out += [f"\t{{0x{f.entry:x}u, (const void *)fn_{f.entry:08x}}}," for f in fns]
+    out.append("\t{0, 0}\n};")
+    out.append(f"static RecompAddrMap fn_map{sfx} = {{ fn_list{sfx}, {len(fns)} }};")
+    out.append(f"GuestFn recomp_lookup{sfx}(uint32_t a) {{ return (GuestFn)recomp_addr_map_find(&fn_map{sfx}, a); }}")
+    out.append(f"__attribute__((constructor)) static void addr_maps_init{sfx}(void) {{ recomp_addr_map_init(&import_map{sfx}); recomp_addr_map_init(&fn_map{sfx}); }}")
     if mod:
         out.append("void recomp_register_module(const char *name, GuestFn (*lookup)(uint32_t), const char *(*import_name)(uint32_t), int (*is_arm)(uint32_t));")
         out.append(f'__attribute__((constructor)) static void register_{mod}(void) {{ recomp_register_module("{mod}", recomp_lookup{sfx}, recomp_import_name{sfx}, recomp_is_arm{sfx}); }}')
