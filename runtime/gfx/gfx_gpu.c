@@ -2506,12 +2506,11 @@ static void target_alias_sync(TargetEntry *e) {
  * in the same scene). "The part it is drawing": the texture's rectangle covers at least half of the draw's clip rect. */
 static int scene_snap;                               /* the current scene's starting pixels: 1 in guest memory, 2 in its GPU snapshot (target_snapshot) */
 static int cur_wx0, cur_wy0, cur_wx1, cur_wy1;       /* the draw being recorded: its clip rect, target pixels */
-/* The starting pixels on the GPU instead (RECOMP_GPU_SNAP=0|1; on by default with Vulkan, as RECOMP_GPU_TRANSFER): a copy of the target taken as
+/* The starting pixels on the GPU instead (RECOMP_GPU_SNAP=0|1; on by default, as RECOMP_GPU_TRANSFER): a copy of the target taken as
  * the scene begins, which those reads sample (target_view: a view or mip_view of the snapshot). The download made Killzone's
  * strip scene a fence wait on the GPU every frame, 4.3 ms on the RTX laptop. Anything that can only read the starting pixels
  * from guest memory gets the snapshot downloaded there once (snap_to_guest). */
 static void target_sync_for_gpu(TargetEntry *e);   /* (below) */
-static int gpu_vulkan(void);   /* (below) */
 static int gpu_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_SNAP"); v = e && *e ? *e != '0' : 1; } return v; }   /* (on Metal too since 2026-11-17, with RECOMP_GPU_TRANSFER) */
 static int target_snapshot(TargetEntry *e) {
 	static uint64_t snaps;
@@ -4152,13 +4151,12 @@ static void view_pass(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *dst, SDL_GPUTex
  * over its memory, at the source's render scale: the next level's source, and what later draws sample (target_view).
  * Guest memory under it is behind until something reads it there: readback_enqueue's rule as for a scene's target (a small
  * one read back a frame later, a sampled one watched), a CPU write's download, a capture (which takes the CPU path).
- * Byte-exact on Metal and Vulkan (RECOMP_GPU_TRANSFER_CHECK=1). On by default with Vulkan, with the snapshot (gpu_snap_on):
+ * Byte-exact on Metal and Vulkan (RECOMP_GPU_TRANSFER_CHECK=1). On by default (with Vulkan since 2026-10-26, Metal since 2026-11-17), with the snapshot (gpu_snap_on):
  * the two together took the last fence wait out of Killzone's frame, windowed at 3x and 21:9 on the RTX laptop 43 -> 55 fps
  * (2026-10-26; on 2026-10-23 the frame rate hadn't moved, with vsync's stall and the flare waits still in it). Their extra
  * resource churn made SDL crash in the window thread's submit until that thread took the renderer's lock too (window.c).
  * RECOMP_GPU_TRANSFER=0|1 picks. Returns 0 for the CPU path to do it. */
 int gfxcap_active(void);   /* gfx_capture.c */
-static int gpu_vulkan(void) { static int v = -1; if (v < 0) { if (!gpu()) return 0; const char *dv = SDL_GetGPUDeviceDriver(gpu()); v = dv && !strcmp(dv, "vulkan"); } return v; }   /* (not cached before the device exists) */
 /* On Metal too since 2026-11-17: byte-exact there (RECOMP_GPU_TRANSFER_CHECK=1, 40 of Killzone's downscales: 0 bytes differ), and
  * with the snapshot it took the strip's per-frame wait and download out of the Mac's frame too (Killzone 1.00's recorded level,
  * unpaced: 76 -> 95 fps median of three on the M4 Pro) */
