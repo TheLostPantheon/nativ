@@ -9,7 +9,7 @@ controls, online play, and what to do when something goes wrong.
   Linux PC on x86-64, including a Steam Deck.
 - **Your own copies of your games**, with their updates if you have them. Nativ takes game folders copied from your
   Vita, PKG files, or a whole folder to search. See [Supported games](../README.md#supported-games) for exactly which
-  releases play.
+  releases play. Other games can be tried as experimental ones (see [Other games](#other-games)).
 - **Their licences.** A game folder copied from your Vita carries its own. For PKGs, Nativ fetches the licence from your
   Vita over Wi-Fi, once.
 - **The PS Vita system software update file**, free from Sony's website. Nativ uses the system libraries inside it and
@@ -60,6 +60,23 @@ After a welcome screen, the launcher walks you through four steps. You can come 
 3. **Online name.** The name other players see when you play online. It shows as `ntv_` plus your name, so they know
    you're playing on PC. Up to 10 letters, digits, `-` or `_`.
 4. **Done.** Your library opens.
+
+## Other games
+
+The library has two sections. **Enhanced with Nativ** holds the supported games: each has fixes and extras made for it,
+and is tested with every release. **Other games** holds everything else you add, built from your copy as experimental
+games.
+
+- **A game Nativ doesn't support yet** gets a pack made from your copy: its main program and the Sony libraries it
+  uses, with no game-specific work. When adding from a folder search, tick **Build experimental games too** to build
+  them; otherwise they're only added, and the card's **Build** builds them later.
+- **A release or version an Enhanced game's pack wasn't made for** (another region, an update Nativ doesn't play yet)
+  shows **Try it anyway** on its card. It then plays without that game's fixes and extras.
+
+An experimental game may not start, may show graphics or sound problems, or may stop partway. When it stops at code
+its build missed, Nativ builds it again with that code and starts it again, a few times over. There's no support for
+these games, but a report zip (the card's **...** menu, **Report a problem**) in a GitHub issue shows what a game is
+missing.
 
 ## Building and playing
 

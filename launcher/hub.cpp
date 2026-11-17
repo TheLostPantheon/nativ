@@ -441,6 +441,11 @@ struct Game {
 	std::string cover, icon;  /* the copy's own art (art_paths): "" when it has none */
 	std::string region;       /* the pack's REGION: the release it plays (US) */
 	bool pack = false, imported = false, built = false;
+	/* enhanced: a pack Nativ ships, tested each release, with the game's own Nativ work (the library's "Enhanced with
+	 * Nativ"); compatible: one it ships without that work; experimental: a pack made from the player's copy (no hooks), or
+	 * a version the game's pack doesn't play, tried anyway (vitarecomp import --experimental) */
+	std::string tier = "enhanced";
+	bool unsupported = false;   /* a version the game's pack doesn't play, not tried yet (vitarecomp import left <title>/unsupported) */
 };
 static std::string recommended_version(const Game &g) {
 	for (auto &v : g.versions) if (v.second == "recommended") return v.first;
@@ -516,6 +521,7 @@ static void library_scan(void) {
 			g.versions = p.versions;
 			g.update_note = pack_value(p, "UPDATE_NOTE");
 			g.region = pack_value(p, "REGION");
+			if (pack_value(p, "TIER") == "compatible") g.tier = "compatible";
 		}
 		closedir(d);
 	}
@@ -533,6 +539,13 @@ static void library_scan(void) {
 	for (auto &kv : by) {
 		Game g = kv.second;
 		std::string w = dumps + "/" + g.id;
+		if (!g.pack) {   /* a game Nativ has no pack for: the one vitarecomp import made from the player's copy (packs.py generate) */
+			const Pack p = pack_read(g_dump + "/packs/" + g.id + "/pack.toml");
+			g.name = pack_value(p, "NAME");
+			std::string elf = pack_value(p, "ELF"); if (!elf.empty()) g.elf = elf;
+			std::string base = pack_value(p, "BASE"); if (!base.empty()) g.base = base;
+			g.tier = "experimental";
+		}
 		g.imported = exists(w + "/elf/" + g.elf);
 #ifdef _WIN32
 		g.built = exists(w + "/recomp/" + g.base + "_host.exe");
@@ -540,6 +553,8 @@ static void library_scan(void) {
 		g.built = exists(w + "/recomp/" + g.base + "_host");
 #endif
 		g.version = first_line(w + "/version");
+		if (g.version == "unknown") g.tier = "experimental";
+		g.unsupported = exists(w + "/unsupported") && !exists(w + "/experimental");
 		if (g.imported) art_paths(g);
 		if (g.name.empty()) g.name = g.id;
 		g_games.push_back(g);
@@ -619,6 +634,10 @@ static void build_steps(std::vector<Step> &steps, const std::string &id, int gro
 	steps.push_back(step("Ready to play", {}, group));
 }
 static void start_build(const Game &g) { std::vector<Step> s; build_steps(s, g.id); task_start("Building " + g.name, "build", g.id, s); }
+static void start_experimental(const Game &g) {   /* a version its pack doesn't play, tried anyway: imported as experimental, then built */
+	std::vector<Step> s{step("Checking its version", vitarecomp({"import", g.id, "--experimental"}))};
+	build_steps(s, g.id); task_start("Building " + g.name, "build", g.id, s);
+}
 static bool needs_online_name(const Game &g);   /* (below: an online game, and no name of the player's own yet) */
 static std::string g_name_game;                  /* the game waiting on the online name prompt (online_name_modal) */
 static void start_play_now(const Game &g);
@@ -790,8 +809,11 @@ static std::vector<Step> found_steps(int *n, std::vector<std::string> *titles) {
 		for (const char *k : {"game", "update"})
 			for (const Found &x : g_found) if (x.pick && x.id == id && x.kind == k && found_ready(x)) { items.push_back(&x); break; }
 		if (items.empty()) continue;
-		bool pack = false;
-		for (const Found &x : g_found) pack |= x.id == id && x.status != "nopack";
+		/* a game Nativ doesn't play as it is (no pack, another region's release, a version its pack doesn't know) builds only
+		 * once the player has said they'll try experimental games (experimental_ok, search_form's tick) */
+		bool exp = false, unknown = false;
+		for (const Found &x : g_found) if (x.pick && x.id == id) { exp |= x.status == "nopack" || x.status == "otherregion" || x.status == "unsupported"; unknown |= x.status == "unsupported"; }
+		const bool pack = !exp || g_prefs["experimental_ok"] == "1";
 		++group;
 		for (const Found *xp : items) {
 			const Found &x = *xp;
@@ -801,7 +823,7 @@ static std::vector<Step> found_steps(int *n, std::vector<std::string> *titles) {
 			steps.push_back(step(x.kind == "update" ? "Adding its update " + x.version : "Adding " + x.name + " " + x.version, argv, group));
 			++*n;
 		}
-		steps.push_back(step("Checking its version", vitarecomp({"import", id}), group));   /* (the game with its update layered over it) */
+		steps.push_back(step("Checking its version", unknown && pack ? vitarecomp({"import", id, "--experimental"}) : vitarecomp({"import", id}), group));   /* (the game with its update layered over it) */
 		if (pack) build_steps(steps, id, group);
 	}
 	return steps;
@@ -810,8 +832,8 @@ static void found_status(const Found &x) {   /* what its game pack says of it, a
 	struct S { const char *key, *text; int tone; };   /* tone: 0 good, 1 a caution, 2 neutral */
 	static const S st[] = {
 		{"recommended", "Recommended version", 0}, {"supported", "Supported version", 0}, {"check", "Checked against its game pack when added", 2},
-		{"unsupported", "This version isn't supported yet", 1}, {"nopack", "No game pack yet: experimental", 1},
-		{"otherregion", "This region's release isn't supported yet", 1},
+		{"unsupported", "This version isn't supported yet: experimental", 1}, {"nopack", "Not supported yet: experimental", 1},
+		{"otherregion", "This region's release isn't supported yet: experimental", 1},
 		{"added", "Already in your library", 2}, {"licensed", "Nothing to add: the game gets its add-ons", 2},
 		{"installed", "Already installed", 2}, {"firmware", "Not installed yet", 0}};
 	for (const S &e : st) if (x.status == e.key) {
@@ -874,6 +896,16 @@ static bool search_form(SDL_Window *win) {   /* a folder searched for games, upd
 	found_list();
 	int n = 0; std::vector<std::string> titles; std::vector<Step> steps = found_steps(&n, &titles);
 	ImGui::Spacing();
+	{	/* a game Nativ doesn't play as it is, picked: built only once the player says they'll try experimental games (kept) */
+		bool exp = false;
+		for (const Found &x : g_found) exp |= x.pick && (x.status == "nopack" || x.status == "otherregion" || x.status == "unsupported");
+		if (exp) {
+			bool ok = g_prefs["experimental_ok"] == "1";
+			if (ImGui::Checkbox("Build experimental games too", &ok)) { prefs_set("experimental_ok", ok ? "1" : "0"); steps = found_steps(&n, &titles); }
+			ui::muted_wrapped("A game Nativ doesn't support yet is built from your copy with no game-specific work: it may not start or may crash, and it comes with no support. Unticked, it is only added.");
+			ImGui::Spacing();
+		}
+	}
 	ImGui::BeginDisabled(n == 0 || g_task.running);
 	std::string label = n ? "Add " + std::to_string(n) + (n == 1 ? " item" : " items") : "Add";
 	bool started = ui::primary_button(label.c_str());
@@ -914,6 +946,7 @@ static bool add_form(SDL_Window *win) {   /* a player's own copy -> decrypted, i
 		started = true;
 	}
 	ImGui::EndDisabled();
+	ui::muted_wrapped("A game Nativ doesn't support yet is built as an experimental one: it may not start or may crash, and it comes with no support.");
 	return started;
 }
 static void task_line(void) {   /* the running task, inline: spinner, its step, Cancel; or the last failure */
@@ -1205,6 +1238,7 @@ static void settings_modal(void) {
 static std::string g_game_settings;   /* the game whose dialog is open ("": none) */
 static Ini g_game_ini;
 static bool game_option(const Game &g, const char *name) {
+	if (g.tier == "experimental") return false;   /* (no hooks: a generated pack, or a version tried anyway) */
 	std::string env = pack_value(pack_read(g_root + "/packs/" + g.id + "/pack.toml"), "RUN_ENV") + " ";
 	size_t a = env.find("RECOMP_GAME_OPTIONS="); if (a == std::string::npos) return false;
 	std::string list = "," + env.substr(a + 20, env.find(' ', a) - a - 20) + ",";
@@ -1548,7 +1582,9 @@ static void game_card(const Game &g, float w, float name_h) {
 	ImGui::SetCursorPosX(pad);
 	{	/* the title id and the version: this copy's, else what the pack plays; a chip when the pack recommends another */
 		std::string line = g.id, rec = recommended_version(g), vs = played_versions(g);
-		if (!g.pack) line += "  -  experimental (no game pack)";
+		if (!g.pack) line += "  ·  experimental";
+		else if (g.version == "unknown") line += "  ·  this version: experimental";
+		else if (g.unsupported) line += "  ·  a version Nativ doesn't play yet";
 		else if (g.imported && !g.version.empty() && g.version != "-") line += "  ·  " + (g.region.empty() ? "" : g.region + " ") + g.version;
 		else if (!g.imported && !vs.empty()) line += "  ·  plays " + (g.region.empty() ? "" : g.region + " ") + vs;
 		ImGui::TextDisabled("%s", line.c_str());
@@ -1566,6 +1602,11 @@ static void game_card(const Game &g, float w, float name_h) {
 	float bw = w - pad * 2, more = ImGui::GetFrameHeight();
 	ImGui::BeginDisabled(busy);
 	if (g.built) { if (ui::primary_button("Play", ImVec2(bw - more - ImGui::GetStyle().ItemSpacing.x, 0))) start_play(g); ImGui::SameLine(); }
+	else if (g.unsupported) {   /* the click is the player's choice to try it: from now on it builds without the pack's hooks */
+		if (ImGui::Button("Try it anyway", ImVec2(bw - more - ImGui::GetStyle().ItemSpacing.x, 0))) start_experimental(g);
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("This version isn't one %s's game pack was made for.\nTried anyway it plays without the pack's game-specific work (hooks):\nexperimental, so it may not start or may crash, and it comes with no support.", g.name.c_str());
+		ImGui::SameLine();
+	}
 	else if (g.imported) { if (ui::primary_button("Build", ImVec2(bw - more - ImGui::GetStyle().ItemSpacing.x, 0))) start_build(g); ImGui::SameLine(); }
 	else { if (ImGui::Button("Add your copy…", ImVec2(bw - more - ImGui::GetStyle().ItemSpacing.x, 0))) g_add_open = true; ImGui::SameLine(); }
 	ImGui::EndDisabled();
@@ -1682,12 +1723,22 @@ static void hub_ui(SDL_Window *win) {
 	ImGui::PushFont(nullptr, em * 1.15f);
 	for (const Game &g : g_games) { float hh = ImGui::CalcTextSize(g.name.c_str(), nullptr, false, cw - em * 1.8f).y; if (hh > name_h) name_h = hh; }
 	ImGui::PopFont();
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));
-	for (size_t i = 0; i < g_games.size(); i++) {
-		if (i % cols) ImGui::SameLine();
-		ImGui::BeginGroup(); game_card(g_games[i], cw, name_h); ImGui::EndGroup();
+	/* two sections: Enhanced with Nativ (the games Nativ ships a pack for, with their own Nativ work) and the rest, built
+	 * from the player's copy as experimental ones (a game with no pack, a version its pack doesn't play) */
+	for (int sec = 0; sec < 2; sec++) {
+		std::vector<const Game *> gs;
+		for (const Game &g : g_games) if ((g.tier == "experimental") == (sec == 1)) gs.push_back(&g);
+		if (gs.empty()) continue;
+		ImGui::Dummy(ImVec2(0, em * (sec ? 0.6f : 0.2f)));
+		ImGui::TextUnformatted(sec ? "Other games" : "Enhanced with Nativ"); ImGui::SameLine();
+		ImGui::TextDisabled(sec ? "experimental: built from your copy with no game-specific work, and no support" : "tested with each release, with extras made for each game");
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));
+		for (size_t i = 0; i < gs.size(); i++) {
+			if (i % cols) ImGui::SameLine();
+			ImGui::BeginGroup(); game_card(*gs[i], cw, name_h); ImGui::EndGroup();
+		}
+		ImGui::PopStyleVar();
 	}
-	ImGui::PopStyleVar();
 	ImGui::EndChild();
 
 	/* the activity bar: what's running (its step), the last failure, the log on demand */

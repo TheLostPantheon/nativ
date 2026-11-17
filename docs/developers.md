@@ -28,8 +28,8 @@ Each stage writes into the game's folder in your library (`dump/decrypted/<title
 |---|---|
 | `firmware <PUP>` | Decrypts Sony's firmware update, whose libraries games load. |
 | `scan <folder>` | Finds games, updates, add-ons and firmware files at any depth, as the launcher's Add dialog does. |
-| `add <copy>` | Decrypts a game or update and keeps it, then runs the stages below when the game has a pack. |
-| `import <title>` | Turns the game's executables into ELF files and identifies which release it is. |
+| `add <copy>` | Decrypts a game or update and keeps it, then runs the stages below. |
+| `import <title>` | Turns the game's executables into ELF files and identifies which release it is. A game with no pack gets one made from the copy. `--experimental` tries a release the pack doesn't play. |
 | `analyze <title>` | Finds every function, in seconds (`recompiler/analyze.py`). |
 | `recompile <title>` | Translates the functions to C and writes the memory image (`recomp.py`, `mkimage.py`). |
 | `build <title>` | Compiles the C with the runtime into the game's program (`runtime/build.py`). |
@@ -56,6 +56,25 @@ which one your copy is.
 
 A game's update is kept beside the game (`patch0`) and decrypted with the game's own licence. When the pack plays the
 updated release, the update is layered over the game as hard links (`app0_patched`).
+
+### Tiers and generated packs
+
+The packs in `packs/` are the **Enhanced** tier: tested with each release, with hooks for the game. A pack can say
+`TIER = "compatible"` instead: shipped, but without that work. Everything else is **experimental**:
+
+- **A game with no pack.** `import` makes one from the copy with `pipeline/packs.py generate`, in the library
+  (`<library>/packs/<title>/pack.toml`): `NAME` and the version from `param.sfo`, `ELF` (the eboot, or the program it
+  starts when it's only a launcher, as Uncharted's is), and `MODULES`: the Sony modules exporting the libraries the
+  program imports, followed through their own imports (`RECOMPILED` in `packs.py`). The online modules are left out, so
+  the game plays offline. The pack is made again at each import while it says `GENERATED = "1"`; delete that line to
+  keep your edits. It's the starting point for a game's own pack.
+- **A release its pack doesn't play.** `import` refuses it and leaves `<title>/unsupported` for the launcher's **Try it
+  anyway**, which runs `import <title> --experimental` (kept as `<title>/experimental`). The copy's version is then
+  `unknown`: it gets the pack's settings for every version and none of `HOOKS`, `IHOOKS`, `GAME_ADDRS` or
+  `FUNCTION_SEEDS`, nor the `RUN_ENV` switches only hooks honour (`packconf.py` `BUILD_SPECIFIC`, `HOOKED_ENV`).
+
+A run that stops at code the analysis missed (the host's exit 2) records it, and `run` builds the game again with it
+and starts it again, up to three times. `test` records it the same way.
 
 ## Licences
 

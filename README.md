@@ -25,6 +25,9 @@ copy of each game and Sony's firmware update file, and the tools decrypt and rec
 
 ## Supported games
 
+These are the **Enhanced with Nativ** games: each has a pack with fixes and extras made for it, and each is tested with
+every release.
+
 | Game | Release | Title ID | Versions |
 |---|---|---|---|
 | Killzone: Mercenary | US | PCSA00107 | 1.00, 1.12 (recommended: Botzone and online play) |
@@ -40,6 +43,11 @@ Not supported yet: other regions (EU, JP, Asia) and the later updates of Unchart
 Knight (1.08, Treasure Trove). The launcher recognises them and tells you which release it supports. It keeps an
 unsupported update, and the game runs without it. Porting a new release starts with `dev/hookmap.py`, which carried
 43 of Killzone 1.12's 46 hooks over from 1.00 by matching code.
+
+**Any other game** can be tried as an experimental one, in the library's Other games section. Nativ makes a pack for it
+from your copy (its main program and the Sony libraries it uses), with none of the game-specific work. Whether it
+starts depends on the game, and there's no support. Another release or version of an Enhanced game can be tried the
+same way, without that game's fixes and extras.
 
 ## Getting started
 
