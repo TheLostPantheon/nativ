@@ -1183,6 +1183,17 @@ _RREF = re.compile(r"c->r\[(\d+)\]")
 _FLAG_HELPERS = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,")
 _FLAG_FIELDS = re.compile(r"\bc->([nzcv])\b")
 _FLAGS_USED = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,|\bc->[nzcv]\b|VMRS_APSR\(c\)")
+# And the VFP/NEON registers: a function whose every reference to them names a register by a constant (s/f [i], d/fd [k],
+# its address included: a NEON load's memcpy into one) works on a local VfpRegs V, the d registers it touches copied in and
+# out like the others. Float-heavy leaf functions (Uncharted's hottest: five to seven register references an instruction,
+# no calls) then keep their whole computation in host registers.
+_VREF = re.compile(r"c->vfp\.(s|f|d|fd)\[(\d+)\]")
+_VANY = re.compile(r"c->vfp\b")
+# Only in functions that call out a few times at most: each call writes back and reloads every d register the function uses,
+# and Uncharted's biggest functions (4,000 instructions, 180 calls, all 32 d registers) grew to 600 KB of C that the C
+# compiler took over a quarter of an hour on. The hot float code is small and calls little (most of it nothing).
+VFP_MAX_CALLS = 16
+_CALLOUT = re.compile(r"\bfn_[0-9a-f]{8}\(c\);|(?<![\w.])f\(c\);|\brecomp_call_external\(c, |\brecomp_ihook_\w+\(c, |recomp_setjmp_begin\(c\)")
 _CALLS = [   # (the statement that calls out, as the emitter writes it; its replacement around RSO/RSI)
     (re.compile(r"\b(fn_[0-9a-f]{8}\(c\);)"), r"{ RSO \1 RSI }"),
     (re.compile(r"(?<![\w.])(f\(c\);)"), r"{ RSO \1 RSI }"),
@@ -1200,7 +1211,13 @@ def reg_locals(lines, head):
     locals: see REG_LOCALS"""
     used = sorted({int(n) for l in lines for n in _RREF.findall(l)} - {15})
     flags = any(_FLAGS_USED.search(l) for l in lines[head:])
-    if not used and not flags: return lines
+    vd = set()
+    for l in lines[head:]:
+        for kind, n in _VREF.findall(l): vd.add(int(n) >> 1 if kind in ("s", "f") else int(n))
+    vfp = (bool(vd) and all(len(_VANY.findall(l)) == len(_VREF.findall(l)) for l in lines[head:])   # (only constant register numbers)
+           and sum(len(_CALLOUT.findall(l)) for l in lines[head:]) <= VFP_MAX_CALLS)
+    vd = sorted(vd) if vfp else []
+    if not used and not flags and not vfp: return lines
     body = []
     for l in lines[head:]:
         l = _RREF.sub(lambda m: m.group(0) if m.group(1) == "15" else f"gr{m.group(1)}", l)
@@ -1208,6 +1225,7 @@ def reg_locals(lines, head):
             l = _FLAG_HELPERS.sub(lambda m: f"{m.group(1)}(&F,", l)
             l = _FLAG_FIELDS.sub(lambda m: f"F.{m.group(1)}", l)
             l = l.replace("VMRS_APSR(c)", "VMRS_APSR2(&F, c)")
+        if vfp: l = l.replace("c->vfp.", "V.")
         if "recomp_setjmp_begin(c)" in l:   # c current for the stub (after the lr just set); its 0, or a longjmp's registers, reloaded
             l = (l.replace("RecompJmp *rj = recomp_setjmp_begin(c);", "RSO RecompJmp *rj = recomp_setjmp_begin(c);")
                   .replace("if (!_setjmp(rj->host)) gr0 = 0; }", "if (!_setjmp(rj->host)) c->r[0] = 0; RSI }"))
@@ -1215,10 +1233,11 @@ def reg_locals(lines, head):
         else:
             for pat, sub in _CALLS: l = pat.sub(sub, l)
         body.append(l)
-    so = " ".join([f"c->r[{n}] = gr{n};" for n in used] + ([f"c->{f} = F.{f};" for f in "nzcv"] if flags else []))
-    si = " ".join([f"gr{n} = c->r[{n}];" for n in used] + ([f"F.{f} = c->{f};" for f in "nzcv"] if flags else []))
+    so = " ".join([f"c->r[{n}] = gr{n};" for n in used] + ([f"c->{f} = F.{f};" for f in "nzcv"] if flags else []) + [f"c->vfp.d[{k}] = V.d[{k}];" for k in vd])
+    si = " ".join([f"gr{n} = c->r[{n}];" for n in used] + ([f"F.{f} = c->{f};" for f in "nzcv"] if flags else []) + [f"V.d[{k}] = c->vfp.d[{k}];" for k in vd])
     decl = ("\tuint32_t " + ", ".join(f"gr{n} = c->r[{n}]" for n in used) + ";" if used else "") + (
-        " Cpu F; F.n = c->n; F.z = c->z; F.c = c->c; F.v = c->v;" if flags else "")
+        " Cpu F; F.n = c->n; F.z = c->z; F.c = c->c; F.v = c->v;" if flags else "") + (
+        " VfpRegs V; " + " ".join(f"V.d[{k}] = c->vfp.d[{k}];" for k in vd) if vd else "")
     return ([f"#define RSO {so}", f"#define RSI {si}", "#undef RECOMP_TR_SYNC", "#define RECOMP_TR_SYNC RSO"] + lines[:head] + [decl] + body
             + ["#undef RSO", "#undef RSI", "#undef RECOMP_TR_SYNC", "#define RECOMP_TR_SYNC"])
 

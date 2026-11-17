@@ -16,12 +16,14 @@
  * found by the in-place checker), so contraction is off for all recompiled code */
 #pragma STDC FP_CONTRACT OFF
 
+/* the VFP/NEON register file: s0-s63 (f: the same words as floats) over d0-d31 (fd: as doubles) */
+typedef union { uint32_t s[64]; uint64_t d[32]; float f[64]; double fd[32]; } VfpRegs;
 typedef struct Cpu {
 	uint32_t r[16];
 	uint32_t n, z, c, v;          /* APSR flags, 0 or 1 */
 	uint32_t q;                   /* sticky saturation */
 	uint32_t _pad;                /* keeps the VFP bank 8-aligned at a fixed offset (difftest mirrors this layout) */
-	union { uint32_t s[64]; uint64_t d[32]; float f[64]; double fd[32]; } vfp;
+	VfpRegs vfp;
 	uint32_t fpscr;               /* N Z C V in bits 31..28 */
 	uint32_t stop;                /* set by the runtime to unwind (unimplemented, fault) */
 } Cpu;

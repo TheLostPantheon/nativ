@@ -31,16 +31,28 @@ static void gfx_lock_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(
 __thread int gfx_host_depth;   /* inside the lock below: guest memory this thread touches now is the graphics code's own access (gfx_gpu.c's read watch) */
 int waitstats_on(void); uint64_t waitstats_now(void); void waitstats_begin(uint64_t t0); void waitstats_lock(uint64_t t0); void waitstats_held(uint64_t t0);
 static __thread uint64_t gfx_hold_t0; static __thread int gfx_hold_depth;   /* (RECOMP_WAIT_STATS: this thread's outermost hold of the lock) */   /* (debug/waitstats.c: RECOMP_WAIT_STATS, the time threads queue for this lock) */
+/* RECOMP_LOCK_HOLD_LOG: the entry point taking the lock (LOCKED's __func__), and the one holding it outermost */
+static __thread const char *gfx_hold_site, *gfx_hold_outer;
 static void gfx_lock_take(void) {
 	pthread_once(&gfx_lock_once, gfx_lock_init);
 	if (!waitstats_on()) { pthread_mutex_lock(&gfx_lock); return; }
 	if (pthread_mutex_trylock(&gfx_lock)) { const uint64_t t0 = waitstats_now(); waitstats_begin(t0); pthread_mutex_lock(&gfx_lock); waitstats_lock(t0); }
-	if (!gfx_hold_depth++) gfx_hold_t0 = waitstats_now();
+	if (!gfx_hold_depth++) { gfx_hold_t0 = waitstats_now(); gfx_hold_outer = gfx_hold_site; }
 }
-static void gfx_lock_give(void) { if (waitstats_on() && !--gfx_hold_depth) waitstats_held(gfx_hold_t0); pthread_mutex_unlock(&gfx_lock); }
-#define LOCKED(...) do { gfx_lock_take(); gfx_host_depth++; __VA_ARGS__; gfx_host_depth--; gfx_lock_give(); } while (0)
+/* RECOMP_LOCK_HOLD_LOG=<ms> (with RECOMP_WAIT_STATS): each outermost hold longer than that, by the entry point that took it
+ * -- what a frame's longest stalls of the other threads are (Killzone's job threads held it up to 9.6 ms at once) */
+static void gfx_lock_give(void) {
+	if (waitstats_on() && !--gfx_hold_depth) {
+		waitstats_held(gfx_hold_t0);
+		static double log_ms = -1; if (log_ms < 0) { const char *e = getenv("RECOMP_LOCK_HOLD_LOG"); log_ms = e ? atof(e) : 0; }
+		const uint64_t d = waitstats_now() - gfx_hold_t0;
+		if (log_ms > 0 && d > log_ms * 1e6) fprintf(stderr, "    renderer lock: held %.2f ms by %s\n", d / 1e6, gfx_hold_outer ? gfx_hold_outer : "?");
+	}
+	pthread_mutex_unlock(&gfx_lock);
+}
+#define LOCKED(...) do { gfx_hold_site = __func__; gfx_lock_take(); gfx_host_depth++; __VA_ARGS__; gfx_host_depth--; gfx_lock_give(); } while (0)
 /* the same lock for the window thread's own SDL_GPU calls (window.c's present loop, RECOMP_WINDOW_LOCK) */
-void gfx_lock_enter(void) { gfx_lock_take(); }
+void gfx_lock_enter(void) { gfx_hold_site = "the window's present"; gfx_lock_take(); }
 void gfx_lock_leave(void) { gfx_lock_give(); }
 
 static int gpu_backend(void) {

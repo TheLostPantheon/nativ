@@ -66,3 +66,29 @@ s32 t_float(s32 a, s32 b, s32 c, s32 d) {   /* (VFP scalar: convert, add, multip
 	double w = (double)c * 1e-3 + (double)z;
 	return (s32)(z * 1000.0f) + (w > 0.0 ? 1 : -1) * (s32)(w * 10.0) + (x < y ? d : -d);
 }
+#include <arm_neon.h>
+static float vin[16], vout[16];
+s32 t_neon(s32 a, s32 b, s32 c, s32 d) {   /* (NEON: vector float multiply-add, min/max, conversions, lane moves) */
+	for (int i = 0; i < 16; i++) vin[i] = (float)((a >> (i & 15)) & 255) * 0.5f - (float)(b & 63);
+	float32x4_t acc = vdupq_n_f32((float)(c & 1023) * 0.125f), k = vdupq_n_f32(1.5f);
+	for (int i = 0; i < 16; i += 4) {
+		float32x4_t x = vld1q_f32(&vin[i]);
+		acc = vmlaq_f32(acc, x, k);
+		acc = vmaxq_f32(vminq_f32(acc, vdupq_n_f32(4096.0f)), vdupq_n_f32(-4096.0f));
+		vst1q_f32(&vout[i], vmulq_f32(acc, x));
+	}
+	int32x4_t q = vcvtq_s32_f32(acc);
+	return vgetq_lane_s32(q, 0) + vgetq_lane_s32(q, 1) * 3 + vgetq_lane_s32(q, 2) * 5 + vgetq_lane_s32(q, 3) * 7 + (s32)vout[(d & 15)];
+}
+s32 t_ivec(s32 a, s32 b, s32 c, s32 d) {   /* (integer loops the compiler vectorises) */
+	static s32 x[32], y[32];
+	for (int i = 0; i < 32; i++) { x[i] = a ^ (i * b); y[i] = c + i * d; }
+	s32 s = 0; for (int i = 0; i < 32; i++) s += x[i] * y[i] + (x[i] >> 3);
+	return s;
+}
+static __attribute__((noinline)) float fscale(float x, s32 k) { return x * (float)(k & 7) + 0.25f; }
+s32 t_fcall(s32 a, s32 b, s32 c, s32 d) {   /* (float values live across calls: callee-saved d8-d15) */
+	float x = (float)a * 0.01f, y = (float)b * 0.02f, z = (float)c * 0.03f;
+	for (int i = 0; i < 6; i++) { float t = fscale(x + y, d + i); x = y * 0.5f + t; y = z - t * 0.25f; z = t + x; }
+	return (s32)(x * 100.0f) ^ (s32)(y * 10.0f) ^ (s32)z;
+}
