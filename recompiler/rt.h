@@ -135,6 +135,9 @@ static inline void VCMP(Cpu *c, double a, double b) {
 	if (a != a || b != b) f = 0x3; else if (a == b) f = 0x6; else if (a < b) f = 0x8; else f = 0x2;
 	c->fpscr = (c->fpscr & 0x0fffffffu) | (f << 28);
 }
+static inline void VMRS_APSR2(Cpu *f, const Cpu *c) {   /* (recomp.py's flags as locals: f the function's copy of them) */
+	f->n = c->fpscr >> 31; f->z = (c->fpscr >> 30) & 1; f->c = (c->fpscr >> 29) & 1; f->v = (c->fpscr >> 28) & 1;
+}
 static inline void VMRS_APSR(Cpu *c) {
 	c->n = c->fpscr >> 31; c->z = (c->fpscr >> 30) & 1; c->c = (c->fpscr >> 29) & 1; c->v = (c->fpscr >> 28) & 1;
 }
@@ -327,7 +330,11 @@ static inline uint32_t RBIT(uint32_t v) {
 /* -DRECOMP_TRACE: every guest instruction reports the state before it runs (difftest's lockstep mode) */
 #ifdef RECOMP_TRACE
 extern void recomp_trace(Cpu *c, uint32_t addr);
-#define TR(a) recomp_trace(c, a)
+/* (registers kept as locals, recomp.py's REG_LOCALS: written back first, so the tracer sees them) */
+#ifndef RECOMP_TR_SYNC
+#define RECOMP_TR_SYNC
+#endif
+#define TR(a) do { RECOMP_TR_SYNC recomp_trace(c, a); } while (0)
 #else
 #define TR(a) ((void)0)
 #endif

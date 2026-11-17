@@ -2512,7 +2512,7 @@ static int cur_wx0, cur_wy0, cur_wx1, cur_wy1;       /* the draw being recorded:
  * from guest memory gets the snapshot downloaded there once (snap_to_guest). */
 static void target_sync_for_gpu(TargetEntry *e);   /* (below) */
 static int gpu_vulkan(void);   /* (below) */
-static int gpu_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_SNAP"); v = e && *e ? *e != '0' : gpu_vulkan(); } return v; }
+static int gpu_snap_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_SNAP"); v = e && *e ? *e != '0' : 1; } return v; }   /* (on Metal too since 2026-11-17, with RECOMP_GPU_TRANSFER) */
 static int target_snapshot(TargetEntry *e) {
 	static uint64_t snaps;
 	target_sync_for_gpu(e);   /* (guest memory newer after a CPU write: up first, as a scene starting on it would) */
@@ -4159,7 +4159,10 @@ static void view_pass(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *dst, SDL_GPUTex
  * RECOMP_GPU_TRANSFER=0|1 picks. Returns 0 for the CPU path to do it. */
 int gfxcap_active(void);   /* gfx_capture.c */
 static int gpu_vulkan(void) { static int v = -1; if (v < 0) { if (!gpu()) return 0; const char *dv = SDL_GetGPUDeviceDriver(gpu()); v = dv && !strcmp(dv, "vulkan"); } return v; }   /* (not cached before the device exists) */
-static int gpu_transfer_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_TRANSFER"); v = e && *e ? *e != '0' : gpu_vulkan(); } return v; }
+/* On Metal too since 2026-11-17: byte-exact there (RECOMP_GPU_TRANSFER_CHECK=1, 40 of Killzone's downscales: 0 bytes differ), and
+ * with the snapshot it took the strip's per-frame wait and download out of the Mac's frame too (Killzone 1.00's recorded level,
+ * unpaced: 76 -> 95 fps median of three on the M4 Pro) */
+static int gpu_transfer_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_GPU_TRANSFER"); v = e && *e ? *e != '0' : 1; } return v; }
 int gfx_gpu_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t sstride, uint32_t dst, uint32_t dstride) {
 	if (!gpu() || !gpu_transfer_on() || gfxcap_active()) return 0;
 	static int trace = -1; if (trace < 0) trace = getenv("RECOMP_GPU_TRANSFER_TRACE") != 0;   /* RECOMP_GPU_TRANSFER_TRACE=1: why a transfer stayed on the CPU */
@@ -5553,13 +5556,13 @@ void gfx_gpu_draw(const GfxDraw *d) {
 
 	/* secondary programs run on the CPU regardless of backend (see usse_spirv.h): this resolves
 	 * dependent-sampler texture-unit assignment too, which the translator needs up front */
-	UsseDraw vdraw = {0}, fdraw = {0};
+	UsseDraw vdraw, fdraw;   /* (usse_setup_registers clears both whole) */
 	sync_draw_reads(d, 0, fp);   /* (the SA words below, the vertex streams the rings copy) */
 	usse_setup_registers(vp, &vdraw, d->vuniforms, d->vubuf);
 	usse_setup_registers(fp, &fdraw, d->funiforms, d->fubuf);
-	UsseInst scratch;
-	memset(&scratch, 0, sizeof scratch); usse_run_secondary(vp, &scratch, &vdraw);
-	memset(&scratch, 0, sizeof scratch); usse_run_secondary(fp, &scratch, &fdraw);
+	UsseInst scratch;   /* (2 KB cleared for each program with a secondary program to run: most have none) */
+	if (usse_has_secondary(vp)) { memset(&scratch, 0, sizeof scratch); usse_run_secondary(vp, &scratch, &vdraw); }
+	if (usse_has_secondary(fp)) { memset(&scratch, 0, sizeof scratch); usse_run_secondary(fp, &scratch, &fdraw); }
 
 	uint32_t sa_for_smp[256]; for (int i = 0; i < 256; i++) sa_for_smp[i] = fdraw.sa_unit[i] ? fdraw.sa_unit[i] - 1u : fdraw.sa[i].u;   /* a dependent sampler's unit (UsseDraw.sa_unit; its SA words stay 0) */
 	uint32_t cube_mask = 0; for (int i = 0; i < 16; i++) if (d->tex[i].data && ((d->tex[i].u_mode >> 4) & 3) == 3) cube_mask |= 1u << i;

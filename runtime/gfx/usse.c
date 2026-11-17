@@ -661,6 +661,11 @@ struct UsseProgram {
 	UsseFragLayout fl;
 	uint32_t literal_addr, literal_words;   /* container 16's data, for the uniform-buffer-address table */
 	int8_t additive;   /* usse_fragment_fb_blend's answer + 1, once asked (0: not yet) */
+	/* usse_get's check that the bytes at addr are still this program: the whole program hashed once a frame (usse_epoch),
+	 * its first 64 bytes at every other draw */
+	uint32_t checked; uint64_t quick;
+	/* usse_setup_registers' containers, from the header once at decode (found: base and size; -1 none) */
+	int32_t cont_base[20], cont_size[20];
 	struct UsseProgram *next, *hnext;   /* the address table's chain; the content table's chain (decoded entries only) */
 };
 typedef struct {
@@ -1605,6 +1610,7 @@ uint32_t usse_float_to_lane(float v, int type) { return float_to_lane(v, type); 
 /* the decode itself, into p (usse_get's tables, or usse_decode_uncached's own) */
 static void decode_program(UsseProgram *p, uint32_t prog_addr, uint32_t hash, uint32_t size) {
 	p->hash = hash; p->size = size; p->supported = 1; p->additive = 0;   /* (new bytes at a known address: decided again) */
+	for (int c = 0; c < 20; c++) { int base = 0, sz = 0; if (find_container(prog_addr, c, &base, &sz)) { p->cont_base[c] = base; p->cont_size[c] = sz; } else p->cont_base[c] = p->cont_size[c] = -1; }
 	uint32_t flags = RD32(prog_addr + H_FLAGS);
 	p->is_fragment = flags & 1;
 	uint32_t pn = RD32(prog_addr + H_PRIM_INSTR_COUNT), pc = pn ? prog_addr + H_PRIM_OFF + RD32(prog_addr + H_PRIM_OFF) : 0;
@@ -1633,20 +1639,30 @@ static void decode_program(UsseProgram *p, uint32_t prog_addr, uint32_t hash, ui
 	p->literal_words = RD32(prog_addr + H_LITERAL_SIZE) / 4;
 	p->literal_addr = prog_addr + H_LITERAL_DATA_OFF + RD32(prog_addr + H_LITERAL_DATA_OFF);
 }
+/* the frames, for usse_get's once-a-frame check (gfx_dispatch.c's present) */
+static uint32_t usse_epoch = 1;
+void usse_frame_tick(void) { usse_epoch++; }
+static uint64_t prog_quick(uint32_t a) { uint64_t h = 0x9E3779B97F4A7C15ull; for (uint32_t i = 0; i < 64; i += 8) { uint64_t w; memcpy(&w, G(a + i), 8); h = (h ^ w) * 0x100000001B3ull; } return h; }
 const UsseProgram *usse_get(uint32_t prog_addr) {
-	uint32_t size, hash = prog_content_hash(prog_addr, &size);
-	int h = (int)((prog_addr >> 4) % PROG_HASH_N), hc = (int)(hash % PROG_HASH_N);
+	/* every draw names its two programs, and hashing a whole program each time was most of what usse_get cost (1.7% of
+	 * Uncharted's main thread, 2026-11-17): once a frame the whole program, otherwise its header bytes */
+	int h = (int)((prog_addr >> 4) % PROG_HASH_N);
 	UsseProgram *e = 0;
 	for (UsseProgram *p = prog_table[h]; p; p = p->next) if (p->addr == prog_addr) { e = p; break; }
-	if (e && e->hash == hash && e->size == size) return e;
+	if (e && e->checked == usse_epoch && e->quick == prog_quick(prog_addr)) return e;
+	uint32_t size, hash = prog_content_hash(prog_addr, &size);
+	int hc = (int)(hash % PROG_HASH_N);
+	if (e && e->hash == hash && e->size == size) { e->checked = usse_epoch; e->quick = prog_quick(prog_addr); return e; }
 	if (!e) { e = calloc(1, sizeof *e); e->addr = prog_addr; e->next = prog_table[h]; prog_table[h] = e; }
 	for (UsseProgram *q = content_table[hc]; q; q = q->hnext) if (q->hash == hash && q->size == size && q != e) {   /* the same program decoded at another address: share the decode */
 		UsseProgram *next = e->next; *e = *q; e->next = next; e->hnext = 0; e->addr = prog_addr;
 		e->literal_addr = prog_addr + H_LITERAL_DATA_OFF + RD32(prog_addr + H_LITERAL_DATA_OFF);
+		e->checked = usse_epoch; e->quick = prog_quick(prog_addr);
 		return e;
 	}
 	UsseProgram *p = e; decode_program(p, prog_addr, hash, size);
 	p->hnext = content_table[hc]; content_table[hc] = p;
+	p->checked = usse_epoch; p->quick = prog_quick(prog_addr);
 	return p;
 }
 /* a decode kept out of usse_get's tables, of a program copied into scratch memory (the shader recipes' loader: programs
@@ -1659,6 +1675,7 @@ UsseProgram *usse_decode_uncached(uint32_t prog_addr) {
 }
 void usse_program_free(UsseProgram *p) { if (p) { free(p->prim); free(p->sec); free(p); } }
 int usse_is_fragment(const UsseProgram *p) { return p->is_fragment; }
+int usse_has_secondary(const UsseProgram *p) { return p->nsec > 0; }
 int usse_supported(const UsseProgram *p) { return p->supported; }
 int usse_primary_reads_memory(const UsseProgram *p) { for (int i = 0; i < p->nprim; i++) if (p->prim[i].op == OP_LDST) return 1; return 0; }
 const UOp *usse_program_code(const UsseProgram *p, int secondary, int *count) {
@@ -1691,9 +1708,8 @@ int usse_param_resource(uint32_t prog, const char *name, int *container) {
 /* the program's literal constants into their SA words (container 16, else 19) */
 static void literals_load(const UsseProgram *p, UsseDraw *d) {
 	uint32_t prog = p->addr;
-	int c19base = 0, c19size = 0; find_container(prog, 19, &c19base, &c19size);
-	int c16base = 0, c16size = 0;
-	int litbase = find_container(prog, 16, &c16base, &c16size) ? c16base : c19base;
+	const int c19base = p->cont_base[19] < 0 ? 0 : p->cont_base[19];
+	const int litbase = p->cont_base[16] >= 0 ? p->cont_base[16] : c19base;   /* (decode_program's, from the header) */
 	uint32_t lcnt = RD32(prog + H_LITERALS_COUNT), lbase = RD32(prog + H_LITERALS_OFF) ? prog + H_LITERALS_OFF + RD32(prog + H_LITERALS_OFF) : 0;
 	for (uint32_t i = 0; i < lcnt; i++) {
 		uint32_t e = lbase + 8 * i; int off = (int)RD32(e); uint32_t val = RD32(e + 4);
@@ -1704,14 +1720,14 @@ void usse_setup_registers(const UsseProgram *p, UsseDraw *d, uint32_t def_unifor
 	uint32_t prog = p->addr;
 	memset(d->sa, 0, sizeof d->sa); memset(d->sa_unit, 0, sizeof d->sa_unit);
 	for (int c = 0; c <= 14; c++) {
-		int base_sa, size_f32;
-		if (!find_container(prog, c, &base_sa, &size_f32) || size_f32 <= 0) continue;
+		const int base_sa = p->cont_base[c], size_f32 = p->cont_size[c];   /* (decode_program's, from the header) */
+		if (base_sa < 0 || size_f32 <= 0) continue;
 		uint32_t bufaddr = c == 14 ? def_uniform_buf : (ubuf ? ubuf[c] : 0);
 		if (!bufaddr) continue;
 		for (int w = 0; w < size_f32 && base_sa + w < 256 && base_sa + w >= 0; w++) d->sa[base_sa + w].u = RD32(bufaddr + 4 * (uint32_t)w);
 		if (c == 14 && uniform_filter) uniform_filter(p, prog, d, base_sa, size_f32);
 	}
-	int c19base = 0, c19size = 0; find_container(prog, 19, &c19base, &c19size);
+	const int c19base = p->cont_base[19] < 0 ? 0 : p->cont_base[19];
 	literals_load(p, d);
 	uint32_t ucnt = RD32(prog + H_UBINFO_COUNT), ubase = RD32(prog + H_UBINFO_OFF) ? prog + H_UBINFO_OFF + RD32(prog + H_UBINFO_OFF) : 0;
 	for (uint32_t i = 0; i < ucnt; i++) {

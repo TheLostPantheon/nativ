@@ -15,6 +15,7 @@
 #include "gfx_coverage.h"
 #include "gfx_capture.h"
 #include "metrics.h"
+void usse_frame_tick(void);   /* usse.c: usse_get checks each program's bytes whole once a frame */
 #include "platform.h"
 
 static uint64_t now_us(void) { return plat_now_us(); }   /* metrics.c: each entry point's own wall-clock cost */
@@ -221,6 +222,7 @@ static void present_scene_wait(uint32_t base) {
 	}
 }
 void gfx_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format) {
+	usse_frame_tick();
 	if (gpu_backend()) present_scene_wait(base);
 	if (gpu_backend() && readback_prewait()) {
 		void *due[16]; int n = 0;

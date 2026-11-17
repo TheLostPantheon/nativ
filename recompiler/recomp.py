@@ -1163,13 +1163,71 @@ class Fn:
         lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
         lines.append("\t}")
         lines.append("}")
-        return lines
+        return reg_locals(lines, 3 if hook else 2) if REG_LOCALS[0] else lines
+
+
+# Registers as C locals (on unless --no-reg-locals): each function keeps the general registers it uses (r0-r14; the pc
+# stays in c, the computed-jump switch reads it) in locals gr0..gr14, loaded after its entry (and entry hook) and written
+# back to c only where something else can see c: before every call out of it (a guest function, an import, an
+# indirect call, a hook, the setjmp stub) and every return, reloaded after each call. In between the C compiler keeps them
+# in host registers: c->r in memory made every instruction a load and a store of the CPU state (62 stores and 53 loads
+# in one of Uncharted's hot functions of 230 instructions, 2026-11-17). The inline helpers that take c (ADDC, SUBC, NZ,
+# COND, SHIFT, VCMP, VMRS_APSR) touch only the flags and the FPSCR. A host longjmp back into a setjmp stub is followed by
+# a reload, so locals that changed after the setjmp don't matter.
+# The flags too: a function that reads or sets N, Z, C, V keeps them in a local Cpu F (its flag fields only: the compiler
+# keeps them as scalars, and drops the ones nothing reads before the next instruction sets them again), synced with c at
+# the same places as the registers. The helpers that take c for the flags (ADDC, SUBC, NZ, SHIFT, COND) get &F; VMRS_APSR
+# (FPSCR's flags into them) becomes VMRS_APSR2(&F, c).
+REG_LOCALS = [True]
+_RREF = re.compile(r"c->r\[(\d+)\]")
+_FLAG_HELPERS = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,")
+_FLAG_FIELDS = re.compile(r"\bc->([nzcv])\b")
+_FLAGS_USED = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,|\bc->[nzcv]\b|VMRS_APSR\(c\)")
+_CALLS = [   # (the statement that calls out, as the emitter writes it; its replacement around RSO/RSI)
+    (re.compile(r"\b(fn_[0-9a-f]{8}\(c\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"(?<![\w.])(f\(c\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_call_external\(c, [^;]*\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_ihook_\w+\(c, [^;]*\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_hook_\w+\(c\);)"), r"{ RSO \1 RSI }"),
+    (re.compile(r"\b(recomp_unimplemented\(c, [^;]*\);)"), r"{ RSO \1 }"),
+    (re.compile(r"\b(UNIMPL\(c, [^;]*\);)"), r"{ RSO \1 }"),
+    (re.compile(r"(?<![\w])(return;)"), r"{ RSO \1 }"),
+]
+
+
+def reg_locals(lines, head):
+    """lines (one function; its first `head` lines the signature, ENTER and the entry hook) with the registers it uses as
+    locals: see REG_LOCALS"""
+    used = sorted({int(n) for l in lines for n in _RREF.findall(l)} - {15})
+    flags = any(_FLAGS_USED.search(l) for l in lines[head:])
+    if not used and not flags: return lines
+    body = []
+    for l in lines[head:]:
+        l = _RREF.sub(lambda m: m.group(0) if m.group(1) == "15" else f"gr{m.group(1)}", l)
+        if flags:
+            l = _FLAG_HELPERS.sub(lambda m: f"{m.group(1)}(&F,", l)
+            l = _FLAG_FIELDS.sub(lambda m: f"F.{m.group(1)}", l)
+            l = l.replace("VMRS_APSR(c)", "VMRS_APSR2(&F, c)")
+        if "recomp_setjmp_begin(c)" in l:   # c current for the stub (after the lr just set); its 0, or a longjmp's registers, reloaded
+            l = (l.replace("RecompJmp *rj = recomp_setjmp_begin(c);", "RSO RecompJmp *rj = recomp_setjmp_begin(c);")
+                  .replace("if (!_setjmp(rj->host)) gr0 = 0; }", "if (!_setjmp(rj->host)) c->r[0] = 0; RSI }"))
+            l = _CALLS[-1][0].sub(_CALLS[-1][1], l)
+        else:
+            for pat, sub in _CALLS: l = pat.sub(sub, l)
+        body.append(l)
+    so = " ".join([f"c->r[{n}] = gr{n};" for n in used] + ([f"c->{f} = F.{f};" for f in "nzcv"] if flags else []))
+    si = " ".join([f"gr{n} = c->r[{n}];" for n in used] + ([f"F.{f} = c->{f};" for f in "nzcv"] if flags else []))
+    decl = ("\tuint32_t " + ", ".join(f"gr{n} = c->r[{n}]" for n in used) + ";" if used else "") + (
+        " Cpu F; F.n = c->n; F.z = c->z; F.c = c->c; F.v = c->v;" if flags else "")
+    return ([f"#define RSO {so}", f"#define RSI {si}", "#undef RECOMP_TR_SYNC", "#define RECOMP_TR_SYNC RSO"] + lines[:head] + [decl] + body
+            + ["#undef RSO", "#undef RSI", "#undef RECOMP_TR_SYNC", "#define RECOMP_TR_SYNC"])
 
 
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     ORDERED_LOADS[0] = "--unordered-loads" not in sys.argv
+    REG_LOCALS[0] = "--no-reg-locals" not in sys.argv
     for flag, table in (("--hooks", HOOKS), ("--insn-hooks", IHOOKS)):
         if flag in sys.argv:
             for tok in sys.argv[sys.argv.index(flag) + 1].split():

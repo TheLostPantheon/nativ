@@ -48,6 +48,10 @@
                                             saves the TEST_FRAMES frame as test.png, and the
                                             graphics coverage map as gfxcov.json
   vitarecomp coverage  <title> ...          the gap table from those maps (gfxcov.py)
+  vitarecomp pgo       <title> <recording> [frames] [from]   profile-guided optimisation: an instrumented build plays the
+                                            recording (a folder with input.txt and savedata0/, as dev/bench.sh), its
+                                            counts go to recomp/pgo.profdata, and from then on every build of the game
+                                            compiles with them (clang; RECOMP_NO_PGO=1 builds without)
   (EXTRA_ENV="A=1 B=0": settings appended to the game's RUN_ENV (run) or TEST_ENV (test/capture) for one command)
   (BUILD_EXTRA_ENV="A=1": settings built into the binary's defaults by build, after RUN_ENV: a diagnostic build for a player)
   vitarecomp accept    <title>              the last test frame becomes the game's reference frame
@@ -582,6 +586,11 @@ def cmd_build(g, mode):
     # BUILD_EXTRA_ENV="A=1 B=2": more settings built into this binary's defaults, after RUN_ENV's (a diagnostic build a player
     # runs as usual, from the launcher: RECOMP_HUD_LOG=2 to log their session's HUD layout)
     run_env = " ".join(x for x in (g.RUN_ENV, ENV.get("BUILD_EXTRA_ENV") or "") if x)
+    # recomp/pgo.profdata (vitarecomp pgo): the game's code compiled with what a recorded session ran most -- branches laid
+    # out for it, hot calls inlined. A function the profile doesn't match (the recompiler changed it since) just compiles
+    # as usual. (Its own set of objects: runtime/build.py keeps one per RECOMP_CFLAGS.)
+    pgo = os.path.join(g.OUT, "pgo.profdata")
+    pgo_flags = f"-fprofile-instr-use={pgo}" if os.path.isfile(pgo) and not ENV.get("RECOMP_NO_PGO") and mode not in ("verify", "profile") and "-fprofile-instr-generate" not in (ENV.get("RECOMP_CFLAGS") or "") else ""
     # the game's own host code (runtime/build.py RECOMP_PACK_SOURCES): every .c in its pack -- hooks.c, a stand-in for its
     # long-gone game server (Killzone's server.c)
     srcs = sorted(glob.glob(os.path.join(glob.escape(os.path.join(PACKS, g.PACK)), "*.c")))
@@ -589,10 +598,45 @@ def cmd_build(g, mode):
     base = os.path.join(g.OUT, g.BASE)
     out, extra = {"verify": (base + "_verify", {"VERIFY": "1"}), "profile": (base + "_prof", {"PROFILE": "1"})}.get(mode, (os.path.join(g.OUT, g.EXE.removesuffix(".exe")), {}))
     if g.windows: extra["TARGET"] = "windows"
+    if pgo_flags: extra["RECOMP_CFLAGS"] = " ".join(x for x in (ENV.get("RECOMP_CFLAGS") or "", pgo_flags) if x); say(f"{g.T}: built with its profile ({os.path.basename(pgo)})")
     mods = [os.path.join(g.OUT, "mod_" + m) for m in g.MODS]
     run([PY, os.path.join(RUNTIME, "build.py"), base, out] + mods, env=env_with(e, extra))
     if mode not in ("verify", "profile") and not ENV.get("RECOMP_BIN"):   # (ready's: which tools built the play program)
         with open(os.path.join(g.OUT, ".built_version"), "w", newline="\n") as f: f.write(tools_version() + "\n")
+
+
+def llvm_profdata():
+    """the profile merger that goes with this platform's clang, or None"""
+    if sys.platform == "darwin":
+        r = subprocess.run(["xcrun", "--find", "llvm-profdata"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip(): return r.stdout.strip()
+    if WINDOWS or ENV.get("TARGET") == "windows":
+        wt = ENV.get("ATIV_WIN_TOOLCHAIN") or os.path.join(os.path.expanduser("~"), "toolchains", "ativ-win")
+        p = os.path.join(wt, "llvm-mingw", "bin", "llvm-profdata" + (".exe" if WINDOWS else ""))
+        if os.path.isfile(p): return p
+    return shutil.which("llvm-profdata") or next((shutil.which(f"llvm-profdata-{v}") for v in range(22, 13, -1) if shutil.which(f"llvm-profdata-{v}")), None)
+
+
+def cmd_pgo(g, rec, frames, frm):
+    """vitarecomp pgo: an instrumented build plays a recorded session (unpaced from <from>, as dev/bench.sh), its counts merged
+    into recomp/pgo.profdata, which every later build of the game uses (cmd_build)"""
+    rec = os.path.abspath(rec or "")
+    if not (os.path.isfile(os.path.join(rec, "input.txt")) and os.path.isdir(os.path.join(rec, "savedata0"))): die("vitarecomp pgo <title> <recording folder: input.txt and savedata0/> [frames] [from]")
+    pd = llvm_profdata()
+    if not pd: die("vitarecomp pgo: no llvm-profdata (the LLVM tools that go with clang) on this machine")
+    raw = os.path.join(g.OUT, "pgo_raw"); rmtree(raw); os.makedirs(raw)
+    env = {"RECOMP_BIN": "pgo", "RECOMP_CFLAGS": " ".join(x for x in (ENV.get("RECOMP_CFLAGS") or "", "-fprofile-instr-generate") if x)}
+    say(f"{g.T}: an instrumented build"); run(SELF + ["build", g.T], env=env_with(env))
+    frames, frm = frames or "3300", frm or "600"
+    say(f"{g.T}: playing {rec} to frame {frames} with it")
+    run(SELF + ["test", g.T], env=env_with(dict(env, TEST_SAVES=os.path.join(rec, "savedata0"), TEST_TOUCH="", TEST_FRAMES=frames, TEST_COVERAGE="0",
+        EXTRA_ENV=f"RECOMP_GFX=gpu RECOMP_SHADERS= RECOMP_CLOCK=fixed RECOMP_NO_MSPACE=1 RECOMP_INPUT_PLAY={os.path.join(rec, 'input.txt')} RECOMP_UNPACED={frm} RECOMP_GPU_PRESENT_NOSYNC=1 LLVM_PROFILE_FILE={os.path.join(raw, '%p-%m.profraw')}")))
+    profs = sorted(glob.glob(os.path.join(glob.escape(raw), "*.profraw")))
+    if not profs: die(f"{g.T}: the run left no profile in {raw}")
+    run([pd, "merge", "-o", os.path.join(g.OUT, "pgo.profdata")] + profs)
+    rmtree(raw)
+    say(f"{g.T}: profile kept in {os.path.join(g.OUT, 'pgo.profdata')}; building with it")
+    run(SELF + ["build", g.T])
 
 
 def game_env(g, words, extra):
@@ -984,7 +1028,7 @@ def main(argv):
     if cmd == "add": cmd_add(T, argv[2:]); return 0
     if cmd == "dist": cmd_dist(T); return 0
     if cmd == "report": cmd_report(T); return 0
-    if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions"):
+    if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions", "pgo"):
         usage(); return 1
     g = Game(T, cmd)
     arg3 = argv[2] if len(argv) > 2 else ""
@@ -997,6 +1041,7 @@ def main(argv):
     elif cmd == "ready": cmd_ready(g)
     elif cmd == "run": cmd_run(g, arg3)
     elif cmd == "test": cmd_test(g)
+    elif cmd == "pgo": cmd_pgo(g, arg3, argv[3] if len(argv) > 3 else "", argv[4] if len(argv) > 4 else "")
     elif cmd == "capture": cmd_capture(g, arg3)
     elif cmd == "replay":
         if not arg3: die("vitarecomp replay: a frame number")
