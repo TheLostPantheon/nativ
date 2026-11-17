@@ -23,6 +23,10 @@
   packs.py info <path>
       one copy's "kind title_id version content_id" (vitarecomp add: the kept licence for it, an update its game's)
   packs.py selftest
+  packs.py generate <app0> <pack.toml> [<module folder> ...]
+      a game pack made from the player's own copy, for a game Nativ has no pack for (an experimental one: no hooks): its
+      name and version from param.sfo, its main program and the Sony modules it runs as recompiled code, found in its
+      own sce_module first, then in the module folders in order
   packs.py layer <app0> <patch0> <out>
       the tree a patched game runs from: app0 with its update's files over it, as hard links (copies where the
       filesystem has none). <out> is generated and replaced whole.
@@ -42,6 +46,8 @@ from vitadecrypt import pkg as PKG  # noqa: E402
 from vitadecrypt import sfo as SFO  # noqa: E402
 from vitadecrypt import rif as RIF  # noqa: E402
 import licenses as LIC  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "recompiler"))
+import imports as IMP  # noqa: E402
 from winfs import remove_file, remove_tree  # noqa: E402
 from datadir import library_dir  # noqa: E402
 import packconf  # noqa: E402
@@ -352,6 +358,68 @@ def selftest() -> None:
     print("packs.py self-test: OK")
 
 
+# The Sony libraries Nativ runs as recompiled code, by the library a program imports: the module that exports it.
+# Every other library is the host's (runtime/: the kernel, display, audio, files, ULT...) or a stub. libgpu_es4
+# comes in through libgxm_es4's own imports, libfios2 through libc's. The online modules (np_matching2, libssl,
+# np_common, librudp) are a curated pack's choice: a generated pack leaves the game offline.
+RECOMPILED = {"SceLibc": "libc", "SceLibm": "libc", "SceLibstdcxx": "libc", "SceGxm": "libgxm_es4", "SceGpuEs4User": "libgpu_es4",
+              "SceFios2": "libfios2", "SceMp4": "libscemp4", "SceAvPlayer": "libsceavplayer"}
+MODULE_ORDER = ("libc", "libgxm_es4", "libgpu_es4", "libfios2", "libscemp4", "libsceavplayer")   # (the curated packs' order)
+
+
+def main_program(app0: str) -> str:
+    """The game's main program, relative to app0: eboot.bin, unless it's a launcher that starts another (Uncharted's
+    eboot only loads uncharted.self): then the program beside it that draws (imports SceGxm)."""
+    def draws(p):
+        try: return any(lib == "SceGxm" for lib, *_ in IMP.imports(p)[1])
+        except (OSError, ValueError, struct.error): return False
+    if draws(os.path.join(app0, "eboot.bin.elf")): return "eboot.bin.elf"
+    others = sorted(f for f in os.listdir(app0) if f.endswith(".elf") and f != "eboot.bin.elf")
+    return next((f for f in others if draws(os.path.join(app0, f))), "eboot.bin.elf")
+
+
+def game_modules(app0: str, elf: str, module_dirs: list[str]) -> tuple[list[str], list[str]]:
+    """MODULES for a program: the modules exporting the libraries it imports (RECOMPILED), and theirs in turn; and the
+    ones no folder has (the firmware isn't installed)"""
+    def find(m):
+        for d in [os.path.join(app0, "sce_module")] + module_dirs:
+            p = os.path.join(d, m + ".suprx.elf")
+            if os.path.isfile(p): return p
+        return None
+    want, missing, todo = set(), [], [os.path.join(app0, elf)]
+    while todo:
+        for lib, *_ in IMP.imports(todo.pop())[1]:
+            m = RECOMPILED.get(lib)
+            if not m or m in want: continue
+            want.add(m)
+            p = find(m)
+            if p: todo.append(p)
+            else: missing.append(m)
+    return [m for m in MODULE_ORDER if m in want], missing
+
+
+def generate(app0: str, out: str, module_dirs: list[str]) -> None:
+    import hashlib, json
+    kind, title, version, name, _cid = identity(app0)
+    elf = main_program(app0)
+    mods, missing = game_modules(app0, elf, module_dirs)
+    if missing: raise SystemExit(f"{title}: {', '.join(missing)} not found: install the firmware first (vitarecomp firmware)")
+    h = hashlib.sha256()
+    with open(os.path.join(app0, elf), "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+    q = lambda s: json.dumps(s, ensure_ascii=False)   # (a TOML basic string)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out + ".new", "w", encoding="utf-8") as f:
+        f.write(f"# {name} ({title}): a pack Nativ made from the player's own copy (packs.py generate). Experimental: no hooks,\n"
+                f"# no support. Made again from the copy each time it's imported while GENERATED is \"1\"; delete that line to keep\n"
+                f"# your own changes (the start of the game's Nativ work: docs/developers.md, Packs).\n"
+                f"NAME = {q(name)}\nTIER = \"experimental\"\nGENERATED = \"1\"\n")
+        if elf != "eboot.bin.elf": f.write(f"ELF = {q(elf)}   # the main program (the eboot starts it)\n")
+        f.write(f"MODULES = {q(' '.join(mods))}\n\n[versions.{q(version or '-')}]\nsha256 = \"{h.hexdigest()}\"\nstatus = \"supported\"\n")
+    os.replace(out + ".new", out)
+    print(f"{title}: generated {out}: {elf}, modules {' '.join(mods) or 'none'}")
+
+
 def main(argv: list[str]) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
@@ -373,6 +441,9 @@ def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == "info":
         kind, title, version, _name, cid = identity(argv[1])
         print(kind, title or "-", version or "-", cid or "-")
+        return 0
+    if len(argv) >= 3 and argv[0] == "generate":
+        generate(argv[1], argv[2], argv[3:])
         return 0
     if argv[:1] == ["selftest"]:
         selftest()

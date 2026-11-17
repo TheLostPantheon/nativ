@@ -18,13 +18,18 @@
                                             (decrypt/vitadecrypt) and kept by kind -- dump/decrypted/<title>/app0 (the
                                             game, with license.rif: its update decrypts with the game's licence),
                                             patch0 (the update) -- then import, analyze, recompile and build when a
-                                            packs/<title>/pack.toml exists (--no-build: decrypt and keep only, more is
-                                            coming -- the game's update: the last add imports and builds them together)
+                                            game pack exists or one is made from the copy (--no-build: decrypt and keep
+                                            only, more is coming -- the game's update: the last add imports and builds
+                                            them together)
   vitarecomp import    <title> [<dump dir>] executables (eboot.bin, sce_module/*.suprx; FAGDec
                                             output, or add's decrypted tree) -> verified ELFs; game
                                             data -> fs/app0. No dump dir: the title's own copy, its
                                             update layered over it (app0_patched, hard links) when
-                                            the pack plays that version; records which version it is
+                                            the pack plays that version; records which version it is.
+                                            A game Nativ has no pack for gets one made from the copy
+                                            (experimental, no hooks: <library>/packs/<title>/pack.toml)
+  vitarecomp import    <title> --experimental   a version the game's pack doesn't play, tried anyway
+                                            (experimental: none of the pack's hooks), from now on
   vitarecomp versions  <title>              the versions the game's pack plays, and which this copy is
   vitarecomp analyze   <title>              functions, code ranges and the memory image of the main
                                             module (analyze.py, seconds; ANALYZER=ghidra: the old
@@ -301,8 +306,17 @@ def cmd_add(T, rest):
     # (--no-build: kept, not imported -- the game alone may be a version the pack refuses that its update makes one it plays)
     if nobuild: die(f"{tid}: kept; the next add (its update) or vitarecomp import {tid} imports it", 0)
     run(SELF + ["import", tid])
-    if not os.path.isfile(os.path.join(PACKS, tid, "pack.toml")): die(f"{tid}: imported; there's no game pack for it yet (packs/{tid}/pack.toml)", 0)
+    if os.path.isfile(os.path.join(W, "unsupported")): die(f"{tid}: kept; a version its pack doesn't play (vitarecomp import {tid} --experimental tries it anyway)", 0)
+    if not Game(tid, "add").c.get("MODULES"): die(f"{tid}: imported; no game pack for it", 0)
     for c in ("analyze", "recompile", "build"): run(SELF + [c, tid])
+
+
+def module_dirs():
+    """where the firmware's modules are, in Game.modelf's order: a console dump's, then each installed firmware's, newest first"""
+    ds = [os.path.join(DUMP, "decrypted", "us"), os.path.join(DUMP, "decrypted", "sys", "external")]
+    for sub in (os.path.join("os0", "us"), os.path.join("vs0", "sys", "external")):
+        ds += sorted(glob.glob(os.path.join(glob.escape(os.path.join(DUMP, "firmware")), "*", sub)), key=natkey, reverse=True)
+    return [d for d in ds if os.path.isdir(d)]
 
 
 def _last_line(argv, env):   # `cmd | tail -1`
@@ -318,7 +332,11 @@ class Game:
         self.T = T
         self.W = os.path.join(DUMP, "decrypted", T)
         self.PACK = T.split("_")[0] if re.match(r"[A-Z]{4}[0-9]{5}_", T) else T
+        # its pack: Nativ's (packs/), else one made from the player's copy, in the library (packs.py generate: an
+        # experimental pack, no hooks; cmd_import makes it)
         self.CONF = os.path.join(PACKS, self.PACK, "pack.toml")
+        self.CURATED = os.path.isfile(self.CONF)
+        if not self.CURATED: self.CONF = os.path.join(DUMP, "packs", self.PACK, "pack.toml")
         # VERSION: which of the pack's builds this copy is (import records it from the main program's hash): the pack's
         # per-version settings (HOOKS, GAME_ADDRS, FUNCTION_SEEDS...) branch on it
         vf = os.path.join(self.W, "version")
@@ -338,6 +356,10 @@ class Game:
         # plays with online off and is told which update it needs (runtime/net/net.c net_online_needs)
         ov = (c.get("ONLINE_VERSIONS") or "").split()
         if ov and version not in ov: c["RUN_ENV"] = ((c.get("RUN_ENV") or "") + " RECOMP_ONLINE_NEEDS=" + ",".join(ov)).strip()
+        # a copy of a version the pack doesn't play, not tried as experimental (import left <title>/unsupported): nothing
+        # builds it, or another version's hooks would patch unrelated code
+        if os.path.isfile(os.path.join(self.W, "unsupported")) and cmd not in ("import", "versions", "add", "report"):
+            die(f"{T}: this copy is a version packs/{self.PACK}/pack.toml doesn't play: vitarecomp import {T} --experimental tries it anyway (no hooks)")
         self.c = c; self.VERSION = version
         # TITLE_ID: the title id the game is told it runs as (sceAppMgr's, RECOMP_TITLE) -- the pack's unless the pack says otherwise
         self.TITLE_ID = c.get("TITLE_ID") or self.PACK
@@ -416,11 +438,17 @@ def cmd_import(g, src):
             info = subprocess.run([PY, os.path.join(R, "packs.py"), "info", os.path.join(W, "patch0")], env=env_with(TOOLS_ENV), capture_output=True, text=True)
             if info.returncode: sys.stderr.write(info.stderr); sys.exit(info.returncode)
             pv = (info.stdout.split() + ["", "", ""])[2]
-            if not g.VERSIONS or version_of(g.VERSIONS, sha256(e)):
+            if not g.VERSIONS or not g.CURATED or version_of(g.VERSIONS, sha256(e)):   # (a generated pack is made from whatever version this is)
                 run([PY, os.path.join(R, "packs.py"), "layer", os.path.join(W, "app0"), os.path.join(W, "patch0"), os.path.join(W, "app0_patched")], env=env_with(TOOLS_ENV))
                 src = os.path.join(W, "app0_patched")
             else:
                 say(f"{g.T}: its update ({pv}) isn't a version packs/{g.PACK}/pack.toml plays yet -- the game runs without it")
+    # a game Nativ has no pack for: one made from this copy (again each import, unless the player took it over: GENERATED)
+    if not g.CURATED and (not os.path.isfile(g.CONF) or packconf.load(g.CONF, "", {}).get("GENERATED") == "1"):
+        if not os.path.isfile(os.path.join(src, "eboot.bin.elf")): die(f"{g.T}: no game pack for it, and this copy has no decrypted eboot.bin.elf to make one from: add the game itself (vitarecomp add)")
+        run([PY, os.path.join(R, "packs.py"), "generate", src, g.CONF] + module_dirs(), env=env_with(TOOLS_ENV))
+        say(f"{g.T}: experimental: Nativ has no game pack for it, so it plays with one made from this copy (no hooks, no support)")
+        g = Game(g.T, "import")
     os.makedirs(os.path.join(W, "elf"), exist_ok=True); os.makedirs(os.path.join(OUT, "fs"), exist_ok=True)
     app0 = os.path.join(OUT, "fs", "app0")
     if os.path.isfile(os.path.join(src, "eboot.bin.elf")):   # decrypted on this machine (add): each ELF beside its SELF, and the whole app0 (sce_sys too) read in place
@@ -442,8 +470,13 @@ def cmd_import(g, src):
         if not v:
             vs = [e.split("=")[0] for e in g.VERSIONS.split()]
             say(f"{g.T}: this copy's {g.ELF} is no version packs/{g.PACK}/pack.toml plays (it plays {', '.join(vs)}): another version or region, or a modified dump (MaiDump's eboot loads its _m modules)? its hooks won't fit")
-            if not ENV.get("FORCE"): die()
-            v = "unknown"
+            # the player can still try it (vitarecomp import <title> --experimental, the launcher's "try it anyway"; FORCE): as an
+            # experimental copy, with the pack's settings for every version and none of its hooks (packconf.load "unknown")
+            if not (ENV.get("FORCE") or os.path.isfile(os.path.join(W, "experimental"))):
+                with open(os.path.join(W, "unsupported"), "w") as f: f.write(sha256(os.path.join(W, "elf", g.ELF)) + "\n")   # (the launcher's "Try it anyway")
+                die(f"{g.T}: kept, not built: try it anyway with vitarecomp import {g.T} --experimental (the launcher's Try it anyway)", 0)
+            v = "unknown"; say(f"{g.T}: experimental: playing it without the pack's hooks (no support)")
+        rmtree(os.path.join(W, "unsupported"))
         with open(os.path.join(W, "version"), "w") as f: f.write(v + "\n")
         say(f"{g.T}: version {v}")
     run_filtered([PY, os.path.join(RECOMPILER, "imports.py"), os.path.join(W, "elf", g.ELF)], None, first=True)
@@ -503,12 +536,12 @@ def recompile_inputs(g):
     """what a title's generated code was made from: recompiler/ and its pack.toml (HOOKS, IHOOKS, MODULES, FUNCTION_SEEDS ...),
     as git hashes a blob of their contents in path order -- dev/build-all.sh's formula before this, so its stamps
     (recomp/.recompile_inputs) stay valid -- and computed without git, so an install has it too"""
-    files = [f"packs/{g.PACK}/pack.toml"] if os.path.isfile(g.CONF) else []
+    files = {f"packs/{g.PACK}/pack.toml": g.CONF} if os.path.isfile(g.CONF) else {}   # (a generated pack's, from the library)
     for d, sub, names in os.walk(RECOMPILER):
         sub[:] = [x for x in sub if x != "__pycache__" and not x.startswith(".")]
         # (hidden files aren't the recompiler's: a tar from a Mac leaves ._ metadata beside each file, 2026-10-26)
-        files += [os.path.relpath(os.path.join(d, n), ROOT).replace(os.sep, "/") for n in names if not n.endswith(".pyc") and not n.startswith(".")]
-    data = b"".join(open(os.path.join(ROOT, f), "rb").read() for f in sorted(files, key=lambda f: f.encode()))
+        files.update((os.path.relpath(os.path.join(d, n), ROOT).replace(os.sep, "/"), os.path.join(d, n)) for n in names if not n.endswith(".pyc") and not n.startswith("."))
+    data = b"".join(open(files[f], "rb").read() for f in sorted(files, key=lambda f: f.encode()))
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
@@ -623,12 +656,42 @@ def cmd_run(g, frames):
         rc = subprocess.run(ENV["ATIV_PRE_LAUNCH"], shell=True).returncode
         if rc: sys.exit(rc)
     try:
-        if os.path.isfile(os.path.join(OUT, "session.log")): os.replace(os.path.join(OUT, "session.log"), os.path.join(OUT, "session.prev.log"))
-        e = game_env(g, g.RUN_ENV.split() + (ENV.get("EXTRA_ENV") or "").split(), fixed)
-        rc = tee_run(g.exe_argv(os.path.join(OUT, g.EXE)) + [g.BASE + ".img", g.entry(), frames or "100000000000"], e, OUT, os.path.join(OUT, "session.log"))
+        # a run that stops at code the analysis missed (exit 2: the host recorded it) is built again with it and started again,
+        # a few times over -- a new game's first hours (every game with no pack of its own) find such code as they go
+        for attempt in range(4):
+            if os.path.isfile(os.path.join(OUT, "session.log")): os.replace(os.path.join(OUT, "session.log"), os.path.join(OUT, "session.prev.log"))
+            e = game_env(g, g.RUN_ENV.split() + (ENV.get("EXTRA_ENV") or "").split(), fixed)
+            rc = tee_run(g.exe_argv(os.path.join(OUT, g.EXE)) + [g.BASE + ".img", g.entry(), frames or "100000000000"], e, OUT, os.path.join(OUT, "session.log"))
+            found = take_missed(g, os.path.join(OUT, "missed_functions.txt"))
+            if rc != 2 or not found or attempt == 3: break
+            say(f"{g.T}: the game reached code its build had missed ({found} new): building it again with that code, then starting it again")
+            for c in ("analyze", "recompile", "build"): run(SELF + [c, g.T])
     finally:
         if ENV.get("ATIV_POST_EXIT"): subprocess.run(ENV["ATIV_POST_EXIT"], shell=True)
     sys.exit(rc)
+
+
+def take_missed(g, missed):
+    """the functions a run found the analysis missed (the host's missed_functions.txt: it stops at a call into code that
+    wasn't recompiled) into the seeds analyze reads -- a firmware module's as an offset into $SEEDS/<module>.txt, the
+    rest the game's analysis/seeds.txt; how many were new"""
+    W, new = g.W, 0
+    if os.path.isfile(missed) and os.path.getsize(missed):
+        for ln in open(missed).read().splitlines():
+            if not ln.split(): continue
+            a, kind = ln.split()[0], " ".join(ln.split()[1:])
+            f, line = os.path.join(W, "analysis", "seeds.txt"), f"{a} {kind}"
+            for i, m in enumerate(g.MODS):
+                b = g.mod_base(i)
+                if b <= int(a, 0) < b + 0x1000000 and not g.modelf(m).startswith(os.path.join(W, "elf") + os.sep):
+                    os.makedirs(g.SEEDS, exist_ok=True); f = os.path.join(g.SEEDS, m + ".txt"); line = f"{int(a, 0) - b:#x} {kind}"
+            have = open(f).read().splitlines() if os.path.isfile(f) else []
+            new += line not in have
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w") as o: o.write("".join(x + "\n" for x in sorted(set(have + [line]))))
+            say(f"the run found a function the analysis missed: {line} in {os.path.basename(f)} (re-run analyze, recompile, build)")
+    rmtree(missed)
+    return new
 
 
 def fresh_fs(g, td):
@@ -670,21 +733,7 @@ def cmd_test(g):
     with open(os.path.join(td, "test.log"), "wb") as log:
         timed(g.exe_argv(os.path.join(OUT, g.EXE)) + [os.path.join("..", g.BASE + ".img"), g.entry(), "100000000000"], e, td, subprocess.DEVNULL, log,
               test_timeout(g))
-    missed = os.path.join(td, "missed_functions.txt")
-    if os.path.isfile(missed) and os.path.getsize(missed):
-        # each address to its module: a firmware module's as an offset into $SEEDS/<module>.txt, the rest the game's
-        for ln in open(missed).read().splitlines():
-            if not ln.split(): continue
-            a, kind = ln.split()[0], " ".join(ln.split()[1:])
-            f, line = os.path.join(W, "analysis", "seeds.txt"), f"{a} {kind}"
-            for i, m in enumerate(g.MODS):
-                b = g.mod_base(i)
-                if b <= int(a, 0) < b + 0x1000000 and not g.modelf(m).startswith(os.path.join(W, "elf") + os.sep):
-                    os.makedirs(g.SEEDS, exist_ok=True); f = os.path.join(g.SEEDS, m + ".txt"); line = f"{int(a, 0) - b:#x} {kind}"
-            have = open(f).read().splitlines() if os.path.isfile(f) else []
-            with open(f, "w") as o: o.write("".join(x + "\n" for x in sorted(set(have + [line]))))
-            say(f"the run found a function the analysis missed: {line} in {os.path.basename(f)} (re-run analyze, recompile, build)")
-    rmtree(missed)
+    take_missed(g, os.path.join(td, "missed_functions.txt"))
     shot = os.path.join(td, "shot_%05d.ppm" % int(frames))
     if not os.path.isfile(shot):
         say(f"no frame {frames} (see {os.path.join(td, 'test.log')})")
@@ -939,6 +988,8 @@ def main(argv):
         usage(); return 1
     g = Game(T, cmd)
     arg3 = argv[2] if len(argv) > 2 else ""
+    if cmd == "import" and arg3 == "--experimental":   # (the player chose to try a version the pack doesn't play: kept)
+        os.makedirs(g.W, exist_ok=True); open(os.path.join(g.W, "experimental"), "w").close(); arg3 = ""
     if cmd == "import": cmd_import(g, arg3)
     elif cmd == "analyze": cmd_analyze(g)
     elif cmd == "recompile": cmd_recompile(g)

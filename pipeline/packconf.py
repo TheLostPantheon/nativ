@@ -22,7 +22,12 @@ DEFAULTS = {
     "BASE": "game", "SPLIT": "16", "TEST_INPUT": "", "TEST_TOUCH": "", "TEST_ENV": "", "TEST_FRAMES": "600",
     "TEST_TOLERANCE": "1", "ELF": "eboot.bin.elf", "HOOKS": "", "IHOOKS": "", "MOD_HOOKS": "", "MOD_IHOOKS": "",
     "GAME_ADDRS": "", "TITLE_ID": "", "VERSIONS": "", "UPDATE_NOTE": "", "FUNCTION_SEEDS": "", "ONLINE_VERSIONS": "",
+    "TIER": "", "GENERATED": "",
 }
+# what an "unknown" copy (a version the pack doesn't play, tried anyway: vitarecomp import --experimental) goes without:
+# everything made for particular builds' addresses, and the switches in RUN_ENV that only those hooks honour
+BUILD_SPECIFIC = ("HOOKS", "IHOOKS", "GAME_ADDRS", "FUNCTION_SEEDS")
+HOOKED_ENV = ("RECOMP_GAME_OPTIONS", "RECOMP_ASPECT_HOOK")
 _KEY = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 STATUSES = ("recommended", "supported")
 
@@ -71,7 +76,7 @@ def load(path, version="", env=None):
     settings, versions, when = read(path)
     v.update(settings)
     v["VERSIONS"] = " ".join(f"{name}={x['sha256']}:{x.get('status', 'supported')}" for name, x in versions.items())
-    if versions:
+    if versions and version != "unknown":
         pick = versions.get(version) or next(iter(versions.values()))
         v.update({k: str(val) for k, val in pick.items() if k not in ("sha256", "status")})
     for name, w in when.items():
@@ -79,6 +84,9 @@ def load(path, version="", env=None):
         for k, val in w.items():
             if k == "append": v.update({k2: " ".join(x for x in (v.get(k2, ""), str(add)) if x) for k2, add in val.items()})
             else: v[k] = str(val)
+    if version == "unknown":
+        v.update({k: "" for k in BUILD_SPECIFIC})
+        v["RUN_ENV"] = " ".join(e for e in v.get("RUN_ENV", "").split() if e.split("=")[0] not in HOOKED_ENV)
     return v
 
 
