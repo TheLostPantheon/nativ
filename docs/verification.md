@@ -24,6 +24,40 @@ minutes. Run it after every change to the runtime or the recompiler, and don't e
 
 Killzone isn't in the gate yet, so test it separately after host changes.
 
+## The tests that need no game
+
+```
+dev/tests/run_all.sh [quick]
+```
+
+These run in CI (`.github/workflows/tests.yml`, macOS and Linux) on every push to main and every pull request, and
+before a push here:
+
+- **`dev/tests/recomp_exec_test.py`:** the recompiler end to end. C programs (`dev/tests/recomp_exec/progs.c`) are
+  compiled for the Vita's CPU by clang, as Thumb and as ARM, then recompiled and run on random inputs. Each result must
+  match Unicorn running the original code. It covers calls, recursion, indirect calls, switch tables, IT blocks, 64-bit
+  arithmetic, every load and store width, struct copies, VFP and NEON. It runs the generated code both as built and with
+  `--no-reg-locals` (registers, flags and float registers in memory), so a change to how functions are emitted is
+  checked against the plain translation and the CPU itself.
+- `pipeline/packconf.py --check` and `pipeline/packs.py selftest`.
+- The kernel, touch gesture and JPEG tests in `runtime/tests/`.
+
+## Measuring performance
+
+```
+dev/bench.sh <title> <recording folder> [frames] [from]
+```
+
+This replays a recorded session (input.txt and savedata0, recorded with `RECOMP_INPUT_RECORD` on the fixed clock)
+headless. From frame `<from>` it runs as fast as the game can (`RECOMP_UNPACED`), and reports frames per second over
+each 300 frames plus each thread's CPU time. Start it after the recording's loads: unpaced loading screens race ahead
+of the recorded input. `REPEAT=n` gives the median of n runs after a warm-up.
+
+To compare two builds, interleave their runs (A, B, A, B...) on a quiet machine, with nothing else building. Uncharted's
+replay is deterministic. Killzone's isn't: its runs drift apart in what they show, and so does their frame rate.
+
+`vitarecomp pgo <title> <recording>` builds a game with a profile from a recorded session (about +7% on Uncharted).
+
 ## Checking the translated code
 
 **`dev/difftest.py`** runs each function against Unicorn, an ARM emulator, from random starting states. It's fast, but
