@@ -4,7 +4,8 @@
 (dev/insnsweep.py's engine). insnsweep tests the forms one game happens to use; this tests the ones no game has met yet,
 so a game that needs one finds it already working.
 
-    dev/isacover.py [--samples N] [--trials T] [--per-form K] [--only SUBSTRING] [--json OUT] [--baseline IN]
+    dev/isacover.py [--samples N] [--trials T] [--per-form K] [--only SUBSTRING] [--shard K/N] [--json OUT] [--baseline IN]
+    dev/isacover.py --merge OUT.json IN.json...      (shards' results as one, and their report)
 
 The corpus: every 16-bit Thumb encoding, and N random encodings (default 400000) from each of the 32-bit spaces (ARM
 data processing, loads and stores, media, VFP, NEON; Thumb-2's), decoded by recomp.py's own capstone instances. What
@@ -88,7 +89,10 @@ def main():
     ap.add_argument("--samples", type=int, default=400000); ap.add_argument("--trials", type=int, default=32)
     ap.add_argument("--per-form", type=int, default=2); ap.add_argument("--only", default="")
     ap.add_argument("--json", default=""); ap.add_argument("--baseline", default=""); ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--shard", default="", help="K/N: only the forms in shard K of N (by a hash of the form), for N processes at once")
+    ap.add_argument("--merge", nargs="+", default=None, help="OUT.json IN.json...: the shards' results as one")
     a = ap.parse_args()
+    if a.merge: return merge(a.merge[0], a.merge[1:], a.baseline)
     rng = random.Random(a.seed)
     seen = decode(candidates(a.samples, rng))
     print(f"decoded: {len(seen)} distinct instructions", flush=True)
@@ -108,6 +112,9 @@ def main():
         mn, _, ops = t.partition(" ")
         f = insnsweep.form_of(mn, ops) + (" (arm)" if arm else "")
         if a.only and a.only not in f: continue
+        if a.shard:
+            k, n = (int(x) for x in a.shard.split("/"))
+            if int.from_bytes(__import__("hashlib").sha1(f.encode()).digest()[:4], "little") % n != k: continue
         forms[f].append((bs[0], arm))
     arm_blk, thumb_blk, inst = bytearray(), bytearray(), {}
     for f in sorted(forms):
@@ -118,6 +125,24 @@ def main():
             inst.setdefault(f, []).append((at, arm))
     print(f"{len(inst)} forms, {sum(len(v) for v in inst.values())} encodings to test", flush=True)
     res = insnsweep.sweep(inst, [(ARM_BASE, bytes(arm_blk)), (THUMB_BASE, bytes(thumb_blk))], a.trials, a.per_form, quiet=True)
+    out = {"forms": sorted(inst), "ok": res["ok"], "untested": res["untested"], "bad": res["bad"], "unsupported": res["unsupported"],
+           "crashed": res["crashed"]}
+    if a.json: json.dump(out, open(a.json, "w"), indent=1)
+    sys.exit(report(out, a.baseline))
+
+
+def merge(out_path, ins, baseline):
+    out = {"forms": [], "ok": 0, "untested": 0, "bad": {}, "unsupported": {}, "crashed": {}}
+    for p in ins:
+        d = json.load(open(p))
+        out["forms"] += d["forms"]; out["ok"] += d.get("ok", 0); out["untested"] += d.get("untested", 0)
+        for k in ("bad", "unsupported", "crashed"): out[k].update(d[k])
+    out["forms"].sort(); json.dump(out, open(out_path, "w"), indent=1)
+    sys.exit(report(out, baseline))
+
+
+def report(res, baseline):
+    inst = res["forms"]
     by_stem = defaultdict(lambda: Counter())
     for f in inst: by_stem[insnsweep.stem(f.split()[0])]["forms"] += 1
     for k in ("bad", "unsupported", "crashed"):
@@ -132,15 +157,13 @@ def main():
     for k, label in (("unsupported", "doesn't handle"), ("bad", "differs")):
         for f, why in sorted(res[k].items())[:60]:
             print(f"  {label}: {f}\n      {why}")
-    if a.json:
-        json.dump({"forms": sorted(inst), "bad": res["bad"], "unsupported": res["unsupported"], "crashed": res["crashed"]},
-                  open(a.json, "w"), indent=1)
-    if a.baseline:
-        base = json.load(open(a.baseline)); failing = set(res["bad"]) | set(res["unsupported"])
+    if baseline:
+        base = json.load(open(baseline)); failing = set(res["bad"]) | set(res["unsupported"])
         was_ok = set(base["forms"]) - set(base["bad"]) - set(base["unsupported"]) - set(base["crashed"])
         worse = sorted(failing & was_ok)
         for f in worse: print(f"REGRESSION {f}: {res['bad'].get(f) or res['unsupported'].get(f)}")
-        sys.exit(1 if worse else 0)
+        return 1 if worse else 0
+    return 0
 
 
 if __name__ == "__main__":
