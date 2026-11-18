@@ -6,7 +6,7 @@
 #include <pthread.h>
 #include "settings.h"
 
-#define MAXSET 160
+#define MAXSET 256
 enum { GAME, SHARED };
 static struct { char key[32], val[96]; unsigned char layer, dirty, gone; } tab[MAXSET];   /* gone: removed, dropped from its file at the next save */
 static int ntab;
@@ -17,7 +17,7 @@ static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
  * its server; first-launch hints are per game) -- every other key is the player's, the same in every game */
 static int game_key(const char *key) {
 	static const char *const own[] = {"fov", "view_distance", "scenery_detail", "character_detail", "qte_time", "private_server", "net_redirect",
-	                                  "menu_hint_shown", "controller_layout", "game_language", NULL};
+	                                  "menu_hint_shown", "controller_layout", "game_language", "bindings_own", NULL};
 	for (int i = 0; own[i]; i++) if (!strcmp(own[i], key)) return 1;
 	return 0;
 }
@@ -98,12 +98,13 @@ void settings_set_str(const char *key, const char *v) {
 	pthread_mutex_unlock(&mx);
 }
 void settings_set_own(const char *key, const char *v) { pthread_mutex_lock(&mx); put(key, v, GAME, 1); pthread_mutex_unlock(&mx); }
+void settings_clear_own(const char *key) { pthread_mutex_lock(&mx); int i = find(key, GAME); if (i >= 0) { tab[i].gone = 1; tab[i].dirty = 1; } pthread_mutex_unlock(&mx); }
 void settings_set_int(const char *key, int v) { char b[32]; snprintf(b, sizeof b, "%d", v); settings_set_str(key, b); }
 void settings_set_float(const char *key, double v) { char b[32]; snprintf(b, sizeof b, "%g", v); settings_set_str(key, b); }
 
 /* saving merges: the file as it is on disk now (the launcher, or another game, may have written it since it was read),
  * with this run's changes over it -- set, or removed -- so nobody's edit is lost to a whole-table write */
-#define MAXLINE 200
+#define MAXLINE 300
 struct merged { int n; char key[MAXLINE][32], val[MAXLINE][96]; };
 static void merge_in(const char *k, const char *v, void *u) {
 	struct merged *m = u;

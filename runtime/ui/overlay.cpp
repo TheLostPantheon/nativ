@@ -47,6 +47,7 @@
 #include "backends/imgui_impl_sdlgpu3.h"
 #include "gpulock.h"   /* the SDL submit below is the locked one, and ImGui's own submits run under the same lock (render_frame): Homebrew SDL 3.4.16's Metal fence race, see that header */
 #include "overlay.h"
+#include "padbind.h"
 #include "commondlg.h"
 #include "savedlg.h"
 #include "ui_theme.h"
@@ -152,7 +153,15 @@ void overlay_shutdown(void) {
 	g_ctx = nullptr; g_has_window = false; g_open = false; g_want_quit = false; g_want_capture = false; g_paused = false;
 }
 
+static int g_rebind = -1;     /* the Controls page's Rebind: the next key pressed goes to this action */
+static int g_prebind = -1;    /* the same for the controller: the next button (or trigger) goes to this action (padbind.h's) */
+static int g_prebind_end;     /* frames until a controller rebind lets go: the press that set it is still down in ImGui's gamepad navigation */
+static char g_bind_note[96];  /* what the last controller rebind took from another action */
 int overlay_is_open(void) { return g_ctx && g_open; }
+int overlay_cancel_rebind(void) {   /* Escape: a rebind in progress stops, the menu stays (window.c) */
+	if (g_rebind < 0 && g_prebind < 0) return 0;
+	g_rebind = g_prebind = -1; g_prebind_end = 0; return 1;
+}
 /* every pause goes through here: display.c freezes the game's clock for exactly the time the menu is up
  * or Game > Pause is on, whichever lasts longer (overlay_game_paused is what display.c and window.c's
  * audio actually poll) */
@@ -167,7 +176,7 @@ void overlay_close(void) {   /* closing the menu resumes: a Game > Pause doesn't
 	if (g_layout_card) { g_layout_card = false; g_layout_ask = 0; g_layout_answer = 1; }   /* (Escape on the layout card: touch, the default) */
 	intro_end();
 	if (g_prep_card) { g_prep_card = false; gfx_gpu_shader_prep_skip(); }   /* (the card closed before the builds were done: Skip) */
-	g_quit_card = false;
+	g_quit_card = false; g_rebind = g_prebind = -1; g_prebind_end = 0;
 	g_open = false; g_paused = false; apply_pause();
 }
 void overlay_toggle(void) { if (g_open) overlay_close(); else overlay_open(); }
@@ -184,11 +193,32 @@ static const char *quit_label(void) { return std::getenv("ATIV_LAUNCHER") ? "Bac
 int overlay_wants_capture(void) { return g_want_capture.exchange(false); }
 
 extern "C" { int window_kb_count(void); const char *window_kb_label(int i); const char *window_kb_key_name(int i);
-             void window_kb_bind(int i, SDL_Keycode k); void window_kb_reset(void); int window_kbm_active(void); }
-static int g_rebind = -1;   /* the Controls page's Rebind: the next key pressed goes to this action */
+             void window_kb_bind(int i, SDL_Keycode k); void window_kb_reset(void); int window_kbm_active(void);
+             int window_pad_count(void); int window_pad_input(int a); int window_pad_bind(int a, int input); void window_pad_reset(void);
+             int window_binds_own(void); void window_binds_set_own(int on); void window_set_pad_labeller(const char *(*f)(int input)); }
+static const char *pad_input_label(int in);   /* (below, with pad_names) */
+/* the Controls page's name for a controller action: the keyboard table's own words, then the four a keyboard has no use for */
+static const char *pad_action_label(int a) {
+	static const char *const extra[4] = {"Front touch cursor (PS TV: L2)", "Rear touch cursor (PS TV: R2)", "PS TV: L3", "PS TV: R3 (also recentres the gyro)"};
+	return a >= PBA_L2 ? extra[a - PBA_L2] : window_kb_label(a + 4);
+}
 void overlay_process_event(const SDL_Event *event) {
 	if (!g_ctx || !g_has_window) return;
-	if (g_rebind >= 0 && event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat) { window_kb_bind(g_rebind, event->key.key); g_rebind = -1; return; }   /* (Escape and F10 close the menu first: window.c) */
+	if (g_rebind >= 0 && event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat) { window_kb_bind(g_rebind, event->key.key); g_rebind = -1; return; }   /* (Escape cancels, F10 closes the menu: window.c) */
+	if (g_prebind >= 0 && g_prebind_end == 0) {   /* (Guide opens and closes the menu before it gets here, and has no input in padbind.h) */
+		int in = -9;
+		if (event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) in = event->gbutton.button;
+		else if (event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && event->gaxis.value > 20000) {
+			if (event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) in = PBI_LTRIG; else if (event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) in = PBI_RTRIG;
+		}
+		if (in != -9 && pb_input_valid(in)) {
+			const int other = window_pad_bind(g_prebind, in); g_prebind_end = 2;
+			if (other >= 0) std::snprintf(g_bind_note, sizeof g_bind_note, "%s was on that button and is now unbound.", pad_action_label(other));
+			else g_bind_note[0] = 0;
+			return;
+		}
+		if (in != -9) return;   /* (a button that can't be bound: nothing) */
+	}
 	ImGui::SetCurrentContext(g_ctx);
 	ImGui_ImplSDL3_ProcessEvent(event);
 }
@@ -496,21 +526,43 @@ static void page_controls(void) {
 		}
 		ui::rows_end();
 	}
-	section_label("Keys");
-	if (ImGui::BeginTable("kbbinds", 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+	section_label("Buttons");
+	window_set_pad_labeller(pad_input_label);
+	if (g_prebind_end > 0 && --g_prebind_end == 0) g_prebind = -1;
+	if (ImGui::BeginTable("binds", 5, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
 		ImGui::TableSetupColumn("Action"); ImGui::TableSetupColumn("Key"); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
+		ImGui::TableSetupColumn("Controller"); ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
 		ImGui::PushStyleColor(ImGuiCol_Text, ui::muted); ImGui::TableHeadersRow(); ImGui::PopStyleColor();
-		for (int i = 0, n = window_kb_count(); i < n; i++) {
-			ImGui::TableNextRow();
-			ImGui::TableNextColumn(); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(window_kb_label(i));
+		const int nk = window_kb_count(), na = window_pad_count();
+		for (int i = 0; i < nk + (na - (nk - 4)); i++) {   // (the keys' rows; the pad's, from Cross on, share them; then the pad-only ones)
+			const int kb = i < nk, a = i < 4 ? -1 : i - 4;
+			ImGui::TableNextRow(); ImGui::PushID(i);
+			ImGui::TableNextColumn(); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(kb ? window_kb_label(i) : pad_action_label(a));
 			ImGui::TableNextColumn(); ImGui::AlignTextToFramePadding();
-			const char *k = window_kb_key_name(i);
-			if (g_rebind == i) ImGui::TextColored(ui::accent, "Press a key…"); else ui::chip(k && *k ? k : "none", ui::text);
-			ImGui::TableNextColumn(); ImGui::PushID(i); if (ImGui::Button("Change")) g_rebind = i; ImGui::PopID();
+			if (kb) { const char *k = window_kb_key_name(i); if (g_rebind == i) ImGui::TextColored(ui::accent, "Press a key…"); else ui::chip(k && *k ? k : "none", ui::text); }
+			ImGui::TableNextColumn();
+			if (kb && ImGui::Button("Change")) { g_rebind = i; g_prebind = -1; g_prebind_end = 0; }
+			ImGui::TableNextColumn(); ImGui::AlignTextToFramePadding();
+			if (a >= 0) { const int in = window_pad_input(a); if (g_prebind == a) ImGui::TextColored(ui::accent, "Press a button…"); else ui::chip(pad_input_label(in), in < 0 ? ui::muted : ui::text); }
+			ImGui::TableNextColumn();
+			if (a >= 0) {
+				ImGui::BeginDisabled(g_prebind >= 0);   // (disabled while one waits: the press that ends it must not click this again)
+				if (ImGui::Button("Change##p")) { g_prebind = a; g_prebind_end = 0; g_rebind = -1; g_bind_note[0] = 0; }
+				ImGui::EndDisabled();
+			}
+			ImGui::PopID();
 		}
 		ImGui::EndTable();
 	}
+	if (g_rebind >= 0 || g_prebind >= 0) ImGui::TextDisabled("Esc cancels. The menu's own F10 and Guide can't be bound.");
+	else if (g_bind_note[0]) ImGui::TextDisabled("%s", g_bind_note);
 	if (ImGui::Button("Reset keys to the defaults")) { window_kb_reset(); g_rebind = -1; }
+	ImGui::SameLine(); if (ImGui::Button("Reset controller buttons")) { window_pad_reset(); g_prebind = -1; g_prebind_end = 0; g_bind_note[0] = 0; }
+	if (ui::rows_begin("bindscope")) {
+		ui::row("Different buttons for this game", "Off: every game uses the same keys and controller buttons. On: this game keeps its own, starting from the ones now.");
+		{ bool own = window_binds_own() != 0; if (ui::toggle("bo", &own)) window_binds_set_own(own ? 1 : 0); }
+		ui::rows_end();
+	}
 	section_label("The game's controls");
 	reference_table("controls", window_controls_count, window_controls_row);
 	section_label("Shortcuts");
@@ -1317,6 +1369,26 @@ static void shoulder_names(const char **bumpers, const char **triggers) {   /* t
 	const char *l, *r, *a; bool tp; int fam; pad_names(&l, &r, &a, &tp, &fam);
 	*bumpers = fam == FAM_SWITCH ? "L / R" : !strcmp(l, "LB") ? "LB / RB" : "L1 / R1";
 	*triggers = fam == FAM_SWITCH ? "ZL / ZR" : !strcmp(l, "LB") ? "LT / RT" : "L2 / R2";
+}
+/* a controller input (padbind.h's id) by this pad's own name: Xbox A / B / X / Y and LB / RB / LT / RT, a Switch's B / A / Y / X
+ * and L / R / ZL / ZR, a Steam Deck's Xbox faces with its L1 / R1 and L2 / R2; the PlayStation names otherwise */
+static const char *pad_input_label(int in) {
+	const char *l, *r, *a; bool tp; int fam; pad_names(&l, &r, &a, &tp, &fam);
+	const bool lb = !std::strcmp(l, "LB");
+	static const char *const ps[4] = {"Cross", "Circle", "Square", "Triangle"}, *const xb[4] = {"A", "B", "X", "Y"}, *const sw[4] = {"B", "A", "Y", "X"};
+	const char *const *face = fam == FAM_XBOX ? xb : fam == FAM_SWITCH ? sw : ps;
+	switch (in) {
+	case 0: case 1: case 2: case 3: return face[in];
+	case 4: return fam == FAM_XBOX ? "View" : fam == FAM_SWITCH ? "Minus" : "Share / Create";
+	case 6: return fam == FAM_XBOX ? "Menu" : fam == FAM_SWITCH ? "Plus" : "Options";
+	case 7: return "L3"; case 8: return "R3";
+	case 9: return l; case 10: return r;
+	case 11: return "D-pad up"; case 12: return "D-pad down"; case 13: return "D-pad left"; case 14: return "D-pad right";
+	case 15: return "Extra button"; case 20: return "Touchpad click";
+	case PBI_LTRIG: return fam == FAM_SWITCH ? "ZL" : lb ? "LT" : "L2";
+	case PBI_RTRIG: return fam == FAM_SWITCH ? "ZR" : lb ? "RT" : "R2";
+	default: return "none";
+	}
 }
 static float ease(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x * x * (3 - 2 * x); }
 /* one device's demonstration at p (its top-left), w x h: its buttons doing the touch, beside a small Vita screen whose
