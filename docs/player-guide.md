@@ -41,6 +41,8 @@ Nothing you add leaves your computer, and Nativ itself contains no Sony or game 
 Nativ keeps your games, builds and saves in its library, a folder apart from the install, so replacing the install never
 touches them: `~/Library/Application Support/ProjectNativ/Nativ/library` on a Mac,
 `%LOCALAPPDATA%\ProjectNativ\Nativ\library` on Windows and `~/.local/share/ProjectNativ/Nativ/library` on Linux.
+To put it on another drive, use **Settings**, **Library**, **Move it…**. On Windows, **Make this install portable** keeps the
+library and your settings inside the `ProjectNativ` folder instead, so the whole folder can move to another drive or PC.
 
 **Updating:** when a new version is out, the launcher says so above your library, with a link to its download page.
 On a Mac, drag the new Project Nativ into Applications and replace the old one; on Windows, replace the `ProjectNativ`
@@ -148,6 +150,11 @@ has a menu with that game's own options. Some worth knowing:
 - **Field of view** (Killzone, Unit 13 and Uncharted).
 - **QTE time** (Killzone): how long you get for the swipe in a takedown or an interrogation, from 1 second (what the
   game's own slow motion gives) to 3. It's the same at 30 and 60 fps.
+- **Stick deadzone** (Controls): how far a controller's stick moves before the game sees it. Raise it if the camera or
+  your character drifts with the stick at rest.
+- **Library** (Settings): where your library is, and **Move it…** to put it somewhere else. Moving it to another drive
+  copies everything first and checks the copy before deleting anything. **Launcher size** makes the launcher's text and
+  controls larger or smaller.
 
 ## Online play
 

@@ -64,6 +64,9 @@
   vitarecomp verify    <title> [seconds]    the in-place checker over a scripted run
   vitarecomp recipes   <title>              the shader recipes play recorded (shader_cache/recipes.txt) merged
                                             into packs/<title>/shaders.txt, the set that ships: no game bytes in it
+  vitarecomp library   [move <folder>]      where the library is; or all of it moved to <folder> (empty or new): renamed
+                                            on the same drive, else copied (hard links and links kept), checked, and only
+                                            then deleted where it was; the launcher finds it there from then on
   vitarecomp dist      <folder>             the install: only what ships copied there (the launcher, this pipeline,
                                             the recompiler, the decrypter, the runtime's sources, the packs; no tests
                                             or developer tools). Over an install a dist wrote it replaces the program
@@ -323,6 +326,99 @@ def module_dirs():
     return [d for d in ds if os.path.isdir(d)]
 
 
+def cmd_library(rest):
+    """vitarecomp library [move <folder>]: the library's folder; or the library moved there -- renamed when it's the same
+    drive, else copied whole (hard links kept as hard links, links re-pointed into the copy), the copy checked file by
+    file count and size, and only then the original deleted. hub.ini's library_dir names the new place (datadir.py)."""
+    if not rest: say(DUMP); return
+    if rest[0] != "move" or len(rest) < 2: die("vitarecomp library move <folder>")
+    src, dest = os.path.realpath(DUMP), os.path.abspath(rest[1])
+    if not os.path.isdir(src): die(f"there's no library at {DUMP}")
+    if os.path.isdir(dest) and os.listdir(dest): die(f"{dest} isn't empty: choose an empty folder, or a new one")
+    rdest = os.path.realpath(dest)
+    if rdest == src or rdest.startswith(src + os.sep) or src.startswith(rdest + os.sep): die(f"{dest} is inside the library, or holds it")
+    def links_inside(top):   # every link (symbolic link, junction) under top, without following any
+        out, todo = [], [top]
+        while todo:
+            d = todo.pop()
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.is_symlink() or _is_junction(e.path): out.append(e.path)
+                    elif e.is_dir(follow_symlinks=False): todo.append(e.path)
+        return out
+    def target_of(l):   # what a link names (a junction's absolute path without Windows' \\?\ prefix)
+        t = os.readlink(l)
+        for pre in ("\\\\?\\", "\\??\\"):
+            if t.startswith(pre): t = t[len(pre):]
+        return t
+    def repoint(target):   # a link's target: into the library -> the same place in the moved one
+        t = target if os.path.isabs(target) else None
+        if t and (os.path.realpath(t) == src or os.path.realpath(t).startswith(src + os.sep)):
+            return os.path.join(dest, os.path.relpath(os.path.realpath(t), src))
+        return target
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    try:
+        if os.path.isdir(dest): os.rmdir(dest)
+        os.rename(src, dest); say(f"the library moved to {dest} (the same drive: renamed)")
+        moved = True
+    except OSError:
+        moved = False
+    if moved:   # links that named the old place absolutely: pointed into the new one
+        for l in links_inside(dest):
+            t = target_of(l)
+            if os.path.isabs(t) and (t == src or t.startswith(src + os.sep)):
+                nt = os.path.join(dest, os.path.relpath(t, src))
+                if os.path.isdir(nt): link_dir(nt, l)
+                else: remove_file(l); os.symlink(nt, l)
+    else:
+        # sizes first: the space it needs (a file with several hard links counted once)
+        seen, total, nfiles = set(), 0, 0
+        for d, subs, files in os.walk(src):
+            subs[:] = [s for s in subs if not os.path.islink(os.path.join(d, s)) and not _is_junction(os.path.join(d, s))]
+            for f in files:
+                p = os.path.join(d, f)
+                if os.path.islink(p): continue
+                st = os.stat(p); key = (st.st_dev, st.st_ino)
+                if key in seen: continue
+                seen.add(key); total += st.st_size; nfiles += 1
+        free = shutil.disk_usage(os.path.dirname(rdest) if not os.path.isdir(dest) else rdest).free
+        if free < total * 1.02 + (1 << 28): die(f"{dest}: {free / 1e9:.1f} GB free, the library is {total / 1e9:.1f} GB")
+        say(f"copying the library ({total / 1e9:.1f} GB, {nfiles} files) to {dest}")
+        firsts, done, copied, step = {}, 0, 0, 1 << 30
+        for d, subs, files in os.walk(src):
+            rel = os.path.relpath(d, src); od = os.path.join(dest, rel) if rel != "." else dest
+            os.makedirs(od, exist_ok=True)
+            keep = []
+            for s in subs:
+                p = os.path.join(d, s)
+                if os.path.islink(p) or _is_junction(p):
+                    t = target_of(p)
+                    link_dir(repoint(t) if os.path.isabs(t) else os.path.normpath(os.path.join(od, t)), os.path.join(od, s), relative=None if os.path.isabs(t) else t)
+                else: keep.append(s)
+            subs[:] = keep
+            for f in files:
+                p, q = os.path.join(d, f), os.path.join(od, f)
+                if os.path.islink(p): os.symlink(repoint(target_of(p)), q); continue
+                st = os.stat(p); key = (st.st_dev, st.st_ino)
+                if st.st_nlink > 1 and key in firsts:
+                    try: os.link(firsts[key], q); continue
+                    except OSError: pass
+                shutil.copy2(p, q); firsts.setdefault(key, q); done += st.st_size; copied += 1
+                if done >= step: say(f"copied {done / 1e9:.1f} of {total / 1e9:.1f} GB"); step += 1 << 30
+        if copied != nfiles or done != total: die(f"the copy doesn't match ({copied} of {nfiles} files, {done} of {total} bytes): the library stays where it was; delete {dest} and try again")
+        say(f"copied: {copied} files, {done / 1e9:.1f} GB; deleting the original")
+        rmtree(src)
+    # where the launcher (and every stage after it) finds it from now on
+    from datadir import prefs_dir, default_library
+    hub = os.path.join(prefs_dir(ROOT), "hub.ini"); lines = []
+    try: lines = [l for l in open(hub, encoding="utf-8").read().splitlines() if not l.startswith("library_dir=")]
+    except OSError: pass
+    if os.path.realpath(dest) != os.path.realpath(default_library()): lines.append(f"library_dir={dest}")
+    os.makedirs(os.path.dirname(hub), exist_ok=True)
+    with open(hub, "w", encoding="utf-8") as f: f.write("".join(l + "\n" for l in lines))
+    say(f"the library is now {dest}")
+
+
 def _last_line(argv, env):   # `cmd | tail -1`
     r = subprocess.run([str(a) for a in argv], env=env, stdout=subprocess.PIPE, text=True, errors="replace")
     lines = r.stdout.rstrip("\n").split("\n")
@@ -461,7 +557,11 @@ def cmd_import(g, src):
             if not os.path.isfile(f): die(f"cp: {f}: No such file or directory")
             shutil.copyfile(f, os.path.join(W, "elf", os.path.basename(f))); shutil.copymode(f, os.path.join(W, "elf", os.path.basename(f)))
         if os.path.islink(app0) or _is_junction(app0) or not os.path.lexists(app0):   # (a link: re-pointed -- the game, or with its update)
-            link_dir(os.path.realpath(src), app0)
+            # relative when the copy is in the library: the library can then move as a whole (issue #101) and every link
+            # still holds (Windows' junctions are absolute: vitarecomp library move re-points them)
+            real, here = os.path.realpath(src), os.path.realpath(os.path.dirname(app0))
+            inside = real.startswith(os.path.realpath(DUMP) + os.sep)
+            link_dir(real, app0, relative=os.path.relpath(real, here) if inside else None)
     else:
         os.makedirs(app0, exist_ok=True)
         run([PY, os.path.join(DECRYPT, "fself2elf.py"), src, os.path.join(W, "elf")])
@@ -928,7 +1028,7 @@ def cmd_update_check():
     kind, _, repo = open(chan, encoding="utf-8").read().strip().partition(" ")
     if kind != "github" or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo): return
     from datadir import prefs_dir
-    cache = os.path.join(prefs_dir(), "update-check.json"); now = time.time(); latest = None
+    cache = os.path.join(prefs_dir(ROOT), "update-check.json"); now = time.time(); latest = None
     try:
         c = json.load(open(cache, encoding="utf-8"))
         if c.get("repo") == repo and now - c.get("at", 0) < 20 * 3600: latest = c
@@ -994,8 +1094,8 @@ def cmd_report(T):
     home = os.path.expanduser("~")
     def private(b): return b.replace(home.encode(), b"~").replace(home.replace("\\", "/").encode(), b"~")
     files = [(os.path.join(OUT, "session.log"), "session.log"), (os.path.join(OUT, "session.prev.log"), "session.prev.log"),
-             (os.path.join(prefs_dir(), "launcher.log"), "launcher.log"), (os.path.join(prefs_dir(), "launcher.prev.log"), "launcher.prev.log"),
-             (os.path.join(OUT, "settings.ini"), "settings-game.ini"), (os.path.join(prefs_dir(), "settings.ini"), "settings.ini")]
+             (os.path.join(prefs_dir(ROOT), "launcher.log"), "launcher.log"), (os.path.join(prefs_dir(ROOT), "launcher.prev.log"), "launcher.prev.log"),
+             (os.path.join(OUT, "settings.ini"), "settings-game.ini"), (os.path.join(prefs_dir(ROOT), "settings.ini"), "settings.ini")]
     f5 = sorted(glob.glob(os.path.join(glob.escape(OUT), "captures", "f5_*")), key=os.path.getmtime)
     f5 = f5[-1] if f5 else ""
     stamp = lambda p: time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
@@ -1027,6 +1127,7 @@ def main(argv):
     if cmd == "licenses": return run([PY, os.path.join(R, "licenses.py")] + argv[1:], env=env_with({"ATIV_DUMP": DUMP}), check=False).returncode
     if cmd == "add": cmd_add(T, argv[2:]); return 0
     if cmd == "dist": cmd_dist(T); return 0
+    if cmd == "library": cmd_library(argv[1:]); return 0
     if cmd == "report": cmd_report(T); return 0
     if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions", "pgo"):
         usage(); return 1
