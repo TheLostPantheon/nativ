@@ -47,6 +47,7 @@
 #include "backends/imgui_impl_sdlgpu3.h"
 #include "gpulock.h"   /* the SDL submit below is the locked one, and ImGui's own submits run under the same lock (render_frame): Homebrew SDL 3.4.16's Metal fence race, see that header */
 #include "overlay.h"
+#include "commondlg.h"
 #include "savedlg.h"
 #include "ui_theme.h"
 #include "languages.h"
@@ -104,6 +105,7 @@ void settings_save(void);
 }
 
 static ImGuiContext *g_ctx;
+static SDL_Window *g_window;   /* the window text input starts on (the text-input dialog) */
 static bool g_has_window;      /* overlay_init was given a real SDL_Window: the platform backend is live */
 /* written by the window thread, read by the game thread (display.c's pause, window.c's audio): atomic,
  * like every other flag that crosses those threads (rscale_req, osd_level_v). g_paused: Game > Pause
@@ -130,7 +132,7 @@ int overlay_init(SDL_GPUDevice *device, SDL_Window *window, SDL_GPUTextureFormat
 	ui::load_system_font(io);   /* an explicit face: without one, ImGui 1.92's own automatic choice (vector vs. bitmap)
 		depends on a DPI scale the headless path never sets, and picks a degenerate (zero-size) one */
 	ui::apply(15.0f, 1.0f);     /* the launcher's look (ui_theme.h), a point smaller: the menu sits over a 960x544 game */
-	g_has_window = window != nullptr;
+	g_has_window = window != nullptr; g_window = window;
 	if (g_has_window && !ImGui_ImplSDL3_InitForSDLGPU(window)) { ImGui::DestroyContext(g_ctx); g_ctx = nullptr; return 0; }
 	ImGui_ImplSDLGPU3_InitInfo info = {};
 	info.Device = device; info.ColorTargetFormat = color_fmt; info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
@@ -900,13 +902,14 @@ static void build_marks(void) {
  * or a card the game closes itself (Saving..., a progress bar) -- over the picture while the game waits on it,
  * the game running underneath (it polls the dialog every frame; nothing pauses). The pad: up/down (left/right
  * on a question), Cross to choose, Circle to go back; the keyboard: arrows, Enter or Space, Escape or
- * Backspace; the mouse: hover and click. window.c hands this the keys and the pad while overlay_dialog_active
+ * Backspace; the mouse: hover and click. window.c hands this the keys and the pad while overlay_dialog_active (the message
+ * and text-input dialogs below count too)
  * (ImGui's SDL backend polls the pad itself, so its buttons arrive whatever the routing). */
 static int g_sd_seq = -1, g_sd_sel; static bool g_sd_armed;
 int overlay_dialog_active(void) {
 	if (!g_ctx || !g_has_window) return 0;
 	SaveDlgView v; const int k = savedlg_view(&v); savedlg_release();
-	return k == SAVEDLG_LIST || k == SAVEDLG_YESNO;
+	return k == SAVEDLG_LIST || k == SAVEDLG_YESNO || cdlg_active();
 }
 static const ImGuiKey K_UP[] = {ImGuiKey_UpArrow, ImGuiKey_W, ImGuiKey_GamepadDpadUp, ImGuiKey_GamepadLStickUp};
 static const ImGuiKey K_DOWN[] = {ImGuiKey_DownArrow, ImGuiKey_S, ImGuiKey_GamepadDpadDown, ImGuiKey_GamepadLStickDown};
@@ -991,6 +994,128 @@ static void build_save_dialog(float w, float hgt) {
 	savedlg_release();   /* (before answering: savedlg_answer takes the same lock) */
 	if (answered) savedlg_answer(seq, answer);
 }
+/* the message dialog (sceMsgDialog, apputil.c through commondlg.h): the game's text over the picture with its
+ * buttons (a card with none, a wait or a progress bar, shows until the game closes it), drawn like the save-data
+ * dialog and answered the same way: left/right or up/down to move, the console's enter button (Cross, or Circle
+ * when the runtime reports that) or Enter or Space to press, the other one or Esc or Backspace for the "No" /
+ * "Cancel" button when there is one; the mouse: hover and click. */
+static int g_md_seq = -1, g_md_sel; static bool g_md_armed;
+static ImGuiKey pad_enter(bool circle) { return circle ? ImGuiKey_GamepadFaceRight : ImGuiKey_GamepadFaceDown; }
+static ImGuiKey pad_back(bool circle) { return circle ? ImGuiKey_GamepadFaceDown : ImGuiKey_GamepadFaceRight; }
+static int g_cdlg_demo;   /* RECOMP_OVERLAY_DUMP_UI=msgdlg / ime: a sample of each card, for checking their layout headless */
+static void build_msg_dialog(float w, float hgt) {
+	MsgDlgView v; int kind;
+	if (g_cdlg_demo == 1) {
+		memset(&v, 0, sizeof v); v.kind = kind = 1; v.seq = 1; v.percent = -1; v.nbuttons = 2; v.back = 1;
+		snprintf(v.label[0], sizeof v.label[0], "Yes"); snprintf(v.label[1], sizeof v.label[1], "No");
+		snprintf(v.msg, sizeof v.msg, "The save data is corrupted and can't be loaded.\nDelete it and start a new game?");
+	} else { kind = msgdlg_view(&v); msgdlg_release(); }
+	if (kind == 0) { g_md_seq = -1; return; }
+	if (v.seq != g_md_seq) { g_md_seq = v.seq; g_md_sel = 0; g_md_armed = false; }
+	const ImGuiKey kok = pad_enter(v.enter_circle), kback = pad_back(v.enter_circle);
+	/* a key already down as the dialog appeared (the press that raised it) answers nothing */
+	if (!g_md_armed && !keys_down(K_OK) && !keys_down(K_BACK) && !ImGui::IsKeyDown(kok) && !ImGui::IsKeyDown(kback)) g_md_armed = true;
+	const bool arm = g_md_armed && kind == 1;
+	bool ok = arm && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) || ImGui::IsKeyPressed(ImGuiKey_Space) || ImGui::IsKeyPressed(kok));
+	const bool back = arm && v.back >= 0 && (ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsKeyPressed(ImGuiKey_Backspace) || ImGui::IsKeyPressed(kback));
+	int answer = -1;
+	const float s = w >= 1400 ? 2.0f : 1.0f;
+	ImGui::SetNextWindowPos(ImVec2(w * 0.5f, hgt * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(fminf(w - 32, 460 * s), 0), ImGuiCond_Always);
+	ImGui::SetNextWindowBgAlpha(0.95f);
+	ImGui::Begin("##msgdlg", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::SetWindowFontScale(s);
+	ImGui::PushTextWrapPos(0); ImGui::TextUnformatted(v.msg[0] ? v.msg : "Please wait."); ImGui::PopTextWrapPos();
+	if (v.percent >= 0) { ImGui::Spacing(); ImGui::ProgressBar(v.percent / 100.0f, ImVec2(-1, 0)); }
+	if (kind == 1) {
+		ImGui::Spacing();
+		if (g_md_armed && v.nbuttons > 1) {
+			if (keys_pressed(K_SIDE) || keys_pressed(K_UP) || keys_pressed(K_DOWN)) {
+				const bool prev = ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_A) || ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_W) ||
+				                  ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickUp);
+				g_md_sel = (g_md_sel + (prev ? v.nbuttons - 1 : 1)) % v.nbuttons;
+			}
+		}
+		const float bw = fminf(130 * s, (ImGui::GetContentRegionAvail().x - 8 * s * (float)(v.nbuttons - 1)) / (float)v.nbuttons);
+		for (int b = 0; b < v.nbuttons; b++) {
+			if (b) ImGui::SameLine();
+			const bool sel = g_md_sel == b;
+			if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+			ImGui::PushID(b);
+			if (ImGui::Button(v.label[b], ImVec2(bw, 0))) answer = b;
+			ImGui::PopID();
+			if (sel) ImGui::PopStyleColor();
+			if (ImGui::IsItemHovered() && (ImGui::GetIO().MouseDelta.x || ImGui::GetIO().MouseDelta.y)) g_md_sel = b;
+		}
+		if (ok) answer = g_md_sel;
+		if (back) answer = v.back;
+		ImGui::TextDisabled(v.back >= 0 ? (v.enter_circle ? "Circle / Enter: choose    Cross / Esc: back" : "Cross / Enter: choose    Circle / Esc: back")
+		                                : (v.enter_circle ? "Circle / Enter: choose" : "Cross / Enter: choose"));
+	}
+	ImGui::End();
+	if (answer >= 0) msgdlg_answer(v.seq, answer);
+}
+
+/* the text-input dialog (sceImeDialog): the game's title over a text field with OK (the game's enter label) and
+ * Cancel. The keyboard types into the field (Enter presses OK on one line; Esc cancels); a controller presses
+ * OK / Cancel with the enter / back button and gets SDL's text input started, which is what raises Steam's
+ * on-screen keyboard in Game Mode. The game's length limit counts UTF-16 units as the console does; Basic Latin
+ * takes ASCII only and Number the digits and . , + - */
+static int g_ime_seq = -1; static bool g_ime_armed, g_ime_typing; static char g_ime_buf[IME_MAX_TEXT * 4 + 8];
+struct ImeFilter { unsigned maxlen; int type; };
+static int ime_filter(ImGuiInputTextCallbackData *d) {
+	const ImeFilter *f = (const ImeFilter *)d->UserData;
+	const unsigned c = (unsigned)d->EventChar;
+	if (cdlg_utf16_units(d->Buf) + (c >= 0x10000 ? 2 : 1) > f->maxlen) return 1;
+	if (f->type == 1 && c >= 0x80) return 1;
+	if (f->type == 2 && !((c >= '0' && c <= '9') || c == '.' || c == ',' || c == '+' || c == '-')) return 1;
+	return 0;
+}
+static void ime_text_input(bool on) {   /* (SDL's text input: the on-screen keyboards of Steam and the phones hang off it) */
+	if (!g_window || g_ime_typing == on) return;
+	g_ime_typing = on;
+	if (on) SDL_StartTextInput(g_window); else SDL_StopTextInput(g_window);
+}
+static void build_ime_dialog(float w, float hgt) {
+	ImeDlgView v; int kind;
+	if (g_cdlg_demo == 2) {
+		memset(&v, 0, sizeof v); v.kind = kind = 1; v.seq = 1; v.maxlen = 16;
+		snprintf(v.title, sizeof v.title, "Enter your name"); snprintf(v.enter_label, sizeof v.enter_label, "OK"); v.text = "Nathan";
+	} else kind = imedlg_view(&v);
+	if (!kind) { imedlg_release(); g_ime_seq = -1; ime_text_input(false); return; }
+	const bool fresh = v.seq != g_ime_seq;
+	if (fresh) { g_ime_seq = v.seq; g_ime_armed = false; snprintf(g_ime_buf, sizeof g_ime_buf, "%s", v.text); }
+	const ImGuiKey kok = pad_enter(v.enter_circle), kback = pad_back(v.enter_circle);
+	if (!g_ime_armed && !ImGui::IsKeyDown(kok) && !ImGui::IsKeyDown(kback) && !ImGui::IsKeyDown(ImGuiKey_Enter) && !ImGui::IsKeyDown(ImGuiKey_Escape)) g_ime_armed = true;
+	const bool pad_ok = g_ime_armed && ImGui::IsKeyPressed(kok, false), cancel = g_ime_armed && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(kback, false));
+	const unsigned maxlen = v.maxlen; const int type = v.type; const bool multi = v.multiline, pass = v.password;
+	char title[520], label[16]; snprintf(title, sizeof title, "%s", v.title); snprintf(label, sizeof label, "%s", v.enter_label);
+	if (g_cdlg_demo != 2) imedlg_release();
+	ime_text_input(true);
+	const float s = w >= 1400 ? 2.0f : 1.0f;
+	ImGui::SetNextWindowPos(ImVec2(w * 0.5f, hgt * 0.4f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+	ImGui::SetNextWindowSize(ImVec2(fminf(w - 32, 560 * s), 0), ImGuiCond_Always);
+	ImGui::SetNextWindowBgAlpha(0.95f);
+	if (fresh) ImGui::SetNextWindowFocus();
+	ImGui::Begin("##imedlg", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::SetWindowFontScale(s);
+	if (title[0]) { ImGui::PushTextWrapPos(0); ImGui::TextUnformatted(title); ImGui::PopTextWrapPos(); ImGui::Separator(); }
+	ImeFilter f = {maxlen, type};
+	ImGuiInputTextFlags fl = ImGuiInputTextFlags_CallbackCharFilter | (pass ? ImGuiInputTextFlags_Password : 0);
+	ImGui::SetNextItemWidth(-1);
+	if (fresh) ImGui::SetKeyboardFocusHere();
+	bool enter;
+	if (multi) enter = ImGui::InputTextMultiline("##ime", g_ime_buf, sizeof g_ime_buf, ImVec2(-1, 4 * ImGui::GetTextLineHeight() + 8 * s), fl, ime_filter, &f);
+	else enter = ImGui::InputText("##ime", g_ime_buf, sizeof g_ime_buf, fl | ImGuiInputTextFlags_EnterReturnsTrue, ime_filter, &f);
+	ImGui::TextDisabled("%u / %u", (unsigned)cdlg_utf16_units(g_ime_buf), maxlen);
+	bool ok = (enter && !multi) || pad_ok, cancelled = cancel;
+	if (ImGui::Button(label, ImVec2(100 * s, 0))) ok = true;
+	ImGui::SameLine(); if (ImGui::Button("Cancel", ImVec2(100 * s, 0))) cancelled = true;
+	ImGui::TextDisabled(v.enter_circle ? "Enter or Circle: %s    Esc or Cross: cancel" : "Enter or Cross: %s    Esc or Circle: cancel", label);
+	ImGui::End();
+	if (ok) imedlg_answer(g_ime_seq, 1, g_ime_buf);
+	else if (cancelled) imedlg_answer(g_ime_seq, 0, "");
+}
 /* everything the closed state shows, and the bar's state machine (see the file's header comment) */
 static void build_closed(void) {
 	ImGuiIO &io = ImGui::GetIO();
@@ -1049,7 +1174,7 @@ static void build_closed(void) {
 	if (g_tab_a > 0) build_tab(w, t);
 	if (g_intro) build_intro();   /* (the touch card in place of the pause banner; the markers drawn over it) */
 	build_marks();
-	if (g_has_window) build_save_dialog(w, hgt);
+	if (g_has_window) { build_save_dialog(w, hgt); build_msg_dialog(w, hgt); build_ime_dialog(w, hgt); }
 	if (g_paused && !g_intro) build_pause_banner(w, hgt);
 	toasts_take(t);
 	if (g_ntoasts) build_toasts(w, hgt, t);
@@ -1069,6 +1194,7 @@ static void render_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint
 	 * it's closed a game's keys and pad are the game's (window.c forwards only mouse events then) */
 	io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad);
 	if (g_open) io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+	else if (have_window && cdlg_active()) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;   /* (the message and text-input dialogs read the pad's buttons through ImGui) */
 	ImGui_ImplSDLGPU3_NewFrame();
 	if (have_window) {
 		ImGui_ImplSDL3_NewFrame();
@@ -1480,6 +1606,11 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 		return;
 	}
 	if (!strcmp(ui, "quit")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_quit); return; }   /* (the quit card) */
+	if (!strcmp(ui, "msgdlg") || !strcmp(ui, "ime")) {   /* (a sample message dialog / text-input dialog) */
+		g_cdlg_demo = ui[0] == 'm' ? 1 : 2;
+		for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, g_cdlg_demo == 1 ? +[] { ImVec2 d = ImGui::GetIO().DisplaySize; build_msg_dialog(d.x, d.y); } : +[] { ImVec2 d = ImGui::GetIO().DisplaySize; build_ime_dialog(d.x, d.y); });
+		g_cdlg_demo = 0; return;
+	}
 	if (!strcmp(ui, "layout")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_layout); return; }   /* (the layout card: RECOMP_GAME_NAME names the game) */
 	if (!strcmp(ui, "prep")) { g_prep_demo[0] = 1240; g_prep_demo[1] = 5837; g_prep_demo[2] = 372; for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_prep); g_prep_demo[0] = -1; return; }   /* (the shader prep card, example numbers) */
 	if (!strncmp(ui, "intro", 5)) {   /* "intro", "intro:pad", "intro:touch": the touch card with that device highlighted; "@<seconds>" after it, that moment of its loop */
