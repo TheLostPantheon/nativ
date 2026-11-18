@@ -65,18 +65,52 @@ _STORE = re.compile(r"(str|stm|push|vst|vpush|swp|strex|srs)")
 _CALL = re.compile(r"(bl|blx|svc|bkpt)(\.w)?$")
 
 
+_CONDS = {"eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"}
+def _is_branch(mn):
+    """b and b<cond> (not bl, blx, bx, bic...: "blo" and "bls" are branches, "bl" is a call)"""
+    return mn == "b" or (mn[0] == "b" and mn[1:] in _CONDS) or mn in ("cbz", "cbnz")
+
+
+def _decides_branch(body, k):
+    """whether the value body[k] loads decides one of the loop's conditional branches: through the registers it feeds
+    and the flags they set, followed round the loop twice (a load at the bottom feeds the next pass's top)"""
+    try:
+        taint = {x for x in body[k].regs_access()[1] if body[k].reg_name(x) not in ("pc", "cpsr", "itstate")}
+        flags = False
+        for j in list(range(k + 1, len(body))) + list(range(0, len(body))):
+            b = body[j]; mn = b.mnemonic.split(".")[0]
+            r, w = b.regs_access(); wn = {b.reg_name(x) for x in w}
+            uses = any(x in taint for x in r)
+            if mn in ("cbz", "cbnz"):
+                if uses: return True
+                continue
+            if _is_branch(mn) and b.cc not in (0, 15):
+                if flags: return True
+                continue
+            if uses:
+                taint |= {x for x in w if b.reg_name(x) not in ("pc", "cpsr", "itstate")}
+                if "cpsr" in wn: flags = True
+            else:
+                taint -= set(w)   # (overwritten by something else)
+                if "cpsr" in wn: flags = False
+        return False
+    except Exception:
+        return True   # (when in doubt, read it every time: correct, just not as fast)
+
+
 def spin_loads(insns):
-    """the loads inside loops that neither store nor call: a wait on memory another thread changes (Resistance's
-    loading screen: `ldr r0, [r4]; cmp r0, #0; bne` back over 256 nops). As plain C loads the compiler may read them
-    once and spin on the copy (clang made that loop `b .`: the game hung at its 40th frame), so these are read anew
-    each time (RD*V, relaxed atomic: the same instruction on arm64 and x86). A loop with a store or a call can't be
-    hoisted that way and keeps the plain load."""
+    """the loads inside loops that neither store nor call and whose value decides when the loop ends: a wait on memory
+    another thread changes (Resistance's loading screen: `ldr r0, [r4]; cmp r0, #0; bne` back over 256 nops). As plain
+    C loads the compiler may read them once and spin on the copy (clang made that loop `b .`: the game hung at its 40th
+    frame), so these are read anew each time (RD*V, relaxed atomic: the same instruction on arm64 and x86). A loop with
+    a store or a call can't be hoisted that way and keeps the plain load, and so does a load that only feeds the
+    loop's work (a table's base, a bound read again each time round): read every time it would stop the compiler
+    vectorising a loop that is no wait (Uncharted had 1461 such loads before this narrowing)."""
     at = {i.address: k for k, i in enumerate(insns)}
     out = set()
     for k, i in enumerate(insns):
         mn = i.mnemonic.split(".")[0]
-        if not (mn.startswith("b") and not mn.startswith(("bl", "bx", "bic", "bfc", "bfi", "bkpt")) or mn in ("cbz", "cbnz")):
-            continue
+        if not _is_branch(mn): continue
         ops = i.operands
         if not ops or ops[-1].type != ARM_OP_IMM: continue
         t = ops[-1].imm & 0xffffffff   # (capstone gives a branch target as a signed int)
@@ -92,7 +126,7 @@ def spin_loads(insns):
             m = next((o.mem for o in b.operands if o.type == ARM_OP_MEM), None)
             if m is None or len(b.operands) > 2 + (b.mnemonic.startswith("ldrd")): continue   # (post-indexed: the address moves)
             if m.base in written or (m.index and m.index in written): continue
-            out.add(b.address)
+            if _decides_branch(body, body.index(b)): out.add(b.address)
     return out
 
 

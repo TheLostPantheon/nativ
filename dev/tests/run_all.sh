@@ -15,6 +15,7 @@ step "game packs (packconf.py --check)" $PY pipeline/packconf.py --check
 step "the README's games table (packconf.py --table)" $PY pipeline/packconf.py --table --check README.md
 step "Steam shortcuts (steam.py selftest)" $PY pipeline/steam.py selftest
 step "copies and versions (packs.py selftest)" env PYTHONPATH=decrypt $PY pipeline/packs.py selftest
+step "spin waits (spin_loads_test.py)" $PY dev/tests/spin_loads_test.py
 step "recompiler against the CPU (recomp_exec_test.py)" $PY dev/tests/recomp_exec_test.py $([ "${1:-}" = quick ] && echo 20 || echo 60)
 
 INC="-I runtime/core -I runtime/gfx -I runtime/audio -I runtime/media -I runtime/input -I runtime/net -I runtime/ui -I runtime/platform -I runtime/debug -I recompiler -I ."
