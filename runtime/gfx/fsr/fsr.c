@@ -245,10 +245,14 @@ int fsr_dispatch(SDL_GPUDevice *dev, SDL_GPUCommandBuffer **cmdp, const FsrFrame
 	static int dead; if (dead) return 0;
 	if (!f->color || !f->depth || !f->motion || !f->dest || !f->rw || !f->rh || f->dw < f->rw || f->dh < f->rh) return 0;
 	if ((F.rw != f->rw || F.rh != f->rh || F.dw != f->dw || F.dh != f->dh || !F.out) && !make_all(dev, cmd, f->rw, f->rh, f->dw, f->dh)) { dead = 1; fprintf(stderr, "    fsr: off (its resources)\n"); return 0; }
-	/* FP16 (RECOMP_FSR_FP16=1; =ab alternates frames, for a profile): Apple GPUs run half at twice the rate (3.9 -> 3.2 ms
-	 * profiled), but on Metal it darkened the output -- Killzone's frame mean 77 -> 65, its puddles' highlights halved --
-	 * so it stays off until that's understood */
-	static int fp16 = -1; static uint32_t nframe; if (fp16 < 0) { const char *e = getenv("RECOMP_FSR_FP16"); fp16 = e && !strcmp(e, "ab") ? 2 : e ? *e != '0' : 0; }
+	/* FP16 (RECOMP_FSR_FP16=0|1; =ab alternates frames, for a profile), on by default on Metal. It once darkened the output
+	 * (Killzone's frame mean 77 -> 65, its puddles' highlights halved): SDK v1.1.4's half-precision pyramid passes are stubs,
+	 * and keeping luma_pyramid and shading_change_pyramid in FP32 (passes.py) cured it. Issue 99, by Tzeentchnet, found
+	 * that and measured the rest bit-exact on synthetic frames, the FSR passes 10% faster on an M5. Checked again on
+	 * Killzone (2026-11-17, frames alternating): output / input brightness 0.98-1.00 on both, no alternation; on an M4 Pro
+	 * the same time (3.35 against 3.39 ms). Vulkan keeps FP32 until it's measured there */
+	static int fp16 = -1; static uint32_t nframe;
+	if (fp16 < 0) { const char *e = getenv("RECOMP_FSR_FP16"), *dv = SDL_GetGPUDeviceDriver(dev); fp16 = e && !strcmp(e, "ab") ? 2 : e && *e ? *e != '0' : dv && !strcmp(dv, "metal"); }
 	const int half = fp16 == 2 ? (int)(nframe++ & 1) : fp16; prof_half = half;
 	const int perm = (half ? 4 : 0) | (f->hdr ? 2 : 0) | (f->inverted ? 1 : 0);
 	const int odd = F.frame_index & 1, reset = f->reset || F.first;
