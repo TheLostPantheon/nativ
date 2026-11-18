@@ -3,7 +3,7 @@
 # libc++ and the kernel's headers, so a machine without a compiler or development files -- SteamOS -- builds with it), with
 # every binary aimed at glibc $GLIBC (anything since 2018 runs them); SDL3 built with it as a shared library that loads its
 # video and audio backends (X11, Wayland, PipeWire, PulseAudio, ALSA) and Vulkan when it runs, so it ships beside the game;
-# zlib and FFmpeg's H.264 decoder (libavcodec + libavutil, static: runtime/media/video.c's sceAvcdec -- the movies) built
+# zlib and FFmpeg's H.264, AAC and MP3 decoders (libavcodec + libavutil, static: video.c's sceAvcdec, the movies; audiodec.c's sceAudiodec) built
 # with it too. No libcurl: the HTTP calls stay stubs, as on Windows.
 # Into $ATIV_LINUX_TOOLCHAIN (default ~/toolchains/ativ-linux); an install keeps it at <root>/toolchain, where
 # runtime/build.py and launcher/build.sh look first.
@@ -85,7 +85,7 @@ if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
   ( cd ffmpeg-src && ./configure --prefix="$D/ffmpeg" --cc="$CC" --cxx="$D/bin/c++" --ar="$D/bin/ar" --ranlib="$D/bin/ranlib" --nm=nm \
       --enable-static --disable-shared --enable-pic --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
       --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-avfilter --disable-debug \
-      --enable-decoder=h264 --enable-parser=h264 --enable-parser=hevc $ASM > ../ffmpeg-configure.log \
+      --enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc $ASM > ../ffmpeg-configure.log \
     && sed -i 's/^#define HAVE_SYSCTL 1/#define HAVE_SYSCTL 0/' config.h \
     && make -j"$(nproc)" > ../ffmpeg-build.log 2>&1 && make install >> ../ffmpeg-build.log 2>&1 )
 fi
@@ -94,5 +94,5 @@ fi
 mkdir -p zlib/share/licenses ffmpeg/share/licenses
 cp zlib-src/LICENSE zlib/share/licenses/LICENSE
 cp ffmpeg-src/LICENSE.md ffmpeg-src/COPYING.LGPLv2.1 ffmpeg/share/licenses/
-printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/linux/setup-toolchain.sh with only the H.264 decoder and parsers enabled.\n' "$FFMPEG" "$FFMPEG" > ffmpeg/share/licenses/SOURCE.txt
+printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/linux/setup-toolchain.sh with only the H.264, AAC and MP3 decoders and the H.264 and HEVC parsers enabled.\n' "$FFMPEG" "$FFMPEG" > ffmpeg/share/licenses/SOURCE.txt
 echo "toolchain: $D (zig $("$D/zig/zig" version), glibc $GLIBC; SDL3 $SDL $([[ -f SDL3/lib/libSDL3.so.0 ]] && echo built || echo MISSING); zlib $ZLIB; FFmpeg $FFMPEG $([[ -f ffmpeg/lib/libavcodec.a ]] && echo built || echo MISSING))"

@@ -3,7 +3,7 @@
 # Apple's Command Line Tools (`xcode-select --install`: the compiler and the macOS SDK, which the Metal code needs and
 # which can't be redistributed). SDL3 as a shared library that ships beside each program; SPIRV-Cross's C API, static
 # (the SPIR-V to Metal translator, the same release Homebrew has, so the Metal source it writes, and the shader caches
-# keyed by it, stay the same); FFmpeg's H.264 decoder, static (runtime/media/video.c: the movies). Everything targets
+# keyed by it, stay the same); FFmpeg's H.264, AAC and MP3 decoders, static (video.c: the movies; audiodec.c). Everything targets
 # macOS $MIN and arm64 (Apple silicon).
 # Into $ATIV_MAC_TOOLCHAIN (default ~/toolchains/ativ-mac); an install keeps it at <root>/toolchain, where runtime/build.py
 # and launcher/build.sh look first.
@@ -48,7 +48,7 @@ if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
   ( cd ffmpeg-src && ./configure --prefix="$D/ffmpeg" --cc=clang --extra-cflags="$F" --extra-ldflags="$F" \
       --enable-static --disable-shared --enable-pic --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
       --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-avfilter --disable-debug \
-      --enable-decoder=h264 --enable-parser=h264 --enable-parser=hevc > ../ffmpeg-configure.log \
+      --enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc > ../ffmpeg-configure.log \
     && make -j"$(sysctl -n hw.ncpu)" > ../ffmpeg-build.log 2>&1 && make install >> ../ffmpeg-build.log 2>&1 )
 fi
 # their licences beside them, as SDL's own install does (an install ships these libraries: Apache 2.0 and the LGPL ask for
@@ -56,7 +56,7 @@ fi
 mkdir -p spirv-cross/share/licenses ffmpeg/share/licenses
 cp spirv-src/LICENSE spirv-cross/share/licenses/LICENSE
 cp ffmpeg-src/LICENSE.md ffmpeg-src/COPYING.LGPLv2.1 ffmpeg/share/licenses/
-printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/macos/setup-toolchain.sh with only the H.264 decoder and parsers enabled.\n' "$FFMPEG" "$FFMPEG" > ffmpeg/share/licenses/SOURCE.txt
+printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/macos/setup-toolchain.sh with only the H.264, AAC and MP3 decoders and the H.264 and HEVC parsers enabled.\n' "$FFMPEG" "$FFMPEG" > ffmpeg/share/licenses/SOURCE.txt
 ok() { [[ -f $1 ]] && echo built || echo MISSING; }
 echo "toolchain: $D (macOS $MIN, $ARCH; SDL3 $SDL $(ok SDL3/lib/libSDL3.0.dylib); SPIRV-Cross $SPIRV_CROSS $(ok spirv-cross/lib/libspirv-cross-c.a); FFmpeg $FFMPEG $(ok ffmpeg/lib/libavcodec.a))"
 echo "$MIN" > "$D/min"

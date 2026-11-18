@@ -102,3 +102,19 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
     clang -O1 -g -Wall -I ../gfx mtl_archive_test.m -framework Metal -framework Foundation -o /tmp/mtl_archive_test && /tmp/mtl_archive_test
 
 It prints `all passed`.
+
+## The audio decoder: `audiodec_test.c`
+
+Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`
+structures as a game does. Always: the init, create, delete and clear calls and their error codes for bad parameters,
+the ATRAC9 info filled in from a configuration word, and a hand-built silent ATRAC9 frame through Decode (the bytes a
+frame takes, the superframe's padding on its last frame, the PCM size). LibAtrac9 has no encoder, so ATRAC9 has no
+reference audio. With `-DRECOMP_AVCODEC` and libavcodec's development files, also the AAC (ADTS and raw frames) and MP3
+decoders: `audiodec/tone.aac` and `audiodec/tone.mp3` are 0.14 s sine tones made with the ffmpeg command line, and
+each Decode's PCM is compared with libavcodec decoding the same frames directly. Without them the test says it skips
+AAC and MP3 and checks that they fail with INVALID_TYPE; `dev/tests/run_all.sh` adds the flag when `pkg-config` finds
+libavcodec.
+
+    cc -O1 -g -w $INC audiodec_test.c ../../third_party/libatrac9/*.c -lm -lpthread -o /tmp/audiodec_test [-DRECOMP_AVCODEC $(pkg-config --cflags --libs libavcodec libavutil)] && /tmp/audiodec_test
+
+It prints `all passed`.

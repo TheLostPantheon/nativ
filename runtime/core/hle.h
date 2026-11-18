@@ -8,7 +8,7 @@ typedef struct { const char *name; HleFn fn; } HleEntry;   /* a subsystem's tabl
 uint64_t guest_time_us(void);   /* display.c: the time the game sees (RECOMP_CLOCK=fixed: deterministic) */
 int guest_clock_fixed(void);
 void guest_time_slept(uint32_t us);   /* display.c: a thread slept this long (the fixed clock advances by it) */
-extern const HleEntry hle_kernel[], hle_display[], hle_ngs[], hle_libc[], hle_io[], hle_sysmem[], hle_apputil[], hle_fios[], hle_gpu[], hle_video[], hle_gesture[], hle_jpeg[], hle_camera[], hle_net[], hle_np[], hle_http[], hle_ssl_local[];
+extern const HleEntry hle_kernel[], hle_display[], hle_ngs[], hle_libc[], hle_io[], hle_sysmem[], hle_apputil[], hle_fios[], hle_gpu[], hle_video[], hle_audiodec[], hle_gesture[], hle_jpeg[], hle_camera[], hle_net[], hle_np[], hle_http[], hle_ssl_local[];
 
 /* a system call's arguments: r0-r3, then the stack (the 5th is STK(0)); the result in r0 */
 #define A0 c->r[0]
