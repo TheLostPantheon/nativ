@@ -373,6 +373,13 @@ class Fn:
             terms = " + ".join(f"(uint32_t)abs((int)(uint8_t)({a} >> {8 * k}) - (int)(uint8_t)({b} >> {8 * k}))" for k in range(4))
             ra = f" + {self.r(ops[3].reg, i)}" if mn == "usada8" else ""
             out = [f"{self.dst(ops[0].reg)} = {terms}{ra};"]
+        elif mn in ("rrx", "rrxs"):   # rotate right through carry by one (C into bit 31); rrxs: C from bit 0, N and Z
+            v = self.r(ops[1].reg, i)
+            out = [f"{{ uint32_t s = {v}, t = (c->c << 31) | (s >> 1); {self.dst(ops[0].reg)} = t;" + (" c->c = s & 1; NZ(c, t);" if mn == "rrxs" else "") + " }"]
+        elif mn in ("sxtb16", "uxtb16") and len(ops) == 2:   # bytes 0 and 2 of rm (rotated: the operand's ror), extended to halfwords
+            v = self.operand(ops[1], i)
+            ext = (lambda k: f"(uint32_t)(uint16_t)(int16_t)(int8_t)({v} >> {16 * k})") if mn[0] == "s" else (lambda k: f"(uint32_t)(uint8_t)({v} >> {16 * k})")
+            out = [f"{self.dst(ops[0].reg)} = {ext(0)} | {ext(1)} << 16;"]
         elif mn in ("uxtab16", "sxtab16"):
             # rm (rotated by the operand's ror) bytes 0 and 2, zero- or sign-extended to halfwords, added to rn's halfwords
             a, v = self.r(ops[1].reg, i), self.operand(ops[2], i)
@@ -739,6 +746,12 @@ class Fn:
             elif mn == "vsli": e = f"((a << {n_}) & 0x{mask:x}u) | (d & 0x{(1 << n_) - 1:x}u)"; s_ = False
             else: e = "d" if n_ >= bits else f"(a >> {n_}) | (d & 0x{mask & ~(mask >> n_):x}u)"; s_ = False
             return same(e, s_, regs3=False)
+        if len(nregs) == 2 and len(ops) == 2 and same_kind and mn == "vclz" and bits in (8, 16):
+            return same("(a == 0 ? BITS : __builtin_clz((uint32_t)a) - (32 - BITS))", False, regs3=False)
+        if mn == "vpaddl" and len(nregs) == 2 and same_kind and dm.group(1) in ("s", "u") and bits == 32:   # pairwise add long, 32 -> 64
+            a_, nb = arr("A", nregs[1], 32, sg)
+            n2 = elem(nregs[0]) // 2
+            return [f"{{ {a_} {'' if sg else 'u'}int64_t O[{n2}]; for (int k = 0; k < {n2}; k++) O[k] = ({'' if sg else 'u'}int64_t)A[2 * k] + A[2 * k + 1]; {put('O', nregs[0], nb)} }}"]
         if len(nregs) == 2 and len(ops) == 2 and same_kind and mn in ("vcls", "vqabs", "vqneg") and sg and bits <= 32:
             e = {"vcls": "CLS(a, BITS)", "vqabs": "SATS(a < 0 ? -a : a, BITS)", "vqneg": "SATS(-a, BITS)"}[mn]
             return same(e, True, regs3=False)
@@ -1122,6 +1135,8 @@ class Fn:
                 if mn in ("vsra", "vrsra"):
                     return pack(lambda j: f"({E(regs[0], j)} + {shr(j)})")
                 return pack(shr)
+        if mn == "vabd" and dt == "f32" and len(ops) == 3 and not imm0:   # |a - b|: the default NaN stays positive
+            return lanes(lambda k: f"F2B(fabsf(FZF({AF(k)} - {BF(k)})))")
         if mn in ("vacgt", "vacge") and dt == "f32":
             op = ">" if mn == "vacgt" else ">="
             return lanes(lambda k: f"(fabsf({AF(k)}) {op} fabsf({BF(k)}) ? 0xffffffffu : 0u)")
@@ -1277,10 +1292,10 @@ class Fn:
         if mn in ("vadd", "vsub", "vmul", "vdiv", "vnmul") and dt in ("f32", "f64") and regs[0][0] in "sd":
             a, b = self.fval(ops[1].reg), self.fval(ops[2].reg)
             op = {"vadd": "+", "vsub": "-", "vmul": "*", "vdiv": "/", "vnmul": "*"}[mn]
-            e = f"{a} {op} {b}"
-            if mn == "vnmul":
-                e = f"-({e})"
-            return [f"{self.fval(ops[0].reg)} = {'DNS' if dt == 'f32' else 'DND'}({e});"]   # (the default NaN: DNS/DND, rt.h)
+            dn = "DNS" if dt == "f32" else "DND"   # (the default NaN: DNS/DND, rt.h)
+            if mn == "vnmul":   # the product's default NaN, then negated: FPNeg flips a NaN's sign too (isacover, x86)
+                return [f"{self.fval(ops[0].reg)} = -{dn}({a} * {b});"]
+            return [f"{self.fval(ops[0].reg)} = {dn}({a} {op} {b});"]
         if mn in ("vmla", "vmls", "vnmla", "vnmls") and regs[0][0] in "sd":
             d, a, b = self.fval(ops[0].reg), self.fval(ops[1].reg), self.fval(ops[2].reg)
             e = {"vmla": f"{d} + {a} * {b}", "vmls": f"{d} - {a} * {b}", "vnmla": f"-{d} - {a} * {b}",

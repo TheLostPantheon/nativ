@@ -64,6 +64,7 @@ def unpredictable(i):
                                       "cdp", "cdp2", "mcr", "mrc", "mcr2", "mrc2"):
         return True   # (coprocessors other than VFP and NEON: a user-mode program has none)
     if "^" in ops: return True
+    if insnsweep.stem(i.mnemonic) == "trap": return True   # (udf, as LLVM spells it)
     st = insnsweep.stem(i.mnemonic)
     if re.match(r"(u|s)?(mul|mla|mls|mull|mlal|maal|mmul|mmla|mmls|lad|lsd|uad|usd|lal|law|ulw|sad|ada)", st) and re.search(r"\bpc\b", ops):
         return True   # multiplies naming pc
