@@ -826,7 +826,7 @@ static void test_sched(void) {
 	slog_clear();
 	uint32_t t1 = sc_thread(name, 21, 160), t2 = sc_thread(name, 22, 160);
 	sc_start(t1, 0); sc_start(t2, 0);
-	uint32_t tmo = word(); WR32(tmo, 100000);
+	uint32_t tmo = word(); WR32(tmo, 1000000);   /* (1 s: the order is the point, not the time; 100 ms was too little for CI's macOS runner) */
 	CHECKEQ(call(h_wait_sema, 3, sc_never, 1, tmo), E_WAIT_TIMEOUT);
 	CHECK(slog_is("21"));
 	sc_join(t1); sc_join(t2);
