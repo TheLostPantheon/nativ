@@ -117,6 +117,8 @@ static void gaps_write(void) {
 	fprintf(f, "%s]\n}\n", ngaps ? "\n  " : "");
 	fclose(f);
 }
+static void gaps_at_exit(void) { gaps_write(); }   /* (a test's exit at its last shot, a window closed: the final counts) */
+__attribute__((constructor)) static void gaps_init(void) { atexit(gaps_at_exit); }
 static void gaps_line(void) {   /* the summary's one line: how much of the game's system the host left undone */
 	char b[512]; int n = snprintf(b, sizeof b, "gaps: %d import%s not implemented", ngaps, ngaps == 1 ? "" : "s");
 	Gap *top[3] = {0}; for (int i = 0; i < ngaps; i++) for (int k = 0; k < 3; k++) if (!top[k] || gaps[i].calls > top[k]->calls) { for (int j = 2; j > k; j--) top[j] = top[j - 1]; top[k] = &gaps[i]; break; }
@@ -663,6 +665,7 @@ static void on_crash(const char *what, void *addr) {   /* (platform.h: the defau
 	        (unsigned long long)((uint8_t *)addr - recomp_mem));
 	plat_backtrace(stderr);
 	summary_threads();
+	snprintf(gaps_stop, sizeof gaps_stop, "a crash: %s at host address %p", what, addr); gaps_write();
 }
 static void on_signal(int sig) {   /* a run stopped from outside still reports where it was */
 	(void)sig;
