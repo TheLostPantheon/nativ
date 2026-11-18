@@ -286,6 +286,15 @@ static inline float RECPS_F32(float a, float b) {
 /* saturation to a bits-wide signed/unsigned integer (vqadd/vqsub/vqshl; the Q flag isn't modelled) */
 static inline int64_t SATS(int64_t v, int bits) { int64_t mx = ((int64_t)1 << (bits - 1)) - 1; return v > mx ? mx : v < -mx - 1 ? -mx - 1 : v; }
 static inline uint64_t SATU(int64_t v, int bits) { int64_t mx = ((int64_t)1 << bits) - 1; return v < 0 ? 0 : v > mx ? (uint64_t)mx : (uint64_t)v; }
+static inline uint64_t SATU64U(uint64_t v, int bits) { uint64_t mx = bits >= 64 ? ~0ull : (1ull << bits) - 1; return v > mx ? mx : v; }   /* (unsigned in, unsigned out) */
+/* VQDMULL / VQDMLAL / VQDMLSL: twice a product of two bits-wide signed elements, saturated to 2 * bits (only
+ * MIN * MIN overflows), and the saturating accumulate into a 2 * bits element */
+static inline int64_t QDMULL(int64_t p, int bits) { return bits >= 32 ? (p > (INT64_MAX >> 1) ? INT64_MAX : 2 * p) : SATS(2 * p, 2 * bits); }
+static inline int64_t QACC(int64_t d, int64_t x, int sgn, int bits) {
+	if (bits < 32) return SATS((int64_t)(int32_t)d + (sgn > 0 ? x : -x), 2 * bits);
+	int64_t r; int o = sgn > 0 ? __builtin_add_overflow(d, x, &r) : __builtin_sub_overflow(d, x, &r);
+	return o ? ((sgn > 0) == (x > 0) ? INT64_MAX : INT64_MIN) : r;
+}
 /* VSHL/VQSHL by register: the shift is the signed low byte of the other operand's element, negative
  * shifts right (logical/arithmetic by sign), results truncated or saturated to the element */
 static inline uint32_t SHLR_U(uint32_t v, int sh, int bits) { return sh >= bits || sh <= -bits ? 0 : sh >= 0 ? v << sh : v >> -sh; }

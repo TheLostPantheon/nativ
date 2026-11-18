@@ -534,6 +534,82 @@ class Fn:
             return ("q", int(n[1:]))
         return ("r", GPR[n]) if n in GPR else (None, None)
 
+    # per element (a: N's, b: M's or the scalar, d: the destination's before), as C over int64_t/uint64_t so nothing
+    # overflows: same width, long (q from d's) and narrowing (d from q). isacover found these unsupported
+    # (2026-11-17), the forms Luufen's fork listed among them
+    SAME = {
+        "vabd": "a > b ? a - b : b - a", "vaba": "d + (a > b ? a - b : b - a)",
+        "vqdmulh": "SATS((a * b) >> (BITS - 1), BITS)", "vqrdmulh": "SATS((a * b + (1LL << (BITS - 2))) >> (BITS - 1), BITS)",
+        "vmul": "a * b", "vmla": "d + a * b", "vmls": "d - a * b",
+    }
+    LONG = {
+        "vmull": "a * b", "vmlal": "d + a * b", "vmlsl": "d - a * b", "vabdl": "a > b ? a - b : b - a",
+        "vabal": "d + (a > b ? a - b : b - a)", "vqdmull": "QDMULL(a * b, BITS)", "vqdmlal": "QACC(d, QDMULL(a * b, BITS), 1, BITS)",
+        "vqdmlsl": "QACC(d, QDMULL(a * b, BITS), -1, BITS)",
+    }
+
+    def neon_elements(self, i, mn, dt, ops, regs):
+        """the element-array forms above, plus vshll, vqmovn/vqmovun and the saturating narrowing shifts (vq[r]shr[u]n),
+        vector or by scalar (dM[x], from the text); None for anything else"""
+        dm = re.fullmatch(r"([sui]?)(8|16|32|64)", dt)
+        if not dm or not regs or any(not r or r[0] not in "dq" for r in regs if r):
+            return None
+        sg, bits = dm.group(1) == "s", int(dm.group(2))
+        sm = re.search(r"d(\d+)\[(\d)\]$", i.op_str)
+        nregs = [r for r in regs if r]
+        def arr(name, r, ebits, signed):   # a C array of register r's elements, and its byte count
+            nb = 16 if r[0] == "q" else 8
+            return f"{'' if signed else 'u'}int{ebits}_t {name}[{nb * 8 // ebits}]; memcpy({name}, &c->vfp.d[{2 * r[1] if r[0] == 'q' else r[1]}], {nb});", nb
+        def put(name, r, nb):
+            return f"memcpy(&c->vfp.d[{2 * r[1] if r[0] == 'q' else r[1]}], {name}, {nb});"
+        def body(expr, cnt, scalar, signed_src):
+            # sources as int64_t or uint64_t by their sign (a product of two uint32 passes INT64_MAX); the destination's
+            # old value as uint64_t, so an accumulation wraps instead of overflowing (QACC takes it signed)
+            e = expr.replace("BITS", str(bits)).replace("QACC(d,", "QACC((int64_t)d,")
+            st = "int64_t" if signed_src else "uint64_t"
+            return (f"for (int k = 0; k < {cnt}; k++) {{ {st} a = A[k], b = {scalar or 'B[k]'}; uint64_t d = (uint64_t)D[k]; (void)b; (void)d;"
+                    f" O[k] = (__typeof__(O[0]))({e}); }}")
+        scal = ""
+        if sm and len(ops) == 3:
+            mreg, x = int(sm.group(1)), int(sm.group(2))
+            scal = f"({'' if sg or dm.group(1) == 'i' else 'u'}int{bits}_t)(c->vfp.d[{mreg}] >> {bits * x})"
+            if bits not in (16, 32): return None
+        elif len(ops) == 3 and len(nregs) < 3:
+            scal = None   # (an immediate third operand: the shift forms below)
+        signed = sg or dm.group(1) == "i"
+        if mn in self.SAME and len(ops) == 3 and nregs[0][0] == nregs[1][0] and bits <= 32 and (mn not in ("vmul", "vmla", "vmls") or (sm and dm.group(1) in ("i", "s", "u"))) \
+                and (mn not in ("vabd", "vaba", "vqdmulh", "vqrdmulh") or dm.group(1) in ("s", "u")) and (mn not in ("vqdmulh", "vqrdmulh") or sg) and scal is not None:
+            if not sm and len(nregs) < 3: return None
+            a_, nb = arr("A", nregs[1], bits, signed)
+            b_ = "" if sm else arr("B", nregs[2], bits, signed)[0]
+            d_ = arr("D", nregs[0], bits, signed)[0]
+            return [f"{{ {a_} {b_} {d_} {'' if signed else 'u'}int{bits}_t O[{nb * 8 // bits}]; {body(self.SAME[mn], nb * 8 // bits, scal, signed)} {put('O', nregs[0], nb)} }}"]
+        if mn in self.LONG and len(ops) == 3 and nregs[0][0] == "q" and nregs[1][0] == "d" and bits <= 32 and dm.group(1) in ("s", "u") \
+                and (not mn.startswith("vqd") or (sg and bits in (16, 32))) and (mn != "vmull" or sm) and scal is not None:
+            if not sm and (len(nregs) < 3 or nregs[2][0] != "d"): return None
+            a_, nb = arr("A", nregs[1], bits, sg)
+            b_ = "" if sm else arr("B", nregs[2], bits, sg)[0]
+            d_ = arr("D", nregs[0], 2 * bits, sg)[0]
+            return [f"{{ {a_} {b_} {d_} {'' if sg else 'u'}int{2 * bits}_t O[{nb * 8 // bits}]; {body(self.LONG[mn], nb * 8 // bits, scal, sg)} {put('O', nregs[0], 16)} }}"]
+        if mn == "vshll" and len(ops) == 3 and ops[2].type == ARM_OP_IMM and nregs[0][0] == "q" and nregs[1][0] == "d" and bits <= 32:
+            # each element widened (sign- or zero-extended; the .i form is the shift by the full width) and shifted left
+            sh = ops[2].imm; s_ = sg
+            a_, nb = arr("A", nregs[1], bits, s_)
+            return [f"{{ {a_} uint{2 * bits}_t O[{8 // (bits // 8)}]; for (int k = 0; k < {8 // (bits // 8)}; k++) O[k] = (uint{2 * bits}_t)((uint64_t)(int64_t)A[k] << {sh}); {put('O', nregs[0], 16)} }}"]
+        qm = re.fullmatch(r"vq(r?)shr(u?)n", mn)
+        if (qm and len(ops) == 3 and ops[2].type == ARM_OP_IMM or mn in ("vqmovn", "vqmovun") and len(ops) == 2) \
+                and nregs[0][0] == "d" and nregs[1][0] == "q" and dm.group(1) in ("s", "u") and bits in (16, 32, 64):
+            # narrowing: each element of qM (shifted right by the immediate, rounded for the r forms), saturated to half
+            # its width, signed or unsigned (the "u" forms: signed in, unsigned out)
+            half = bits // 2; uns = (qm and qm.group(2)) or mn == "vqmovun" or not sg
+            sh = ops[2].imm if qm else 0; rnd = bool(qm and qm.group(1))
+            a_, _ = arr("A", nregs[1], bits, sg)
+            if sh: v = f"(A[k] >> {sh}) + {'((A[k] >> ' + str(sh - 1) + ') & 1)' if rnd else '0'}"
+            else: v = "A[k]"
+            sat = f"SATU({v}, {half})" if uns and sg else f"SATU64U((uint64_t)({v}), {half})" if uns else f"SATS({v}, {half})"
+            return [f"{{ {a_} {'u' if uns else ''}int{half}_t O[{128 // bits}]; for (int k = 0; k < {128 // bits}; k++) O[k] = ({'u' if uns else ''}int{half}_t){sat}; {put('O', nregs[0], 8)} }}"]
+        return None
+
     def neon_lanes(self, i, mn, dt, ops, regs):
         """NEON ops on 32-bit lanes of d/q registers (lane k of dN is s[2N+k], of qN is s[4N+k]);
         every lane is computed into a temporary first, so a destination can also be a source"""
@@ -547,6 +623,9 @@ class Fn:
         n = 4 if q else 2
         def dbytes(r):   # (first d index, d count) of a d or q register
             return (2 * r[1], 2) if r[0] == "q" else (r[1], 1)
+        more = self.neon_elements(i, mn, dt, ops, regs)
+        if more is not None:
+            return more
         if mn == "vext" and len(ops) == 4 and ops[3].type == ARM_OP_IMM:
             # bytes of N (low) then M (high), from element imm: the register's width of them
             (dn, cnt), (an, _), (bn, _) = dbytes(regs[0]), dbytes(regs[1]), dbytes(regs[2])
