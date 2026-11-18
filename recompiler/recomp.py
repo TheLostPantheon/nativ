@@ -275,9 +275,115 @@ class Fn:
         elif mn in ("mul", "muls"):
             a = self.r(ops[1].reg, i); b = self.r(ops[2].reg if len(ops) == 3 else ops[0].reg, i)
             out = [f"{{ uint32_t t = {a} * {b}; {self.dst(ops[0].reg)} = t;" + (" NZ(c, t);" if S else "") + " }"]
-        elif mn in ("mla", "mls"):
-            e = f"{self.r(ops[3].reg, i)} {'+' if mn == 'mla' else '-'} {self.r(ops[1].reg, i)} * {self.r(ops[2].reg, i)}"
-            out = [f"{self.dst(ops[0].reg)} = {e};"]
+        elif mn in ("mla", "mls", "mlas"):
+            e = f"{self.r(ops[3].reg, i)} {'-' if mn == 'mls' else '+'} {self.r(ops[1].reg, i)} * {self.r(ops[2].reg, i)}"
+            out = [f"{{ uint32_t t = {e}; {self.dst(ops[0].reg)} = t;" + (" NZ(c, t);" if mn == "mlas" else "") + " }"]
+        elif mn in ("umulls", "smulls", "umlals", "smlals"):   # the flag-setting long multiplies: N and Z from the 64-bit result
+            lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            ty, cast = ("uint64_t", "(uint64_t)") if mn[0] == "u" else ("int64_t", "(int64_t)(int32_t)")
+            acc = f" + (({ty})(((uint64_t){hi} << 32) | {lo}))" if mn.startswith(("umlal", "smlal")) else ""
+            out = [f"{{ {ty} t = {cast}{a} * {cast}{b}{acc}; {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); c->n = (uint32_t)((uint64_t)t >> 63); c->z = t == 0; }}"]
+        elif mn in ("qadd", "qsub", "qdadd", "qdsub"):
+            # saturating 32-bit add and subtract (qd: rn doubled first, saturating too); Q set when anything saturated
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            dbl = mn.startswith("qd")
+            src = f"int64_t y = (int32_t){b}; int64_t yy = {'2 * y' if dbl else 'y'}; int64_t ys = yy > 0x7fffffffLL ? 0x7fffffffLL : yy < -0x80000000LL ? -0x80000000LL : yy; if (ys != yy) c->q = 1;"
+            op = "-" if mn.endswith("sub") else "+"
+            out = [f"{{ {src} int64_t r = (int64_t)(int32_t){a} {op} ys, rs = r > 0x7fffffffLL ? 0x7fffffffLL : r < -0x80000000LL ? -0x80000000LL : r; if (rs != r) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)rs; }}"]
+        elif re.fullmatch(r"(s|q|sh|u|uq|uh)(add16|sub16|asx|sax|add8|sub8)", mn):
+            # ARMv6 SIMD on core registers: two halfwords or four bytes at once, signed (s, q saturating, sh halving) or
+            # unsigned (u, uq, uh); asx adds the top and subtracts the bottom with M's halves exchanged, sax the reverse.
+            # The plain s and u forms set GE per lane (signed: result >= 0; unsigned add: a carry out; subtract: no borrow)
+            pm = re.fullmatch(r"(s|q|sh|u|uq|uh)(add16|sub16|asx|sax|add8|sub8)", mn)
+            pre, op = pm.group(1), pm.group(2)
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            sgn = pre in ("s", "q", "sh"); w = 8 if op.endswith("8") else 16; nl = 32 // w
+            ext = (lambda v, k: f"(int64_t)(int{w}_t)({v} >> {w * k})") if sgn else (lambda v, k: f"(int64_t)(uint{w}_t)({v} >> {w * k})")
+            lanes_ = []
+            for k in range(nl):
+                if op in ("asx", "sax"):   # lane 0 (bottom) and lane 1 (top) with M's halves exchanged
+                    o_ = ("-" if k == 0 else "+") if op == "asx" else ("+" if k == 0 else "-")
+                    lanes_.append((f"{ext(a, k)} {o_} {ext(b, 1 - k)}", o_))
+                else:
+                    o_ = "+" if op.startswith("add") else "-"
+                    lanes_.append((f"{ext(a, k)} {o_} {ext(b, k)}", o_))
+            parts, ge = [], []
+            for k, (e, o_) in enumerate(lanes_):
+                v = f"r{k}"
+                parts.append(f"int64_t {v} = {e};")
+                if pre == "q": res = f"(uint32_t)(uint{w}_t)SATS({v}, {w})"
+                elif pre == "uq": res = f"(uint32_t)(uint{w}_t)SATU({v}, {w})"
+                elif pre in ("sh", "uh"): res = f"(uint32_t)(uint{w}_t)({v} >> 1)"
+                else: res = f"(uint32_t)(uint{w}_t){v}"
+                parts.append(f"uint32_t o{k} = {res};")
+                if pre in ("s", "u"):
+                    cond = f"{v} >= 0" if pre == "s" or o_ == "-" else f"{v} >= 0x{1 << w:x}LL"
+                    bits_ = 0b11 if w == 16 else 1
+                    ge.append(f"(({cond}) ? 0x{bits_ << (k * (w // 8)):x}u : 0u)")
+            res = " | ".join(f"o{k} << {w * k}" for k in range(nl))
+            out = [f"{{ {' '.join(parts)} {self.dst(ops[0].reg)} = {res};" + (f" c->ge = {' | '.join(ge)};" if ge else "") + " }"]
+        elif mn == "sel":   # each byte from rn where its GE bit is set, else from rm
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            out = [f"{{ uint32_t m = (c->ge & 1 ? 0xffu : 0) | (c->ge & 2 ? 0xff00u : 0) | (c->ge & 4 ? 0xff0000u : 0) | (c->ge & 8 ? 0xff000000u : 0); {self.dst(ops[0].reg)} = ({a} & m) | ({b} & ~m); }}"]
+        elif re.fullmatch(r"sm(lad|lsd|uad|usd|lald|lsld)x?", mn):
+            # dual 16x16 multiplies: the bottom and top halves of rn times those of rm (x: rm's halves exchanged), their
+            # sum (ad) or difference (sd), plus an accumulator: 32-bit ra (Q set on the accumulation's overflow) or the
+            # 64-bit rdlo:rdhi (the l forms)
+            x = mn.endswith("x"); base_ = mn.rstrip("x")
+            long_ = base_ in ("smlald", "smlsld"); acc_ = base_ in ("smlad", "smlsd")
+            if long_: lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            else: a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            bb = f"(({b} >> 16) | ({b} << 16))" if x else b
+            p0, p1 = f"(int64_t)(int16_t){a} * (int16_t){bb}", f"(int64_t)(int16_t)({a} >> 16) * (int16_t)({bb} >> 16)"
+            sd = "-" if "sd" in base_ else "+"
+            if long_:
+                out = [f"{{ int64_t t = (int64_t)(((uint64_t){hi} << 32) | {lo}) + ({p0} {sd} {p1}); {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); }}"]
+            else:
+                ra = f" + (int32_t){self.r(ops[3].reg, i)}" if acc_ else ""
+                out = [f"{{ int64_t p = {p0} {sd} {p1}, t = p{ra}; if (t != (int32_t)t) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)t; }}"]
+        elif re.fullmatch(r"smm(ul|la|ls)r?", mn):
+            # most significant word: (ra << 32 +/- rn * rm, + 0x80000000 rounding for the r forms) >> 32
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            prod = f"(int64_t)(int32_t){a} * (int32_t){b}"
+            if mn.startswith("smmul"): e = prod
+            else:
+                ra = f"(int64_t)((uint64_t){self.r(ops[3].reg, i)} << 32)"
+                e = f"{ra} {'+' if mn.startswith('smmla') else '-'} {prod}"
+            rnd = " + 0x80000000LL" if mn.endswith("r") else ""
+            out = [f"{self.dst(ops[0].reg)} = (uint32_t)((uint64_t)((int64_t)(({e}){rnd})) >> 32);"]
+        elif re.fullmatch(r"sm(la|ul)w[bt]", mn):
+            # 32 x 16 (rm's bottom or top half, signed), the top 32 bits of the 48-bit product; smlaw adds ra, Q on overflow
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            h = f"(int16_t)({b} >> 16)" if mn.endswith("t") else f"(int16_t){b}"
+            p_ = f"(((int64_t)(int32_t){a} * {h}) >> 16)"
+            if mn.startswith("smlaw"):
+                out = [f"{{ int64_t t = {p_} + (int32_t){self.r(ops[3].reg, i)}; if (t != (int32_t)t) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)t; }}"]
+            else:
+                out = [f"{self.dst(ops[0].reg)} = (uint32_t){p_};"]
+        elif re.fullmatch(r"smlal[bt][bt]", mn):   # 16 x 16 halves into the 64-bit rdlo:rdhi
+            lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            ha = f"(int16_t)({a} >> 16)" if mn[-2] == "t" else f"(int16_t){a}"
+            hb = f"(int16_t)({b} >> 16)" if mn[-1] == "t" else f"(int16_t){b}"
+            out = [f"{{ int64_t t = (int64_t)(((uint64_t){hi} << 32) | {lo}) + (int64_t){ha} * {hb}; {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); }}"]
+        elif mn == "umaal":   # rdhi:rdlo = rn * rm + rdlo + rdhi (never overflows 64 bits)
+            lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            out = [f"{{ uint64_t t = (uint64_t){a} * {b} + {lo} + {hi}; {lo} = (uint32_t)t; {hi} = (uint32_t)(t >> 32); }}"]
+        elif mn in ("usad8", "usada8"):   # the sum of the four bytes' absolute differences (+ ra)
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            terms = " + ".join(f"(uint32_t)abs((int)(uint8_t)({a} >> {8 * k}) - (int)(uint8_t)({b} >> {8 * k}))" for k in range(4))
+            ra = f" + {self.r(ops[3].reg, i)}" if mn == "usada8" else ""
+            out = [f"{self.dst(ops[0].reg)} = {terms}{ra};"]
+        elif mn in ("uxtab16", "sxtab16"):
+            # rm (rotated by the operand's ror) bytes 0 and 2, zero- or sign-extended to halfwords, added to rn's halfwords
+            a, v = self.r(ops[1].reg, i), self.operand(ops[2], i)
+            ext = (lambda k: f"(uint32_t)(int32_t)(int8_t)({v} >> {16 * k})") if mn[0] == "s" else (lambda k: f"(uint32_t)(uint8_t)({v} >> {16 * k})")
+            out = [f"{self.dst(ops[0].reg)} = (uint32_t)(uint16_t)({a} + {ext(0)}) | (uint32_t)(uint16_t)(({a} >> 16) + {ext(1)}) << 16;"]
+        elif mn in ("swp", "swpb"):   # (deprecated) the word or byte at [rn] swapped with rm, the old value into rd
+            rd, rm_, rn_ = self.dst(ops[0].reg), self.r(ops[1].reg, i), self.r(ops[2].mem.base, i)
+            rd_, wr = ("RD32", "WR32") if mn == "swp" else ("RD8", "WR8")
+            out = [f"{{ uint32_t a = {rn_}, v = {rm_}; uint32_t t = {rd_}(a); {wr}(a, v); {rd} = t; }}"]
+        elif mn == "mrs" and len(ops) == 2 and ops[0].type == ARM_OP_REG:   # the APSR: N Z C V Q and GE
+            out = [f"{self.dst(ops[0].reg)} = c->n << 31 | c->z << 30 | c->c << 29 | c->v << 28 | (c->q ? 1u : 0u) << 27 | (c->ge & 15) << 16;"]
         elif mn in ("umull", "smull", "umlal", "smlal"):
             lo, hi, a, b = (self.dst(ops[k].reg) for k in range(2)), None, self.r(ops[2].reg, i), self.r(ops[3].reg, i)
             lo, hi = self.dst(ops[0].reg), self.dst(ops[1].reg)

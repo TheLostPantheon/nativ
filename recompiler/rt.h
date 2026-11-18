@@ -22,7 +22,8 @@ typedef struct Cpu {
 	uint32_t r[16];
 	uint32_t n, z, c, v;          /* APSR flags, 0 or 1 */
 	uint32_t q;                   /* sticky saturation */
-	uint32_t _pad;                /* keeps the VFP bank 8-aligned at a fixed offset (difftest mirrors this layout) */
+	uint32_t ge;                  /* the APSR's GE bits (3..0): set by the ARMv6 parallel adds and subtracts, read by sel. (It
+	                               * also keeps the VFP bank 8-aligned at a fixed offset; difftest and insnsweep mirror this layout) */
 	VfpRegs vfp;
 	uint32_t fpscr;               /* N Z C V in bits 31..28 */
 	uint32_t stop;                /* set by the runtime to unwind (unimplemented, fault) */
