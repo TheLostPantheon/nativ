@@ -335,7 +335,7 @@ class Fn:
             else: a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
             bb = f"(({b} >> 16) | ({b} << 16))" if x else b
             p0, p1 = f"(int64_t)(int16_t){a} * (int16_t){bb}", f"(int64_t)(int16_t)({a} >> 16) * (int16_t)({bb} >> 16)"
-            sd = "-" if "sd" in base_ else "+"
+            sd = "-" if base_ in ("smlsd", "smusd", "smlsld") else "+"
             if long_:
                 out = [f"{{ int64_t t = (int64_t)(((uint64_t){hi} << 32) | {lo}) + ({p0} {sd} {p1}); {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); }}"]
             else:
