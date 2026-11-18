@@ -453,7 +453,7 @@ class Fn:
             out = []   # hints
         elif mn == "adr":
             out = [f"{self.dst(ops[0].reg)} = 0x{((A + self.pc_off) & ~3) + ops[1].imm & 0xffffffff:x}u;"]
-        elif mn.startswith("v"):
+        elif mn.startswith("v") or mn in ("fstmiax", "fldmiax", "fstmdbx", "fldmdbx"):   # (the deprecated FSTMX/FLDMX: vfp() maps them)
             out = self.vfp(i, mn, dt, ops)
         else:
             raise Unsupported(mn)
