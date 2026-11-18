@@ -37,7 +37,7 @@ player's machine needs nothing else. Each sits in the install with its licence (
 | Software | Version | Licence | Where in an install |
 |---|---|---|---|
 | [SDL](https://libsdl.org) | 3.4.16 | zlib | `toolchain/SDL3/share/licenses/SDL3/` |
-| [FFmpeg](https://ffmpeg.org): libavcodec and libavutil, the H.264 decoder only | 7.1.1 | LGPL 2.1 or later | `toolchain/ffmpeg/share/licenses/`, with where its unmodified source is |
+| [FFmpeg](https://ffmpeg.org): libavcodec and libavutil, the H.264, AAC and MP3 decoders only | 7.1.1 | LGPL 2.1 or later | `toolchain/ffmpeg/share/licenses/`, with where its unmodified source is |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) (macOS) | vulkan-sdk-1.4.363.0 | Apache 2.0 | `toolchain/spirv-cross/share/licenses/` |
 | [Zig](https://ziglang.org), its Clang and LLVM (Linux) | 0.15.2 | MIT; LLVM: Apache 2.0 with LLVM exceptions | `toolchain/zig/` |
 | [zlib](https://zlib.net) (Linux, Windows) | 1.3.1 | zlib | `toolchain/zlib/share/licenses/` |

@@ -22,6 +22,9 @@ unit() { local t=$1; shift; (cd runtime/tests && $CC -O1 -g -w -D_GNU_SOURCE ${I
 step "kernel (kernel_test.c)" unit kernel_test -lpthread
 step "touch gestures (gesture_test.c)" unit gesture_test -lm -lpthread
 step "JPEG (jpeg_test.c)" unit jpeg_test
+# the audio decoder: ATRAC9 always; AAC and MP3 too where libavcodec's development files are installed (CI may not have them: the test then skips those and checks they fail cleanly)
+AVC=(); pkg-config --exists libavcodec libavutil 2>/dev/null && AVC=(-DRECOMP_AVCODEC $(pkg-config --cflags --libs libavcodec libavutil))
+step "audio decoder (audiodec_test.c)" unit audiodec_test ${AVC[@]+"${AVC[@]}"} $ROOT/third_party/libatrac9/*.c -lm -lpthread
 
 echo
 if [ ${#failed[@]} -eq 0 ]; then echo "all passed"; else echo "FAILED: ${failed[*]}"; exit 1; fi

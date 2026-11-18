@@ -242,16 +242,16 @@ def main(argv):
     # overlay.cpp + Dear ImGui are C++: cc (clang) won't pull its runtime in for object files alone, the
     # same reasoning as the spirv-cross block's own comment above
     CXXLIB = ["-lc++"] if DARWIN or WIN or LT else ["-lstdc++"]   # (zig's libc++ for the install's toolchain)
-    # libavcodec (FFmpeg): the H.264 decoder behind sceAvcdec* (video.c) -- linked where pkg-config finds it
+    # libavcodec (FFmpeg): the H.264 decoder behind sceAvcdec* (video.c) and the AAC and MP3 ones behind sceAudiodec* (audiodec.c) -- linked where pkg-config finds it
     # (Homebrew's ffmpeg, a Linux distribution's libavcodec-dev); without it movies fail to start, as before
     AVCODEC = []
-    if LT:   # the toolchain's static H.264-only FFmpeg, as on Windows
+    if LT:   # the toolchain's static FFmpeg (H.264, AAC, MP3), as on Windows
         if os.path.isfile(os.path.join(LT, "ffmpeg", "lib", "libavcodec.a")): AVCODEC = ["-DRECOMP_AVCODEC", "-I" + os.path.join(LT, "ffmpeg", "include"), os.path.join(LT, "ffmpeg", "lib", "libavcodec.a"), os.path.join(LT, "ffmpeg", "lib", "libavutil.a")]
-    elif MT:   # the Mac toolchain's static H.264-only FFmpeg
+    elif MT:   # the Mac toolchain's static FFmpeg (H.264, AAC, MP3)
         if os.path.isfile(os.path.join(MT, "ffmpeg", "lib", "libavcodec.a")): AVCODEC = ["-DRECOMP_AVCODEC", "-I" + os.path.join(MT, "ffmpeg", "include"), os.path.join(MT, "ffmpeg", "lib", "libavcodec.a"), os.path.join(MT, "ffmpeg", "lib", "libavutil.a")]
     elif not WIN and pkg_exists("libavcodec", "libavutil"):
         AVCODEC = ["-DRECOMP_AVCODEC"] + out_of(["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil"])
-    elif WIN and os.path.isfile(os.path.join(WT, "ffmpeg", "lib", "libavcodec.a")):   # Windows: the toolchain's static H.264-only FFmpeg (runtime/platform/win/setup-toolchain.sh)
+    elif WIN and os.path.isfile(os.path.join(WT, "ffmpeg", "lib", "libavcodec.a")):   # Windows: the toolchain's static FFmpeg (H.264, AAC, MP3) (runtime/platform/win/setup-toolchain.sh)
         AVCODEC = ["-DRECOMP_AVCODEC", "-I" + os.path.join(WT, "ffmpeg", "include"), os.path.join(WT, "ffmpeg", "lib", "libavcodec.a"), os.path.join(WT, "ffmpeg", "lib", "libavutil.a"), "-lole32", "-luser32", "-lbcrypt"]
     # libcurl: SceHttp (http.c) -- a game's HTTPS to its own (or a community) server; without it the HTTP calls stay stubs
     CURL = ["-DRECOMP_CURL"] + out_of(["pkg-config", "--cflags", "--libs", "libcurl"]) if not WIN and not LT and not MT and pkg_exists("libcurl") else []   # (none in the Linux install's toolchain: stubs, as on Windows)
@@ -266,7 +266,7 @@ def main(argv):
     # the guest addresses the game's hooks use for this build of it (vitarecomp: the pack's GAME_ADDRS; hooks.c game_addr)
     if ENV.get("RECOMP_GAME_ADDRS"): ENVDEF.append(f'-DRECOMP_GAME_ADDRS="{ENV["RECOMP_GAME_ADDRS"]}"')
     host = [part(f) for f in (
-        "main hle libc io sysmem apputil fios psarc gxp_index kernel gpu video display gesture gxm_sony usse usse_spirv gfx_soft gfx_gpu "
+        "main hle libc io sysmem apputil fios psarc gxp_index kernel gpu video audiodec display gesture gxm_sony usse usse_spirv gfx_soft gfx_gpu "
         "gfx_dispatch gfx_coverage gfx_capture guestwatch metrics settings hooks motion window gpulock ngs stallprof waitstats memscan jpeg camera post "
         "ssao fsr/fsr net np http sha1 ssl_local online/m2_server online/m2_wire online/m2_rooms online/m2_proxy online/discovery online/basic_msg online/stun online/overlay online/dht online/upnp online/aes128 online/status online/crypto").split()]
     # the game's own host code (vitarecomp: every .c in packs/<title>/), in this game's build alone

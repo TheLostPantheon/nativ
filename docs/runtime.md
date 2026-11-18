@@ -50,6 +50,11 @@ instead of every second one. It's experimental and per game, because games assum
 PCM and ATRAC9), patches and buses. ATRAC9 is decoded by LibAtrac9 (MIT, in `third_party/libatrac9`), and output goes
 through SDL. Reverb sends are dropped for now.
 
+`runtime/audio/audiodec.c` implements `sceAudiodec`, the codec engine's decoder that games feed their own music and
+movie soundtracks to: ATRAC9 through the same LibAtrac9, AAC and MP3 through libavcodec (as `video.c` does H.264), one
+frame per Decode call into 16-bit PCM. Without libavcodec's AAC and MP3 decoders in the build those types fail with
+the error code a game can handle.
+
 ## Graphics
 
 ### The software backend

@@ -1,7 +1,7 @@
 #!/bin/bash
 # The Windows cross toolchain, pinned: llvm-mingw (clang + the mingw-w64 UCRT runtime, winpthreads included -- the
 # same compiler as macOS, Linux and the Android NDK), SDL3's MinGW development package, and zlib built with it; and
-# FFmpeg's H.264 decoder (libavcodec + libavutil, static, nothing else: runtime/media/video.c's sceAvcdec -- the movies),
+# FFmpeg's H.264, AAC and MP3 decoders (libavcodec + libavutil, static, nothing else: runtime/media/video.c's sceAvcdec for the movies, runtime/audio/audiodec.c's sceAudiodec),
 # built with it too (no x86 assembly unless nasm is installed: the Vita's 960x544 video decodes fine in C). The HEVC
 # parser only for its SEI code: FFmpeg 7.1's H.264 decoder calls the film-grain helper built with it.
 # Into $ATIV_WIN_TOOLCHAIN (default ~/toolchains/ativ-win); build.sh's TARGET=windows looks there.
@@ -44,7 +44,7 @@ if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
       --cross-prefix=x86_64-w64-mingw32- --cc=x86_64-w64-mingw32-clang --cxx=x86_64-w64-mingw32-clang++ --ar=llvm-ar --nm=llvm-nm --ranlib=llvm-ranlib \
       --enable-static --disable-shared --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
       --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-avfilter --disable-debug \
-      --enable-decoder=h264 --enable-parser=h264 --enable-parser=hevc $ASM > ../ffmpeg-configure.log \
+      --enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc $ASM > ../ffmpeg-configure.log \
     && PATH="$D/llvm-mingw/bin:$PATH" make -j"$( (nproc || sysctl -n hw.ncpu) 2>/dev/null)" > ../ffmpeg-build.log 2>&1 && PATH="$D/llvm-mingw/bin:$PATH" make install >> ../ffmpeg-build.log 2>&1 )
 fi
 echo "toolchain: $D ($("$CC" --version | head -1); SDL3 $SDL; zlib $ZLIB; FFmpeg $FFMPEG $([[ -f ffmpeg/lib/libavcodec.a ]] && echo built || echo MISSING))"
