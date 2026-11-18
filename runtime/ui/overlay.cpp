@@ -49,6 +49,7 @@
 #include "overlay.h"
 #include "savedlg.h"
 #include "ui_theme.h"
+#include "languages.h"
 #define STBI_NO_STDIO
 #include "third_party/stb/stb_image.h"   /* (its implementation: runtime/media/jpeg.c) */
 #include "prompts_png.h"                 /* third_party/kenney-prompts/prompts.png as bytes (runtime/build.py writes it) */
@@ -358,6 +359,13 @@ static void page_game(void) {
 	if (!ui::rows_begin("game")) return;
 	ui::row("Frame rate", "60 is experimental: parts of a game timed in fixed 1/30 s steps can run fast.");
 	{ static const char *const names[2] = {"30##fr", "60##fr"}; int v = P.fr >= 60; if (ui::segmented(names, 2, &v)) set_frame_rate(v ? 60 : 30); }
+	ui::row("Language", "Applies the next time the game starts. A language the game doesn't have is ignored.");
+	{	static const char *labels[1 + game_language_count]; static int built;
+		if (!built) { built = 1; labels[0] = "Automatic (English)"; for (int i = 0; i < game_language_count; i++) labels[i + 1] = game_languages[i].label; }
+		char cur[32]; settings_str("game_language", "auto", cur, sizeof cur);
+		int v = 0; for (int i = 0; i < game_language_count; i++) if (!strcmp(cur, game_languages[i].key)) v = i + 1;
+		if (ui::choice("##lang", labels, 1 + game_language_count, &v)) { settings_set_str("game_language", v ? game_languages[v - 1].key : "auto"); settings_save(); }
+	}
 	if (game_option("fov")) {
 		ui::row("Field of view", "A wider view. 1.00× is the game's own.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##fov", &P.fov, 0.75f, 1.5f, "%.2f×")) set_fov(P.fov);

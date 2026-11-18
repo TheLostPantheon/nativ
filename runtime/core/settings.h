@@ -35,6 +35,9 @@
  *   full_res_world gfx_gpu.c  0 | 1 (default 1)          the buffers a game draws below the screen's resolution at the full one (RECOMP_TARGET_SCALE; read at each scene)
  *   ssao          ssao.c      0 | 1 (default 1)          ambient occlusion on the main 3D scene, for a game that names it (RECOMP_SSAO; RECOMP_SSAO_ON wins)
  *   ssao_strength ssao.c      0..2 (default 1.0)         how dark (read every frame)
+ *   game_language apputil.c   auto | japanese | english_us | french | ... (ui/languages.h; default auto: English US)   the language the
+ *                             game is told the system speaks, read when it asks at boot (a game's own option: each supports other languages;
+ *                             RECOMP_GAME_LANGUAGE wins). The date and time formats, enter button and time zone stay as they were.
  *   open_psid     apputil.c   32 hex digits: this install's console id (sceKernelGetOpenPsId), random, made once; a game
  *                             with saves from before keeps the old fixed one in its own file
  *   online_id     np.c        the player's name online, after "ntv_" (at most 10 letters, digits, '-' or '_'; empty:

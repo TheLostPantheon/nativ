@@ -81,6 +81,16 @@ inline bool segmented(const char *const *labels, int n, int *v) {
 	ImGui::PopStyleVar();
 	return ch;
 }
+/* a choice of many as a dropdown (a list too long for segmented); true when it changes. id: unique in the window */
+inline bool choice(const char *id, const char *const *labels, int n, int *v) {
+	bool ch = false;
+	ImGui::SetNextItemWidth(-FLT_MIN);
+	if (ImGui::BeginCombo(id, labels[*v])) {
+		for (int i = 0; i < n; i++) if (ImGui::Selectable(labels[i], *v == i) && *v != i) { *v = i; ch = true; }
+		ImGui::EndCombo();
+	}
+	return ch;
+}
 inline bool toggle(const char *id, bool *on) {   /* Off / On as a segmented pair */
 	char a[64], b[64]; snprintf(a, sizeof a, "Off##%s", id); snprintf(b, sizeof b, "On##%s", id);
 	const char *const ls[2] = {a, b};
