@@ -1,5 +1,6 @@
 # Unit 13 (PCSA00014, US). Only facts about the game (the format: pipeline/packconf.py).
 NAME = "Unit 13"
+FEATURES = "widescreen fov mouse_aim online"   # what this pack adds (pipeline/packconf.py FEATURE_NAMES; :experimental where it is): the README's games table and its checks
 # REGION: the release this pack plays (its content id: UP..., North America); another region's release is another build,
 # not played yet -- a search names it and says this release is the one Ativ plays
 REGION = "US"

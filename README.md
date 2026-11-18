@@ -28,12 +28,18 @@ copy of each game and Sony's firmware update file, and the tools decrypt and rec
 These are the **Enhanced with Nativ** games: each has a pack with fixes and extras made for it, and each is tested with
 every release.
 
-| Game | Release | Title ID | Versions |
-|---|---|---|---|
-| Killzone: Mercenary | US | PCSA00107 | 1.00, 1.12 (recommended: Botzone and online play) |
-| Uncharted: Golden Abyss | US | PCSA00029 | 1.00 |
-| Unit 13 | US | PCSA00014 | 1.00 |
-| Shovel Knight | US | PCSE00640 | 1.00 |
+<!-- games table: made by pipeline/packconf.py --table --write README.md -->
+| Game | Release | Title ID | Versions | Widescreen | Field of view | 1:1 mouse aim | FSR 3.1 | Online play |
+|---|---|---|---|---|---|---|---|---|
+| Killzone: Mercenary | US | PCSA00107 | 1.00, 1.12 (recommended: adds Botzone and online play) | Yes | Yes | Yes | Experimental | Yes (1.12) |
+| Uncharted: Golden Abyss | US | PCSA00029 | 1.00 | Yes | Yes | Yes | Experimental |  |
+| Unit 13 | US | PCSA00014 | 1.00 | Yes | Yes | Yes |  | Yes |
+| Shovel Knight | US | PCSE00640 | 1.00 |  |  |  |  |  |
+<!-- end of games table -->
+
+Every game plays at up to six times the Vita's resolution, and at 30 or 60 fps; 60 is experimental everywhere. The
+columns are what each game's pack adds, from its pack.toml's FEATURES, which the tests check against what the pack
+actually switches on.
 
 Each game's pack supports exact releases, recognised by the SHA-256 of the game's main program. Game-specific fixes,
 such as Killzone's physics fix or the widescreen cameras, patch code at fixed addresses, so they only fit the build
