@@ -195,7 +195,10 @@ Three shared hooks need no C in the pack, only an `IHOOKS` entry:
 `dev/hookscan.py <analysis/eboot.data.json>` lists every place a game builds 1/30 or 960/544 in a register, as
 `IHOOKS` candidates. On the enhanced games it finds every site their packs list. It also finds sites that must be
 left alone, such as a fixed-step loop that's already frame-rate independent, so each candidate is checked by
-playing at 30 and 60 fps before it goes in a pack. `--pack packs/<title>/pack.toml` compares with what a pack lists.
+playing at 30 and 60 fps before it goes in a pack. `--pack packs/<title>/pack.toml` compares with what a pack lists. `--verify <title> --from <frame>` sorts the 1/30
+candidates by running the game: its verify build counts each function's calls over a stretch at 30 fps, switches to 60
+and counts over the same game time again. A function that runs once a frame doubles: hook it. One in a fixed-step loop
+runs as often per second at either rate: leave it.
 
 Example: Unit 13's field-of-view setting widens its camera update's fields for the length of the update, so the
 projection, culling and stored field of view all agree, while the weapon camera stays as it was. Widening only the

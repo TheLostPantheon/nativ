@@ -7,6 +7,14 @@ widescreen for a new game start from a list instead of a search:
   aspect     960/544 as a float (0x3fe1e1e2): the view's aspect, widened for wider screens (recomp_ihook_aspect)
 
     dev/hookscan.py <analysis/eboot.data.json> [--pack packs/<title>/pack.toml [--version V]]
+    dev/hookscan.py <analysis/eboot.data.json> --verify <title> --from <frame> [--frames N]
+
+--verify sorts the frame_dt candidates by running the game: one headless run of its verify build on the fixed clock
+counts every function's entries over N frames at 30 fps from <frame>, switches the frame rate to 60, and counts again over
+2N frames, the same game time. A function that builds "one frame = 1/30 s" runs once a frame, so its count doubles at 60:
+hook it. One in a fixed-step loop (step 1/30 until caught up with real time) runs as often per second at either rate:
+leave it. Pick <frame> where the game plays its world, with the scripted input done by then (frames run twice as fast
+at 60, so inputs after the switch land elsewhere). The run uses the game's TEST_INPUT, its GPU renderer and ATIV_DUMP.
 
 Each site is where a core register receives the constant: the movt of a movw/movt pair, or a pc-relative ldr from a
 literal pool. An IHOOKS entry goes on that instruction ("0xADDR:frame_dt"), which is how the packs list them. Loads
@@ -67,12 +75,60 @@ def pack_sites(path, version):
     return sites
 
 
+def verify(b, found, title, start, n):
+    """(site, kind, function, count at 30, count at 60, verdict) for each frame_dt candidate, from one headless run"""
+    import subprocess
+    root = os.path.join(HERE, "..")
+    vit = [sys.executable, os.path.join(root, "pipeline", "vitarecomp.py")]
+    a0, a1 = start, start + n
+    sw = a1 + 30                 # (a second at 30 to settle after the switch)
+    b0, b1 = sw + 60, sw + 60 + 2 * n
+    env = dict(os.environ, RECOMP_BIN="verify", TEST_FRAMES=str(b1 + 1), TEST_COVERAGE="0", TIMEOUT=os.environ.get("TIMEOUT", "1800"),
+               EXTRA_ENV=" ".join(x for x in (os.environ.get("EXTRA_ENV", ""), "RECOMP_GFX=gpu RECOMP_CLOCK=fixed",
+                                               f"RECOMP_WATCH_WINDOWS={a0}-{a1},{b0}-{b1}", f"RECOMP_SETTINGS_SWITCH={sw}:frame_rate=60") if x))
+    print(f"verify build of {title}, then one run: frames {a0}-{a1} at 30 fps, the switch at {sw}, {b0}-{b1} at 60", flush=True)
+    subprocess.run(vit + ["build", title, "verify"], env=env, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(vit + ["test", title], env=env, stdout=subprocess.DEVNULL)
+    import glob
+    logs = sorted(glob.glob(os.path.join(os.environ.get("ATIV_DUMP", os.path.join(root, "dump")), "decrypted", title, "recomp", "test_verify", "test.log")))
+    if not logs: sys.exit("no test_verify/test.log: the run didn't start")
+    windows, cur = [], None
+    for line in open(logs[0], errors="replace"):
+        if line.startswith("== watch: entries per function"): cur = {}; windows.append(cur); continue
+        if cur is not None:
+            m = re.match(r"\s+\S+\s+(0x[0-9a-f]+)\s+(\d+)", line)
+            if m: cur[int(m.group(1), 16)] = cur.get(int(m.group(1), 16), 0) + int(m.group(2))
+            elif not line.startswith("  "): cur = None
+    if len(windows) < 2: sys.exit(f"the run counted {len(windows)} of 2 windows (see {logs[0]}): did it reach frame {b1}?")
+    out = []
+    for kind, site, reg, entry, how in found:
+        if kind != "frame_dt": continue
+        c30, c60 = windows[0].get(entry, 0), windows[1].get(entry, 0)
+        if not c30 and not c60: v = "not run in the windows"
+        elif c30 and c60 / c30 >= 1.6: v = "per frame: hook it"
+        elif c30 and c60 / c30 <= 1.3: v = "per second (a fixed step): leave it"
+        else: v = "unclear"
+        out.append((site, kind, entry, c30, c60, v))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("analysis"); ap.add_argument("--pack", default=""); ap.add_argument("--version", default="")
+    ap.add_argument("--verify", default="", metavar="TITLE"); ap.add_argument("--from", dest="start", type=int, default=0)
+    ap.add_argument("--frames", type=int, default=150)
     a = ap.parse_args()
     b = Build(a.analysis)
     found = scan(b)
+    if a.verify:
+        if not a.start: sys.exit("--verify needs --from <frame>: where the game plays its world")
+        name = lambda e: b.names.get(e) or f"fn_{e:08x}"
+        rows = verify(b, found, a.verify, a.start, a.frames)
+        for site, kind, entry, c30, c60, v in rows:
+            print(f"  {site:#010x} in {name(entry):<14} {c30:>6} at 30, {c60:>6} at 60: {v}")
+        keep = [r for r in rows if r[5].startswith("per frame")]
+        if keep: print("\nIHOOKS: " + " ".join(f"{s:#x}:frame_dt" for s, *_ in keep))
+        return
     name = lambda e: b.names.get(e) or f"fn_{e:08x}"
     for kind in sorted({k for k, *_ in found}):
         rows = [f for f in found if f[0] == kind]
