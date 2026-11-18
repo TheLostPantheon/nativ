@@ -61,6 +61,41 @@ class FoldedImm:
         self.shift = type("Shift", (), {"type": 0, "value": 0})()
 
 
+_STORE = re.compile(r"(str|stm|push|vst|vpush|swp|strex|srs)")
+_CALL = re.compile(r"(bl|blx|svc|bkpt)(\.w)?$")
+
+
+def spin_loads(insns):
+    """the loads inside loops that neither store nor call: a wait on memory another thread changes (Resistance's
+    loading screen: `ldr r0, [r4]; cmp r0, #0; bne` back over 256 nops). As plain C loads the compiler may read them
+    once and spin on the copy (clang made that loop `b .`: the game hung at its 40th frame), so these are read anew
+    each time (RD*V, relaxed atomic: the same instruction on arm64 and x86). A loop with a store or a call can't be
+    hoisted that way and keeps the plain load."""
+    at = {i.address: k for k, i in enumerate(insns)}
+    out = set()
+    for k, i in enumerate(insns):
+        mn = i.mnemonic.split(".")[0]
+        if not (mn.startswith("b") and not mn.startswith(("bl", "bx", "bic", "bfc", "bfi", "bkpt")) or mn in ("cbz", "cbnz")):
+            continue
+        ops = i.operands
+        if not ops or ops[-1].type != ARM_OP_IMM: continue
+        t = ops[-1].imm & 0xffffffff   # (capstone gives a branch target as a signed int)
+        if t > i.address or t not in at: continue
+        body = insns[at[t]:k + 1]
+        if any(_STORE.match(b.mnemonic) or _CALL.match(b.mnemonic.split(".")[0]) for b in body): continue
+        try:   # the registers the loop writes: a load whose address uses none of them reads the same place every time
+            written = set().union(*(set(b.regs_access()[1]) for b in body))
+        except Exception:
+            continue
+        for b in body:
+            if not b.mnemonic.startswith("ldr") or b.mnemonic.startswith("ldrex"): continue
+            m = next((o.mem for o in b.operands if o.type == ARM_OP_MEM), None)
+            if m is None or len(b.operands) > 2 + (b.mnemonic.startswith("ldrd")): continue   # (post-indexed: the address moves)
+            if m.base in written or (m.index and m.index in written): continue
+            out.add(b.address)
+    return out
+
+
 class Fn:
     def __init__(self, entry, insns, entries, arm=False):
         self.entry, self.insns, self.entries, self.arm = entry, insns, entries, arm
@@ -69,6 +104,8 @@ class Fn:
         self.addrs = {i.address for i in insns}
         self.lines, self.unimpl = [], []
         self.ordered = ORDERED_LOADS[0] and any(i.mnemonic in SYNC_MN for i in insns)
+        self.spin = spin_loads(insns)
+
 
     def reg(self, rid):
         n = md.reg_name(rid)
@@ -506,6 +543,8 @@ class Fn:
                       "ldrsb": "(uint32_t)(int8_t)RD8", "ldrsh": "(uint32_t)(int16_t)RD16"}[mn]
                 if self.ordered and mn != "ldrex":
                     rd = re.sub(r"RD(8|16|32)$", r"RD\1A", rd)
+                elif i.address in self.spin and mn != "ldrex":   # (a load in a store-free, call-free loop: read every time)
+                    rd = re.sub(r"RD(8|16|32)$", r"RD\1V", rd)
                 out.append(f" {self.dst(o.reg)} = {rd}(ea{off});")
             else:
                 wr = {4: "WR32", 2: "WR16", 1: "WR8"}[sz]
