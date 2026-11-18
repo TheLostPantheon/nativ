@@ -147,7 +147,7 @@ back. `RECOMP_LOG_TOUCH=1` and `RECOMP_LOG_MOTION=1` show touch and motion reads
 
 ## System dialogs
 
-The Vita draws some screens itself: the save-data dialog and message boxes. The runtime
+The Vita draws some screens itself: the save-data dialog, message boxes and the text-input keyboard. The runtime
 keeps the console's states for each (NONE, RUNNING, FINISHED: the game polls `GetStatus`, reads `GetResult`, then calls
 `Term`) and the overlay draws the screen over the picture, in the launcher's look. `runtime/core/apputil.c` holds the
 state, `runtime/core/savedlg.h` and `commondlg.h` are what the overlay reads, and `runtime/ui/overlay.cpp` draws and
@@ -159,10 +159,17 @@ answers. The game keeps running underneath; keys and the pad go to the dialog wh
   reports that as the enter button) or Enter presses the selected button; Circle or Esc presses No or Cancel when
   there is one. `GetResult` carries the button's id. A card with no buttons stays until the game calls `Close` (or
   `Abort`); `ProgressBarInc`, `SetValue` and `SetMsg` change a bar.
+- **Text input** (`sceImeDialog`). The game's title over a text field starting with its initial text, with an OK button
+  (labelled Send, Search or Go if the game asks) and Cancel. The keyboard types into the field and Enter presses OK;
+  with a controller, SDL's text input is started, which raises Steam's on-screen keyboard in Game Mode, and Cross and
+  Circle press OK and Cancel. The game's length limit is enforced in UTF-16 units; Basic Latin takes ASCII only and
+  the number types digits and `. , + -`. On OK the text is written to the game's buffer as UTF-16 and the result is
+  OK; Cancel reports a canceled result and leaves the buffer alone.
 
 Without anyone to answer (a headless run, `save_dialog=auto` in the settings, or `RECOMP_SAVE_DIALOG=auto`) the
-message dialog presses its first button after a few `GetStatus` polls. It logs what it showed and what was answered, as
-`message dialog:` lines. The trophy setup, network check and EULA dialogs still finish at once with an OK result.
+message dialog presses its first button, and the text dialog answers OK with the initial text, or `RECOMP_IME_TEXT`
+if set, after a few `GetStatus` polls. Each dialog logs what it showed and what was answered, as `message dialog:`
+and `ime dialog:` lines. The trophy setup, network check and EULA dialogs still finish at once with an OK result.
 
 ## Code hooks
 

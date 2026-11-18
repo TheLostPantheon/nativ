@@ -23,7 +23,7 @@
 
 /* ---- common dialogs: one that was opened finishes at once with an OK result, as if the player
  * confirmed it; each kind has its own state (a dialog never opened reports NONE). The save-data
- * dialog and the message dialog are the exceptions: real ones, below. */
+ * dialog, the message dialog and the text-input dialog are the exceptions: real ones, below. */
 enum { DLG_TROPHY, DLG_NETCHECK, DLG_EULA, DLG_N };
 static int dialog_open[DLG_N];
 #define DIALOG(kind, name) \
@@ -554,9 +554,88 @@ void msgdlg_answer(int seq, int button) {
 	pthread_mutex_unlock(&md_mu);
 }
 
+/* ---- the text-input dialog (sceImeDialog): the system's on-screen keyboard and text field. SceImeDialogParam: type
+ * +0x14 (0 default, 1 basic latin, 2 number, 3 extended number, 4 URL, 5 mail), option +0x18 (1 multiline), dialogMode
+ * +0x20, textBoxMode +0x24 (1 password), title +0x28, maxTextLength +0x2c, initialText +0x30, inputTextBuffer +0x34
+ * (UTF-16, maxTextLength + 1 units), enterLabel +0x84 (0 OK, 1 Send, 2 Search, 3 Go). The states are the message
+ * dialog's. On OK the text goes to inputTextBuffer, terminated, and GetResult reads result 0, button ENTER (2); Cancel
+ * (Circle, Esc) is USER_CANCELED (1) with button CLOSE (1) and leaves the buffer alone. The overlay draws it
+ * (build_ime_dialog); with nobody to answer (sd_auto) it answers OK after a few GetStatus polls with the initial text,
+ * or RECOMP_IME_TEXT's. */
+static pthread_mutex_t ime_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	int open, status, result, button, seq, polls;
+	int type, multiline, password, label;
+	unsigned maxlen; uint32_t out;   /* the game's buffer (guest address) */
+	char title[520], text[IME_MAX_TEXT * 4 + 4];
+} ime;
+static void ime_finish(int result, int button, const char *how) {   /* (locked) */
+	ime.result = result; ime.button = button; ime.status = ST_FINISHED;
+	fprintf(stderr, "    ime dialog: %s\n", how);
+}
+static void h_ime_init(Cpu *c) {
+	if (!A0) { RET(0x80020402u); return; }
+	const uint32_t prm = A0, title = RD32(prm + 0x28), init = RD32(prm + 0x30), out = RD32(prm + 0x34);
+	const unsigned maxlen = RD32(prm + 0x2c);
+	if (!out || !maxlen || maxlen > IME_MAX_TEXT) { RET(0x80102001u); return; }   /* SCE_IME_DIALOG_ERROR_PARAM */
+	pthread_mutex_lock(&ime_mu);
+	ime.open = 1; ime.status = ST_RUNNING; ime.result = 0; ime.button = 0; ime.polls = 0; ime.seq++;
+	ime.type = (int)RD32(prm + 0x14); ime.multiline = RD32(prm + 0x18) & 1; ime.password = RD32(prm + 0x24) == 1;
+	ime.label = G(prm)[0x84] <= 3 ? G(prm)[0x84] : 0; ime.maxlen = maxlen; ime.out = out;
+	ime.title[0] = 0; if (title) cdlg_utf16_to_utf8(G(title), IME_MAX_TEXT, ime.title, sizeof ime.title);
+	ime.text[0] = 0; if (init) cdlg_utf16_to_utf8(G(init), maxlen, ime.text, sizeof ime.text);   /* (cut to the limit: the field starts valid) */
+	fprintf(stderr, "    ime dialog: \"%s\", up to %u characters, type %d%s%s, starts with \"%s\"\n", ime.title, maxlen, ime.type,
+		ime.multiline ? ", multiline" : "", ime.password ? ", password" : "", ime.password ? "(hidden)" : ime.text);
+	pthread_mutex_unlock(&ime_mu);
+	RET(0);
+}
+static void ime_ok(const char *text) {   /* (locked) the game's buffer gets the text, cut to maxTextLength */
+	const size_t n = cdlg_utf8_to_utf16(text, G(ime.out), ime.maxlen);
+	char shown[IME_MAX_TEXT * 4 + 4]; cdlg_utf16_to_utf8(G(ime.out), n, shown, sizeof shown);
+	char how[256]; snprintf(how, sizeof how, "answered OK: \"%.200s\"", ime.password ? "(hidden)" : shown);
+	ime_finish(0, 2, how);
+}
+static void h_ime_status(Cpu *c) {
+	pthread_mutex_lock(&ime_mu);
+	if (ime.open && ime.status == ST_RUNNING && ++ime.polls >= 3 && sd_auto()) { const char *e = getenv("RECOMP_IME_TEXT"); ime_ok(e ? e : ime.text); }
+	const int s = ime.open ? ime.status : ST_NONE;
+	pthread_mutex_unlock(&ime_mu);
+	RET(s);
+}
+static void h_ime_result(Cpu *c) {   /* (SceImeDialogResult *): result +0, button +4 */
+	if (!A0) { RET(0x80020402u); return; }
+	pthread_mutex_lock(&ime_mu);
+	const int open = ime.open, done = open && ime.status == ST_FINISHED;
+	if (done) { WR32(A0, ime.result); WR32(A0 + 4, ime.button); }
+	pthread_mutex_unlock(&ime_mu);
+	RET(done ? 0 : open ? 0x80020410u : 0x80020404u);
+}
+static void h_ime_term(Cpu *c) { pthread_mutex_lock(&ime_mu); ime.open = 0; ime.status = ST_NONE; pthread_mutex_unlock(&ime_mu); RET(0); }
+static void h_ime_abort(Cpu *c) {
+	pthread_mutex_lock(&ime_mu);
+	const int ok = ime.open && ime.status == ST_RUNNING;
+	if (ok) ime_finish(2, 0, "aborted by the game");   /* ABORTED, no button */
+	pthread_mutex_unlock(&ime_mu);
+	RET(ok ? 0 : 0x80020404u);
+}
+int imedlg_view(ImeDlgView *v) {
+	pthread_mutex_lock(&ime_mu);
+	static const char *const labels[] = {"OK", "Send", "Search", "Go"};
+	v->kind = ime.open && ime.status == ST_RUNNING; v->seq = ime.seq; v->type = ime.type; v->multiline = ime.multiline; v->password = ime.password;
+	v->enter_circle = SYSPARAM_ENTER_BUTTON == 0; v->maxlen = ime.maxlen; v->text = ime.text;
+	memcpy(v->title, ime.title, sizeof v->title); snprintf(v->enter_label, sizeof v->enter_label, "%s", labels[ime.label]);
+	return v->kind;
+}
+void imedlg_release(void) { pthread_mutex_unlock(&ime_mu); }
+void imedlg_answer(int seq, int ok, const char *text) {
+	pthread_mutex_lock(&ime_mu);
+	if (ime.open && seq == ime.seq && ime.status == ST_RUNNING) { if (ok) ime_ok(text); else ime_finish(1, 1, "cancelled"); }
+	pthread_mutex_unlock(&ime_mu);
+}
 int cdlg_active(void) {
 	pthread_mutex_lock(&md_mu); const int m = md.open && md.status == ST_RUNNING && md.nbtn; pthread_mutex_unlock(&md_mu);
-	return m;
+	pthread_mutex_lock(&ime_mu); const int i = ime.open && ime.status == ST_RUNNING; pthread_mutex_unlock(&ime_mu);
+	return m || i;
 }
 
 /* ---- trophies: a context and a handle that accept everything */
@@ -691,6 +770,8 @@ const HleEntry hle_apputil[] = {
 	{"sceMsgDialogGetResult", h_msg_dlg_result},
 	{"sceMsgDialogTerm", h_msg_dlg_term}, {"sceMsgDialogAbort", h_msg_dlg_abort}, {"sceMsgDialogClose", h_msg_dlg_close},
 	{"sceMsgDialogProgressBarInc", h_msg_bar_inc}, {"sceMsgDialogProgressBarSetValue", h_msg_bar_set}, {"sceMsgDialogProgressBarSetMsg", h_msg_bar_msg},
+	{"sceImeDialogInit", h_ime_init}, {"sceImeDialogGetStatus", h_ime_status}, {"sceImeDialogGetResult", h_ime_result},
+	{"sceImeDialogTerm", h_ime_term}, {"sceImeDialogAbort", h_ime_abort},
 	{"SceCommonDialog_33626E2C", h_eula_dlg_init}, {"SceCommonDialog_B7D4C911", h_eula_dlg_status},
 	{"SceCommonDialog_D1858A78", h_eula_dlg_result}, {"SceCommonDialog_BEBAEF25", h_eula_dlg_term}, {"SceCommonDialog_B55CF0E3", h_eula_dlg_term},
 	{"sceCommonDialogUpdate", h_zero},

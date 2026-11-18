@@ -1,7 +1,7 @@
 /*
- * Unit harness for the message dialog in runtime/core/apputil.c: the parameter parsing
- * (guest SceMsgDialogParam bytes), the console's states (NONE, RUNNING, FINISHED), the results
- * a game reads, and the headless auto-answer. It includes apputil.c so the
+ * Unit harness for the message dialog and the text-input dialog in runtime/core/apputil.c: the parameter parsing
+ * (guest SceMsgDialogParam / SceImeDialogParam bytes), the console's states (NONE, RUNNING, FINISHED), the results
+ * a game reads, the headless auto-answer, and the UTF-16 round trip of commondlg.h. It includes apputil.c so the
  * h_* handlers are reachable and supplies the runtime symbols it takes from elsewhere (stubs/ holds a stand-in
  * for SDL's header). What the overlay draws and the keys it answers by are not covered: they need a window.
  * Build and run: see README.md in this directory.
@@ -40,6 +40,7 @@ static uint32_t call(HleFn f, int n, ...) {
 }
 /* guest strings and structs */
 static uint32_t gstr(const char *s) { uint32_t a = guest_alloc((uint32_t)strlen(s) + 1, 4); strcpy((char *)G(a), s); return a; }
+static uint32_t g16(const char *utf8, unsigned max) { uint32_t a = guest_alloc((max + 1) * 2, 4); cdlg_utf8_to_utf16(utf8, G(a), max); return a; }
 static uint32_t gzero(uint32_t n) { uint32_t a = guest_alloc(n, 8); memset(G(a), 0, n); return a; }
 
 /* SceMsgDialogParam: mode +0x50, userMsgParam +0x54, sysMsgParam +0x58, errorCodeParam +0x5c, progBarParam +0x60 */
@@ -50,6 +51,27 @@ static uint32_t msg_user(int buttons, const char *text, const char *b1, const ch
 	return prm;
 }
 static int msg_status(void) { return (int)call(h_msg_dlg_status, 0); }
+static void test_utf16(void) {
+	/* "A", e-acute, euro sign, and a character outside the BMP (U+1F600 as a surrogate pair) */
+	const char *u8 = "A\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80";
+	uint8_t w[32]; char back[32];
+	size_t n = cdlg_utf8_to_utf16(u8, w, 16);
+	CHECKEQ((uint32_t)n, 5); CHECKEQ(w[0], 'A'); CHECKEQ(w[2], 0xe9); CHECKEQ(w[4], 0xac); CHECKEQ(w[5], 0x20);
+	CHECKEQ(w[6], 0x3d); CHECKEQ(w[7], 0xd8); CHECKEQ(w[8], 0x00); CHECKEQ(w[9], 0xde);   /* D83D DE00 */
+	CHECKEQ(w[10], 0); CHECKEQ(w[11], 0);                                                 /* terminator */
+	CHECKEQ((uint32_t)cdlg_utf16_to_utf8(w, 16, back, sizeof back), (uint32_t)strlen(u8)); CHECK(!strcmp(back, u8));
+	CHECKEQ((uint32_t)cdlg_utf16_units(u8), 5);
+	/* the limit never splits a pair: 4 units fit "A", e-acute, euro, not the emoji */
+	n = cdlg_utf8_to_utf16(u8, w, 4); CHECKEQ((uint32_t)n, 3); CHECKEQ(w[6], 0); CHECKEQ(w[7], 0);
+	n = cdlg_utf8_to_utf16(u8, w, 5); CHECKEQ((uint32_t)n, 5);
+	n = cdlg_utf8_to_utf16("", w, 4); CHECKEQ((uint32_t)n, 0);
+	/* a lone high surrogate becomes U+FFFD; the output buffer's size is respected */
+	uint8_t bad[6] = {0x3d, 0xd8, 'x', 0, 0, 0};
+	cdlg_utf16_to_utf8(bad, 3, back, sizeof back); CHECK(!strcmp(back, "\xef\xbf\xbd" "x"));
+	cdlg_utf8_to_utf16(u8, w, 16); char small[4]; cdlg_utf16_to_utf8(w, 5, small, sizeof small); CHECK(!strcmp(small, "A\xc3\xa9"));
+	/* a stray continuation byte and a truncated sequence both decode to something, never overrun */
+	n = cdlg_utf8_to_utf16("a\x80z\xe2\x82", w, 8); CHECKEQ((uint32_t)n, 4);
+}
 static void test_msg(void) {
 	hud = 1;   /* a window to answer in: nothing answers by itself */
 	uint32_t res = gzero(0x2c), prm;
@@ -126,10 +148,75 @@ static void test_msg(void) {
 	for (int i = 0; i < 10; i++) CHECKEQ(msg_status(), ST_RUNNING);
 	call(h_msg_dlg_term, 0);
 }
+/* SceImeDialogParam: type +0x14, option +0x18, dialogMode +0x20, textBoxMode +0x24, title +0x28, maxTextLength +0x2c,
+ * initialText +0x30, inputTextBuffer +0x34, enterLabel +0x84 */
+static uint32_t ime_param(const char *title, unsigned max, const char *init, uint32_t out, uint32_t type, uint32_t option) {
+	uint32_t prm = gzero(0xa8);
+	WR32(prm + 0x14, type); WR32(prm + 0x18, option); WR32(prm + 0x28, g16(title, 64)); WR32(prm + 0x2c, max);
+	WR32(prm + 0x30, g16(init, max)); WR32(prm + 0x34, out);
+	return prm;
+}
+static void test_ime(void) {
+	hud = 1;
+	const uint32_t res = gzero(0x24), out = gzero(2 * 64), sent = 0xaaaaaaaau;
+	ImeDlgView v; char got[300];
+	memset(G(out), 0xaa, 2 * 64);
+	CHECKEQ(call(h_ime_init, 1, 0), 0x80020402u);
+	CHECKEQ(call(h_ime_status, 0), ST_NONE);
+	CHECKEQ(call(h_ime_init, 1, ime_param("T", 0, "", out, 0, 0)), 0x80102001u);       /* no room for a character */
+	CHECKEQ(call(h_ime_init, 1, ime_param("T", 3000, "", out, 0, 0)), 0x80102001u);    /* past 2048 */
+	CHECKEQ(call(h_ime_init, 1, ime_param("T", 8, "", 0, 0, 0)), 0x80102001u);         /* no buffer */
+
+	/* OK: the text goes to the game's buffer as UTF-16, terminated, cut to the limit */
+	uint32_t prm = ime_param("Enter a n\xc3\xa5me", 8, "Bob", out, 5, 1);
+	WR32(prm + 0x24, 1); G(prm)[0x84] = 2;
+	CHECKEQ(call(h_ime_init, 1, prm), 0);
+	for (int i = 0; i < 10; i++) CHECKEQ(call(h_ime_status, 0), ST_RUNNING);
+	CHECKEQ(call(h_ime_result, 1, res), 0x80020410u);
+	CHECKEQ(imedlg_view(&v), 1);
+	CHECK(!strcmp(v.title, "Enter a n\xc3\xa5me") && !strcmp(v.text, "Bob") && !strcmp(v.enter_label, "Search"));
+	CHECKEQ(v.maxlen, 8); CHECKEQ(v.type, 5); CHECK(v.multiline && v.password);
+	imedlg_release(); CHECK(cdlg_active());
+	imedlg_answer(v.seq - 1, 1, "stale");   /* an answer to a dialog that has gone is dropped */
+	CHECKEQ(call(h_ime_status, 0), ST_RUNNING);
+	imedlg_answer(v.seq, 1, "Zo\xc3\xab" "123456789");
+	CHECKEQ(call(h_ime_status, 0), ST_FINISHED);
+	CHECK(!cdlg_active());
+	CHECKEQ(call(h_ime_result, 1, res), 0); CHECKEQ(RD32(res), 0); CHECKEQ(RD32(res + 4), 2);   /* OK, ENTER */
+	cdlg_utf16_to_utf8(G(out), 64, got, sizeof got); CHECK(!strcmp(got, "Zo\xc3\xab" "12345"));   /* 8 units, then NUL */
+	CHECKEQ(G(out)[16], 0); CHECKEQ(G(out)[17], 0);
+	call(h_ime_term, 0); CHECKEQ(call(h_ime_status, 0), ST_NONE);
+
+	/* Cancel: result USER_CANCELED, button CLOSE, the buffer left alone */
+	memset(G(out), 0xaa, 2 * 64);
+	CHECKEQ(call(h_ime_init, 1, ime_param("Name", 8, "Al", out, 0, 0)), 0);
+	imedlg_view(&v); imedlg_release(); CHECK(!strcmp(v.enter_label, "OK") && !v.multiline && !v.password);
+	imedlg_answer(v.seq, 0, "");
+	CHECKEQ(call(h_ime_result, 1, res), 0); CHECKEQ(RD32(res), 1); CHECKEQ(RD32(res + 4), 1);
+	CHECKEQ(RD32(out), sent); call(h_ime_term, 0);
+
+	/* Abort: ABORTED, no button; an initial text longer than the limit is cut */
+	CHECKEQ(call(h_ime_init, 1, ime_param("Name", 3, "abcdef", out, 0, 0)), 0);
+	imedlg_view(&v); CHECK(!strcmp(v.text, "abc")); imedlg_release();
+	CHECKEQ(call(h_ime_abort, 0), 0); call(h_ime_result, 1, res); CHECKEQ(RD32(res), 2); CHECKEQ(RD32(res + 4), 0);
+	CHECKEQ(call(h_ime_abort, 0), 0x80020404u); call(h_ime_term, 0);
+
+	/* headless: OK with the initial text after a few polls, or RECOMP_IME_TEXT's */
+	hud = 0;
+	CHECKEQ(call(h_ime_init, 1, ime_param("Name", 8, "Rex", out, 0, 0)), 0);
+	CHECKEQ(call(h_ime_status, 0), ST_RUNNING); CHECKEQ(call(h_ime_status, 0), ST_RUNNING); CHECKEQ(call(h_ime_status, 0), ST_FINISHED);
+	cdlg_utf16_to_utf8(G(out), 64, got, sizeof got); CHECK(!strcmp(got, "Rex"));
+	call(h_ime_result, 1, res); CHECKEQ(RD32(res), 0); CHECKEQ(RD32(res + 4), 2); call(h_ime_term, 0);
+	setenv("RECOMP_IME_TEXT", "Scripted", 1);
+	CHECKEQ(call(h_ime_init, 1, ime_param("Name", 4, "Rex", out, 0, 0)), 0);
+	call(h_ime_status, 0); call(h_ime_status, 0); call(h_ime_status, 0);
+	cdlg_utf16_to_utf8(G(out), 64, got, sizeof got); CHECK(!strcmp(got, "Scri"));   /* cut to the game's limit */
+	call(h_ime_term, 0); unsetenv("RECOMP_IME_TEXT");
+}
 int main(void) {
 	recomp_mem = mmap(0, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (recomp_mem == MAP_FAILED) { perror("mmap"); return 2; }
-	test_msg();
+	test_utf16(); test_msg(); test_ime();
 	fprintf(stderr, "%d checks, %d failed\n", checks, fails);
 	return fails ? 1 : 0;
 }
