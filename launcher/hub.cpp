@@ -1607,6 +1607,7 @@ static void setup_modal(SDL_Window *win) {
 
 static bool g_add_open;   /* the Add a game dialog */
 /* ---- a game's card: its cover (pic0), icon, name, state, one primary action */
+static std::string self_exe(void);   /* (below, with find_root) */
 static void game_card(const Game &g, float w, float name_h) {
 	const float em = ImGui::GetFontSize(), pad = em * 0.9f;
 	const float img_h = w * 544.0f / 960.0f;
@@ -1693,6 +1694,13 @@ static void game_card(const Game &g, float w, float name_h) {
 		if (ImGui::MenuItem("Game settings…")) { make_dir(g_dump + "/decrypted/" + g.id + "/recomp"); g_game_settings = g.id; }
 		ImGui::EndDisabled();
 		if (ImGui::MenuItem("Show its folder")) open_folder(g_dump + "/decrypted/" + g.id);
+		ImGui::BeginDisabled(busy || !g.imported);
+		if (ImGui::MenuItem("Add to Steam")) {   /* (a non-Steam game starting it with --play: Steam's Game Mode, a Steam Deck) */
+			Step s = step("Adding it to Steam", vitarecomp({"steam", g.id})); s.env.push_back("NATIV_LAUNCHER_EXE=" + self_exe());
+			task_start("Adding " + g.name + " to Steam", "steam", g.id, {s});
+		}
+		ImGui::EndDisabled();
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Adds it to Steam as a non-Steam game, with its own art, so Steam (and a Steam Deck's\nGame Mode) can start it. Close Steam first: it rewrites its list when it quits.");
 		ImGui::BeginDisabled(busy);
 		if (ImGui::MenuItem("Report a problem…"))   /* (the logs, settings and F5 pictures in one zip, shown in its folder) */
 			task_start("Making a bug report for " + g.name, "report", g.id, {step("Collecting the logs and settings", vitarecomp({"report", g.id}))});
@@ -1905,6 +1913,24 @@ static int shot(SDL_Window *win, const char *path, int w, int h) {
 
 /* the repository (or an install of it): ATIV_ROOT, else the one the launcher sits in -- launcher/nativ, or beside it
  * at the top -- wherever it was moved, else where it was built */
+/* the launcher's own program, for a Steam shortcut to run (vitarecomp steam): on Linux the AppImage when it runs as one */
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+static std::string self_exe(void) {
+#ifdef _WIN32
+	wchar_t w[MAX_PATH * 4]; DWORD n = GetModuleFileNameW(nullptr, w, MAX_PATH * 4);
+	int m = WideCharToMultiByte(CP_UTF8, 0, w, (int)n, nullptr, 0, nullptr, nullptr); std::string s((size_t)m, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w, (int)n, &s[0], m, nullptr, nullptr); return s;
+#elif defined(__APPLE__)
+	char b[4096]; uint32_t n = sizeof b; if (_NSGetExecutablePath(b, &n) != 0) return "";
+	if (char *full = realpath(b, nullptr)) { std::string s = full; free(full); return s; }
+	return b;
+#else
+	if (const char *a = getenv("APPIMAGE")) if (*a) return a;
+	char b[4096]; ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1); if (n <= 0) return ""; b[n] = 0; return b;
+#endif
+}
 static std::string find_root(void) {
 	if (const char *r = getenv("ATIV_ROOT")) if (*r) return r;
 	if (const char *b = SDL_GetBasePath())
@@ -2008,7 +2034,12 @@ static bool mac_preflight(void) {
 }
 #endif
 
-int main(int, char **) {
+/* nativ --play <title>: that game started as the launcher opens (built first when it needs it, the launcher showing that), and
+ * the launcher closed when the game ends -- what a Steam shortcut runs (Add to Steam, the card's menu), so Steam's Game Mode
+ * starts the game and sees it end */
+static std::string g_autoplay;
+int main(int argc, char **argv) {
+	for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--play")) g_autoplay = argv[i + 1];
 	g_root = find_root();
 	if (!exists(g_root + "/pipeline/vitarecomp.py")) {   /* (the launcher apart from its folder: run from inside the zip, or copied out alone) */
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Project Nativ", "Project Nativ can't find the rest of its files.\n\nIf you opened it from inside the zip, extract the whole zip first (on Windows: right-click it, Extract All), then open Project Nativ from the extracted folder.", nullptr);
@@ -2068,6 +2099,14 @@ int main(int, char **) {
 	set_env("RECOMP_SETTINGS_SHARED", shared_path());   /* the games it starts read the same shared file (runtime/core/main.c) */
 	library_scan();
 	g_setup_open = g_prefs["setup_done"] != "1" || !g_firmware;   /* first run, or the firmware still missing */
+	if (!g_autoplay.empty() && !shot_path) {
+		const Game *g = nullptr; for (const Game &x : g_games) if (x.id == g_autoplay) g = &x;
+		if (g && g->imported && !g_setup_open) start_play(*g);
+		else {
+			SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Project Nativ", ("Project Nativ can't start " + g_autoplay + " yet: add it to your library first.").c_str(), nullptr);
+			g_autoplay.clear();
+		}
+	}
 	if (!g_firmware && g_prefs["setup_done"] == "1") g_setup_step = 1;
 	if (shot_path) {
 		std::string ui_sel = getenv("ATIV_SHOT_UI") ? getenv("ATIV_SHOT_UI") : "library";
@@ -2108,7 +2147,8 @@ int main(int, char **) {
 		static Uint64 last_scan;
 		if (g_task.running && SDL_GetTicks() - last_scan > 1500) { library_scan(); last_scan = SDL_GetTicks(); }   /* (a long add: its card follows) */
 		if (g_refresh.exchange(false)) {
-			if (g_task.kind == "play") { SDL_RestoreWindow(win); SDL_RaiseWindow(win); }   /* (the game closed: back to the library) */
+			if (g_task.kind == "play" && !g_autoplay.empty() && g_task.ok) quit = true;   /* (--play: the game ended, and with it the launcher Steam started) */
+			else if (g_task.kind == "play") { SDL_RestoreWindow(win); SDL_RaiseWindow(win); }   /* (the game closed: back to the library) */
 			library_scan();
 			if (g_task.kind == "scan" && g_task.ok) scan_load(scan_file());
 			if (g_task.kind == "report" && g_task.ok) open_folder(g_dump + "/reports");
