@@ -1002,9 +1002,14 @@ static void build_save_dialog(float w, float hgt) {
 static int g_md_seq = -1, g_md_sel; static bool g_md_armed;
 static ImGuiKey pad_enter(bool circle) { return circle ? ImGuiKey_GamepadFaceRight : ImGuiKey_GamepadFaceDown; }
 static ImGuiKey pad_back(bool circle) { return circle ? ImGuiKey_GamepadFaceDown : ImGuiKey_GamepadFaceRight; }
+static int g_cdlg_demo;   /* RECOMP_OVERLAY_DUMP_UI=msgdlg / ime: a sample of each card, for checking their layout headless */
 static void build_msg_dialog(float w, float hgt) {
-	MsgDlgView v; const int kind = msgdlg_view(&v);
-	msgdlg_release();
+	MsgDlgView v; int kind;
+	if (g_cdlg_demo == 1) {
+		memset(&v, 0, sizeof v); v.kind = kind = 1; v.seq = 1; v.percent = -1; v.nbuttons = 2; v.back = 1;
+		snprintf(v.label[0], sizeof v.label[0], "Yes"); snprintf(v.label[1], sizeof v.label[1], "No");
+		snprintf(v.msg, sizeof v.msg, "The save data is corrupted and can't be loaded.\nDelete it and start a new game?");
+	} else { kind = msgdlg_view(&v); msgdlg_release(); }
 	if (kind == 0) { g_md_seq = -1; return; }
 	if (v.seq != g_md_seq) { g_md_seq = v.seq; g_md_sel = 0; g_md_armed = false; }
 	const ImGuiKey kok = pad_enter(v.enter_circle), kback = pad_back(v.enter_circle);
@@ -1072,7 +1077,11 @@ static void ime_text_input(bool on) {   /* (SDL's text input: the on-screen keyb
 	if (on) SDL_StartTextInput(g_window); else SDL_StopTextInput(g_window);
 }
 static void build_ime_dialog(float w, float hgt) {
-	ImeDlgView v; const int kind = imedlg_view(&v);
+	ImeDlgView v; int kind;
+	if (g_cdlg_demo == 2) {
+		memset(&v, 0, sizeof v); v.kind = kind = 1; v.seq = 1; v.maxlen = 16;
+		snprintf(v.title, sizeof v.title, "Enter your name"); snprintf(v.enter_label, sizeof v.enter_label, "OK"); v.text = "Nathan";
+	} else kind = imedlg_view(&v);
 	if (!kind) { imedlg_release(); g_ime_seq = -1; ime_text_input(false); return; }
 	const bool fresh = v.seq != g_ime_seq;
 	if (fresh) { g_ime_seq = v.seq; g_ime_armed = false; snprintf(g_ime_buf, sizeof g_ime_buf, "%s", v.text); }
@@ -1081,7 +1090,7 @@ static void build_ime_dialog(float w, float hgt) {
 	const bool pad_ok = g_ime_armed && ImGui::IsKeyPressed(kok, false), cancel = g_ime_armed && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(kback, false));
 	const unsigned maxlen = v.maxlen; const int type = v.type; const bool multi = v.multiline, pass = v.password;
 	char title[520], label[16]; snprintf(title, sizeof title, "%s", v.title); snprintf(label, sizeof label, "%s", v.enter_label);
-	imedlg_release();
+	if (g_cdlg_demo != 2) imedlg_release();
 	ime_text_input(true);
 	const float s = w >= 1400 ? 2.0f : 1.0f;
 	ImGui::SetNextWindowPos(ImVec2(w * 0.5f, hgt * 0.4f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -1597,6 +1606,11 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 		return;
 	}
 	if (!strcmp(ui, "quit")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_quit); return; }   /* (the quit card) */
+	if (!strcmp(ui, "msgdlg") || !strcmp(ui, "ime")) {   /* (a sample message dialog / text-input dialog) */
+		g_cdlg_demo = ui[0] == 'm' ? 1 : 2;
+		for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, g_cdlg_demo == 1 ? +[] { ImVec2 d = ImGui::GetIO().DisplaySize; build_msg_dialog(d.x, d.y); } : +[] { ImVec2 d = ImGui::GetIO().DisplaySize; build_ime_dialog(d.x, d.y); });
+		g_cdlg_demo = 0; return;
+	}
 	if (!strcmp(ui, "layout")) { for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_layout); return; }   /* (the layout card: RECOMP_GAME_NAME names the game) */
 	if (!strcmp(ui, "prep")) { g_prep_demo[0] = 1240; g_prep_demo[1] = 5837; g_prep_demo[2] = 372; for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_prep); g_prep_demo[0] = -1; return; }   /* (the shader prep card, example numbers) */
 	if (!strncmp(ui, "intro", 5)) {   /* "intro", "intro:pad", "intro:touch": the touch card with that device highlighted; "@<seconds>" after it, that moment of its loop */
