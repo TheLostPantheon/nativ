@@ -16,6 +16,7 @@ double aspect_widen(void);              /* the horizontal widening for the aspec
 double fov_scale(double fov);           /* a vertical fov (radians) under the fov setting; 0: leave it */
 void widen_aspect_reg(Cpu *c, int reg); /* a register holding 960/544, widened by aspect_widen() */
 void recomp_ihook_frame_dt(Cpu *c, int reg);
+void recomp_ihook_aspect(Cpu *c, int reg);   /* any game's 960/544 site, widened (IHOOKS="addr:aspect") */
 uint64_t display_frames(void);
 int display_frame_rate_60(void);
 float display_frame_dt(void);

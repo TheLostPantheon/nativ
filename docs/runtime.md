@@ -155,6 +155,17 @@ The hook functions are written per game in `packs/<title>/hooks.c`, with shared 
 Without hooks, the generated code is unchanged. The recompiler warns when an address isn't a function entry or an
 instruction.
 
+Three shared hooks need no C in the pack, only an `IHOOKS` entry:
+
+- `frame_dt` replaces a 1/30 s float with the time the frame actually took, while the 60 fps cap is on.
+- `frames30` doubles a count of frames written for 30 fps.
+- `aspect` widens 960/544 for a wider screen.
+
+`dev/hookscan.py <analysis/eboot.data.json>` lists every place a game builds 1/30 or 960/544 in a register, as
+`IHOOKS` candidates. On the enhanced games it finds every site their packs list. It also finds sites that must be
+left alone, such as a fixed-step loop that's already frame-rate independent, so each candidate is checked by
+playing at 30 and 60 fps before it goes in a pack. `--pack packs/<title>/pack.toml` compares with what a pack lists.
+
 Example: Unit 13's field-of-view setting widens its camera update's fields for the length of the update, so the
 projection, culling and stored field of view all agree, while the weapon camera stays as it was. Widening only the
 projection had left objects popping in and out at the new edges.
