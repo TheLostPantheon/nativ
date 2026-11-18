@@ -54,6 +54,19 @@ def candidates(samples, rng):
     return out
 
 
+def unpredictable(i):
+    """forms the ARM ARM leaves UNPREDICTABLE or privileged, which no compiler emits and the CPU needn't agree on with
+    itself: ldm/stm "^" (user registers, exception return); NEON and VFP transfers naming pc as a core register (a
+    vld/vst base, vmov's source); a register list running past d31 (capstone names it fpinst2, mvfr0...); a register-
+    shifted register with pc anywhere in it"""
+    ops = i.op_str
+    if "^" in ops: return True
+    if re.search(r"\b(fpinst2?|mvfr[012]|fpexc|fpsid)\b", ops): return True
+    if i.mnemonic.startswith(("v", "f")) and re.search(r"\bpc\b", ops): return True
+    if re.search(r"\b(lsl|lsr|asr|ror) (r\d+|sb|sl|fp|ip|sp|lr|pc)\b", ops) and re.search(r"\bpc\b", ops): return True
+    return False
+
+
 def decode(cands):
     """what capstone decodes, the whole encoding consumed, not control flow: {(text, arm): [bytes...]}"""
     seen = defaultdict(list)
@@ -61,7 +74,7 @@ def decode(cands):
         dis = recomp.md_arm if arm else recomp.md
         i = next(dis.disasm(b, ARM_BASE if arm else THUMB_BASE, count=1), None)
         if i is None or i.size != len(b): continue
-        if insnsweep.is_control(i, i.mnemonic): continue
+        if insnsweep.is_control(i, i.mnemonic) or unpredictable(i): continue
         seen[(f"{i.mnemonic} {i.op_str}".strip(), arm)].append(b)
     return seen
 

@@ -50,6 +50,17 @@ class Unsupported(Exception):
     pass
 
 
+class FoldedImm:
+    """an immediate operand made from two of capstone's (an ARM "#imm8, #rot" spelling): what the translator reads of one"""
+    type = ARM_OP_IMM
+    subtracted = False
+    vector_index = -1
+
+    def __init__(self, imm):
+        self.imm = imm
+        self.shift = type("Shift", (), {"type": 0, "value": 0})()
+
+
 class Fn:
     def __init__(self, entry, insns, entries, arm=False):
         self.entry, self.insns, self.entries, self.arm = entry, insns, entries, arm
@@ -129,6 +140,13 @@ class Fn:
                     mn = mn[:-len(cc)]
                     break
         ops = list(i.operands)
+        if self.arm and len(ops) >= 3 and ops[-1].type == ARM_OP_IMM and ops[-2].type == ARM_OP_IMM \
+                and (int.from_bytes(i.bytes[:4], "little") >> 25) & 7 == 0b001:
+            # an ARM data-processing immediate whose encoding capstone spells "#imm8, #rot" (a rotation it
+            # can't print as one constant): the value is imm8 rotated right by rot. Only the imm8 was used
+            # (eors r3, r9, #104, #10; isacover, 2026-11-17). imm_carry still reads C from the encoding
+            v, rot = ops[-2].imm & 0xff, ops[-1].imm & 31
+            ops = ops[:-2] + [FoldedImm(((v >> rot) | (v << (32 - rot))) & 0xffffffff if rot else v)]
         # capstone's update_flags is also true for some non-S forms (adc.w): trust the mnemonic's S
         S = i.update_flags and mn.endswith("s") and mn != "mls"
         nxt = i.address + i.size
@@ -940,10 +958,12 @@ class Fn:
             nd = [2 * regs[0][1], 2 * regs[0][1] + 1] if regs[0][0] == "q" else [regs[0][1]]
             return [" ".join(f"c->vfp.d[{x}] = 0x{rep64:x}ull;" for x in nd)]
         if mn == "vmov" and len(ops) == 2 and regs[0] and regs[0][0] == "d" and regs[1] and regs[1][0] == "r":
-            # vmov.32 dN[x], rT (capstone gives the lane in the operand's vector_index)
+            # vmov.<8|16|32> dN[x], rT (capstone gives the lane in the operand's vector_index): the low bits of rT into
+            # that element. The .8 and .16 forms were written as 32-bit lanes (vmov.8 d14[2] shifted by 64: isacover)
+            bits = int(dt) if dt in ("8", "16") else 32
             lane = ops[0].vector_index if ops[0].vector_index >= 0 else 0
-            sh = 32 * lane
-            return [f"c->vfp.d[{regs[0][1]}] = (c->vfp.d[{regs[0][1]}] & ~(0xffffffffull << {sh})) | ((uint64_t)c->r[{regs[1][1]}] << {sh});"]
+            sh, mask = bits * lane, (1 << bits) - 1
+            return [f"c->vfp.d[{regs[0][1]}] = (c->vfp.d[{regs[0][1]}] & ~(0x{mask:x}ull << {sh})) | ((uint64_t)(c->r[{regs[1][1]}] & 0x{mask:x}u) << {sh});"]
         if mn == "vmov" and dt in ("u8", "s8", "u16", "s16") and len(ops) == 2 and regs[0] and regs[0][0] == "r" and regs[1] and regs[1][0] == "d" and ops[1].vector_index >= 0:
             # vmov.u16 rT, dN[x]: one element of a D register to a core register, zero- or sign-extended
             bits = int(dt[1:]); sh = bits * ops[1].vector_index
@@ -1120,14 +1140,14 @@ class Fn:
                     else:
                         out.append(f" memcpy(G(ea + {es * k}), {p_} + {lane * es}, {es});")
                 post = [o for o in ops if o.type == ARM_OP_REG and md.reg_name(o.reg) in GPR and o is not ops[0]]
-                if i.writeback:   # one element transferred either way
+                if i.writeback or post:   # one element transferred either way ("[rN], rM" isn't writeback to capstone 5)
                     out.append(f" c->r[{base}] = ea + {es if alld else es * len(ds)};" if not post else f" c->r[{base}] = ea + {self.r(post[-1].reg, i)};")
                 out.append(" }")
                 return ["".join(out)]
             for k, dn in enumerate(ds):
                 out.append(f" c->vfp.d[{dn}] = RD64(ea + {8 * k});" if mn == "vld1" else f" WR64(ea + {8 * k}, c->vfp.d[{dn}]);")
             post = [o for o in ops if o.type == ARM_OP_REG and md.reg_name(o.reg) in GPR and o is not ops[0]]
-            if i.writeback:
+            if i.writeback or post:   # ("[rN], rM": capstone 5 doesn't call that writeback; the base stayed put. isacover, 2026-11-17)
                 out.append(f" c->r[{base}] = ea + {8 * len(ds)};" if not post else f" c->r[{base}] = ea + {self.r(post[-1].reg, i)};")
             out.append(" }")
             return ["".join(out)]
