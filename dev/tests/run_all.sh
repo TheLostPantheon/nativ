@@ -12,6 +12,8 @@ failed=()
 step() { local name=$1; shift; echo "== $name"; if "$@"; then echo "   ok"; else echo "   FAILED"; failed+=("$name"); fi; }
 
 step "game packs (packconf.py --check)" $PY pipeline/packconf.py --check
+step "the README's games table (packconf.py --table)" $PY pipeline/packconf.py --table --check README.md
+step "Steam shortcuts (steam.py selftest)" $PY pipeline/steam.py selftest
 step "copies and versions (packs.py selftest)" env PYTHONPATH=decrypt $PY pipeline/packs.py selftest
 step "recompiler against the CPU (recomp_exec_test.py)" $PY dev/tests/recomp_exec_test.py $([ "${1:-}" = quick ] && echo 20 || echo 60)
 
