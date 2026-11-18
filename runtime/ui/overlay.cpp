@@ -195,7 +195,7 @@ void overlay_process_event(const SDL_Event *event) {
  * next frame), then this copy is the live value and every edit saves at once. One setter per key, so
  * the page and the menu can't drift apart. The values with a live owner elsewhere (render scale,
  * aspect, fullscreen, the overlay level) are read from that owner every frame instead. */
-static struct { bool loaded; float fov, view, scen, chr, tcs, gyro_sens, vol; int fr, gyro, gyro_flat; } P;
+static struct { bool loaded; float fov, view, scen, chr, tcs, gyro_sens, vol, deadzone; int fr, gyro, gyro_flat; } P;
 static void prefs_load(void) {
 	if (P.loaded) return;
 	char b[16];
@@ -206,6 +206,7 @@ static void prefs_load(void) {
 	P.tcs = (float)settings_float("touch_cursor_speed", 1.0);
 	P.gyro = settings_int("gyro", 1); P.gyro_flat = !strcmp(settings_str("gyro_pose", "upright", b, sizeof b), "flat");
 	P.gyro_sens = (float)settings_float("gyro_sens", 1.0);
+	P.deadzone = (float)settings_float("stick_deadzone", 0.0) * 100.0f;
 	P.vol = (float)settings_float("volume", 1.0);
 	P.loaded = true;
 }
@@ -228,6 +229,7 @@ static void set_tcs(float v) { P.tcs = v; settings_set_float("touch_cursor_speed
 static void set_gyro(int on) { P.gyro = on != 0; settings_set_int("gyro", P.gyro); settings_save(); }
 static void set_gyro_pose(int flat) { P.gyro_flat = flat != 0; settings_set_str("gyro_pose", flat ? "flat" : "upright"); settings_save(); }
 static void set_gyro_sens(float v) { P.gyro_sens = v; settings_set_float("gyro_sens", v); settings_save(); }
+static void set_deadzone(float pct) { P.deadzone = pct; settings_set_float("stick_deadzone", pct / 100.0f); settings_save(); }
 static void set_volume(float v) { P.vol = v; settings_set_float("volume", v); settings_save(); }   /* window.c applies it to every output port */
 static void set_osd(int level) { metrics_osd_set(level); settings_set_int("osd", level); settings_save(); }
 
@@ -457,6 +459,8 @@ static void page_controls(void) {
 		  if (ui::segmented(names, 2, &v)) { settings_set_str("shoulder_buttons", v ? "bumpers" : "triggers"); settings_save(); } }
 		ui::row("Touch cursor speed", "Hold the shoulder pair that isn't L and R, and move a stick: the cursor is a finger on the touch screen (Cross, L or R presses). Move both sticks for two fingers.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##tcs", &P.tcs, 0.25f, 3.0f, "%.2f×")) set_tcs(P.tcs);
+		ui::row("Stick deadzone", "How far a controller's stick moves before the game sees it: raise it if the camera or your character drifts on its own.");
+		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##dz", &P.deadzone, 0.0f, 50.0f, "%.0f%%")) set_deadzone(P.deadzone);
 		ui::rows_end();
 	}
 	section_label("Motion");

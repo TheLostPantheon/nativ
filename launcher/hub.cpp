@@ -161,8 +161,10 @@ static void window_icon(SDL_Window *win) {
 
 /* ---- the user's settings (the platform's per-user app folder, or ATIV_PREFS=<dir>: a test's): setup finished, the
  * drawer's state (hub.ini); a folder search's results (scan.tsv); the settings every game reads (settings.ini) */
+static bool portable_install(void) { return exists(g_root + "/portable.txt"); }   /* (Windows' zip: everything in its own folder; pipeline/datadir.py portable) */
 static std::string pref_dir(void) {
 	if (const char *d = getenv("ATIV_PREFS")) { make_dir(d); return std::string(d) + "/"; }
+	if (portable_install()) { make_dir(g_root + "/settings"); return g_root + "/settings/"; }
 	char *p = SDL_GetPrefPath("ProjectNativ", "Nativ");
 	std::string s = p ? p : "";
 	SDL_free(p);
@@ -1169,6 +1171,60 @@ static std::string online_tag(Ini &shared) {
 	std::string tag; for (int n = 0; n < 6; n++, v >>= 5) tag += al[v & 31];
 	return tag;
 }
+/* Settings' Library page: where the library is, moving it (vitarecomp library move: renamed on the same drive, else copied,
+ * checked and then deleted where it was), making a Windows install portable, and the launcher's own size */
+static std::string g_move_dest; static bool g_move_portable;
+static float g_dpi_scale = 1.0f;
+static void apply_ui_scale(void) {   /* (the style rebuilt from ImGui's defaults: ui::apply scales what it's given) */
+	float k = (float)atof(g_prefs["ui_scale"].c_str()); if (!(k >= 0.6f && k <= 2.0f)) k = 1.0f;
+	ImGui::GetStyle() = ImGuiStyle(); ui::apply(16.0f, g_dpi_scale * k);
+}
+static void library_page(void) {
+	const float em = ImGui::GetFontSize();
+	ui::row("Library", "Your games, their builds and your saves. Moving it to another drive copies everything first, which can take a while for big games.");
+	ImGui::PushStyleColor(ImGuiCol_Text, ui::muted); ImGui::TextWrapped("%s", g_dump.c_str()); ImGui::PopStyleColor();
+	ImGui::BeginDisabled(g_task.running || portable_install());
+	if (ImGui::Button("Move it…")) { g_move_dest.clear(); g_move_portable = false; pick_folder(nullptr, &g_move_dest); }
+	ImGui::EndDisabled();
+	ImGui::SameLine(); if (ImGui::Button("Show it")) open_folder(g_dump);
+	if (portable_install()) ui::muted_wrapped("This install is portable: the library and settings stay in its own folder.");
+#ifdef _WIN32
+	else {
+		ui::row("Portable", "Keep the library and your settings in this Project Nativ folder, so the whole folder can go on another drive or computer.");
+		ImGui::BeginDisabled(g_task.running);
+		if (ImGui::Button("Make this install portable…")) { g_move_dest = g_root + "\\library"; g_move_portable = true; }
+		ImGui::EndDisabled();
+	}
+#endif
+	if (!g_move_dest.empty() && !ImGui::IsPopupOpen("move_library")) ImGui::OpenPopup("move_library");
+	if (ImGui::BeginPopup("move_library")) {
+		ImGui::PushTextWrapPos(em * 26);
+		ImGui::TextWrapped(g_move_portable ? "Move the library into this folder and keep your settings here?" : "Move the library to %s?", g_move_dest.c_str());
+		ui::muted_wrapped("Nothing is deleted until everything has been copied and checked. Don't start a game until it's done.");
+		ImGui::PopTextWrapPos();
+		if (ui::primary_button("Move")) {
+			task_start(g_move_portable ? "Making this install portable" : "Moving your library", "library", "", {step("Moving the library", vitarecomp({"library", "move", g_move_dest}))});
+			if (g_move_portable) {   /* (the settings copied now; portable.txt once the move has finished, below) */
+				make_dir(g_root + "/settings");
+				for (const char *f : {"hub.ini", "settings.ini", "scan.tsv"}) {
+					std::string body = read_file(pref_dir() + f);
+					if (!body.empty()) if (FILE *o = fopen((g_root + "/settings/" + f).c_str(), "wb")) { fwrite(body.data(), 1, body.size(), o); fclose(o); }
+				}
+				g_prefs["portable_pending"] = "1";
+			}
+			g_move_dest.clear(); ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine(); if (ImGui::Button("Cancel")) { g_move_dest.clear(); ImGui::CloseCurrentPopup(); }
+		ImGui::EndPopup();
+	}
+	ui::row("Launcher size", "Larger or smaller text and controls in this window.");
+	{	float k = (float)atof(g_prefs["ui_scale"].c_str()); if (!(k >= 0.6f && k <= 2.0f)) k = 1.0f;
+		int pct = (int)lroundf(k * 100);
+		ImGui::SetNextItemWidth(-FLT_MIN);
+		if (ImGui::SliderInt("##uiscale", &pct, 70, 150, "%d%%")) {}
+		if (ImGui::IsItemDeactivatedAfterEdit()) { pct = (pct + 2) / 5 * 5; char b[16]; snprintf(b, sizeof b, "%.2f", pct / 100.0); prefs_set("ui_scale", b); apply_ui_scale(); }
+	}
+}
 static void settings_modal(void) {
 	const ImGuiViewport *vp = ImGui::GetMainViewport();
 	const float em = ImGui::GetFontSize();
@@ -1181,9 +1237,9 @@ static void settings_modal(void) {
 	ui::heading("Settings", em * 1.4f);
 	ui::muted_wrapped("For every game. A game reads them when it starts; its own menu (F10) changes them too, for every game. A game's own options, and any value it keeps for itself, are under Game settings on its card.");
 	ImGui::Dummy(ImVec2(0, em * 0.2f));
-	static const char *const tabs[] = {"Display##st", "Controls##st", "Sound & online##st"};
-	ui::segmented(tabs, 3, &g_settings_tab); tab_hint();
-	g_settings_tab = (g_settings_tab + tab_step() + 3) % 3;
+	static const char *const tabs[] = {"Display##st", "Controls##st", "Sound & online##st", "Library##st"};
+	ui::segmented(tabs, 4, &g_settings_tab); tab_hint();
+	g_settings_tab = (g_settings_tab + tab_step() + 4) % 4;
 	ImGui::Dummy(ImVec2(0, em * 0.2f));
 	SetTarget t{&g_shared, shared_path(), SHARED_HEADER};
 	ImGui::BeginChild("settings_rows", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - em * 0.4f), 0);
@@ -1219,6 +1275,9 @@ static void settings_modal(void) {
 			toggle_row(t, "Gyro", "A controller's gyro as the Vita's motion sensor.", "gyro", true);
 			seg_row(t, "A level controller is a Vita held", "Upright, as in your hands, or flat on a table.", "gyro_pose", "upright", {{"upright", "Upright"}, {"flat", "Flat"}});
 			slider_row(t, "Gyro sensitivity", nullptr, "gyro_sens", 1.0, 0.25f, 3.0f, "%.2f×");
+			slider_row(t, "Stick deadzone", "How far a controller's stick moves before the game sees it: raise it if the camera or your character drifts on its own.", "stick_deadzone", 0.0, 0.0f, 50.0f, "%.0f%%", 100.0f);
+		} else if (g_settings_tab == 3) {
+			library_page();
 		} else {
 			slider_row(t, "Volume", nullptr, "volume", 1.0, 0.0f, 100.0f, "%.0f%%", 100.0f);
 			toggle_row(t, "Play online", ONLINE_EXPL, "online", true);
@@ -1865,9 +1924,23 @@ static std::string find_root(void) {
 /* the player's library (pipeline/datadir.py makes the same choice; the stages get this one as ATIV_DUMP): ATIV_DUMP, else
  * <root>/dump when it exists (a checkout, an install from before), else the platform's per-user data folder -- local, not
  * roaming, on Windows: a game is gigabytes -- so an update replaces the install without touching what the player made */
+static std::string default_library(void);
 static std::string library_dir(void) {
 	if (const char *d = getenv("ATIV_DUMP")) if (*d) return d;
+	if (portable_install()) return g_root + "/library";
 	if (exists(g_root + "/dump")) return g_root + "/dump";
+	{	/* the folder the player moved it to (Settings, Library: vitarecomp library move writes hub.ini's library_dir) */
+		std::string hub = pref_dir() + "hub.ini";
+		if (FILE *f = fopen(hub.c_str(), "r")) {
+			char line[1024]; std::string v;
+			while (fgets(line, sizeof line, f)) if (!strncmp(line, "library_dir=", 12)) { v = line + 12; while (!v.empty() && (v.back() == '\n' || v.back() == '\r')) v.pop_back(); }
+			fclose(f);
+			if (!v.empty() && exists(v)) return v;
+		}
+	}
+	return default_library();
+}
+static std::string default_library(void) {
 	const char *home = getenv("HOME"); std::string base;
 #ifdef _WIN32
 	const char *la = getenv("LOCALAPPDATA"), *up = getenv("USERPROFILE");
@@ -1943,6 +2016,7 @@ int main(int, char **) {
 	}
 	g_dump = library_dir();
 	set_env("ATIV_DUMP", g_dump);   /* (the stages it runs: the same library whatever their own rule finds) */
+	if (portable_install()) { set_env("ATIV_PREFS", pref_dir()); set_env("RECOMP_SETTINGS_SHARED", pref_dir() + "settings.ini"); }   /* (and the games: the settings in its folder too) */
 	const char *shot_path = getenv("ATIV_SHOT");
 #ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
@@ -1981,13 +2055,14 @@ int main(int, char **) {
 	io.IniFilename = nullptr;
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;   /* a controller (or the arrows) moves through everything; L1/R1 the tabs */
 	ui::load_system_font(io);
-	ui::apply(16.0f, scale);
+	ui::apply(16.0f, scale); g_dpi_scale = scale;
 	ImGui_ImplSDL3_InitForSDLGPU(win);
 	ImGui_ImplSDLGPU3_InitInfo info = {};
 	info.Device = g_gpu; info.ColorTargetFormat = shot_path ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM : SDL_GetGPUSwapchainTextureFormat(g_gpu, win); info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
 	ImGui_ImplSDLGPU3_Init(&info);
 
 	prefs_load();
+	apply_ui_scale();
 	g_settings_writable = !shot_path || getenv("ATIV_PREFS");
 	if (g_settings_writable) settings_migrate();   /* (a screenshot run touches no one's settings but a test folder's) */
 	set_env("RECOMP_SETTINGS_SHARED", shared_path());   /* the games it starts read the same shared file (runtime/core/main.c) */
@@ -2037,6 +2112,11 @@ int main(int, char **) {
 			library_scan();
 			if (g_task.kind == "scan" && g_task.ok) scan_load(scan_file());
 			if (g_task.kind == "report" && g_task.ok) open_folder(g_dump + "/reports");
+			if (g_task.kind == "library" && g_task.ok && g_prefs["portable_pending"] == "1") {   /* (Make this install portable: the marker, now the library is here) */
+				if (FILE *o = fopen((g_root + "/portable.txt").c_str(), "w")) { fputs("Project Nativ keeps its library and settings in this folder (library, settings).\n", o); fclose(o); }
+				prefs_set("portable_pending", ""); set_env("ATIV_PREFS", pref_dir()); set_env("RECOMP_SETTINGS_SHARED", pref_dir() + "settings.ini");
+			}
+			if (g_task.kind == "library") { std::string was = g_dump; set_env("ATIV_DUMP", ""); g_dump = library_dir(); set_env("ATIV_DUMP", g_dump); prefs_load(); if (g_dump != was) library_scan(); }   /* (a move: the library's new place) */
 			if (g_task.kind == "play") {   /* Windows refused the game (vitarecomp's SAC_BLOCKED line): the Smart App Control dialog */
 				bool blocked;
 				{ std::lock_guard<std::mutex> l(g_log_lock); blocked = !g_task.ok && g_log.find("Smart App Control is on", g_task.log_from) != std::string::npos; }

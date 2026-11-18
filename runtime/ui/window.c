@@ -57,6 +57,24 @@ static uint8_t *frame;                 /* RGBA, the latest presented frame */
 static uint32_t fw, fh, new_frame;
 static volatile uint32_t buttons;
 static volatile uint8_t sticks[4] = {128, 128, 128, 128};
+/* a pad's sticks as it reports them, and through the deadzone ("stick_deadzone", 0-0.5: Settings, Controls; issue #8) into
+ * sticks[]: radial, and rescaled so the zone's edge is the stick at rest and full tilt stays full tilt -- a worn pad's drift
+ * kept from turning the camera or walking the player. 0 (the default): the pad's own values, as before */
+static int16_t pad_raw[4];
+static void pad_sticks(int only) {   /* (only: the stick whose axis moved, 0 left 1 right; -1 both) */
+	static float dz = -1; static uint64_t at; const uint64_t t = now_us();
+	if (dz < 0 || t - at > 500000) { at = t; dz = (float)settings_float("stick_deadzone", 0.0); if (!(dz > 0)) dz = 0; if (dz > 0.5f) dz = 0.5f; }
+	for (int s = 0; s < 4; s += 2) {
+		if (only >= 0 && s != 2 * only) continue;
+		if (!(dz > 0)) { sticks[s] = (uint8_t)((pad_raw[s] + 32768) >> 8); sticks[s + 1] = (uint8_t)((pad_raw[s + 1] + 32768) >> 8); continue; }
+		float x = pad_raw[s] / 32768.0f, y = pad_raw[s + 1] / 32768.0f, m = sqrtf(x * x + y * y);
+		const float k = m <= dz ? 0 : (m - dz) / (1 - dz) / m;
+		for (int i = 0; i < 2; i++) {
+			long v = lroundf((i ? y : x) * k * 32768.0f); if (v < -32768) v = -32768; if (v > 32767) v = 32767;
+			sticks[s + i] = (uint8_t)((v + 32768) >> 8);
+		}
+	}
+}
 static int active;
 static int self_paced; static uint64_t last_paced_us;   /* a present mode that doesn't wait for vsync: the present loop paces itself */
 static volatile int touch_down, touch_x, touch_y;   /* the mouse as the front touch panel (1920x1088) */
@@ -1016,7 +1034,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 				pad_gyro = g && a;
 				fprintf(stderr, "gamepad: %s%s%s\n", SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?", SDL_GetNumGamepadTouchpads(pad) > 0 ? ", touchpad" : "", pad_gyro ? ", gyro" : "");
 			}
-			if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) { SDL_CloseGamepad(pad); pad = 0; __atomic_store_n(&pad_connected, 0, __ATOMIC_RELAXED); pad_gyro = 0; motion_lost(); gamepad_touch_release(); buttons = 0; for (int i = 0; i < 4; i++) sticks[i] = 128; }
+			if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) { SDL_CloseGamepad(pad); pad = 0; __atomic_store_n(&pad_connected, 0, __ATOMIC_RELAXED); pad_gyro = 0; motion_lost(); gamepad_touch_release(); buttons = 0; for (int i = 0; i < 4; i++) { sticks[i] = 128; pad_raw[i] = 0; } }
 			if (e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) {
 				if (e.gsensor.sensor == SDL_SENSOR_ACCEL) motion_feed_accel(e.gsensor.data, e.gsensor.sensor_timestamp);
 				else if (e.gsensor.sensor == SDL_SENSOR_GYRO) motion_feed_gyro(e.gsensor.data, e.gsensor.sensor_timestamp);
@@ -1108,8 +1126,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_RIGHT && mouse_to_touch(e.button.x, e.button.y, 0, &tx, &ty)) { mouse_rear_x = tx; mouse_rear_y = clampi(ty, REAR_Y0, REAR_Y1); mouse_rear_down = 1; }
 			if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_RIGHT) mouse_rear_down = 0;
 			if (e.type == SDL_EVENT_MOUSE_MOTION && mouse_rear_down && mouse_to_touch(e.motion.x, e.motion.y, 1, &tx, &ty)) { mouse_rear_x = tx; mouse_rear_y = clampi(ty, REAR_Y0, REAR_Y1); }
-			if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.axis < 4)
-				sticks[e.gaxis.axis] = (uint8_t)((e.gaxis.value + 32768) >> 8);
+			if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.axis < 4) { pad_raw[e.gaxis.axis] = e.gaxis.value; pad_sticks(e.gaxis.axis / 2); }
 		}
 		{	/* keyboard + mouse, once a loop: which scheme, the capture, WASD as the left stick, the look's stand-in */
 			static uint64_t last; uint64_t t = now_us(); double dt = last ? (t - last) / 1e6 : 0; last = t;
@@ -1313,7 +1330,8 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (open && !was_open) { buttons = 0; touch_down = 0; gamepad_touch_release(); for (int i = 0; i < KB_N; i++) kb_binds[i].held = 0; }   /* let go of what was held as it opened */
 			if (was_open && !open) {
 				kb_reload();   /* (the Controls page may have rebound keys) */
-				for (int i = 0; i < 4; i++) sticks[i] = pad ? (uint8_t)((SDL_GetGamepadAxis(pad, (SDL_GamepadAxis)i) + 32768) >> 8) : 128;
+				for (int i = 0; i < 4; i++) pad_raw[i] = pad ? SDL_GetGamepadAxis(pad, (SDL_GamepadAxis)i) : 0;
+				pad_sticks(-1);
 				pad_resync(pad);   /* and L and R: one held through the menu sends no new event (the other pair, held through, waits for a new press) */
 			}
 			was_open = open;
