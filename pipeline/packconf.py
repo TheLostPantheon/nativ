@@ -26,7 +26,7 @@ DEFAULTS = {
     "BASE": "game", "SPLIT": "16", "TEST_INPUT": "", "TEST_TOUCH": "", "TEST_ENV": "", "TEST_FRAMES": "600",
     "TEST_TOLERANCE": "1", "ELF": "eboot.bin.elf", "HOOKS": "", "IHOOKS": "", "MOD_HOOKS": "", "MOD_IHOOKS": "",
     "GAME_ADDRS": "", "TITLE_ID": "", "VERSIONS": "", "UPDATE_NOTE": "", "FUNCTION_SEEDS": "", "ONLINE_VERSIONS": "",
-    "TIER": "", "GENERATED": "", "FEATURES": "",
+    "TIER": "", "GENERATED": "", "FEATURES": "", "LANGUAGES": "",
 }
 # FEATURES: the names a pack may list, the README table's column for each, and what in the pack's settings makes the
 # feature (None: nothing to check it against)
@@ -142,6 +142,9 @@ def _check():
                     said, does = ("lists", "don't make") if name in features(v) else ("leaves out", "make")
                     raise PackError(f"FEATURES {said} {name}, but the pack's settings {does} it")
             print(f"ok     {title} features: {v['FEATURES'] or '-'}")
+            known = re.findall(r'\{"(\w+)", "[^"]*"\}', open(os.path.join(here, "..", "runtime", "ui", "languages.h")).read())
+            for lang in v["LANGUAGES"].split():
+                if lang not in known: raise PackError(f"LANGUAGES: unknown language {lang!r} (runtime/ui/languages.h: {', '.join(known)})")
         except PackError as e:
             bad += 1; print(f"BAD    {title}: {e}")
     return bad

@@ -3,6 +3,7 @@
 # eboot.data.json so the pipeline stages stay uniform).
 NAME = "Uncharted: Golden Abyss"
 FEATURES = "widescreen fov mouse_aim fsr:experimental"   # what this pack adds (pipeline/packconf.py FEATURE_NAMES; :experimental where it is): the README's games table and its checks
+LANGUAGES = "english_us spanish"   # the languages it starts in (2026-11-17, headless title screens): the US build has English, Spanish and French; French crashed at boot on the EU data copy this was checked with, and the others fall back to English
 # REGION: the release this pack plays (its content id: UP..., North America); another region's release is another build,
 # not played yet -- a search names it and says this release is the one Ativ plays
 REGION = "US"

@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "guestwatch.h"
+#include "languages.h"
 #include "hle.h"
 #include "net.h"
 #include "overlay.h"   /* (overlay_toast_titled: the network check's notice) */
@@ -408,13 +409,23 @@ static void h_trophy_create(Cpu *c) { if (A0) WR32(A0, 1); RET(0); }
  * when the queue is empty, which ends a game's drain loop */
 static void h_receive_system_event(Cpu *c) { RET(0x80802016u); }
 
-/* system settings (id, *value): 1 language (1 English US), 2 enter button (1 cross), 4 date format
+/* the system language the game is told: settings "game_language" (ui/languages.h's keys, in the SCE_SYSTEM_PARAM_LANG_*
+ * order, so a key's index is its id; RECOMP_GAME_LANGUAGE wins), "auto" or anything unknown: English (US), as before the setting.
+ * Read at each query, but a game asks once at boot, so a change applies the next time it starts. */
+static uint32_t system_language(void) {
+	char b[32]; const char *e = getenv("RECOMP_GAME_LANGUAGE");
+	if (e) snprintf(b, sizeof b, "%s", e); else settings_str("game_language", "auto", b, sizeof b);
+	if (!e && !game_language_allowed(b)) return 1;   /* (a language this game wasn't checked in: English, as before the setting) */
+	for (int i = 0; i < game_language_count; i++) if (!strcmp(b, game_languages[i].key)) return (uint32_t)i;
+	return 1;
+}
+/* system settings (id, *value): 1 language (system_language: English US unless chosen), 2 enter button (1 cross), 4 date format
  * (0 YYYY/MM/DD), 5 time format (0 12-hour), 6 time zone (0 minutes: UTC, which is what the host's
  * RTC reports as local time too), 7 summer time (0 off); 3 is the user name, a string. Anything else
  * is SCE_APPUTIL_ERROR_PARAMETER, as on the console. */
 static void h_system_param_int(Cpu *c) {
 	if (A0 < 1 || A0 > 7 || A0 == 3 || !A1) { RET(0x80100600u); return; }
-	WR32(A1, A0 == 1 || A0 == 2 ? 1 : 0); RET(0);
+	WR32(A1, A0 == 1 ? system_language() : A0 == 2 ? 1 : 0); RET(0);
 }
 /* (id, buffer, size): only the user name (3) is a string -- "Player" (RECOMP_USERNAME overrides),
  * truncated to the buffer like strncpy plus a terminator; Killzone asks for it at boot (17 bytes:

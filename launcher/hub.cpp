@@ -26,6 +26,7 @@
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlgpu3.h"
 #include "ui_theme.h"   /* the look shared with the in-game overlay */
+#include "languages.h"   /* the language list the runtime answers from */
 #include <ctime>
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -1032,7 +1033,7 @@ static void ini_save(const Ini &x, const std::string &path, const char *header) 
 static const char *const SHARED_HEADER = "# Project Nativ's settings for every game (the launcher's Settings, and each game's menu; runtime/core/settings.h)";
 static const char *const GAME_HEADER = "# vitarecomp settings for this game: its own options, and where it differs from the shared settings (runtime/core/settings.h)";
 static bool game_key(const std::string &k) {   /* (settings.c's game_key: kept in the game's own file) */
-	for (const char *g : {"fov", "view_distance", "scenery_detail", "character_detail", "qte_time", "private_server", "net_redirect", "menu_hint_shown", "controller_layout"}) if (k == g) return true;
+	for (const char *g : {"fov", "view_distance", "scenery_detail", "character_detail", "qte_time", "private_server", "net_redirect", "menu_hint_shown", "controller_layout", "game_language"}) if (k == g) return true;
 	return false;
 }
 /* the shared keys' defaults where a game reads no value (runtime/core/settings.h; the consumers' own) */
@@ -1366,6 +1367,18 @@ static void game_settings_modal(void) {
 	SetTarget t{&g_game_ini, game_settings_path(g->id), GAME_HEADER};
 	bool any = false;
 	if (ui::rows_begin("game_own")) {
+		{	/* the languages the pack lists (LANGUAGES: the ones checked to start; a game can fail to start in another) */
+			const std::string list = g->tier == "experimental" ? "" : " " + pack_value(pack_read(g_root + "/packs/" + g->id + "/pack.toml"), "LANGUAGES") + " ";
+			std::vector<const char *> labels{"Automatic (English)"}; std::vector<int> keys{-1};
+			for (int i = 0; i < game_language_count; i++) if (list.find(std::string(" ") + game_languages[i].key + " ") != std::string::npos) { labels.push_back(game_languages[i].label); keys.push_back(i); }
+			if (labels.size() > 1) {
+				any = true;
+				ui::row("Language", "The languages this game has been checked in. Applies the next time the game starts.");
+				std::string cur = tget(t, "game_language", "auto"); int v = 0;
+				for (size_t k = 1; k < keys.size(); k++) if (cur == game_languages[keys[k]].key) v = (int)k;
+				if (ui::choice("##lang", labels.data(), (int)labels.size(), &v)) target_write(t, "game_language", v ? game_languages[keys[v]].key : "auto");
+			}
+		}
 		if (game_option(*g, "fov")) { any = true; slider_row(t, "Field of view", "A wider view. 1.00× is the game's own.", "fov", 1.0, 0.75f, 1.5f, "%.2f×"); }
 		if (game_option(*g, "view_distance")) { any = true; slider_row(t, "View distance", "How far fading scenery reaches. 1.00× is the game's own.", "view_distance", 1.0, 1.0f, 3.0f, "%.2f×"); }
 		if (game_option(*g, "scenery_detail")) { any = true; slider_row(t, "Scenery detail", "How far small scenery details stay visible. 1.00× is the game's own.", "scenery_detail", 1.0, 1.0f, 8.0f, "%.1f×"); }
