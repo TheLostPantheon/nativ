@@ -60,6 +60,9 @@ def unpredictable(i):
     vld/vst base, vmov's source); a register list running past d31 (capstone names it fpinst2, mvfr0...); a register-
     shifted register with pc anywhere in it; a pc base that's written back (post-indexed or "!")"""
     ops = i.op_str
+    if insnsweep.stem(i.mnemonic) in ("stc", "stcl", "ldc", "ldcl", "stc2", "stc2l", "ldc2", "ldc2l", "mcrr", "mrrc", "mcrr2", "mrrc2",
+                                      "cdp", "cdp2", "mcr", "mrc", "mcr2", "mrc2"):
+        return True   # (coprocessors other than VFP and NEON: a user-mode program has none)
     if "^" in ops: return True
     if re.search(r"\[pc\](,|!|$)", ops) or re.search(r"\[pc, [^\]]*\]!", ops): return True   # a pc base written back
     m = re.match(r"(\w+)(?:, (\w+))?, \[(\w+)(\]|,[^\]]*\]!)", ops)   # a load into its own base, written back

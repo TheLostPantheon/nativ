@@ -377,6 +377,15 @@ class Fn:
         sz = {"ldr": 4, "str": 4, "ldrb": 1, "strb": 1, "ldrh": 2, "strh": 2, "ldrsb": 1, "ldrsh": 2,
               "ldrd": 4, "strd": 4, "ldrex": 4, "strex": 4}[mn]
         out = [f"{{ uint32_t ea = {a};"]
+        if post:   # the base's next value, from the offset register as it was before the load (ldrb fp, [r5], -fp: isacover)
+            po = ops[-1]
+            # (a register's own shift too: ldr r4, [r0], -r1, asr #31 dropped the asr; isacover, 2026-11-17)
+            inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.shifted(self.r(po.reg, i), po.shift.type, po.shift.value))
+            sub = getattr(po, "subtracted", False)
+            if self.arm:   # the sign is the encoding's U bit (23): capstone drops it for ldrht/ldrsht ("#-0x91", "-r0")
+                sub = not (int.from_bytes(i.bytes[:4], "little") >> 23) & 1
+                if po.type == ARM_OP_IMM: inc = f"0x{abs(po.imm) & 0xffffffff:x}u"
+            out.append(f" uint32_t nb = ea {'-' if sub else '+'} {inc};")
         for k, o in enumerate(regs):
             off = f" + {4 * k}" if k else ""
             if load:
@@ -389,14 +398,7 @@ class Fn:
                 wr = {4: "WR32", 2: "WR16", 1: "WR8"}[sz]
                 out.append(f" {wr}(ea{off}, {self.r(o.reg, i)});")
         if post:
-            po = ops[-1]
-            # (a register's own shift too: ldr r4, [r0], -r1, asr #31 dropped the asr; isacover, 2026-11-17)
-            inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.shifted(self.r(po.reg, i), po.shift.type, po.shift.value))
-            sub = getattr(po, "subtracted", False)
-            if self.arm:   # the sign is the encoding's U bit (23): capstone drops it for ldrht/ldrsht ("#-0x91", "-r0")
-                sub = not (int.from_bytes(i.bytes[:4], "little") >> 23) & 1
-                if po.type == ARM_OP_IMM: inc = f"0x{abs(po.imm) & 0xffffffff:x}u"
-            out.append(f" {self.dst(m.base)} = ea {'-' if sub else '+'} {inc};")
+            out.append(f" {self.dst(m.base)} = nb;")
         elif i.writeback:
             out.append(f" {self.dst(m.base)} = ea;")
         out.append(" }")
@@ -1200,6 +1202,18 @@ class Fn:
             es = int(dt) // 8 if dt.isdigit() else 4
             lm = re.search(r"\{d\d+\[(\d+)\]", i.op_str)
             load = mn.startswith("vld")
+            if load and "[]" in i.op_str and len(ds) == nst:
+                # to all lanes: the structure's element k (at ea + k * size) into every lane of register k ({d20[], d22[]}
+                # filled only the first lane's bytes as a whole structure load; isacover, 2026-11-17)
+                base = GPR[md.reg_name(m_op.mem.base)]
+                out = [f"{{ uint32_t ea = c->r[{base}];"]
+                for k, dd in enumerate(ds):
+                    out.append(f" {{ uint8_t e[{es}]; memcpy(e, G(ea + {k * es}), {es}); for (int j = 0; j < 8; j += {es}) memcpy(((uint8_t *)&c->vfp.d[{dd}]) + j, e, {es}); }}")
+                post = [o for o in ops if o.type == ARM_OP_REG and md.reg_name(o.reg) in GPR and o is not ops[0]]
+                if i.writeback or post:
+                    out.append(f" c->r[{base}] = ea + {nst * es};" if not post else f" c->r[{base}] = ea + {self.r(post[-1].reg, i)};")
+                out.append(" }")
+                return ["".join(out)]
             if lm:
                 moves = [(int(lm.group(1)), dd) for dd in ds]
             else:
