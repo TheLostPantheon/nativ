@@ -539,10 +539,18 @@ static void ab_at_frame(uint64_t f) { if (f >= ab_at) watch_ab_capture(); }
  * RECOMP_SETTINGS_SWITCH frames: what one setting runs and another doesn't, at the same moment */
 #define MAX_WATCH_WINDOWS 16
 static uint64_t ww_from[MAX_WATCH_WINDOWS], ww_to[MAX_WATCH_WINDOWS]; static int n_ww, ww_i;
+static uint64_t ww_t0;
 static void ww_frame(uint64_t f) {
 	if (ww_i >= n_ww) return;
-	if (!watch_win_open && f >= ww_from[ww_i]) watch_open(1);
-	else if (watch_win_open && f >= ww_to[ww_i]) { watch_close(); ww_i++; }
+	extern uint64_t guest_time_us_peek(void);   /* (a peek: under the fixed clock a read would move it) */
+	if (!watch_win_open && f >= ww_from[ww_i]) { ww_t0 = guest_time_us_peek(); watch_open(1); }
+	else if (watch_win_open && f >= ww_to[ww_i]) {
+		/* the game time the window took: whether a frame-rate switch before it took (dev/hookscan.py --verify checks) */
+		uint64_t dt = guest_time_us_peek() - ww_t0, n = f - ww_from[ww_i];
+		fprintf(stderr, "== watch window %d: frames %llu-%llu, %.3f s of game time, %.2f ms a frame\n", ww_i, (unsigned long long)ww_from[ww_i],
+		        (unsigned long long)f, dt / 1e6, n ? dt / 1e3 / (double)n : 0.0);
+		watch_close(); ww_i++;
+	}
 }
 __attribute__((constructor)) static void watch_window_key(void) {
 	extern void (*window_f9)(void), (*window_f6)(void); extern void display_set_frame_hook(void (*)(uint64_t));
