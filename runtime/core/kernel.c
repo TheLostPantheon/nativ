@@ -101,7 +101,8 @@ typedef struct Thread {
 	char name[32];
 	Cpu *cpu;
 	pthread_t th;
-	int started, done, deleted;
+	int started, done, deleted;  /* done: it ended and is DORMANT (started stays set; StartThread runs it again, below) */
+	uint32_t ends;               /* how many runs have ended: a WaitThreadEnd sleeper that a restart outpaces still sees its run end */
 	uint32_t status;
 	uint32_t wait_type, wait_id; /* what it is blocked on (GetThreadInfo's status WAITING) */
 	uint32_t tls, tls_keys;      /* its TLS block (TPIDRURO) and sceKernelGetTLSAddr's keys: a fiber running under it shares both */
@@ -500,7 +501,7 @@ static void h_create_thread(Cpu *c) {   /* (name, entry, priority, stack size, a
 static void thread_done(Thread *t, uint32_t status) {
 	sched_thread_exit(t);
 	pthread_mutex_lock(&klock);
-	t->status = status; t->done = 1;
+	t->status = status; t->done = 1; t->ends++;
 	pthread_cond_broadcast(&kcond);
 	pthread_mutex_unlock(&klock);
 }
@@ -540,7 +541,13 @@ static void spawn(Thread *t, Cpu *n) {
 static void h_start_thread(Cpu *c) {   /* (uid, arg size, arg block): the block is copied to the new stack */
 	Thread *t = thread_of(A0);
 	if (!t || t == &main_thread) { RET(E_UNKNOWN_THREAD_ID); return; }
-	if (t->started) { RET(E_NOT_DORMANT); return; }
+	pthread_mutex_lock(&klock);
+	if (t->started && !t->done) { pthread_mutex_unlock(&klock); RET(E_NOT_DORMANT); return; }
+	/* an ended thread is DORMANT, not gone: it runs again from its entry on its own stack with the new arguments, at its
+	 * initial priority, its previous exit status no longer reported. The previous run's host thread is detached and has
+	 * only to return (it touches nothing of t after thread_done), so a new one takes over; the scheduler admits t afresh */
+	if (t->done) { t->done = 0; t->wait_type = t->wait_id = 0; t->prio = t->init_prio; t->cb_pending = 0; t->fiber = 0; }
+	pthread_mutex_unlock(&klock);
 	Cpu *n = calloc(1, sizeof *n);
 	uint32_t sp = t->stack + t->stack_size - 16, size = A1;
 	if (size && A2) { sp = (sp - size) & ~7u; memcpy(G(sp), G(A2), size); }
@@ -625,19 +632,20 @@ static void h_wait_thread_end(Cpu *c) {   /* (uid, *status, *timeout) -> 0, the 
 	pthread_mutex_lock(&klock);
 	if (me) cb_publish(me, &klock, &kcond);
 	int b = 0;   /* the slot is given up only if it actually sleeps, and taken back once klock is released */
-	while (!t->done && !(me && cb_pending(me))) {
+	const uint32_t gen = t->ends;   /* a restart can clear done before this sleeper runs: the run it waited for ended all the same */
+	while (!t->done && t->ends == gen && !(me && cb_pending(me))) {
 		if (!b) b = sched_block_begin();
 		if (timed ? pthread_cond_timedwait(&kcond, &klock, &ts) == ETIMEDOUT : pthread_cond_wait(&kcond, &klock) != 0) break;
 	}
 	if (me) cb_publish(me, 0, 0);
-	int done = t->done;
+	int done = t->done || t->ends != gen; uint32_t status = t->status;
 	pthread_mutex_unlock(&klock);
 	thread_waits(0, 0);
 	if (b) sched_block_end();
 	if (!done && me && cb_pending(me)) { timeout_left(A2, timed, &ts); RET(E_CB_RETRY); return; }
 	if (!done) { if (A2) WR32(A2, 0); RET(E_WAIT_TIMEOUT); return; }
 	timeout_left(A2, timed, &ts);
-	if (A1) WR32(A1, t->status);
+	if (A1) WR32(A1, status);
 	RET(0);
 }
 static void h_thread_exit_status(Cpu *c) {
@@ -740,6 +748,7 @@ typedef struct {
 	uint8_t *ring; int cap, used, rpos;   /* a message pipe's bytes: a ring of the created size */
 	uint32_t func, common, notify_arg, notifier; int ncount;   /* a callback: its function and common argument; the notifications not yet delivered */
 	uint64_t tbase; int trunning;   /* a timer: running, the guest clock at which its count was 0; stopped, the count itself */
+	int ev_armed, ev_type, ev_repeat; uint64_t ev_sched, ev_interval;   /* a timer's event (SetTimerEvent): when (on the timer's count), its type, repeat; its state is bits & 1 */
 } Obj;
 static __thread pthread_cond_t *my_cv;
 static pthread_cond_t *wait_cv(void) { if (!my_cv) { my_cv = malloc(sizeof *my_cv); pthread_cond_init(my_cv, 0); } return my_cv; }
@@ -807,6 +816,8 @@ static void dequeue(Obj *o, Waiter *w) {
 	if (w->next) w->next->prev = w->prev; else o->tail = w->prev;
 	w->next = w->prev = 0; o->nwait--;
 }
+static void timer_fire(Obj *o);   /* (timers, below) */
+static uint64_t timer_slice_us(Obj *o);
 static void wake(Obj *o, Waiter *w, uint32_t result) { dequeue(o, w); w->result = result; if (waitstats_on()) w->wake_ns = waitstats_now(); __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE); pthread_cond_signal(w->cv); }
 /* RECOMP_WAIT_SPIN_US=n: a wait spins up to n us for its wake before it sleeps (o->m let go meanwhile). A job system's
  * hand-offs come within microseconds; a sleep and a wake cost more than that under load (RECOMP_WAIT_STATS: 8-13 us on
@@ -839,8 +850,21 @@ static uint32_t wait_on(Obj *o, Waiter *w, uint32_t timeout_p, uint32_t edelete,
 		pthread_mutex_lock(&o->m);
 	}
 	while (!w->woken && !o->deleted && !(t && cb_pending(t))) {
+		if (o->kind == TIMER) {   /* nothing signals a timer's expiry: the waiters look at the timer's count themselves, in slices of the real time that count needs */
+			timer_fire(o);
+			if (w->woken) break;
+		}
 		if (!b) b = sched_block_begin();   /* the slot goes before the first sleep (o->m held: giving it up never waits) */
-		if (!timed) pthread_cond_wait(w->cv, &o->m);
+		if (o->kind == TIMER) {
+			struct timespec sl; clock_gettime(CLOCK_REALTIME, &sl);
+			uint64_t us = timer_slice_us(o);
+			sl.tv_sec += us / 1000000; sl.tv_nsec += (us % 1000000) * 1000;
+			if (sl.tv_nsec >= 1000000000) { sl.tv_sec++; sl.tv_nsec -= 1000000000; }
+			int past = timed && (ts.tv_sec < sl.tv_sec || (ts.tv_sec == sl.tv_sec && ts.tv_nsec < sl.tv_nsec));   /* the wait's own deadline comes first */
+			pthread_cond_timedwait(w->cv, &o->m, past ? &ts : &sl);
+			if (past) { struct timespec now; clock_gettime(CLOCK_REALTIME, &now); if (now.tv_sec > ts.tv_sec || (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec)) break; }
+		}
+		else if (!timed) pthread_cond_wait(w->cv, &o->m);
 		else if (pthread_cond_timedwait(w->cv, &o->m, &ts) == ETIMEDOUT) break;
 	}
 	if (t) cb_publish(t, 0, 0);
@@ -1192,11 +1216,12 @@ static void h_create_sevent(Cpu *c) { Obj *o = new_obj(SEVENT, A0, A1); o->bits 
 static void sevent_take(Obj *o, uint32_t bits, uint32_t out, uint32_t udata) {
 	if (out) WR32(out, o->bits);
 	if (udata) WR64(udata, o->udata);
-	if (o->attr & 0x100) o->bits &= ~bits;
+	if (o->kind == SEVENT && (o->attr & 0x100)) o->bits &= ~bits;
 }
 static uint32_t sevent_wait(Obj *o, uint32_t bits, uint32_t out, uint32_t udata, uint32_t timeout_p, int poll) {
 	if (!bits) return E_ILLEGAL_PATTERN;
 	pthread_mutex_lock(&o->m);
+	if (o->kind == TIMER) { bits = 1; timer_fire(o); }   /* a timer's one event bit: the pattern asked for is not read (assumed) */
 	uint32_t r = 0;
 	if (o->bits & bits) sevent_take(o, bits, out, udata);
 	else if (poll) { if (out) WR32(out, o->bits); r = E_EVENT_COND; }
@@ -1208,8 +1233,9 @@ static uint32_t sevent_wait(Obj *o, uint32_t bits, uint32_t out, uint32_t udata,
 	pthread_mutex_unlock(&o->m);
 	return r;
 }
-static void h_wait_sevent(Cpu *c) { Obj *o = by_uid(A0, SEVENT); RET(o ? sevent_wait(o, A1, A2, A3, STK(0), 0) : E_UNKNOWN_EVENT_ID); }   /* (uid, waitPattern, *resultPattern, *userData, *timeout) */
-static void h_poll_sevent(Cpu *c) { Obj *o = by_uid(A0, SEVENT); RET(o ? sevent_wait(o, A1, A2, A3, 0, 1) : E_UNKNOWN_EVENT_ID); }
+static Obj *ev_obj(uint32_t uid) { Obj *o = by_uid(uid, SEVENT); return o ? o : by_uid(uid, TIMER); }   /* what WaitEvent/PollEvent/ClearEvent take: a simple event, or a timer (its event) */
+static void h_wait_sevent(Cpu *c) { Obj *o = ev_obj(A0); RET(o ? sevent_wait(o, A1, A2, A3, STK(0), 0) : E_UNKNOWN_EVENT_ID); }   /* (uid, waitPattern, *resultPattern, *userData, *timeout) */
+static void h_poll_sevent(Cpu *c) { Obj *o = ev_obj(A0); RET(o ? sevent_wait(o, A1, A2, A3, 0, 1) : E_UNKNOWN_EVENT_ID); }
 static void h_set_sevent(Cpu *c) {   /* (uid, setPattern, userData (r2:r3)) */
 	Obj *o = by_uid(A0, SEVENT); if (!o) { RET(E_UNKNOWN_EVENT_ID); return; }
 	pthread_mutex_lock(&o->m);
@@ -1221,7 +1247,7 @@ static void h_set_sevent(Cpu *c) {   /* (uid, setPattern, userData (r2:r3)) */
 	pthread_mutex_unlock(&o->m);
 	RET(0);
 }
-static void h_clear_sevent(Cpu *c) { Obj *o = by_uid(A0, SEVENT); if (!o) { RET(E_UNKNOWN_EVENT_ID); return; } pthread_mutex_lock(&o->m); o->bits &= A1; pthread_mutex_unlock(&o->m); RET(0); }   /* (uid, bits to keep) */
+static void h_clear_sevent(Cpu *c) { Obj *o = ev_obj(A0); if (!o) { RET(E_UNKNOWN_EVENT_ID); return; } pthread_mutex_lock(&o->m); o->bits &= A1; pthread_mutex_unlock(&o->m); RET(0); }   /* (uid, bits to keep) */
 static void h_delete_sevent(Cpu *c) { h_delete_uid(c, SEVENT, E_UNKNOWN_EVENT_ID); }
 
 /* ---- kernel callbacks (sceKernelCreateCallback: name, attr, function, common): a function the
@@ -1750,10 +1776,8 @@ static void h_open_mutex(Cpu *c) { open_named(c, MUTEX); }
  * continues from it, SetTimerTime replaces it. Start on a running timer returns 1 and Stop on a
  * stopped one 0 (Vita3K's Timer, taken from there: the vitasdk headers have no SCE_KERNEL_ERROR_
  * code for either and the firmware's own return was not read). The wide calls return the time in
- * r0:r1 and, for a bad uid, the error code sign-extended (also assumed). The other half of a kernel
- * timer, SetTimerEvent arming an event that threads waiting on the timer's uid are woken by, has no
- * counterpart in this wait machinery yet: those calls say NOT_IMPLEMENTED, so a game that relies on
- * the event fails visibly instead of waiting on a success that never fires. */
+ * r0:r1 and, for a bad uid, the error code sign-extended (also assumed). The timer's event
+ * (SetTimerEvent and the calls after GetTimerInfo's own) follows the functions below. */
 static uint64_t timer_count(Obj *o) { return o->trunning ? guest_time_us() - o->tbase : o->tbase; }   /* o->m held */
 static uint64_t timer_err64(void) { return (uint64_t)(int64_t)(int32_t)E_UNKNOWN_TIMER_ID; }
 static void timer_ret64(Cpu *c, uint64_t v) { c->r[0] = (uint32_t)v; c->r[1] = (uint32_t)(v >> 32); }
@@ -1810,7 +1834,7 @@ static void h_set_timer_time_wide(Cpu *c) {   /* (uid, time in r2:r3: a 64-bit a
 	Obj *o = by_uid(A0, TIMER);
 	timer_ret64(c, o ? timer_set(o, (uint64_t)A2 | ((uint64_t)A3 << 32)) : timer_err64());
 }
-static void h_get_timer_info(Cpu *c) {   /* (uid, *SceKernelTimerInfo 0x60): the event fields (schedule, interval, type, repeat, waiters) stay 0 until events exist */
+static void h_get_timer_info(Cpu *c) {   /* (uid, *SceKernelTimerInfo 0x60): the event fields (schedule, interval, type, repeat) are 0 while no event is armed */
 	Obj *o = by_uid(A0, TIMER);
 	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
 	if (!A1 || RD32(A1) != 0x60) { RET(A1 ? E_INVALID_ARGUMENT_SIZE : E_ILLEGAL_ADDR); return; }
@@ -1818,15 +1842,72 @@ static void h_get_timer_info(Cpu *c) {   /* (uid, *SceKernelTimerInfo 0x60): the
 	memset(G(A1 + 4), 0, 0x5c);
 	WR32(A1 + 4, o->uid); memcpy(G(A1 + 8), o->name, 32); WR32(A1 + 0x28, o->attr); WR32(A1 + 0x2c, o->trunning);
 	WR64(A1 + 0x30, o->tbase); WR64(A1 + 0x38, timer_count(o));   /* base: the origin while running, the stored time while stopped */
+	timer_fire(o);
+	if (o->ev_armed) { WR64(A1 + 0x40, o->ev_sched); WR64(A1 + 0x48, o->ev_interval); WR32(A1 + 0x50, o->ev_type); WR32(A1 + 0x54, o->ev_repeat); }
+	WR32(A1 + 0x58, o->nwait);
 	pthread_mutex_unlock(&o->m);
 	RET(0);
 }
-static void h_timer_event_missing(Cpu *c) {   /* SetTimerEvent, CancelTimer, GetTimerEventRemainingTime */
-	static int said; if (said++ < 4) fprintf(stderr, "    kernel timer events are not implemented (lr %#x)\n", c->r[14]);
-	RET(E_NOT_IMPLEMENTED);
+/* The event (vitasdk libkernel.h and SceKernelTimerInfo): SetTimerEvent(uid, type, *interval, repeat) arms it for
+ * `interval` microseconds on the timer's own count ("logical timer time", so a stopped timer never expires it).
+ * It fires when the count reaches the schedule: SET_EVENT (0) sets the event, which stays set until ClearEvent
+ * (or a re-arm or Cancel) and releases every waiter, PULSE_EVENT (1) releases only the threads waiting then and
+ * leaves it clear. A repeating event rearms one interval on, skipping the periods nobody saw (the schedule lands
+ * on the next one after the count). Threads wait with WaitEvent/PollEvent on the timer's uid. Nothing here
+ * signals the expiry (no timer thread): the calls look at the count (timer_fire) and a waiter checks it in
+ * wait_on, in slices of at most 1 ms of real time (the whole 1 ms while the timer is stopped, or the guest
+ * clock is a fixed one that only the game's frames advance). */
+static void timer_fire(Obj *o) {   /* o->m held */
+	if (!o->ev_armed) return;
+	uint64_t n = timer_count(o);
+	if (n < o->ev_sched) return;
+	if (o->ev_repeat) { uint64_t iv = o->ev_interval ? o->ev_interval : 1; o->ev_sched += ((n - o->ev_sched) / iv + 1) * iv; }
+	else { o->ev_armed = 0; o->ev_sched = 0; }
+	o->bits |= 1; o->udata = 0;
+	for (Waiter *w = o->head, *nx; w; w = nx) { nx = w->next; sevent_take(o, w->bits, w->out, w->udata); wake(o, w, 0); }
+	if (o->ev_type == 1) o->bits &= ~1u;
 }
-#define h_set_timer_event h_timer_event_missing
-#define h_cancel_timer h_timer_event_missing
+static uint64_t timer_slice_us(Obj *o) {   /* o->m held */
+	if (!o->trunning || guest_clock_fixed() || !o->ev_armed) return 1000;
+	uint64_t n = timer_count(o), left = o->ev_sched > n ? o->ev_sched - n : 0;
+	return left < 1 ? 1 : left > 1000 ? 1000 : left;   /* never longer than 1 ms: the count can be moved (SetTimerTime) or a hand-set clock advanced meanwhile */
+}
+static void h_set_timer_event(Cpu *c) {   /* (uid, type, *interval, repeat) */
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	if (!A2) { RET(E_ILLEGAL_ADDR); return; }
+	if (A1 > 1) { RET(E_ILLEGAL_MODE); return; }   /* (the code for a bad type is assumed) */
+	pthread_mutex_lock(&o->m);
+	o->ev_armed = 1; o->ev_type = A1; o->ev_repeat = A3 != 0; o->ev_interval = RD64(A2);
+	o->ev_sched = timer_count(o) + o->ev_interval;
+	o->bits &= ~1u;   /* arming starts over: an event left set by the last arming is cleared (assumed) */
+	timer_fire(o);    /* an interval of 0 is due at once */
+	pthread_mutex_unlock(&o->m);
+	RET(0);
+}
+static void h_cancel_timer(Cpu *c) {   /* (uid, *numWaitThreads): disarms, clears the event, and ends the waits with WAIT_CANCEL */
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	pthread_mutex_lock(&o->m);
+	timer_fire(o);   /* an expiry already due is delivered first */
+	uint32_t n = 0;
+	while (o->head) { wake(o, o->head, E_WAIT_CANCEL); n++; }
+	o->ev_armed = 0; o->ev_sched = 0; o->bits &= ~1u;
+	pthread_mutex_unlock(&o->m);
+	if (A1) WR32(A1, n);
+	RET(0);
+}
+static void h_timer_event_remaining(Cpu *c) {   /* (uid, *SceKernelSysClock): the time to the armed event, 0 when none is armed (assumed) */
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	if (!A1) { RET(E_ILLEGAL_ADDR); return; }
+	pthread_mutex_lock(&o->m);
+	timer_fire(o);
+	uint64_t n = timer_count(o);
+	WR64(A1, o->ev_armed && o->ev_sched > n ? o->ev_sched - n : 0);
+	pthread_mutex_unlock(&o->m);
+	RET(0);
+}
 
 /* sceKernelGetTLSAddr(key): a word of per-thread storage per key (0..255; the C library keeps
  * errno and its per-thread state there) */
@@ -1879,7 +1960,7 @@ const HleEntry hle_kernel[] = {
 	{"sceKernelGetTimerTime", h_get_timer_time}, {"sceKernelGetTimerTimeWide", h_get_timer_time_wide},
 	{"sceKernelGetTimerBase", h_get_timer_base}, {"sceKernelGetTimerBaseWide", h_get_timer_base_wide},
 	{"sceKernelSetTimerTime", h_set_timer_time}, {"sceKernelSetTimerTimeWide", h_set_timer_time_wide}, {"sceKernelGetTimerInfo", h_get_timer_info},
-	{"sceKernelSetTimerEvent", h_set_timer_event}, {"sceKernelCancelTimer", h_cancel_timer}, {"sceKernelGetTimerEventRemainingTime", h_timer_event_missing},
+	{"sceKernelSetTimerEvent", h_set_timer_event}, {"sceKernelCancelTimer", h_cancel_timer}, {"sceKernelGetTimerEventRemainingTime", h_timer_event_remaining},
 	{"sceUltWaitingQueueResourcePoolGetWorkAreaSize", h_ult_pool_size}, {"_sceUltWaitingQueueResourcePoolCreate", h_zero_ok},
 	{"sceUltWaitingQueueResourcePoolDestroy", h_zero_ok},
 	{"_sceUltSemaphoreCreate", h_ult_sema_create}, {"sceUltSemaphoreAcquire", h_ult_sema_acquire},

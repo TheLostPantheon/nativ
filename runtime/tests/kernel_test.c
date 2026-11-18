@@ -361,6 +361,9 @@ static volatile int handler_calls; static uint32_t handler_common, handler_type_
 static uint32_t the_sema;   /* the semaphore block_entry's thread waits on (set by test_threads) */
 static void block_entry(Cpu *c) { c->r[0] = call(h_wait_sema, 3, the_sema, 1, 0) == 0 ? 3 : 4; }
 static void guest_handler(Cpu *c) { handler_calls++; handler_type_seen |= c->r[0]; handler_common = c->r[3]; c->r[0] = 0; }
+static void guest_entry_echo(Cpu *c) { c->r[0] = c->r[0] ? RD32(c->r[1]) : 0xdead; }   /* returns the first word of its argument block */
+static volatile int entry_runs;
+static void guest_entry_count(Cpu *c) { entry_runs++; c->r[0] = 100 + entry_runs; }
 static void test_threads(void) {
 	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "worker");
 	guest_fns[0] = guest_entry_7; guest_fns[1] = guest_entry_exit; guest_fns[2] = guest_entry_args; guest_fns[3] = guest_handler;
@@ -385,6 +388,34 @@ static void test_threads(void) {
 	CHECKEQ(call(h_wait_thread_end, 3, t, st, 0), 0); CHECKEQ(RD32(st), 1);
 	CHECKEQ(call(h_thread_exit_status, 2, t, st), 0); CHECKEQ(RD32(st), 1);
 	CHECKEQ(call(h_delete_thread, 1, t), 0); CHECKEQ(call(h_wait_thread_end, 3, t, st, 0), E_UNKNOWN_THREAD_ID);
+	/* an ended thread is DORMANT and can be started again: the second run takes the new argument, ends with its own status */
+	guest_fns[25] = guest_entry_echo; guest_fns[26] = guest_entry_count; guest_fns[4] = block_entry;
+	uint32_t r = call(h_create_thread, 7, name, 0x1000 + 4 * 25, 140, 0x1000, 0, 0, 0);
+	WR32(arg, 111); CHECKEQ(call(h_start_thread, 3, r, 4, arg), 0);
+	CHECKEQ(call(h_wait_thread_end, 3, r, st, 0), 0); CHECKEQ(RD32(st), 111);
+	CHECKEQ(call(h_thread_info, 2, r, info), 0); CHECKEQ(RD32(info + 0x2c), 16); CHECKEQ(RD32(info + 0x5c), 111);   /* ended: DORMANT, exit status kept */
+	WR32(arg, 222); CHECKEQ(call(h_start_thread, 3, r, 4, arg), 0);
+	CHECKEQ(call(h_wait_thread_end, 3, r, st, 0), 0); CHECKEQ(RD32(st), 222);
+	CHECKEQ(call(h_thread_exit_status, 2, r, st), 0); CHECKEQ(RD32(st), 222);
+	for (int i = 0; i < 20; i++) { WR32(arg, 300 + i); CHECKEQ(call(h_start_thread, 3, r, 4, arg), 0); CHECKEQ(call(h_wait_thread_end, 3, r, st, 0), 0); CHECKEQ(RD32(st), 300 + i); }
+	CHECKEQ(call(h_thread_info, 2, r, info), 0); CHECKEQ(RD32(info + 0x2c), 16); CHECKEQ(RD32(info + 0x40), 140);
+	CHECKEQ(call(h_delete_thread, 1, r), 0); CHECKEQ(call(h_start_thread, 3, r, 4, arg), E_UNKNOWN_THREAD_ID);   /* deleted after a restart: gone */
+	/* a restart while the thread is running, ended by ExitThread, and one that blocks the second run */
+	uint32_t rb = call(h_create_thread, 7, name, 0x1000 + 4 * 4, 160, 0x1000, 0, 0, 0);
+	uint32_t rs = the_sema = call(h_create_sema, 5, name, 0, 0, 1, 0);
+	CHECKEQ(call(h_start_thread, 3, rb, 0, 0), 0); nap(20);
+	CHECKEQ(call(h_start_thread, 3, rb, 0, 0), E_NOT_DORMANT);   /* running (waiting) */
+	CHECKEQ(call(h_delete_thread, 1, rb), E_NOT_DORMANT);
+	CHECKEQ(call(h_signal_sema, 2, rs, 1), 0); CHECKEQ(call(h_wait_thread_end, 3, rb, st, 0), 0); CHECKEQ(RD32(st), 3);
+	CHECKEQ(call(h_start_thread, 3, rb, 0, 0), 0); nap(20);   /* second run: blocks again, reported WAITING, not DORMANT */
+	CHECKEQ(call(h_thread_info, 2, rb, info), 0); CHECKEQ(RD32(info + 0x2c), 8); CHECKEQ(RD32(info + 0x5c), 0);
+	CHECKEQ(call(h_thread_exit_status, 2, rb, st), E_NOT_DORMANT);
+	CHECKEQ(call(h_signal_sema, 2, rs, 1), 0); CHECKEQ(call(h_wait_thread_end, 3, rb, st, 0), 0); CHECKEQ(RD32(st), 3);
+	uint32_t rx = call(h_create_thread, 7, name, 0x1000 + 4 * 1, 160, 0x1000, 0, 0, 0);   /* ends in sceKernelExitThread(9) */
+	for (int i = 0; i < 3; i++) { CHECKEQ(call(h_start_thread, 3, rx, 0, 0), 0); CHECKEQ(call(h_wait_thread_end, 3, rx, st, 0), 0); CHECKEQ(RD32(st), 9); }
+	uint32_t rc = call(h_create_thread, 7, name, 0x1000 + 4 * 26, 160, 0x1000, 0, 0, 0);   /* each run's entry executes anew */
+	for (int i = 1; i <= 3; i++) { CHECKEQ(call(h_start_thread, 3, rc, 0, 0), 0); CHECKEQ(call(h_wait_thread_end, 3, rc, st, 0), 0); CHECKEQ(RD32(st), 100 + i); }
+	CHECKEQ((uint32_t)entry_runs, 3);
 	/* a thread ending through sceKernelExitThread; event handlers see its start and exit */
 	uint32_t h = call(h_register_thread_event, 5, name, 0xfffffff0u, 4 | 8, 0x100c, 0xc0ffee);
 	CHECK(h & 1);
@@ -683,6 +714,87 @@ static void test_misc(void) {
  * value is exact); Start/Stop/Get/Set are time-keeping only, the event half is refused loudly */
 static uint64_t timer_wide(HleFn f, uint32_t uid) { Cpu c = { 0 }; c.r[0] = uid; f(&c); return c.r[0] | ((uint64_t)c.r[1] << 32); }
 static uint64_t timer_set_wide(uint32_t uid, uint64_t v) { Cpu c = { 0 }; c.r[0] = uid; c.r[2] = (uint32_t)v; c.r[3] = (uint32_t)(v >> 32); h_set_timer_time_wide(&c); return c.r[0] | ((uint64_t)c.r[1] << 32); }
+/* ---- timer events: SetTimerEvent arms on the timer's count; WaitEvent/PollEvent on the timer's uid see it */
+typedef struct { uint32_t uid, out, timeout, result; volatile int done; } TmWait;
+static void tm_waiter(void *p) { TmWait *w = p; w->result = call(h_wait_sevent, 5, w->uid, 1, w->out, 0, w->timeout); w->done = 1; }
+static void set_event(uint32_t t, uint32_t type, uint64_t iv, int repeat) { uint32_t q = word(); WR64(q, iv); CHECKEQ(call(h_set_timer_event, 4, t, type, q, repeat), 0); }
+static uint64_t remaining(uint32_t t) { uint32_t q = word(); CHECKEQ(call(h_timer_event_remaining, 2, t, q), 0); return RD64(q); }
+static void test_timer_events(uint32_t name) {
+	uint32_t q = word(), out = word(), cnt = word(), info = guest_alloc(0x60, 8);
+	uint32_t t = call(h_create_timer, 3, name, 0, 0);
+	uint64_t saved_clock = test_clock_us; test_clock_us = 5000;
+	CHECKEQ(call(h_set_timer_event, 4, 0x1234, 0, q, 0), E_UNKNOWN_TIMER_ID);
+	WR64(q, 1000); CHECKEQ(call(h_set_timer_event, 4, t, 2, q, 0), E_ILLEGAL_MODE); CHECKEQ(call(h_set_timer_event, 4, t, 0, 0, 0), E_ILLEGAL_ADDR);
+	CHECK(remaining(t) == 0);   /* nothing armed */
+	CHECKEQ(call(h_timer_event_remaining, 2, t, 0), E_ILLEGAL_ADDR); CHECKEQ(call(h_timer_event_remaining, 2, 0x1234, q), E_UNKNOWN_TIMER_ID);
+	/* SET_EVENT on a stopped timer: the count does not move, so the event does not come */
+	set_event(t, 0, 1000, 0);
+	CHECK(remaining(t) == 1000);
+	test_clock_us += 5000; CHECK(remaining(t) == 1000);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND);
+	CHECKEQ(call(h_start_timer, 1, t), 0);
+	test_clock_us += 400; CHECK(remaining(t) == 600);
+	WR32(info, 0x60); CHECKEQ(call(h_get_timer_info, 2, t, info), 0);
+	CHECK(RD64(info + 0x40) == 1000 && RD64(info + 0x48) == 1000); CHECKEQ(RD32(info + 0x50), 0); CHECKEQ(RD32(info + 0x54), 0);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND); CHECKEQ(RD32(out), 0);
+	test_clock_us += 600;   /* the count passes the schedule: the event is set and stays set */
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0); CHECKEQ(RD32(out), 1);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0);
+	CHECK(remaining(t) == 0);
+	WR32(info, 0x60); CHECKEQ(call(h_get_timer_info, 2, t, info), 0); CHECK(RD64(info + 0x40) == 0);   /* a one-shot is disarmed once it fired */
+	CHECKEQ(call(h_clear_sevent, 2, t, 0), 0);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND);
+	/* a waiter sleeps until the count gets there; a second one too; both released by the one SET_EVENT */
+	set_event(t, 0, 2000, 0);
+	TmWait a = { .uid = t, .out = word() }, b = { .uid = t, .out = word() };
+	pthread_t ta = go(tm_waiter, &a); pthread_t tb = go(tm_waiter, &b); nap(20);
+	CHECK(!a.done && !b.done);
+	WR32(info, 0x60); CHECKEQ(call(h_get_timer_info, 2, t, info), 0); CHECKEQ(RD32(info + 0x58), 2);   /* two waiters */
+	test_clock_us += 1999; nap(20); CHECK(!a.done && !b.done);
+	test_clock_us += 1; pthread_join(ta, 0); pthread_join(tb, 0);
+	CHECKEQ(a.result, 0); CHECKEQ(b.result, 0); CHECKEQ(RD32(a.out), 1);
+	CHECKEQ(call(h_wait_sevent, 5, t, 1, out, 0, 0), 0);   /* still set: a later wait returns at once */
+	/* a timed wait on a timer that never fires times out */
+	CHECKEQ(call(h_clear_sevent, 2, t, 0), 0);
+	TmWait c = { .uid = t, .out = word(), .timeout = word() }; WR32(c.timeout, 15000);
+	pthread_t tc = go(tm_waiter, &c); pthread_join(tc, 0); CHECKEQ(c.result, E_WAIT_TIMEOUT); CHECKEQ(RD32(c.timeout), 0);
+	/* PULSE_EVENT wakes the current waiters and is not left set */
+	set_event(t, 1, 500, 0);
+	TmWait d = { .uid = t, .out = word() }; pthread_t td = go(tm_waiter, &d); nap(20); CHECK(!d.done);
+	test_clock_us += 500; pthread_join(td, 0); CHECKEQ(d.result, 0);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND);
+	set_event(t, 1, 100, 0); test_clock_us += 200;   /* nobody waiting: the pulse is lost */
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND);
+	/* repeat: a period passes every interval; missed periods do not pile up */
+	set_event(t, 0, 1000, 1);
+	test_clock_us += 1000; CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0); CHECKEQ(call(h_clear_sevent, 2, t, 0), 0);
+	CHECK(remaining(t) == 1000);
+	test_clock_us += 3500; CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0); CHECKEQ(call(h_clear_sevent, 2, t, 0), 0);
+	CHECK(remaining(t) == 500);   /* the schedule skipped to the next period after the count */
+	WR32(info, 0x60); CHECKEQ(call(h_get_timer_info, 2, t, info), 0); CHECKEQ(RD32(info + 0x54), 1);
+	test_clock_us += 500; CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0); CHECKEQ(call(h_clear_sevent, 2, t, 0), 0);
+	/* a repeating PULSE wakes a waiter each period */
+	set_event(t, 1, 1000, 1);
+	for (int i = 0; i < 2; i++) { TmWait e = { .uid = t, .out = word() }; pthread_t te = go(tm_waiter, &e); nap(20); CHECK(!e.done); test_clock_us += 1000; pthread_join(te, 0); CHECKEQ(e.result, 0); }
+	/* Cancel: disarms, clears a set event, ends waits with WAIT_CANCEL and counts them */
+	TmWait f = { .uid = t, .out = word() }; pthread_t tf = go(tm_waiter, &f); nap(20);
+	WR32(cnt, 99); CHECKEQ(call(h_cancel_timer, 2, t, cnt), 0); pthread_join(tf, 0); CHECKEQ(f.result, E_WAIT_CANCEL); CHECKEQ(RD32(cnt), 1);
+	CHECK(remaining(t) == 0); test_clock_us += 5000; CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND);
+	set_event(t, 0, 10, 0); test_clock_us += 10; CHECKEQ(call(h_cancel_timer, 2, t, cnt), 0); CHECKEQ(RD32(cnt), 0);   /* a set event is cleared */
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_EVENT_COND);
+	CHECKEQ(call(h_cancel_timer, 2, t, 0), 0); CHECKEQ(call(h_cancel_timer, 2, 0x1234, 0), E_UNKNOWN_TIMER_ID);
+	/* the count set forward past the schedule fires it; zero interval is due at once; delete releases a waiter */
+	set_event(t, 0, 1000, 0);
+	CHECKEQ(call(h_stop_timer, 1, t), 1); timer_set(by_uid(t, TIMER), 10000000); CHECKEQ(call(h_start_timer, 1, t), 0);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0);
+	CHECKEQ(call(h_clear_sevent, 2, t, 0), 0); set_event(t, 0, 0, 0); CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), 0);
+	CHECKEQ(call(h_clear_sevent, 2, t, 0), 0); set_event(t, 0, 50000, 0);
+	TmWait g = { .uid = t, .out = word() }; pthread_t tg = go(tm_waiter, &g); nap(20);
+	CHECKEQ(call(h_delete_timer, 1, t), 0); pthread_join(tg, 0); CHECKEQ(g.result, E_WAIT_DELETE);
+	CHECKEQ(call(h_poll_sevent, 4, t, 1, out, 0), E_UNKNOWN_EVENT_ID);
+	CHECKEQ(call(h_wait_sevent, 5, t, 0, out, 0, 0), E_UNKNOWN_EVENT_ID);
+	test_clock_us = saved_clock;
+}
 static void test_timers(void) {
 	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "tmr");
 	uint32_t q = guest_alloc(8, 8);
@@ -728,9 +840,6 @@ static void test_timers(void) {
 	/* open by name, close */
 	CHECKEQ(call(h_open_timer, 1, name), t); CHECKEQ(call(h_close_timer, 1, t), 0);
 	CHECKEQ(call(h_close_timer, 1, 0x1234), E_UNKNOWN_TIMER_ID);
-	/* the event half is not there: an error, not a success the game would wait on */
-	CHECKEQ(call(h_set_timer_event, 4, t, 0, q, 0), E_NOT_IMPLEMENTED);
-	CHECKEQ(call(h_cancel_timer, 2, t, 0), E_NOT_IMPLEMENTED);
 	/* delete: the uid stops resolving, in every call; a semaphore's uid isn't a timer's */
 	CHECKEQ(call(h_delete_timer, 1, t), 0);
 	CHECKEQ(call(h_delete_timer, 1, t), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_start_timer, 1, t), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_stop_timer, 1, t), E_UNKNOWN_TIMER_ID);
@@ -738,6 +847,7 @@ static void test_timers(void) {
 	CHECKEQ(call(h_get_timer_base, 2, t, q), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_get_timer_info, 2, t, info), E_UNKNOWN_TIMER_ID);
 	CHECK(timer_wide(h_get_timer_time_wide, t) == (uint64_t)(int64_t)(int32_t)E_UNKNOWN_TIMER_ID);   /* a wide call's error: the code, sign-extended */
 	CHECKEQ(call(h_open_timer, 1, name), E_UID_CANNOT_FIND_BY_NAME);
+	test_timer_events(name);
 	CHECKEQ(call(h_delete_timer, 1, 0), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_start_timer, 1, 0xdeadbeef), E_UNKNOWN_TIMER_ID);
 	uint32_t s = call(h_create_sema, 5, name, 0, 0, 1, 0); CHECKEQ(call(h_start_timer, 1, s), E_UNKNOWN_TIMER_ID);
 	/* the count follows the guest clock alone, so a fixed clock gives the same values every run */
@@ -827,6 +937,13 @@ static void test_sched(void) {
 	sc_start(h, 0); nap(30); CHECK(slog_is(""));   /* ready, but main holds the core */
 	sched_boundary(); CHECK(slog_is("H"));       /* preempted: H ran until it blocked, then the core came back */
 	CHECKEQ(call(h_signal_sema, 2, sc_sema, 1), 0); nap(30); CHECK(slog_is("H"));
+	sched_boundary(); CHECK(slog_is("Hh"));
+	sc_join(h);
+	/* 1b. the same thread started again once it ended: admitted to the scheduler afresh, it preempts at the next boundary as before */
+	slog_clear();
+	sc_start(h, 0); nap(30); CHECK(slog_is(""));
+	sched_boundary(); CHECK(slog_is("H"));
+	CHECKEQ(call(h_signal_sema, 2, sc_sema, 1), 0); nap(30);
 	sched_boundary(); CHECK(slog_is("Hh"));
 	sc_join(h);
 
