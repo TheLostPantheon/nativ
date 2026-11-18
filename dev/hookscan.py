@@ -81,8 +81,8 @@ def verify(b, found, title, start, n):
     root = os.path.join(HERE, "..")
     vit = [sys.executable, os.path.join(root, "pipeline", "vitarecomp.py")]
     a0, a1 = start, start + n
-    sw = a1 + 30                 # (a second at 30 to settle after the switch)
-    b0, b1 = sw + 60, sw + 60 + 2 * n
+    sw = a1                      # the windows back to back around the switch: the scene barely moves between them
+    b0, b1 = sw + 2, sw + 2 + 2 * n
     env = dict(os.environ, RECOMP_BIN="verify", TEST_FRAMES=str(b1 + 1), TEST_COVERAGE="0", TIMEOUT=os.environ.get("TIMEOUT", "1800"),
                EXTRA_ENV=" ".join(x for x in (os.environ.get("EXTRA_ENV", ""), "RECOMP_GFX=gpu RECOMP_CLOCK=fixed",
                                                f"RECOMP_WATCH_WINDOWS={a0}-{a1},{b0}-{b1}", f"RECOMP_SETTINGS_SWITCH={sw}:frame_rate=60") if x))
@@ -100,15 +100,21 @@ def verify(b, found, title, start, n):
             if m: cur[int(m.group(1), 16)] = cur.get(int(m.group(1), 16), 0) + int(m.group(2))
             elif not line.startswith("  "): cur = None
     if len(windows) < 2: sys.exit(f"the run counted {len(windows)} of 2 windows (see {logs[0]}): did it reach frame {b1}?")
+    # per presented frame, against the game's own frame: the function that runs exactly once a frame in both windows
+    # (n at 30, 2n at 60). A per-object function's count moves with the scene; divided by a once-a-frame function's it
+    # doesn't. A function in a fixed-step loop runs at the same rate per second, so per frame it halves at 60
+    ref = [e for e, c in windows[0].items() if c == n and windows[1].get(e) == 2 * n]
     out = []
     for kind, site, reg, entry, how in found:
         if kind != "frame_dt": continue
         c30, c60 = windows[0].get(entry, 0), windows[1].get(entry, 0)
+        p30, p60 = c30 / n, c60 / (2 * n)   # per frame
         if not c30 and not c60: v = "not run in the windows"
-        elif c30 and c60 / c30 >= 1.6: v = "per frame: hook it"
-        elif c30 and c60 / c30 <= 1.3: v = "per second (a fixed step): leave it"
-        else: v = "unclear"
+        elif c30 and c60 and 0.75 <= p60 / p30 <= 1.33: v = "per frame: hook it"
+        elif c30 and c60 and 0.4 <= p60 / p30 <= 0.6: v = "per second (a fixed step): leave it"
+        else: v = f"unclear ({p30:.1f} a frame at 30, {p60:.1f} at 60)"
         out.append((site, kind, entry, c30, c60, v))
+    if not ref: print("  (no function ran exactly once a frame in both windows: the frame rate switch may not have taken)")
     return out
 
 
