@@ -147,8 +147,9 @@ has a menu with that game's own options. Some worth knowing:
 - **Render scale**: draws the game at up to six times the Vita's resolution.
 - **Aspect ratio**: native, 21:9, 32:9 or your window's shape. The HUD keeps its own shape on wide screens.
 - **Frame rate**: 30 or 60. 60 is experimental: parts of a game timed in fixed 1/30 second steps can run fast.
-- **Language** (a game's settings, and the menu's Game page): the language the game is told the system speaks. It applies
-  the next time the game starts, and a language the game doesn't have is ignored. Automatic is English.
+- **Language** (a game's settings, and the menu's Game page): the language the game is told the system speaks, from the
+  ones that game has been checked in (Uncharted: English and Spanish). It applies the next time the game starts.
+  Automatic is English.
 - **Field of view** (Killzone, Unit 13 and Uncharted).
 - **QTE time** (Killzone): how long you get for the swipe in a takedown or an interrogation, from 1 second (what the
   game's own slow motion gives) to 3. It's the same at 30 and 60 fps.

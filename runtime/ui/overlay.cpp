@@ -359,12 +359,14 @@ static void page_game(void) {
 	if (!ui::rows_begin("game")) return;
 	ui::row("Frame rate", "60 is experimental: parts of a game timed in fixed 1/30 s steps can run fast.");
 	{ static const char *const names[2] = {"30##fr", "60##fr"}; int v = P.fr >= 60; if (ui::segmented(names, 2, &v)) set_frame_rate(v ? 60 : 30); }
-	ui::row("Language", "Applies the next time the game starts. A language the game doesn't have is ignored.");
-	{	static const char *labels[1 + game_language_count]; static int built;
-		if (!built) { built = 1; labels[0] = "Automatic (English)"; for (int i = 0; i < game_language_count; i++) labels[i + 1] = game_languages[i].label; }
-		char cur[32]; settings_str("game_language", "auto", cur, sizeof cur);
-		int v = 0; for (int i = 0; i < game_language_count; i++) if (!strcmp(cur, game_languages[i].key)) v = i + 1;
-		if (ui::choice("##lang", labels, 1 + game_language_count, &v)) { settings_set_str("game_language", v ? game_languages[v - 1].key : "auto"); settings_save(); }
+	{	static const char *labels[1 + game_language_count]; static int keys[1 + game_language_count], n = -1;   /* (the languages the game was checked in) */
+		if (n < 0) { n = 1; labels[0] = "Automatic (English)"; keys[0] = -1; for (int i = 0; i < game_language_count; i++) if (game_language_allowed(game_languages[i].key)) { labels[n] = game_languages[i].label; keys[n++] = i; } }
+		if (n > 1) {
+			ui::row("Language", "The languages this game has been checked in. Applies the next time the game starts.");
+			char cur[32]; settings_str("game_language", "auto", cur, sizeof cur);
+			int v = 0; for (int k = 1; k < n; k++) if (!strcmp(cur, game_languages[keys[k]].key)) v = k;
+			if (ui::choice("##lang", labels, n, &v)) { settings_set_str("game_language", v ? game_languages[keys[v]].key : "auto"); settings_save(); }
+		}
 	}
 	if (game_option("fov")) {
 		ui::row("Field of view", "A wider view. 1.00× is the game's own.");

@@ -461,6 +461,10 @@ class Game:
         # plays with online off and is told which update it needs (runtime/net/net.c net_online_needs)
         ov = (c.get("ONLINE_VERSIONS") or "").split()
         if ov and version not in ov: c["RUN_ENV"] = ((c.get("RUN_ENV") or "") + " RECOMP_ONLINE_NEEDS=" + ",".join(ov)).strip()
+        # LANGUAGES: the languages the game was checked to start in, the only ones its Language setting offers and honours
+        # (runtime/ui/languages.h); an experimental copy gets none, so it runs in English as it always did
+        langs = (c.get("LANGUAGES") or "").split()
+        if langs and version != "unknown": c["RUN_ENV"] = ((c.get("RUN_ENV") or "") + " RECOMP_GAME_LANGUAGES=" + ",".join(langs)).strip()
         # a copy of a version the pack doesn't play, not tried as experimental (import left <title>/unsupported): nothing
         # builds it, or another version's hooks would patch unrelated code
         if os.path.isfile(os.path.join(self.W, "unsupported")) and cmd not in ("import", "versions", "add", "report"):

@@ -415,6 +415,7 @@ static void h_receive_system_event(Cpu *c) { RET(0x80802016u); }
 static uint32_t system_language(void) {
 	char b[32]; const char *e = getenv("RECOMP_GAME_LANGUAGE");
 	if (e) snprintf(b, sizeof b, "%s", e); else settings_str("game_language", "auto", b, sizeof b);
+	if (!e && !game_language_allowed(b)) return 1;   /* (a language this game wasn't checked in: English, as before the setting) */
 	for (int i = 0; i < game_language_count; i++) if (!strcmp(b, game_languages[i].key)) return (uint32_t)i;
 	return 1;
 }

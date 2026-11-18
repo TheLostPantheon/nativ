@@ -11,3 +11,13 @@ static const GameLanguage game_languages[] = {
 	{"english_gb", "English (UK)"}, {"turkish", "Turkish"},
 };
 static const int game_language_count = (int)(sizeof game_languages / sizeof game_languages[0]);
+/* the languages this game was checked in (its pack's LANGUAGES, passed as RECOMP_GAME_LANGUAGES="a,b"): a game that
+ * lacks a language can fall back to English or fail to start (Uncharted US crashed at boot in French on its EU data),
+ * so only these are offered, and a stored choice outside them is ignored */
+#include <stdlib.h>
+#include <string.h>
+static inline int game_language_allowed(const char *key) {
+	const char *l = getenv("RECOMP_GAME_LANGUAGES"); size_t n = strlen(key);
+	for (const char *p = l; p && *p; ) { const char *e = strchr(p, ','); size_t m = e ? (size_t)(e - p) : strlen(p); if (m == n && !strncmp(p, key, n)) return 1; p = e ? e + 1 : p + m; }
+	return 0;
+}
