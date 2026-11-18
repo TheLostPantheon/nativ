@@ -8,8 +8,9 @@
  *    LibAtrac9 ships no encoder or test stream, so ATRAC9 has no reference-audio check.
  *  - AAC and MP3 (only with -DRECOMP_AVCODEC and libavcodec's headers and libraries; without them the test says
  *    so and checks that those types fail with INVALID_TYPE): tone.aac and tone.mp3, 0.14 s sine tones made with
- *    the ffmpeg command line (-c:a aac, libmp3lame), are decoded through Decode frame by frame (AAC as ADTS and
- *    as raw frames) and the PCM compared with libavcodec decoding the same file directly.
+ *    the ffmpeg command line (-c:a aac, libmp3lame), are decoded through Decode frame by frame (AAC as ADTS, as
+ *    raw frames with their size given, and as raw frames back to back with none, as Sony's AvPlayer passes them)
+ *    and the PCM compared with libavcodec decoding the same file directly.
  *
  *     cc -O1 -g -w -I ../core -I ../../recompiler -I ../.. audiodec_test.c ../../third_party/libatrac9/*.c -lm -lpthread \
  *        -o /tmp/audiodec_test [-DRECOMP_AVCODEC $(pkg-config --cflags --libs libavcodec libavutil)] && /tmp/audiodec_test
@@ -154,7 +155,10 @@ static int16_t *reference(int id, const uint8_t *asc, int asc_n, int ch, int rat
 	return out;
 }
 /* a codec's frames through Decode, one call each, against the reference; returns the PCM sample count */
-static void run_stream(const char *name, uint32_t type, uint32_t info_words, const uint32_t *info, uint8_t **frames, uint32_t *sizes, int n, int use_hint, const int16_t *ref, size_t ref_n) {
+/* how the frames sit in the buffer: alone with zeros after (inputEsSize 0), alone with inputEsSize set to the
+ * frame's size, or back to back with inputEsSize left at the last call's answer (Sony's AvPlayer) */
+enum { ALONE, ALONE_SIZED, PACKED };
+static void run_stream(const char *name, uint32_t type, uint32_t info_words, const uint32_t *info, uint8_t **frames, uint32_t *sizes, int n, int mode, const int16_t *ref, size_t ref_n) {
 	char what[160];
 	ctrl_setup(CTRL, ES, PCM); memset(G(INFO), 0, 0x20);
 	for (uint32_t i = 0; i < info_words; i++) WR32(INFO + 4 * i, info[i]);
@@ -165,8 +169,11 @@ static void run_stream(const char *name, uint32_t type, uint32_t info_words, con
 	snprintf(what, sizeof what, "%s: maxEsSize %u, maxPcmSize %u", name, RD32(CTRL + C_ES_MAX), RD32(CTRL + C_PCM_MAX)); check(RD32(CTRL + C_ES_MAX) > 0 && RD32(CTRL + C_PCM_MAX) > 0, what);
 	size_t got = 0; int ok = 1, sizes_ok = 1;
 	for (int i = 0; i < n; i++) {
-		memset(G(ES), 0, 2048); memcpy(G(ES), frames[i], sizes[i]);   /* (zeros after the frame, as a game's buffer has) */
-		WR32(CTRL + C_ES, ES); WR32(CTRL + C_PCM, PCM); WR32(CTRL + C_ES_USED, use_hint ? sizes[i] : 0);
+		memset(G(ES), 0, 2048);
+		if (mode == PACKED) for (uint32_t k = i, at = 0; k < (uint32_t)n && at + sizes[k] <= 2048; at += sizes[k], k++) memcpy(G(ES) + at, frames[k], sizes[k]);
+		else memcpy(G(ES), frames[i], sizes[i]);
+		WR32(CTRL + C_ES, ES); WR32(CTRL + C_PCM, PCM);
+		if (mode != PACKED) WR32(CTRL + C_ES_USED, mode == ALONE_SIZED ? sizes[i] : 0);
 		if (call("sceAudiodecDecode", CTRL, 0)) { ok = 0; break; }
 		if (RD32(CTRL + C_ES_USED) != sizes[i]) sizes_ok = 0;
 		uint32_t g = RD32(CTRL + C_PCM_GIVEN);
@@ -203,8 +210,9 @@ static void test_aac(void) {
 	ctrl_setup(CTRL, ES, PCM); memset(G(INFO), 0, 0x20); for (int i = 0; i < 5; i++) WR32(INFO + 4 * i, info_bad[i]);
 	check(call("sceAudiodecCreateDecoder", CTRL, T_AAC) == AD_ERR_AAC_INVALID_CH, "AAC with 6 channels: AAC INVALID_CH");
 	check(call("sceAudiodecGetContextSize", CTRL, T_AAC) == 0x18000, "GetContextSize(AAC)");
-	run_stream("AAC (ADTS)", T_AAC, 5, info_adts, adts, asz, cnt, 0, ref_adts, an);
-	run_stream("AAC (raw frames, size from the caller)", T_AAC, 5, info_raw, raw, rsz, cnt, 1, ref_raw, rn);
+	run_stream("AAC (ADTS)", T_AAC, 5, info_adts, adts, asz, cnt, ALONE, ref_adts, an);
+	run_stream("AAC (raw frames, size from the caller)", T_AAC, 5, info_raw, raw, rsz, cnt, ALONE_SIZED, ref_raw, rn);
+	run_stream("AAC (raw frames back to back, no sizes)", T_AAC, 5, info_raw, raw, rsz, cnt, PACKED, ref_raw, rn);
 	check(call("sceAudiodecTermLibrary", T_AAC, 0) == 0, "TermLibrary(AAC)");
 	free(ref_raw); free(ref_adts); free(f);
 }
@@ -223,7 +231,7 @@ static void test_mp3(void) {
 	check(call("sceAudiodecCreateDecoderExternal", CTRL, T_MP3) == AD_ERR_MP3_INVALID_MPEG_VERSION, "MP3 with the reserved version: INVALID_MPEG_VERSION");
 	for (int i = 0; i < 3; i++) WR32(INFO + 4 * i, bad_ch[i]);
 	check(call("sceAudiodecCreateDecoderExternal", CTRL, T_MP3) == AD_ERR_MP3_INVALID_CH, "MP3 with 3 channels: MP3 INVALID_CH");
-	run_stream("MP3", T_MP3, 3, info, fr, sz, cnt, 0, ref, rn);
+	run_stream("MP3", T_MP3, 3, info, fr, sz, cnt, ALONE, ref, rn);
 	free(ref); free(f);
 }
 #endif

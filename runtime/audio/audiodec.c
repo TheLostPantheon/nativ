@@ -15,10 +15,13 @@
  * reports the bytes it took (inputEsSize) and wrote (outputPcmSize). ATRAC9 frames are variable length inside a
  * superframe, so a frame takes its own bytes and the superframe's last one also the padding after it. ADTS and
  * MP3 frames state their length in the header. A raw AAC frame does not, and libavcodec's public API does not
- * report how much of a packet the decoder used, so the caller's inputEsSize (what it set before the call: its
- * sample's size) is the frame's length; without one the buffer up to its last nonzero byte is. The host keeps the
- * decoders' memory itself, so the *External calls are the plain ones and GetContextSize only has to answer
- * something the caller can allocate. RECOMP_AUDIODEC_LOG=1 logs the lifecycle.
+ * report how much of a packet the decoder used, so aacframe.h measures the frame from its own syntax: callers
+ * don't say (Sony's AvPlayer leaves inputEsSize at the last call's answer and puts the next frame right after),
+ * and a packet that runs past the frame is decoded by libavcodec as more frames. A frame aacframe.h can't
+ * measure (a coupling element, another profile's tools) falls back to the caller's inputEsSize, then the buffer
+ * up to its last nonzero byte. The host keeps the decoders' memory itself, so the *External calls are the plain
+ * ones and GetContextSize only has to answer something the caller can allocate. RECOMP_AUDIODEC_LOG=1 logs the
+ * lifecycle.
  */
 #include "hle.h"
 #include <pthread.h>
@@ -26,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "third_party/libatrac9/libatrac9.h"
+#include "aacframe.h"
 #ifdef RECOMP_AVCODEC
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -74,6 +78,7 @@ static const char *type_name(uint32_t type) { return type == T_AT9 ? "ATRAC9" : 
 typedef struct {
 	int used; uint32_t type;
 	uint32_t es_max, pcm_max, pcm_cap, ch, adts;   /* pcm_max is what the API reports, pcm_cap what a frame may write (implicit SBR doubles AAC) */
+	int sfi;                    /* raw AAC: the sampling-frequency index, for aacframe.h */
 	int32_t last_err;
 	void *at9; unsigned char config[4]; Atrac9CodecInfo ci;
 	int sf_frame, sf_left;      /* the frame within the superframe; its bytes not yet taken */
@@ -150,6 +155,7 @@ static int av_create(Dec *d, uint32_t type, uint32_t ch, uint32_t rate, uint32_t
 	int sr = -1;
 	for (int i = 0; i < 13; i++) if (rates[i] == rate) sr = i;
 	if (type == T_AAC && !adts && sr < 0) return -1;
+	d->sfi = sr;
 	d->av = codec ? avcodec_alloc_context3(codec) : 0;
 	d->frm = av_frame_alloc(); d->pkt = av_packet_alloc(); d->in = calloc(1, d->es_max + AV_INPUT_BUFFER_PADDING_SIZE);
 	if (!d->av || !d->frm || !d->pkt || !d->in) return -1;
@@ -237,7 +243,7 @@ static void create(Cpu *c, int external) {   /* External: the caller hands over 
 		WR32(info + I_AT9_SF_SIZE, ci.superframeSize); WR32(info + I_AT9_SF_FRAMES, ci.framesInSuperframe);
 	}
 	WR32(ctrl + C_HANDLE, i + 1); WR32(ctrl + C_ES_MAX, es_max); WR32(ctrl + C_PCM_MAX, pcm_max);
-	if (ad_log()) fprintf(stderr, "audiodec: decoder %d: %s, %u ch, %u Hz, max es %u, max pcm %u\n", i + 1, type_name(type), ch, type == T_AT9 ? (uint32_t)ci.samplingRate : rate, es_max, pcm_max);
+	if (ad_log()) fprintf(stderr, "audiodec: decoder %d: %s, %u ch, %u Hz, adts %u, sbr %u, max es %u, max pcm %u\n", i + 1, type_name(type), ch, type == T_AT9 ? (uint32_t)ci.samplingRate : rate, adts, sbr, es_max, pcm_max);
 	RET(0);
 }
 static void h_create(Cpu *c) { create(c, 0); }
@@ -296,11 +302,15 @@ static uint32_t mp3_len(const uint8_t *p) {
 	int mpeg1 = v == 3, hz = mp3_hz[mpeg1 ? 0 : v == 2 ? 1 : 2][sr];
 	return (uint32_t)((mpeg1 ? 144 : 72) * mp3_kbps[!mpeg1][br] * 1000 / hz + pad);
 }
-/* the frame's byte count: ADTS and MP3 headers say it; a raw AAC frame is what the caller set in inputEsSize,
- * else the buffer up to its last nonzero byte (a raw_data_block ends in ID_END's 1-bits) */
+/* the frame's byte count: ADTS and MP3 headers say it; a raw AAC frame's is read from its syntax (aacframe.h),
+ * else it's what the caller set in inputEsSize, else the buffer up to its last nonzero byte (a raw_data_block ends
+ * in ID_END's 1-bits) */
 static uint32_t frame_len(Dec *d, const uint8_t *es, uint32_t hint) {
 	if (d->type == T_MP3) return mp3_len(es);
 	if (d->adts) return es[0] == 0xFF && (es[1] & 0xF0) == 0xF0 ? (uint32_t)(es[3] & 3) << 11 | (uint32_t)es[4] << 3 | es[5] >> 5 : 0;
+	int m = aac_raw_frame_len(es, d->es_max, d->sfi);
+	if (m > 0) return (uint32_t)m;
+	if (ad_log()) { static int said; if (said++ < 4) fprintf(stderr, "audiodec: a raw AAC frame aacframe.h can't measure; using %s\n", hint ? "inputEsSize" : "the buffer's last nonzero byte"); }
 	if (hint && hint <= d->es_max) return hint;
 	uint32_t n = d->es_max; while (n && !es[n - 1]) n--;
 	return n;
