@@ -113,6 +113,18 @@ Buttons are named as on a PlayStation controller; on an Xbox controller, L1 and 
 **L and R buttons** (Controls, in the menu and the launcher's Settings) swaps the shoulder pairs: L and R on the bumpers
 (L1 and R1), and the touch cursor on the triggers.
 
+**Changing the buttons.** The menu's Controls page (F10, or the Guide button) lists every Vita button with the key and
+the controller button that press it. Choose Change next to one and press the new key or button; Esc cancels. A key or
+button that already did something else is taken from it, and that one shows "none" until you set it again. The triggers
+count as buttons, and the controller column uses your controller's own names (A, B, X, Y and LB, RB on an Xbox
+controller). The same table has the touch cursor's two buttons, which are the shoulder pair that isn't L and R until you
+change them, and L3 and R3, which only a PS TV layout uses (R3 also recentres the gyro). F10 and the Guide button
+always open the menu and can't be bound. Reset keys to the defaults and Reset controller buttons put the originals back.
+
+The buttons are the same in every game. Turn on **Different buttons for this game** to give one game its own keys and
+controller buttons, starting from the ones you have now; turning it off goes back to the shared set. The launcher's
+Settings > Controls shows what has been changed and can reset it; the buttons themselves are changed in a game.
+
 **Controller layout** (Killzone 1.12): the game decides as it starts whether it plays with its touch controls, as on a
 handheld, or with its own PS TV layout, which puts every touch action on buttons and sticks, and keeps that until you
 quit. The **Standard** layout, the game's touch controls, is the default and works with keyboard, mouse and controller

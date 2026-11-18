@@ -49,6 +49,7 @@ int overlay_is_open(void);
 int overlay_layout_ask(void);
 void overlay_open(void);
 void overlay_close(void);
+int overlay_cancel_rebind(void);   /* Escape in the menu: stops a Controls rebind waiting for its key or button (1), else 0 and Escape closes the menu */
 void overlay_toggle(void);
 /* Game > Pause in the menu bar: the game held without the menu (a banner says so). overlay_game_paused
  * is the one flag display.c and window.c's audio poll: the full menu open OR this pause. Closing the

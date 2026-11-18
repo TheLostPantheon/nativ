@@ -27,6 +27,7 @@ step "raw AAC frame lengths (aacframe_test.c)" unit aacframe_test
 # the audio decoder: ATRAC9 always; AAC and MP3 too where libavcodec's development files are installed (CI may not have them: the test then skips those and checks they fail cleanly)
 AVC=(); pkg-config --exists libavcodec libavutil 2>/dev/null && AVC=(-DRECOMP_AVCODEC $(pkg-config --cflags --libs libavcodec libavutil))
 step "audio decoder (audiodec_test.c)" unit audiodec_test ${AVC[@]+"${AVC[@]}"} $ROOT/third_party/libatrac9/*.c -lm -lpthread
+step "controller button bindings (padbind_test.c)" unit padbind_test ../core/settings.c -lpthread
 step "message and text-input dialogs (commondlg_test.c)" unit commondlg_test -I stub -lpthread
 
 echo

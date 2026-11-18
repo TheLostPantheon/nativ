@@ -24,6 +24,10 @@
  *   mouse_invert  window.c    0 | 1 (default 0)          the look's y inverted
  *   bind_<action> window.c    an SDL key name           keyboard+mouse bindings (kb_binds: move_up/down/left/right,
  *                                                       cross, circle, square, triangle, l, r, start, select, up/down/left/right)
+ *   padbind_<action>  window.c  an SDL gamepad button name (south, leftshoulder, dpup, ...) or lefttrigger | righttrigger | none:
+ *                             the controller's buttons (ui/padbind.h: cross, circle, square, triangle, l, r, start, select, up, down,
+ *                             left, right, l2, r2, l3, r3); absent: the default, "shoulder_buttons" included
+ *   bindings_own  window.c    1 in a game's own file: this game's bind_* and padbind_* are its own (the menu's "Different buttons for this game")
  *   camera        camera.c    light | webcam | dark (default light)   what the Vita's camera sees: a lamp toggled with F7, the computer's camera, or a dark room (RECOMP_CAMERA wins)
  *   raw_look      window.c    0 | 1 (default 1; 0 in a scripted run)   Mouse aim: Direct, a game's raw mouse-look hook (hooks.c),
  *                             or Stick, the right-stick stand-in (a game without the hook gets it either way); F8 switches
@@ -79,6 +83,7 @@ void settings_set_int(const char *key, int v);
 void settings_set_float(const char *key, double v);
 void settings_set_str(const char *key, const char *v);
 void settings_set_own(const char *key, const char *v);   /* into the game's own file whatever the key: this game's value apart from the shared one */
+void settings_clear_own(const char *key);   /* drops the game's own value of a key: the shared one reads again */
 void settings_save(void);   /* writes the changed files now, merged with them as they are on disk (the setters don't) */
 int settings_shared_dir(char *buf, int n);   /* the shared file's folder, with its separator (0: none -- a test, or RECOMP_SETTINGS) */
 int settings_game_option(const char *name);   /* this game's pack offers that option (RECOMP_GAME_OPTIONS, its RUN_ENV: "fov,online") */
