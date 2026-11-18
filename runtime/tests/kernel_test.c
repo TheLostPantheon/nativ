@@ -22,7 +22,8 @@ static uint32_t heap = 0x81000000;
 uint32_t guest_alloc(uint32_t size, uint32_t align) { heap = (heap + align - 1) & ~(align - 1); uint32_t a = heap; heap += size; return a; }
 uint32_t tls_block(void) { return guest_alloc(0x100, 64); }
 void recomp_runfast(void) {}
-uint64_t guest_time_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
+static uint64_t test_clock_us;   /* nonzero: a hand-set guest clock (the timer tests), else the host's monotonic one */
+uint64_t guest_time_us(void) { if (test_clock_us) return test_clock_us; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000; }
 int guest_clock_fixed(void) { return 0; }
 void guest_time_slept(uint32_t us) { (void)us; }
 void display_vblank_callbacks(void) {}   /* display.c's vblank callbacks: none here */
@@ -678,6 +679,72 @@ static void test_misc(void) {
 	CHECKEQ(call(h_backtrace_self, 4, 0, 0, n, 0), 0); CHECKEQ(RD32(n), 0);
 }
 
+/* ================= timers: a counter in microseconds on the guest clock (a hand-set clock here, so every
+ * value is exact); Start/Stop/Get/Set are time-keeping only, the event half is refused loudly */
+static uint64_t timer_wide(HleFn f, uint32_t uid) { Cpu c = { 0 }; c.r[0] = uid; f(&c); return c.r[0] | ((uint64_t)c.r[1] << 32); }
+static uint64_t timer_set_wide(uint32_t uid, uint64_t v) { Cpu c = { 0 }; c.r[0] = uid; c.r[2] = (uint32_t)v; c.r[3] = (uint32_t)(v >> 32); h_set_timer_time_wide(&c); return c.r[0] | ((uint64_t)c.r[1] << 32); }
+static void test_timers(void) {
+	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "tmr");
+	uint32_t q = guest_alloc(8, 8);
+	test_clock_us = 1000000;
+	uint32_t t = call(h_create_timer, 3, name, 0, 0); CHECK((int32_t)t > 0);
+	/* a stopped timer reads 0 and stays there */
+	CHECKEQ(call(h_get_timer_time, 2, t, q), 0); CHECK(RD64(q) == 0);
+	test_clock_us += 500; CHECK(timer_wide(h_get_timer_time_wide, t) == 0);
+	CHECKEQ(call(h_stop_timer, 1, t), 0);   /* stopping a stopped timer: 0, nothing changes */
+	/* running: counts the guest clock */
+	CHECKEQ(call(h_start_timer, 1, t), 0);
+	test_clock_us += 1000; CHECK(timer_wide(h_get_timer_time_wide, t) == 1000);
+	CHECKEQ(call(h_get_timer_time, 2, t, q), 0); CHECK(RD64(q) == 1000);
+	CHECKEQ(call(h_start_timer, 1, t), 1);   /* already running: 1, the count goes on */
+	test_clock_us += 1; CHECK(timer_wide(h_get_timer_time_wide, t) == 1001);
+	/* stop freezes; the stopped time doesn't move; restart continues from it */
+	CHECKEQ(call(h_stop_timer, 1, t), 1);
+	test_clock_us += 5000; CHECK(timer_wide(h_get_timer_time_wide, t) == 1001);
+	CHECKEQ(call(h_start_timer, 1, t), 0);
+	test_clock_us += 99; CHECK(timer_wide(h_get_timer_time_wide, t) == 1100);
+	/* the base: 0 while stopped, else the clock at which the count was 0 */
+	CHECKEQ(call(h_get_timer_base, 2, t, q), 0); CHECK(RD64(q) == test_clock_us - 1100);
+	CHECK(timer_wide(h_get_timer_base_wide, t) == test_clock_us - 1100);
+	/* set replaces the count and gives back the old one; the pointer form is in/out */
+	WR64(q, 7000000); CHECKEQ(call(h_set_timer_time, 2, t, q), 0); CHECK(RD64(q) == 1100);
+	test_clock_us += 3; CHECK(timer_wide(h_get_timer_time_wide, t) == 7000003);
+	CHECK(timer_set_wide(t, 0x100000000ull + 5) == 7000003);   /* a 64-bit argument in r2:r3, a 64-bit result in r0:r1 */
+	CHECK(timer_wide(h_get_timer_time_wide, t) == 0x100000005ull);
+	CHECKEQ(call(h_stop_timer, 1, t), 1);
+	CHECK(timer_set_wide(t, 40) == 0x100000005ull); CHECK(timer_wide(h_get_timer_time_wide, t) == 40);   /* set while stopped */
+	CHECKEQ(call(h_get_timer_base, 2, t, q), 0); CHECK(RD64(q) == 0);
+	/* the info structure: 0x60 bytes, the size field decides what is copied */
+	uint32_t info = guest_alloc(0x60, 8); memset(G(info), 0xee, 0x60); WR32(info, 0x60);
+	CHECKEQ(call(h_get_timer_info, 2, t, info), 0);
+	CHECKEQ(RD32(info), 0x60); CHECKEQ(RD32(info + 4), t); CHECK(!strcmp((char *)G(info + 8), "tmr")); CHECKEQ(RD32(info + 0x28), 0); CHECKEQ(RD32(info + 0x2c), 0);
+	CHECK(RD64(info + 0x30) == 40); CHECK(RD64(info + 0x38) == 40);   /* stopped: the stored time is the base and the current time */
+	CHECK(RD64(info + 0x40) == 0 && RD64(info + 0x48) == 0); CHECKEQ(RD32(info + 0x50), 0); CHECKEQ(RD32(info + 0x54), 0); CHECKEQ(RD32(info + 0x58), 0);
+	CHECKEQ(call(h_start_timer, 1, t), 0); test_clock_us += 10;
+	CHECKEQ(call(h_get_timer_info, 2, t, info), 0);
+	CHECKEQ(RD32(info + 0x2c), 1); CHECK(RD64(info + 0x30) == test_clock_us - 50 && RD64(info + 0x38) == 50);
+	WR32(info, 0x30); CHECKEQ(call(h_get_timer_info, 2, t, info), E_INVALID_ARGUMENT_SIZE);
+	CHECKEQ(call(h_get_timer_info, 2, t, 0), E_ILLEGAL_ADDR);
+	/* open by name, close */
+	CHECKEQ(call(h_open_timer, 1, name), t); CHECKEQ(call(h_close_timer, 1, t), 0);
+	CHECKEQ(call(h_close_timer, 1, 0x1234), E_UNKNOWN_TIMER_ID);
+	/* the event half is not there: an error, not a success the game would wait on */
+	CHECKEQ(call(h_set_timer_event, 4, t, 0, q, 0), E_NOT_IMPLEMENTED);
+	CHECKEQ(call(h_cancel_timer, 2, t, 0), E_NOT_IMPLEMENTED);
+	/* delete: the uid stops resolving, in every call; a semaphore's uid isn't a timer's */
+	CHECKEQ(call(h_delete_timer, 1, t), 0);
+	CHECKEQ(call(h_delete_timer, 1, t), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_start_timer, 1, t), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_stop_timer, 1, t), E_UNKNOWN_TIMER_ID);
+	CHECKEQ(call(h_get_timer_time, 2, t, q), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_set_timer_time, 2, t, q), E_UNKNOWN_TIMER_ID);
+	CHECKEQ(call(h_get_timer_base, 2, t, q), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_get_timer_info, 2, t, info), E_UNKNOWN_TIMER_ID);
+	CHECK(timer_wide(h_get_timer_time_wide, t) == (uint64_t)(int64_t)(int32_t)E_UNKNOWN_TIMER_ID);   /* a wide call's error: the code, sign-extended */
+	CHECKEQ(call(h_open_timer, 1, name), E_UID_CANNOT_FIND_BY_NAME);
+	CHECKEQ(call(h_delete_timer, 1, 0), E_UNKNOWN_TIMER_ID); CHECKEQ(call(h_start_timer, 1, 0xdeadbeef), E_UNKNOWN_TIMER_ID);
+	uint32_t s = call(h_create_sema, 5, name, 0, 0, 1, 0); CHECKEQ(call(h_start_timer, 1, s), E_UNKNOWN_TIMER_ID);
+	/* the count follows the guest clock alone, so a fixed clock gives the same values every run */
+	uint32_t t2 = call(h_create_timer, 3, 0, 0, 0); CHECKEQ(call(h_start_timer, 1, t2), 0); test_clock_us += 250000; CHECK(timer_wide(h_get_timer_time_wide, t2) == 250000);
+	test_clock_us = 0;
+}
+
 /* ================= the scheduler (RECOMP_SCHED=vita), run last and switched on only here: every
  * other test runs with it off, as the host does by default. Threads are real guest threads
  * (CreateThread/StartThread, so they are admitted and wait for a slot); their "guest code" calls
@@ -913,6 +980,7 @@ int main(void) {
 	test_callbacks();
 	test_fibers();
 	test_misc();
+	test_timers();
 	int before = checks, failed_before = fails;
 	test_sched();
 	fprintf(stderr, "scheduler (RECOMP_SCHED=vita): %d checks, %d failed\n", checks - before, fails - failed_before);
