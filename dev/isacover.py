@@ -58,9 +58,12 @@ def unpredictable(i):
     """forms the ARM ARM leaves UNPREDICTABLE or privileged, which no compiler emits and the CPU needn't agree on with
     itself: ldm/stm "^" (user registers, exception return); NEON and VFP transfers naming pc as a core register (a
     vld/vst base, vmov's source); a register list running past d31 (capstone names it fpinst2, mvfr0...); a register-
-    shifted register with pc anywhere in it"""
+    shifted register with pc anywhere in it; a pc base that's written back (post-indexed or "!")"""
     ops = i.op_str
     if "^" in ops: return True
+    if re.search(r"\[pc\](,|!|$)", ops) or re.search(r"\[pc, [^\]]*\]!", ops): return True   # a pc base written back
+    m = re.match(r"(\w+)(?:, (\w+))?, \[(\w+)(\]|,[^\]]*\]!)", ops)   # a load into its own base, written back
+    if m and i.mnemonic.startswith("ldr") and m.group(3) in (m.group(1), m.group(2)) and (m.group(4) == "]" and ops.endswith(tuple("0123456789abcdefxr")) and "]," in ops or m.group(4).endswith("!")): return True
     if re.search(r"\b(fpinst2?|mvfr[012]|fpexc|fpsid)\b", ops): return True
     if i.mnemonic.startswith(("v", "f")) and re.search(r"\bpc\b", ops): return True
     if re.search(r"\b(lsl|lsr|asr|ror) (r\d+|sb|sl|fp|ip|sp|lr|pc)\b", ops) and re.search(r"\bpc\b", ops): return True

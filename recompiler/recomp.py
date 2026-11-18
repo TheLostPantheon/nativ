@@ -123,6 +123,8 @@ class Fn:
             # [rN, -rM]: capstone 5 says so in the operand's subtracted, not mem.scale (-1 in capstone 4): every
             # ARM-mode subtracted register offset was added (isacover, 2026-11-17)
             sub = getattr(op, "subtracted", False) or m.scale == -1
+            if self.arm and insn.size == 4:   # ARM's loads and stores carry the sign in the U bit (23); capstone drops it for some (ldrht)
+                sub = not (int.from_bytes(insn.bytes[:4], "little") >> 23) & 1
             return f"({base} {'-' if sub else '+'} {idx})"
         return f"({base} + {m.disp})" if m.disp else base
 
@@ -139,6 +141,9 @@ class Fn:
                 if mn.endswith(cc) and len(mn) > len(cc):
                     mn = mn[:-len(cc)]
                     break
+        # the unprivileged loads and stores (ldrt, strbt...) are the plain ones in a user-mode program
+        mn = {"ldrt": "ldr", "ldrbt": "ldrb", "ldrht": "ldrh", "ldrsbt": "ldrsb", "ldrsht": "ldrsh", "strt": "str", "strbt": "strb",
+              "strht": "strh"}.get(mn, mn)
         ops = list(i.operands)
         if self.arm and len(ops) >= 3 and ops[-1].type == ARM_OP_IMM and ops[-2].type == ARM_OP_IMM \
                 and (int.from_bytes(i.bytes[:4], "little") >> 25) & 7 == 0b001:
@@ -177,7 +182,25 @@ class Fn:
         elif mn == "movt":
             d = self.dst(ops[0].reg)
             out = [f"{d} = ({d} & 0xffffu) | (0x{ops[1].imm & 0xffff:x}u << 16);"]
-        elif mn in ("add", "adds", "sub", "subs", "adc", "adcs", "sbc", "sbcs", "rsb", "rsbs", "addw", "subw"):
+        elif mn in ("ssat", "usat"):
+            # ssat/usat rd, #n, rm{, lsl|asr #s}: rm shifted (the operand's shift), saturated to an n-bit signed (1..32) or
+            # unsigned (0..31) range, Q set when it saturated (isacover, 2026-11-17: unsupported until then)
+            n_ = ops[1].imm; v = self.operand(ops[2], i)
+            lo, hi = (-(1 << (n_ - 1)), (1 << (n_ - 1)) - 1) if mn == "ssat" else (0, (1 << n_) - 1)
+            out = [f"{{ int64_t v = (int32_t){v}, r = v > {hi}LL ? {hi}LL : v < {lo}LL ? {lo}LL : v; if (r != v) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)r; }}"]
+        elif mn in ("ssat16", "usat16"):
+            # each halfword of rm saturated to n bits, signed (1..16) or unsigned (0..15); Q when either saturated
+            n_ = ops[1].imm; v = self.r(ops[2].reg, i)
+            lo, hi = (-(1 << (n_ - 1)), (1 << (n_ - 1)) - 1) if mn == "ssat16" else (0, (1 << n_) - 1)
+            sat = lambda h: f"({{ int32_t x = (int16_t)({v} >> {16 * h}), y = x > {hi} ? {hi} : x < {lo} ? {lo} : x; if (y != x) c->q = 1; (uint32_t)(uint16_t)y; }})"
+            out = [f"{self.dst(ops[0].reg)} = {sat(0)} | {sat(1)} << 16;"]
+        elif mn in ("pkhbt", "pkhtb"):
+            # pack halfwords: pkhbt keeps rn's bottom and takes the top of rm << n; pkhtb keeps rn's top and takes
+            # the bottom of rm asr n (the operand's shift)
+            a, b = self.r(ops[1].reg, i), self.operand(ops[2], i)
+            e = f"({a} & 0xffffu) | ({b} & 0xffff0000u)" if mn == "pkhbt" else f"({a} & 0xffff0000u) | ({b} & 0xffffu)"
+            out = [f"{self.dst(ops[0].reg)} = {e};"]
+        elif mn in ("add", "adds", "sub", "subs", "adc", "adcs", "sbc", "sbcs", "rsb", "rsbs", "rsc", "rscs", "addw", "subw"):
             # Thumb's pc-relative add/sub with an immediate (ADDW/SUBW T4, ADD T1/T3 from the pc: the ADR forms)
             # read the pc as Align(address + 4, 4), not address + 4 -- Killzone's MD5 formed each round's
             # continuation with `addw ip, pc, #0x4f` at a 2-aligned site and `bx ip` landed two bytes into
@@ -210,6 +233,8 @@ class Fn:
                 e = f"SUBC(c, {a}, {b}, c->c, {1 if S else 0})"
             elif base == "rsb":
                 e = f"SUBC(c, {b}, {a}, 1, {1 if S else 0})"
+            elif base == "rsc":   # (ARM only: reverse subtract with carry)
+                e = f"SUBC(c, {b}, {a}, c->c, {1 if S else 0})"
             else:
                 raise Unsupported(mn)
             out = [f"{self.dst(ops[0].reg)} = {e};"]
@@ -367,7 +392,11 @@ class Fn:
             po = ops[-1]
             # (a register's own shift too: ldr r4, [r0], -r1, asr #31 dropped the asr; isacover, 2026-11-17)
             inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.shifted(self.r(po.reg, i), po.shift.type, po.shift.value))
-            out.append(f" {self.dst(m.base)} = ea {'-' if getattr(po, 'subtracted', False) else '+'} {inc};")
+            sub = getattr(po, "subtracted", False)
+            if self.arm:   # the sign is the encoding's U bit (23): capstone drops it for ldrht/ldrsht ("#-0x91", "-r0")
+                sub = not (int.from_bytes(i.bytes[:4], "little") >> 23) & 1
+                if po.type == ARM_OP_IMM: inc = f"0x{abs(po.imm) & 0xffffffff:x}u"
+            out.append(f" {self.dst(m.base)} = ea {'-' if sub else '+'} {inc};")
         elif i.writeback:
             out.append(f" {self.dst(m.base)} = ea;")
         out.append(" }")
