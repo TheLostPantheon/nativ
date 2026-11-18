@@ -64,6 +64,8 @@
   vitarecomp verify    <title> [seconds]    the in-place checker over a scripted run
   vitarecomp recipes   <title>              the shader recipes play recorded (shader_cache/recipes.txt) merged
                                             into packs/<title>/shaders.txt, the set that ships: no game bytes in it
+  vitarecomp steam     <title>              the game as a Steam shortcut (pipeline/steam.py): Steam's Game Mode starts it
+                                            through the launcher (NATIV_LAUNCHER_EXE, the launcher's own path)
   vitarecomp library   [move <folder>]      where the library is; or all of it moved to <folder> (empty or new): renamed
                                             on the same drive, else copied (hard links and links kept), checked, and only
                                             then deleted where it was; the launcher finds it there from then on
@@ -1129,7 +1131,7 @@ def main(argv):
     if cmd == "dist": cmd_dist(T); return 0
     if cmd == "library": cmd_library(argv[1:]); return 0
     if cmd == "report": cmd_report(T); return 0
-    if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions", "pgo"):
+    if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions", "pgo", "steam"):
         usage(); return 1
     g = Game(T, cmd)
     arg3 = argv[2] if len(argv) > 2 else ""
@@ -1143,6 +1145,10 @@ def main(argv):
     elif cmd == "run": cmd_run(g, arg3)
     elif cmd == "test": cmd_test(g)
     elif cmd == "pgo": cmd_pgo(g, arg3, argv[3] if len(argv) > 3 else "", argv[4] if len(argv) > 4 else "")
+    elif cmd == "steam":
+        exe = ENV.get("NATIV_LAUNCHER_EXE") or os.path.join(ROOT, "launcher", "nativ" + (".exe" if WINDOWS else ""))
+        art = os.path.join(linked_dir(os.path.join(g.OUT, "fs", "app0")), "sce_sys")
+        run([PY, os.path.join(R, "steam.py"), "add", g.T, g.NAME or g.T, exe] + ([art] if os.path.isdir(art) else []))
     elif cmd == "capture": cmd_capture(g, arg3)
     elif cmd == "replay":
         if not arg3: die("vitarecomp replay: a frame number")
