@@ -12,9 +12,14 @@ widescreen for a new game start from a list instead of a search:
 --verify sorts the frame_dt candidates by running the game: one headless run of its verify build on the fixed clock
 counts every function's entries over N frames at 30 fps from <frame>, switches the frame rate to 60, and counts again over
 2N frames, the same game time. A function that builds "one frame = 1/30 s" runs once a frame, so its count doubles at 60:
-hook it. One in a fixed-step loop (step 1/30 until caught up with real time) runs as often per second at either rate:
-leave it. Pick <frame> where the game plays its world, with the scripted input done by then (frames run twice as fast
-at 60, so inputs after the switch land elsewhere). The run uses the game's TEST_INPUT, its GPU renderer and ATIV_DUMP.
+a hook candidate. One in a fixed-step loop (step 1/30 until caught up with real time) runs as often per second at
+either rate, and so does one an engine runs for half its objects a frame at 60: counts can't tell those two apart, so
+that verdict says to check in play rather than to leave it. The verdicts are where to look, not proof: Uncharted's pack
+hooks two sites (0x81289498, 0x8129103e) that count as the same rate per second here, after a hand measurement in live
+play (2026-10-10) that counted them once a frame. Each window's game time is printed, and no verdicts come out unless
+they ran at 30 and 60 fps. Pick <frame> where the game plays its world, with the scripted input done by then (frames run
+twice as fast at 60, so inputs after the switch land elsewhere). The run uses the game's TEST_INPUT, its GPU renderer
+and ATIV_DUMP.
 
 Each site is where a core register receives the constant: the movt of a movw/movt pair, or a pc-relative ldr from a
 literal pool. An IHOOKS entry goes on that instruction ("0xADDR:frame_dt"), which is how the packs list them. Loads
@@ -120,8 +125,8 @@ def verify(b, found, title, start, n):
         c30, c60 = windows[0].get(entry, 0), windows[1].get(entry, 0)
         p30, p60 = c30 / n, c60 / (2 * n)   # per frame
         if not c30 and not c60: v = "not run in the windows"
-        elif c30 and c60 and 0.75 <= p60 / p30 <= 1.33: v = "per frame: hook it"
-        elif c30 and c60 and 0.4 <= p60 / p30 <= 0.6: v = "per second (a fixed step): leave it"
+        elif c30 and c60 and 0.75 <= p60 / p30 <= 1.33: v = "per frame: a hook candidate"
+        elif c30 and c60 and 0.4 <= p60 / p30 <= 0.6: v = "the same rate per second (a fixed step, or half the objects a frame): check in play"
         else: v = f"unclear ({p30:.1f} a frame at 30, {p60:.1f} at 60)"
         out.append((site, kind, entry, c30, c60, v))
     if not ref: print("  (no function ran exactly once a frame in both windows: the frame rate switch may not have taken)")
@@ -143,7 +148,7 @@ def main():
         for site, kind, entry, c30, c60, v in rows:
             print(f"  {site:#010x} in {name(entry):<14} {c30:>6} at 30, {c60:>6} at 60: {v}")
         keep = [r for r in rows if r[5].startswith("per frame")]
-        if keep: print("\nIHOOKS: " + " ".join(f"{s:#x}:frame_dt" for s, *_ in keep))
+        if keep: print("\nIHOOKS candidates (check each in play at 60): " + " ".join(f"{s:#x}:frame_dt" for s, *_ in keep))
         return
     name = lambda e: b.names.get(e) or f"fn_{e:08x}"
     for kind in sorted({k for k, *_ in found}):
