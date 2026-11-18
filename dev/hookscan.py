@@ -92,14 +92,24 @@ def verify(b, found, title, start, n):
     import glob
     logs = sorted(glob.glob(os.path.join(os.environ.get("ATIV_DUMP", os.path.join(root, "dump")), "decrypted", title, "recomp", "test_verify", "test.log")))
     if not logs: sys.exit("no test_verify/test.log: the run didn't start")
-    windows, cur = [], None
+    windows, cur, ms = [], None, []
     for line in open(logs[0], errors="replace"):
+        t = re.match(r"== watch window \d+: .*, ([\d.]+) ms a frame", line)
+        if t: ms.append(float(t.group(1))); continue
         if line.startswith("== watch: entries per function"): cur = {}; windows.append(cur); continue
         if cur is not None:
             m = re.match(r"\s+\S+\s+(0x[0-9a-f]+)\s+(\d+)", line)
             if m: cur[int(m.group(1), 16)] = cur.get(int(m.group(1), 16), 0) + int(m.group(2))
             elif not line.startswith("  "): cur = None
     if len(windows) < 2: sys.exit(f"the run counted {len(windows)} of 2 windows (see {logs[0]}): did it reach frame {b1}?")
+    # the game time each window took: the counts compare 30 against 60 only if the game really ran at each. A stretch it
+    # can't hold at 60 (loading, a heavy scene, a cap of its own) runs slower after the switch and makes every per-frame
+    # function look like a fixed step
+    if len(ms) >= 2:
+        print(f"  game time a frame: {ms[0]:.1f} ms in the 30 fps window, {ms[1]:.1f} ms in the 60 fps one")
+        if not (30.0 <= ms[0] <= 36.7 and 15.0 <= ms[1] <= 18.4):
+            sys.exit(f"the windows didn't run at 30 and 60 fps ({ms[0]:.1f} and {ms[1]:.1f} ms a frame), so their counts can't tell a "
+                     f"per-frame step from a fixed one: try another --from, in play the game holds at 60")
     # per presented frame, against the game's own frame: the function that runs exactly once a frame in both windows
     # (n at 30, 2n at 60). A per-object function's count moves with the scene; divided by a once-a-frame function's it
     # doesn't. A function in a fixed-step loop runs at the same rate per second, so per frame it halves at 60
