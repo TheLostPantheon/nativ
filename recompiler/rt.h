@@ -78,6 +78,11 @@ static inline uint8_t RD8(uint32_t a) { return *G(a); }
 /* ordered loads (recomp.py SYNC_MN: in lock-free code): no later load is satisfied before this one -- an acquire load
  * (LDAPR on an Apple core, a plain mov on x86); an unaligned address takes a plain load and a load fence */
 static inline uint32_t RD32A(uint32_t a) { if (a & 3) { uint32_t v = RD32(a); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; } return __atomic_load_n((uint32_t *)G(a), __ATOMIC_ACQUIRE); }
+/* a load in a loop that neither stores nor calls (recomp.py spin_loads): relaxed atomic, so the compiler reads it every
+ * time round instead of once (a wait on another thread's flag); misaligned, a volatile byte read */
+static inline uint32_t RD32V(uint32_t a) { if (a & 3) { volatile uint8_t *p = G(a); return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; } return __atomic_load_n((uint32_t *)G(a), __ATOMIC_RELAXED); }
+static inline uint16_t RD16V(uint32_t a) { if (a & 1) { volatile uint8_t *p = G(a); return (uint16_t)(p[0] | p[1] << 8); } return __atomic_load_n((uint16_t *)G(a), __ATOMIC_RELAXED); }
+static inline uint8_t RD8V(uint32_t a) { return __atomic_load_n(G(a), __ATOMIC_RELAXED); }
 static inline uint16_t RD16A(uint32_t a) { if (a & 1) { uint16_t v = RD16(a); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; } return __atomic_load_n((uint16_t *)G(a), __ATOMIC_ACQUIRE); }
 static inline uint8_t RD8A(uint32_t a) { return __atomic_load_n(G(a), __ATOMIC_ACQUIRE); }
 static inline void WR32(uint32_t a, uint32_t v) { memcpy(G(a), &v, 4); }

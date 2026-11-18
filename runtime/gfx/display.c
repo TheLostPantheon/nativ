@@ -859,6 +859,18 @@ static void h_touch_panel_info(Cpu *c) {   /* front panel 0..1919 x 0..1087; bac
 }
 /* sceDisplayGetRefreshRate(float *): the panel's nominal rate, 59.94 Hz, as the SDK reports it (a
  * theoretical value; the host's vblank grid above runs at 60) */
+/* sceDisplayGetVcount: the vblanks since boot, 60 a second. WipEout 2048 waits for the next one by polling it (with the
+ * stub's constant 0 it made 3 billion calls and never passed its second frame): a thread that reads the same count over
+ * and over is in such a wait, so from its 17th identical read it sleeps to the next edge, the way a time poll moves the
+ * fixed clock (guest_time_us). A count read once or twice a frame never waits */
+static __thread uint64_t vc_last; static __thread uint32_t vc_same;
+static void h_get_vcount(Cpu *c) {
+	uint64_t e = vb_now();
+	if (e == vc_last && ++vc_same > 16) { vb_wait_until(e + 1, 1); e = vb_now(); vc_same = 0; }   /* (as sceDisplayWaitVblankStart: the fixed clock moves too) */
+	else if (e != vc_last) vc_same = 0;
+	vc_last = e; RET((uint32_t)e);
+}
+static void h_set_gpo(Cpu *c) { RET(0); }   /* sceKernelSetGPO: the devkit's debug LEDs (WipEout sets them a million times): none here */
 static void h_refresh_rate(Cpu *c) { if (!A0) { RET(0x80290002u); return; } float hz = 59.94f; memcpy(G(A0), &hz, 4); RET(0); }   /* no pointer: SCE_DISPLAY_ERROR_INVALID_ADDR */
 /* sceCtrlSetSamplingMode(mode): 0 digital, 1 analog, 2 analog wide; returns the PREVIOUS mode (the
  * console starts digital). The sticks are reported either way -- a game that left the pad digital
@@ -967,7 +979,7 @@ const HleEntry hle_display[] = {
 	 * PS TV, which has no touch screen, and it never created its touch recognizers (no menu answered a tap) */
 	{"sceCtrlReadBufferPositive2", h_ctrl_read2}, {"sceCtrlPeekBufferPositive2", h_ctrl_peek2},
 	{"sceAudioOutGetAdopt", h_audio_adopt},   /* (port type): 1, the type can be opened -- only voice chat or the system's music takes one */
-	{"sceDisplayGetRefreshRate", h_refresh_rate},
+	{"sceDisplayGetRefreshRate", h_refresh_rate}, {"sceDisplayGetVcount", h_get_vcount}, {"sceKernelSetGPO", h_set_gpo},
 	{"sceCtrlSetSamplingMode", h_ctrl_mode}, {"sceCtrlSetSamplingModeExt", h_ctrl_mode}, {"sceTouchSetSamplingState", h_touch_sampling},
 	{"sceMotionStartSampling", h_motion_start}, {"sceMotionStopSampling", h_motion_stop}, {"sceMotionGetState", h_motion_state},
 	{"sceMotionGetBasicOrientation", h_motion_basic}, {"sceMotionReset", h_motion_reset}, {"sceMotionSetDeadband", h_input_ok}, {"sceMotionSetTiltCorrection", h_input_ok},
