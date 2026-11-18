@@ -27,7 +27,7 @@
  *   camera        camera.c    light | webcam | dark (default light)   what the Vita's camera sees: a lamp toggled with F7, the computer's camera, or a dark room (RECOMP_CAMERA wins)
  *   raw_look      window.c    0 | 1 (default 1; 0 in a scripted run)   Mouse aim: Direct, a game's raw mouse-look hook (hooks.c),
  *                             or Stick, the right-stick stand-in (a game without the hook gets it either way); F8 switches
- *   save_dialog   apputil.c   ask | auto (default ask)   the save-data dialog: the overlay asks (slot list, yes/no), or every question answers itself (the focused slot, YES); RECOMP_SAVE_DIALOG wins
+ *   save_dialog   apputil.c   ask | auto (default ask)   the system dialogs: the overlay asks (save slot list, yes/no, message buttons), or every question answers itself (the focused slot, YES, the first button); RECOMP_SAVE_DIALOG wins
  *   shadow_filter gfx_gpu.c   0 | 1 | 2 (default 1)     shadow-map samples averaged: 0 the game's one, 1 soft, 2 softer (RECOMP_SHADOW_FILTER wins)
  *   aspect_ratio  window.c    native | 21:9 | 32:9 | window   a wider view, for games with a camera hook (RECOMP_ASPECT_HOOK=1; hooks.c aspect_widen)
  *   hud_layout    gfx_gpu.c   edges | 16:9 | stretch (default edges)   with a wider view: the 2D elements at their own shape, anchored

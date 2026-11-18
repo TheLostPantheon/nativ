@@ -69,6 +69,19 @@ cc -O1 -g -Wall -Wno-unused-function $INC gesture_test.c -o /tmp/gesture_test -l
 
 It prints `scripted taps: N checks, 0 failed` and `console trace: 684 records, 0 differ`.
 
+## System dialogs: `commondlg_test.c`
+
+Checks the message dialog in `runtime/core/apputil.c` with parameter blocks built in guest
+memory the way a game builds them: each message mode and button type, the system messages, the progress bar calls,
+and the errors the console gives for bad parameters. It checks
+the states a game sees (RUNNING until answered, NOT_FINISHED from `GetResult`, FINISHED after, NONE after `Term`),
+answers to a dialog that has gone, `Close` and `Abort`, and the headless auto-answer. Drawing and key handling need a window and aren't covered. The test includes `apputil.c`, so it
+builds with `-I stub`, a stand-in for SDL's header.
+
+    cc -O1 -g -Wall -Wno-unused-function $INC -I stub commondlg_test.c -o /tmp/commondlg_test -lpthread && /tmp/commondlg_test
+
+It prints `N checks, 0 failed`.
+
 ## JPEG: `jpeg_test.c`
 
 Checks `runtime/media/jpeg.c` (SceJpeg and SceJpegEnc) the way Uncharted's photo minigame uses it: a 960x544 picture

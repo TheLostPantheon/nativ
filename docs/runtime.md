@@ -145,6 +145,25 @@ back. `RECOMP_LOG_TOUCH=1` and `RECOMP_LOG_MOTION=1` show touch and motion reads
 `RECOMP_TOUCH_ANY=1` treats any touch device as one (a Mac trackpad becomes an absolute multi-touch surface), and
 `RECOMP_FINGER_SCRIPT="frame:down|move|up:finger:x,y;..."` pushes finger events into a windowed run.
 
+## System dialogs
+
+The Vita draws some screens itself: the save-data dialog and message boxes. The runtime
+keeps the console's states for each (NONE, RUNNING, FINISHED: the game polls `GetStatus`, reads `GetResult`, then calls
+`Term`) and the overlay draws the screen over the picture, in the launcher's look. `runtime/core/apputil.c` holds the
+state, `runtime/core/savedlg.h` and `commondlg.h` are what the overlay reads, and `runtime/ui/overlay.cpp` draws and
+answers. The game keeps running underneath; keys and the pad go to the dialog while it waits.
+
+- **Save data.** The slot list, the yes/no questions and the "Saving..." cards.
+- **Message dialog** (`sceMsgDialog`). The game's text with its buttons (OK, Yes/No, OK/Cancel, Cancel or up to three
+  of its own), one of the system's messages, an error code, or a progress bar. Cross (or Circle, when the system
+  reports that as the enter button) or Enter presses the selected button; Circle or Esc presses No or Cancel when
+  there is one. `GetResult` carries the button's id. A card with no buttons stays until the game calls `Close` (or
+  `Abort`); `ProgressBarInc`, `SetValue` and `SetMsg` change a bar.
+
+Without anyone to answer (a headless run, `save_dialog=auto` in the settings, or `RECOMP_SAVE_DIALOG=auto`) the
+message dialog presses its first button after a few `GetStatus` polls. It logs what it showed and what was answered, as
+`message dialog:` lines. The trophy setup, network check and EULA dialogs still finish at once with an OK result.
+
 ## Code hooks
 
 Sometimes a feature has to reach into one particular guest function rather than a system call: a field-of-view

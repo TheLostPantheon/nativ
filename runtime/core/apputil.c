@@ -17,13 +17,14 @@
 #include "net.h"
 #include "overlay.h"   /* (overlay_toast_titled: the network check's notice) */
 #include "platform.h"
+#include "commondlg.h"
 #include "savedlg.h"
 #include "settings.h"
 
 /* ---- common dialogs: one that was opened finishes at once with an OK result, as if the player
  * confirmed it; each kind has its own state (a dialog never opened reports NONE). The save-data
- * dialog is the exception: a real one, below. */
-enum { DLG_TROPHY, DLG_NETCHECK, DLG_MSG, DLG_EULA, DLG_N };
+ * dialog and the message dialog are the exceptions: real ones, below. */
+enum { DLG_TROPHY, DLG_NETCHECK, DLG_EULA, DLG_N };
 static int dialog_open[DLG_N];
 #define DIALOG(kind, name) \
 	static void h_##name##_init(Cpu *c) { dialog_open[kind] = 1; RET(0); } \
@@ -31,7 +32,6 @@ static int dialog_open[DLG_N];
 	static void h_##name##_term(Cpu *c) { dialog_open[kind] = 0; RET(0); }
 DIALOG(DLG_TROPHY, trophy_dlg)
 DIALOG(DLG_NETCHECK, net_dlg)
-DIALOG(DLG_MSG, msg_dlg)
 DIALOG(DLG_EULA, eula_dlg)
 static void h_dialog_result(Cpu *c) { if (A0) WR32(A0, 0); RET(0); }
 /* SceNetCheckDialogResult {result, psnModeSucceeded, ...}: online (net.h), connected and, in the PSN modes, signed in (np.c's
@@ -402,6 +402,163 @@ void savedlg_answer(int seq, int choice) {
 	pthread_mutex_unlock(&sd_mu);
 }
 
+/* ---- the message dialog (sceMsgDialog): the system's own message card -- the game's text (or one of the
+ * system's) with its buttons, an error code, or a progress bar. The same console states as the save-data dialog:
+ * Init -> RUNNING until a button is pressed (or the game's Close / Abort), then FINISHED, GetResult reads the
+ * button, Term. The overlay draws it and answers (commondlg.h, build_msg_dialog); a card with no buttons (a
+ * progress bar, a wait card) stays until the game closes it. With nobody to answer (sd_auto: a headless run,
+ * save_dialog=auto) the first button answers after a few GetStatus polls, which is a few frames of the game's
+ * own loop. Until 2026-11 every dialog of this kind finished at once with OK. */
+#define SYSPARAM_ENTER_BUTTON 1   /* what sceAppUtilSystemParamGetInt reports for the enter button: 1 Cross (0 would be Circle) */
+static pthread_mutex_t md_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	int open, status, mode;             /* Init..Term; RUNNING / FINISHED */
+	int result, button;                 /* GetResult: 0 OK, 2 aborted; the button id (1 OK/Yes, 2 No/Cancel, 3) */
+	int seq, polls, percent;            /* a new dialog bumps seq; GetStatus polls since Init; a bar's 0..100 or -1 */
+	int nbtn, id[3], back;              /* the buttons and the ids they answer; the one Circle / Esc presses */
+	char label[3][48], msg[520];
+} md;
+/* the system's text for a sysMsgType (SceMsgDialogSystemMessageType) and its buttons: 0 none (the game closes it),
+ * 1 OK, 2 Cancel */
+static const char *md_sysmsg(int type, int *buttons) {
+	*buttons = 1;
+	switch (type) {
+	case 1: case 5: *buttons = 0; return "Please wait.";
+	case 6: *buttons = 2; return "Please wait...";
+	case 2: return "There is not enough free space on the memory card.";
+	case 3: return "Move away from the source of interference, or adjust the compass by moving your system.";
+	case 7: return "Cannot continue the application. No memory card is inserted.";
+	case 8: return "Cannot perform this operation. No memory card is inserted.";
+	case 100: return "You must enable the microphone.";
+	case 101: return "You must use Wi-Fi to do this.";
+	case 102: return "You must use Wi-Fi to use this application.";
+	case 103: return "No content is available yet.";
+	}
+	return "An error occurred.";
+}
+/* (locked) open the dialog SceMsgDialogParam `prm` describes: mode +0x50 (1 USER_MSG, 2 SYSTEM_MSG, 3 ERROR_CODE,
+ * 4 PROGRESS_BAR), then the pointers userMsgParam +0x54, sysMsgParam +0x58, errorCodeParam +0x5c, progBarParam +0x60.
+ * Returns 0, or the error the console gives (SCE_MSG_DIALOG_ERROR_PARAM). */
+static uint32_t md_open(uint32_t prm) {
+	const int mode = (int)RD32(prm + 0x50);
+	const uint32_t up = RD32(prm + 0x54), sp = RD32(prm + 0x58), ep = RD32(prm + 0x5c), pp = RD32(prm + 0x60);
+	char msg[520] = ""; int nbtn = 1, back = -1, bar = -1, ids[3] = {1, 2, 3}, b = 0;
+	const char *l[3] = {"OK", 0, 0};
+	switch (mode) {
+	case 1: {   /* USER_MSG: buttonType +0, msg +4 (UTF-8), buttonParam +8 (texts msg1 +0, msg2 +8, msg3 +0x10) */
+		if (!up) return 0x80100a01u;
+		const uint32_t m = RD32(up + 4), bp = RD32(up + 8); const int bt = (int)RD32(up);
+		if (m) snprintf(msg, sizeof msg, "%s", (const char *)G(m));
+		switch (bt) {
+		case 0: break;
+		case 1: nbtn = 2; l[0] = "Yes"; l[1] = "No"; back = 1; break;
+		case 2: nbtn = 0; break;
+		case 3: nbtn = 2; l[1] = "Cancel"; back = 1; break;
+		case 4: nbtn = 1; l[0] = "Cancel"; ids[0] = 2; back = 0; break;
+		case 5:
+			nbtn = 3; l[0] = "Yes"; l[1] = "No"; l[2] = "Retry";
+			for (int i = 0; i < 3 && bp; i++) { const uint32_t t = RD32(bp + 8 * (uint32_t)i); if (t && *(const char *)G(t)) l[i] = (const char *)G(t); }
+			break;
+		default: return 0x80100a01u;
+		}
+		break;
+	}
+	case 2:   /* SYSTEM_MSG: sysMsgType +0, value +4 */
+		if (!sp) return 0x80100a01u;
+		snprintf(msg, sizeof msg, "%s", md_sysmsg((int)RD32(sp), &b));
+		nbtn = b ? 1 : 0; if (b == 2) { l[0] = "Cancel"; ids[0] = 2; back = 0; }
+		break;
+	case 3:   /* ERROR_CODE: errorCode +0 */
+		if (!ep) return 0x80100a01u;
+		snprintf(msg, sizeof msg, "An error occurred. (%08X)", RD32(ep));
+		break;
+	case 4: {   /* PROGRESS_BAR: barType +0, a system message param +4 (type +4), the game's own text +0x2c */
+		if (!pp) return 0x80100a01u;
+		const uint32_t m = RD32(pp + 0x2c);
+		snprintf(msg, sizeof msg, "%s", m ? (const char *)G(m) : md_sysmsg((int)RD32(pp + 4), &b));
+		nbtn = 0; bar = 0;
+		break;
+	}
+	default: return 0x80100a01u;
+	}
+	md.open = 1; md.status = ST_RUNNING; md.mode = mode; md.result = 0; md.button = 0; md.polls = 0; md.percent = bar; md.seq++;
+	snprintf(md.msg, sizeof md.msg, "%s", msg);
+	md.nbtn = nbtn; md.back = back;
+	for (int i = 0; i < nbtn; i++) { md.id[i] = ids[i]; snprintf(md.label[i], sizeof md.label[i], "%s", l[i]); }
+	fprintf(stderr, "    message dialog: %s, %d button%s%s%s%s: \"%s\"\n", mode == 1 ? "message" : mode == 2 ? "system message" : mode == 3 ? "error code" : "progress bar",
+		nbtn, nbtn == 1 ? "" : "s", nbtn ? " (" : "", nbtn ? l[0] : "", nbtn ? ")" : "", msg);
+	return 0;
+}
+static void md_finish(int result, int button, const char *how) {   /* (locked) */
+	md.result = result; md.button = button; md.status = ST_FINISHED;
+	fprintf(stderr, "    message dialog: %s\n", how);
+}
+static void h_msg_dlg_init(Cpu *c) {
+	if (!A0) { RET(0x80020402u); return; }   /* SCE_COMMON_DIALOG_ERROR_NULL */
+	pthread_mutex_lock(&md_mu); uint32_t r = md_open(A0); pthread_mutex_unlock(&md_mu);
+	RET(r);
+}
+static void h_msg_dlg_status(Cpu *c) {
+	pthread_mutex_lock(&md_mu);
+	if (md.open && md.status == ST_RUNNING && md.nbtn && ++md.polls >= 3 && sd_auto()) md_finish(0, md.id[0], "answered by the test run");
+	const int s = md.open ? md.status : ST_NONE;
+	pthread_mutex_unlock(&md_mu);
+	RET(s);
+}
+static void h_msg_dlg_result(Cpu *c) {   /* (SceMsgDialogResult *): mode +0, result +4, buttonId +8 */
+	if (!A0) { RET(0x80020402u); return; }
+	pthread_mutex_lock(&md_mu);
+	const int open = md.open, done = open && md.status == ST_FINISHED;
+	if (done) { WR32(A0, md.mode); WR32(A0 + 4, md.result); WR32(A0 + 8, md.button); }
+	pthread_mutex_unlock(&md_mu);
+	RET(done ? 0 : open ? 0x80020410u : 0x80020404u);   /* NOT_FINISHED / NOT_RUNNING */
+}
+static void h_msg_dlg_term(Cpu *c) { pthread_mutex_lock(&md_mu); md.open = 0; md.status = ST_NONE; pthread_mutex_unlock(&md_mu); RET(0); }
+static void h_msg_dlg_abort(Cpu *c) {
+	pthread_mutex_lock(&md_mu);
+	const int ok = md.open && md.status == ST_RUNNING;
+	if (ok) md_finish(2, 0, "aborted by the game");   /* ABORTED */
+	pthread_mutex_unlock(&md_mu);
+	RET(ok ? 0 : 0x80020404u);
+}
+static void h_msg_dlg_close(Cpu *c) {   /* the game ends the dialog itself (the one with no buttons): finished with OK and no button */
+	pthread_mutex_lock(&md_mu);
+	const int ok = md.open && md.status == ST_RUNNING;
+	if (ok) md_finish(0, 0, "closed by the game");
+	pthread_mutex_unlock(&md_mu);
+	RET(ok ? 0 : 0x80020404u);
+}
+static void h_msg_bar_inc(Cpu *c) { pthread_mutex_lock(&md_mu); if (md.open && md.percent >= 0) { md.percent += (int)A1; if (md.percent > 100 || md.percent < 0) md.percent = 100; } pthread_mutex_unlock(&md_mu); RET(0); }   /* (target, delta) */
+static void h_msg_bar_set(Cpu *c) { pthread_mutex_lock(&md_mu); if (md.open && md.percent >= 0) md.percent = A1 > 100 ? 100 : (int)A1; pthread_mutex_unlock(&md_mu); RET(0); }   /* (target, rate) */
+static void h_msg_bar_msg(Cpu *c) {   /* (target, UTF-8 text) */
+	pthread_mutex_lock(&md_mu);
+	if (md.open && md.percent >= 0 && A1) snprintf(md.msg, sizeof md.msg, "%s", (const char *)G(A1));
+	pthread_mutex_unlock(&md_mu);
+	RET(0);
+}
+int msgdlg_view(MsgDlgView *v) {
+	pthread_mutex_lock(&md_mu);
+	const int live = md.open && md.status == ST_RUNNING;
+	v->kind = !live ? 0 : md.nbtn ? 1 : 2; v->seq = md.seq; v->percent = md.percent; v->nbuttons = md.nbtn; v->back = md.back;
+	v->enter_circle = SYSPARAM_ENTER_BUTTON == 0;
+	memcpy(v->label, md.label, sizeof v->label); memcpy(v->msg, md.msg, sizeof v->msg);
+	return v->kind;
+}
+void msgdlg_release(void) { pthread_mutex_unlock(&md_mu); }
+void msgdlg_answer(int seq, int button) {
+	pthread_mutex_lock(&md_mu);
+	if (md.open && seq == md.seq && md.status == ST_RUNNING && button >= 0 && button < md.nbtn) {
+		char how[96]; snprintf(how, sizeof how, "answered: %s", md.label[button]);
+		md_finish(0, md.id[button], how);
+	}
+	pthread_mutex_unlock(&md_mu);
+}
+
+int cdlg_active(void) {
+	pthread_mutex_lock(&md_mu); const int m = md.open && md.status == ST_RUNNING && md.nbtn; pthread_mutex_unlock(&md_mu);
+	return m;
+}
+
 /* ---- trophies: a context and a handle that accept everything */
 static void h_trophy_create(Cpu *c) { if (A0) WR32(A0, 1); RET(0); }
 
@@ -425,7 +582,7 @@ static uint32_t system_language(void) {
  * is SCE_APPUTIL_ERROR_PARAMETER, as on the console. */
 static void h_system_param_int(Cpu *c) {
 	if (A0 < 1 || A0 > 7 || A0 == 3 || !A1) { RET(0x80100600u); return; }
-	WR32(A1, A0 == 1 ? system_language() : A0 == 2 ? 1 : 0); RET(0);
+	WR32(A1, A0 == 1 ? system_language() : A0 == 2 ? SYSPARAM_ENTER_BUTTON : 0); RET(0);
 }
 /* (id, buffer, size): only the user name (3) is a string -- "Player" (RECOMP_USERNAME overrides),
  * truncated to the buffer like strncpy plus a terminator; Killzone asks for it at boot (17 bytes:
@@ -531,8 +688,9 @@ const HleEntry hle_apputil[] = {
 	{"sceNetCheckDialogTerm", h_net_dlg_term},
 	{"sceMsgDialogInit", h_msg_dlg_init},
 	{"sceMsgDialogGetStatus", h_msg_dlg_status},
-	{"sceMsgDialogGetResult", h_dialog_result},
-	{"sceMsgDialogTerm", h_msg_dlg_term},
+	{"sceMsgDialogGetResult", h_msg_dlg_result},
+	{"sceMsgDialogTerm", h_msg_dlg_term}, {"sceMsgDialogAbort", h_msg_dlg_abort}, {"sceMsgDialogClose", h_msg_dlg_close},
+	{"sceMsgDialogProgressBarInc", h_msg_bar_inc}, {"sceMsgDialogProgressBarSetValue", h_msg_bar_set}, {"sceMsgDialogProgressBarSetMsg", h_msg_bar_msg},
 	{"SceCommonDialog_33626E2C", h_eula_dlg_init}, {"SceCommonDialog_B7D4C911", h_eula_dlg_status},
 	{"SceCommonDialog_D1858A78", h_eula_dlg_result}, {"SceCommonDialog_BEBAEF25", h_eula_dlg_term}, {"SceCommonDialog_B55CF0E3", h_eula_dlg_term},
 	{"sceCommonDialogUpdate", h_zero},

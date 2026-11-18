@@ -25,6 +25,7 @@ step "JPEG (jpeg_test.c)" unit jpeg_test
 # the audio decoder: ATRAC9 always; AAC and MP3 too where libavcodec's development files are installed (CI may not have them: the test then skips those and checks they fail cleanly)
 AVC=(); pkg-config --exists libavcodec libavutil 2>/dev/null && AVC=(-DRECOMP_AVCODEC $(pkg-config --cflags --libs libavcodec libavutil))
 step "audio decoder (audiodec_test.c)" unit audiodec_test ${AVC[@]+"${AVC[@]}"} $ROOT/third_party/libatrac9/*.c -lm -lpthread
+step "message dialog (commondlg_test.c)" unit commondlg_test -I stub -lpthread
 
 echo
 if [ ${#failed[@]} -eq 0 ]; then echo "all passed"; else echo "FAILED: ${failed[*]}"; exit 1; fi
