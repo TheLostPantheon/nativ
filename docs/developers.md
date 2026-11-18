@@ -131,7 +131,10 @@ its SHA-256.
 2. On the Mac: `NATIV_RELEASES=<owner>/<repo> dev/release.sh v0.1.0 mac windows`; on Linux the same with `linux`.
    Copy the Linux zip into the Mac's `build/release/v0.1.0/` and run `dev/release.sh v0.1.0` there once more to write
    `SHA256SUMS` over all three.
-3. Publish: the script prints the `gh release create` command.
+3. Draft the notes: `dev/release-notes.py v0.1.0 --gate <gate log> --out notes.md` lists the pull requests merged since
+   the last tag and the issues they closed, ticks what CI and the gate show, and leaves the play tests as boxes to tick
+   or strike. Known issues come from the player guide, and the downloads' sizes and checksums from step 2.
+4. Publish: the script prints the `gh release create` command; give it `--notes-file notes.md`.
 
 `NATIV_RELEASES` names the GitHub repository whose releases are the installs' updates: `vitarecomp dist` writes it to
 `updates.txt`, and the launcher runs `vitarecomp update-check` at start (GitHub asked at most once a day), which shows a
