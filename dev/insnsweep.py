@@ -225,19 +225,35 @@ def sweep(forms, blocks, trials=64, per_form=3, quiet=False):
             body = "\n\t".join(lines)
             if "goto L_" in body:
                 continue
+            if re.search(r"\bNone\b", body):   # (Python's None in C: a register the translator couldn't name)
+                unsupported[f] = f"TRANSLATOR ERROR: emitted None ({body[:120]})"
+                continue
             csrc.append(f"static void t_{a:08x}(Cpu *c) {{\n\t{body}\n\treturn;\njump:\n\tc->stop = 2;\n}}")
             chosen.append((f, a, arm, f"{i.mnemonic} {i.op_str}", i))
-    csrc.append("GuestFn recomp_lookup(uint32_t a) {\n\tswitch (a) {")
-    csrc += [f"\tcase 0x{a:x}u: return t_{a:08x};" for _, a, _, _, _ in chosen]
-    csrc.append("\t}\n\treturn 0;\n}")
-    csrc.append("const char *recomp_import_name(uint32_t a) { (void)a; return 0; }")
-    csrc.append("int recomp_is_arm(uint32_t a) { (void)a; return 0; }")
     tmp = tempfile.mkdtemp(prefix="insnsweep_")
     cpath = os.path.join(tmp, "sweep.c")
-    open(cpath, "w").write("\n".join(csrc) + "\n")
     lib_path = os.path.join(tmp, "sweep.dylib")
-    subprocess.run(["cc", "-O1", "-ffp-contract=off", "-w", "-fPIC", "-shared", "-I", HERE, "-I", os.path.join(HERE, "..", "recompiler"), cpath,
-                    os.path.join(HERE, "glue.c"), "-o", lib_path], check=True)
+    head, fns = csrc[:2], csrc[2:]   # (one test function per chosen instance, in chosen's order)
+    for attempt in range(8):   # generated C that doesn't compile is the translator's error for that form: dropped, said, rebuilt
+        lines_of, text, n = [], list(head), sum(t.count("\n") + 1 for t in head)
+        for (f, a, _, _, _), t in zip(chosen, fns):
+            lines_of.append((n + 1, n + t.count("\n") + 1, f)); text.append(t); n += t.count("\n") + 1
+        text.append("GuestFn recomp_lookup(uint32_t a) {\n\tswitch (a) {")
+        text += [f"\tcase 0x{a:x}u: return t_{a:08x};" for _, a, _, _, _ in chosen]
+        text += ["\t}\n\treturn 0;\n}", "const char *recomp_import_name(uint32_t a) { (void)a; return 0; }",
+                 "int recomp_is_arm(uint32_t a) { (void)a; return 0; }"]
+        open(cpath, "w").write("\n".join(text) + "\n")
+        r = subprocess.run(["cc", "-O1", "-ffp-contract=off", "-w", "-fPIC", "-shared", "-I", HERE, "-I", os.path.join(HERE, "..", "recompiler"),
+                            cpath, os.path.join(HERE, "glue.c"), "-o", lib_path], capture_output=True, text=True)
+        if r.returncode == 0: break
+        bad_lines = {int(m) for m in re.findall(r"sweep\.c:(\d+):\d+: error", r.stderr)}
+        bad_forms = {f for lo, hi, f in lines_of for l in bad_lines if lo <= l <= hi}
+        if not bad_forms: raise SystemExit("the sweep's harness doesn't compile:\n" + r.stderr[-3000:])
+        for f in bad_forms: unsupported[f] = "TRANSLATOR ERROR: its C doesn't compile (" + next((e for e in r.stderr.splitlines() if "error" in e), "")[-150:] + ")"
+        keep = [k for k, c in enumerate(chosen) if c[0] not in bad_forms]
+        chosen, fns = [chosen[k] for k in keep], [fns[k] for k in keep]
+    else:
+        raise SystemExit("the sweep's harness still doesn't compile after 8 rounds")
     lib = ctypes.CDLL(lib_path)
     lib.recomp_run.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     arena = mmap.mmap(-1, 1 << 32, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)

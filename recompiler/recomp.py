@@ -91,19 +91,28 @@ class Fn:
         amt = (f"(c->r[{GPR[md.reg_name(o.shift.value)]}] & 0xff)" if st >= 6 else str(o.shift.value))
         return f"SHIFT(c, {v}, {st}, {amt}, {1 if setc else 0})"
 
+    @staticmethod
+    def shifted(idx, st, sh):
+        """an index register's value shifted as an addressing mode shifts it (capstone's shift types: 1 asr, 2 lsl,
+        3 lsr, 4 ror, 5 rrx)"""
+        if st == 2 and sh:
+            return f"({idx} << {sh})"
+        if st in (1, 3, 4, 5):
+            return f"SHIFT(c, {idx}, {st}, {sh if st != 5 else 1}u, 0)"
+        return idx
+
     def addr(self, op, insn):
         m = op.mem
         base = self.r(m.base, insn) if md.reg_name(m.base) != "pc" else f"0x{(insn.address + self.pc_off) & ~3:x}u"
         if m.index:
-            idx = self.r(m.index, insn)
             # this capstone reports [rN, rM, lsl #k] in the operand's shift, not mem.lshift. ARM mode
             # also has lsr/asr/ror/rrx offsets ([r5, sl, lsr #12] in libgxm): those went through as lsl
             st, sh = (op.shift.type, op.shift.value) if op.shift.type else ((2, m.lshift) if m.lshift else (0, 0))
-            if st == 2 and sh:
-                idx = f"({idx} << {sh})"
-            elif st in (1, 3, 4, 5):
-                idx = f"SHIFT(c, {idx}, {st}, {sh if st != 5 else 1}u, 0)"
-            return f"({base} {'-' if m.scale == -1 else '+'} {idx})"
+            idx = self.shifted(self.r(m.index, insn), st, sh)
+            # [rN, -rM]: capstone 5 says so in the operand's subtracted, not mem.scale (-1 in capstone 4): every
+            # ARM-mode subtracted register offset was added (isacover, 2026-11-17)
+            sub = getattr(op, "subtracted", False) or m.scale == -1
+            return f"({base} {'-' if sub else '+'} {idx})"
         return f"({base} + {m.disp})" if m.disp else base
 
     def emit(self, s):
@@ -338,7 +347,8 @@ class Fn:
                 out.append(f" {wr}(ea{off}, {self.r(o.reg, i)});")
         if post:
             po = ops[-1]
-            inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.r(po.reg, i))
+            # (a register's own shift too: ldr r4, [r0], -r1, asr #31 dropped the asr; isacover, 2026-11-17)
+            inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.shifted(self.r(po.reg, i), po.shift.type, po.shift.value))
             out.append(f" {self.dst(m.base)} = ea {'-' if getattr(po, 'subtracted', False) else '+'} {inc};")
         elif i.writeback:
             out.append(f" {self.dst(m.base)} = ea;")
@@ -503,6 +513,8 @@ class Fn:
             dd = regs[0][1]
             tab = [r[1] for r in regs[1:-1]]
             ix = regs[-1][1]
+            if None in tab or ix is None or dd is None:   # a list running past d31: UNPREDICTABLE (it emitted d[None])
+                raise Unsupported(f"{mn}: a register list past d31")
             n = 8 * len(tab)
             loads = " ".join(f"memcpy(t + {8 * k}, &c->vfp.d[{d}], 8);" for k, d in enumerate(tab))
             miss = f"o[k]" if mn == "vtbx" else "0"
