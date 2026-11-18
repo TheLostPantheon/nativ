@@ -101,7 +101,8 @@ typedef struct Thread {
 	char name[32];
 	Cpu *cpu;
 	pthread_t th;
-	int started, done, deleted;
+	int started, done, deleted;  /* done: it ended and is DORMANT (started stays set; StartThread runs it again, below) */
+	uint32_t ends;               /* how many runs have ended: a WaitThreadEnd sleeper that a restart outpaces still sees its run end */
 	uint32_t status;
 	uint32_t wait_type, wait_id; /* what it is blocked on (GetThreadInfo's status WAITING) */
 	uint32_t tls, tls_keys;      /* its TLS block (TPIDRURO) and sceKernelGetTLSAddr's keys: a fiber running under it shares both */
@@ -500,7 +501,7 @@ static void h_create_thread(Cpu *c) {   /* (name, entry, priority, stack size, a
 static void thread_done(Thread *t, uint32_t status) {
 	sched_thread_exit(t);
 	pthread_mutex_lock(&klock);
-	t->status = status; t->done = 1;
+	t->status = status; t->done = 1; t->ends++;
 	pthread_cond_broadcast(&kcond);
 	pthread_mutex_unlock(&klock);
 }
@@ -540,7 +541,13 @@ static void spawn(Thread *t, Cpu *n) {
 static void h_start_thread(Cpu *c) {   /* (uid, arg size, arg block): the block is copied to the new stack */
 	Thread *t = thread_of(A0);
 	if (!t || t == &main_thread) { RET(E_UNKNOWN_THREAD_ID); return; }
-	if (t->started) { RET(E_NOT_DORMANT); return; }
+	pthread_mutex_lock(&klock);
+	if (t->started && !t->done) { pthread_mutex_unlock(&klock); RET(E_NOT_DORMANT); return; }
+	/* an ended thread is DORMANT, not gone: it runs again from its entry on its own stack with the new arguments, at its
+	 * initial priority, its previous exit status no longer reported. The previous run's host thread is detached and has
+	 * only to return (it touches nothing of t after thread_done), so a new one takes over; the scheduler admits t afresh */
+	if (t->done) { t->done = 0; t->wait_type = t->wait_id = 0; t->prio = t->init_prio; t->cb_pending = 0; t->fiber = 0; }
+	pthread_mutex_unlock(&klock);
 	Cpu *n = calloc(1, sizeof *n);
 	uint32_t sp = t->stack + t->stack_size - 16, size = A1;
 	if (size && A2) { sp = (sp - size) & ~7u; memcpy(G(sp), G(A2), size); }
@@ -625,19 +632,20 @@ static void h_wait_thread_end(Cpu *c) {   /* (uid, *status, *timeout) -> 0, the 
 	pthread_mutex_lock(&klock);
 	if (me) cb_publish(me, &klock, &kcond);
 	int b = 0;   /* the slot is given up only if it actually sleeps, and taken back once klock is released */
-	while (!t->done && !(me && cb_pending(me))) {
+	const uint32_t gen = t->ends;   /* a restart can clear done before this sleeper runs: the run it waited for ended all the same */
+	while (!t->done && t->ends == gen && !(me && cb_pending(me))) {
 		if (!b) b = sched_block_begin();
 		if (timed ? pthread_cond_timedwait(&kcond, &klock, &ts) == ETIMEDOUT : pthread_cond_wait(&kcond, &klock) != 0) break;
 	}
 	if (me) cb_publish(me, 0, 0);
-	int done = t->done;
+	int done = t->done || t->ends != gen; uint32_t status = t->status;
 	pthread_mutex_unlock(&klock);
 	thread_waits(0, 0);
 	if (b) sched_block_end();
 	if (!done && me && cb_pending(me)) { timeout_left(A2, timed, &ts); RET(E_CB_RETRY); return; }
 	if (!done) { if (A2) WR32(A2, 0); RET(E_WAIT_TIMEOUT); return; }
 	timeout_left(A2, timed, &ts);
-	if (A1) WR32(A1, t->status);
+	if (A1) WR32(A1, status);
 	RET(0);
 }
 static void h_thread_exit_status(Cpu *c) {

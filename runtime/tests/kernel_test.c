@@ -361,6 +361,9 @@ static volatile int handler_calls; static uint32_t handler_common, handler_type_
 static uint32_t the_sema;   /* the semaphore block_entry's thread waits on (set by test_threads) */
 static void block_entry(Cpu *c) { c->r[0] = call(h_wait_sema, 3, the_sema, 1, 0) == 0 ? 3 : 4; }
 static void guest_handler(Cpu *c) { handler_calls++; handler_type_seen |= c->r[0]; handler_common = c->r[3]; c->r[0] = 0; }
+static void guest_entry_echo(Cpu *c) { c->r[0] = c->r[0] ? RD32(c->r[1]) : 0xdead; }   /* returns the first word of its argument block */
+static volatile int entry_runs;
+static void guest_entry_count(Cpu *c) { entry_runs++; c->r[0] = 100 + entry_runs; }
 static void test_threads(void) {
 	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "worker");
 	guest_fns[0] = guest_entry_7; guest_fns[1] = guest_entry_exit; guest_fns[2] = guest_entry_args; guest_fns[3] = guest_handler;
@@ -385,6 +388,34 @@ static void test_threads(void) {
 	CHECKEQ(call(h_wait_thread_end, 3, t, st, 0), 0); CHECKEQ(RD32(st), 1);
 	CHECKEQ(call(h_thread_exit_status, 2, t, st), 0); CHECKEQ(RD32(st), 1);
 	CHECKEQ(call(h_delete_thread, 1, t), 0); CHECKEQ(call(h_wait_thread_end, 3, t, st, 0), E_UNKNOWN_THREAD_ID);
+	/* an ended thread is DORMANT and can be started again: the second run takes the new argument, ends with its own status */
+	guest_fns[25] = guest_entry_echo; guest_fns[26] = guest_entry_count; guest_fns[4] = block_entry;
+	uint32_t r = call(h_create_thread, 7, name, 0x1000 + 4 * 25, 140, 0x1000, 0, 0, 0);
+	WR32(arg, 111); CHECKEQ(call(h_start_thread, 3, r, 4, arg), 0);
+	CHECKEQ(call(h_wait_thread_end, 3, r, st, 0), 0); CHECKEQ(RD32(st), 111);
+	CHECKEQ(call(h_thread_info, 2, r, info), 0); CHECKEQ(RD32(info + 0x2c), 16); CHECKEQ(RD32(info + 0x5c), 111);   /* ended: DORMANT, exit status kept */
+	WR32(arg, 222); CHECKEQ(call(h_start_thread, 3, r, 4, arg), 0);
+	CHECKEQ(call(h_wait_thread_end, 3, r, st, 0), 0); CHECKEQ(RD32(st), 222);
+	CHECKEQ(call(h_thread_exit_status, 2, r, st), 0); CHECKEQ(RD32(st), 222);
+	for (int i = 0; i < 20; i++) { WR32(arg, 300 + i); CHECKEQ(call(h_start_thread, 3, r, 4, arg), 0); CHECKEQ(call(h_wait_thread_end, 3, r, st, 0), 0); CHECKEQ(RD32(st), 300 + i); }
+	CHECKEQ(call(h_thread_info, 2, r, info), 0); CHECKEQ(RD32(info + 0x2c), 16); CHECKEQ(RD32(info + 0x40), 140);
+	CHECKEQ(call(h_delete_thread, 1, r), 0); CHECKEQ(call(h_start_thread, 3, r, 4, arg), E_UNKNOWN_THREAD_ID);   /* deleted after a restart: gone */
+	/* a restart while the thread is running, ended by ExitThread, and one that blocks the second run */
+	uint32_t rb = call(h_create_thread, 7, name, 0x1000 + 4 * 4, 160, 0x1000, 0, 0, 0);
+	uint32_t rs = the_sema = call(h_create_sema, 5, name, 0, 0, 1, 0);
+	CHECKEQ(call(h_start_thread, 3, rb, 0, 0), 0); nap(20);
+	CHECKEQ(call(h_start_thread, 3, rb, 0, 0), E_NOT_DORMANT);   /* running (waiting) */
+	CHECKEQ(call(h_delete_thread, 1, rb), E_NOT_DORMANT);
+	CHECKEQ(call(h_signal_sema, 2, rs, 1), 0); CHECKEQ(call(h_wait_thread_end, 3, rb, st, 0), 0); CHECKEQ(RD32(st), 3);
+	CHECKEQ(call(h_start_thread, 3, rb, 0, 0), 0); nap(20);   /* second run: blocks again, reported WAITING, not DORMANT */
+	CHECKEQ(call(h_thread_info, 2, rb, info), 0); CHECKEQ(RD32(info + 0x2c), 8); CHECKEQ(RD32(info + 0x5c), 0);
+	CHECKEQ(call(h_thread_exit_status, 2, rb, st), E_NOT_DORMANT);
+	CHECKEQ(call(h_signal_sema, 2, rs, 1), 0); CHECKEQ(call(h_wait_thread_end, 3, rb, st, 0), 0); CHECKEQ(RD32(st), 3);
+	uint32_t rx = call(h_create_thread, 7, name, 0x1000 + 4 * 1, 160, 0x1000, 0, 0, 0);   /* ends in sceKernelExitThread(9) */
+	for (int i = 0; i < 3; i++) { CHECKEQ(call(h_start_thread, 3, rx, 0, 0), 0); CHECKEQ(call(h_wait_thread_end, 3, rx, st, 0), 0); CHECKEQ(RD32(st), 9); }
+	uint32_t rc = call(h_create_thread, 7, name, 0x1000 + 4 * 26, 160, 0x1000, 0, 0, 0);   /* each run's entry executes anew */
+	for (int i = 1; i <= 3; i++) { CHECKEQ(call(h_start_thread, 3, rc, 0, 0), 0); CHECKEQ(call(h_wait_thread_end, 3, rc, st, 0), 0); CHECKEQ(RD32(st), 100 + i); }
+	CHECKEQ((uint32_t)entry_runs, 3);
 	/* a thread ending through sceKernelExitThread; event handlers see its start and exit */
 	uint32_t h = call(h_register_thread_event, 5, name, 0xfffffff0u, 4 | 8, 0x100c, 0xc0ffee);
 	CHECK(h & 1);
@@ -827,6 +858,13 @@ static void test_sched(void) {
 	sc_start(h, 0); nap(30); CHECK(slog_is(""));   /* ready, but main holds the core */
 	sched_boundary(); CHECK(slog_is("H"));       /* preempted: H ran until it blocked, then the core came back */
 	CHECKEQ(call(h_signal_sema, 2, sc_sema, 1), 0); nap(30); CHECK(slog_is("H"));
+	sched_boundary(); CHECK(slog_is("Hh"));
+	sc_join(h);
+	/* 1b. the same thread started again once it ended: admitted to the scheduler afresh, it preempts at the next boundary as before */
+	slog_clear();
+	sc_start(h, 0); nap(30); CHECK(slog_is(""));
+	sched_boundary(); CHECK(slog_is("H"));
+	CHECKEQ(call(h_signal_sema, 2, sc_sema, 1), 0); nap(30);
 	sched_boundary(); CHECK(slog_is("Hh"));
 	sc_join(h);
 
