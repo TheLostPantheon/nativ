@@ -704,6 +704,61 @@ class Fn:
             sh = ops[2].imm; s_ = sg
             a_, nb = arr("A", nregs[1], bits, s_)
             return [f"{{ {a_} uint{2 * bits}_t O[{8 // (bits // 8)}]; for (int k = 0; k < {8 // (bits // 8)}; k++) O[k] = (uint{2 * bits}_t)((uint64_t)(int64_t)A[k] << {sh}); {put('O', nregs[0], 16)} }}"]
+        same_kind = len(nregs) >= 2 and all(r[0] == nregs[0][0] for r in nregs)
+        elem = lambda r: (16 if r[0] == "q" else 8) * 8 // bits   # elements of register r at this width
+        T = lambda s_: f"{'' if s_ else 'u'}int{bits}_t"
+        def same(expr, src_signed, regs3=True):   # O[k] = expr over A (N), B (M) and D, all this width
+            a_, nb = arr("A", nregs[1], bits, src_signed)
+            b_ = arr("B", nregs[2], bits, src_signed)[0] if regs3 else ""
+            d_ = arr("D", nregs[0], bits, src_signed)[0]
+            e = expr.replace("BITS", str(bits))
+            st = "int64_t" if src_signed else "uint64_t"
+            return [f"{{ {a_} {b_} {d_} {T(src_signed)} O[{elem(nregs[0])}]; for (int k = 0; k < {elem(nregs[0])}; k++) {{ {st} a = A[k]{', b = B[k]' if regs3 else ''};"
+                    f" uint64_t d = (uint64_t)D[k]; (void)d; O[k] = ({T(src_signed)})({e}); }} {put('O', nregs[0], nb)} }}"]
+        three = len(nregs) == 3 and len(ops) == 3 and same_kind
+        two_imm = len(nregs) == 2 and len(ops) == 3 and ops[2].type == ARM_OP_IMM and same_kind
+        # by register: the rounding shifts at every width, and the plain and saturating ones at 64 bits (shift: the signed
+        # low byte of M's element)
+        if three and dm.group(1) in ("s", "u") and (mn in ("vrshl", "vqrshl") or (mn in ("vqshl", "vshl") and bits == 64)):
+            sh = "(int8_t)b"
+            if mn == "vrshl": e = f"RSHL_{'S' if sg else 'U'}(a, {sh}, BITS)"
+            elif mn == "vqrshl": e = f"({sh} >= 0 ? QSHL{'S' if sg else 'U'}(a, {sh}, BITS) : RSHL_{'S' if sg else 'U'}(a, {sh}, BITS))"
+            elif mn == "vqshl": e = f"QSHL{'S' if sg else 'U'}(a, {sh}, BITS)"
+            else: e = (f"({sh} >= 0 ? ({sh} >= 64 ? 0 : (uint64_t)a << {sh}) : ({sh} <= -64 ? (uint64_t)(a >> 63) : (uint64_t)(a >> -{sh})))" if sg
+                       else f"({sh} >= 0 ? ({sh} >= 64 ? 0 : a << {sh}) : ({sh} <= -64 ? 0 : a >> -{sh}))")
+            return same(e, sg)
+        if three and mn in ("vqadd", "vqsub") and bits == 64 and dm.group(1) in ("s", "u"):
+            e = (f"{'QADDS64' if mn == 'vqadd' else 'QSUBS64'}(a, b)" if sg else ("(a + b < a ? ~0ull : a + b)" if mn == "vqadd" else "(a < b ? 0 : a - b)"))
+            return same(e, sg)
+        if two_imm and (mn in ("vqshlu",) or (mn in ("vshl", "vshr", "vqshl") and bits == 64) or (mn in ("vsli", "vsri") and bits in (8, 16))):
+            n_ = ops[2].imm; mask = (1 << bits) - 1
+            if mn == "vqshlu": e = f"(a < 0 ? 0 : QSHLU((uint64_t)a, {n_}, BITS))"; s_ = True
+            elif mn == "vshl": e = f"(uint64_t)a << {n_}"; s_ = False
+            elif mn == "vshr": e = (f"a >> {min(n_, 63)}" if sg else (f"a >> {n_}" if n_ < 64 else "0")); s_ = sg
+            elif mn == "vqshl": e = f"QSHL{'S' if sg else 'U'}(a, {n_}, 64)"; s_ = sg
+            elif mn == "vsli": e = f"((a << {n_}) & 0x{mask:x}u) | (d & 0x{(1 << n_) - 1:x}u)"; s_ = False
+            else: e = "d" if n_ >= bits else f"(a >> {n_}) | (d & 0x{mask & ~(mask >> n_):x}u)"; s_ = False
+            return same(e, s_, regs3=False)
+        if len(nregs) == 2 and len(ops) == 2 and same_kind and mn in ("vcls", "vqabs", "vqneg") and sg and bits <= 32:
+            e = {"vcls": "CLS(a, BITS)", "vqabs": "SATS(a < 0 ? -a : a, BITS)", "vqneg": "SATS(-a, BITS)"}[mn]
+            return same(e, True, regs3=False)
+        if mn == "vpadal" and len(nregs) == 2 and same_kind and dm.group(1) in ("s", "u") and bits <= 32:
+            # pairwise add long and accumulate: each pair of M's elements, widened, added into D's element of twice the width
+            a_, nb = arr("A", nregs[1], bits, sg); d_ = arr("D", nregs[0], 2 * bits, sg)[0]
+            n2 = elem(nregs[0]) // 2
+            return [f"{{ {a_} {d_} for (int k = 0; k < {n2}; k++) D[k] = ({'' if sg else 'u'}int{2 * bits}_t)((uint64_t)D[k] + (uint64_t)((int64_t)A[2 * k] + (int64_t)A[2 * k + 1])); {put('D', nregs[0], nb)} }}"]
+        if mn == "vrshrn" and len(ops) == 3 and ops[2].type == ARM_OP_IMM and nregs[0][0] == "d" and nregs[1][0] == "q" and bits in (16, 32, 64):
+            n_ = ops[2].imm; a_, _ = arr("A", nregs[1], bits, False)
+            return [f"{{ {a_} uint{bits // 2}_t O[{128 // bits}]; for (int k = 0; k < {128 // bits}; k++) O[k] = (uint{bits // 2}_t)((A[k] >> {n_}) + ((A[k] >> {n_ - 1}) & 1)); {put('O', nregs[0], 8)} }}"]
+        if mn in ("vtrn", "vzip") and len(nregs) == 2 and same_kind and dt in (("8", "16") if mn == "vtrn" else ("8", "16", "32")):
+            # vtrn: each pair's second element of D swapped with the first of M; vzip: D and M interleaved, the first half into D
+            es = bits // 8; nb = 16 if nregs[0][0] == "q" else 8
+            dd, mm = (2 * r[1] if r[0] == "q" else r[1] for r in nregs)
+            if mn == "vtrn":
+                loop = f"for (int e = 0; e < {nb // es}; e += 2) {{ uint8_t t[{es}]; memcpy(t, x + (e + 1) * {es}, {es}); memcpy(x + (e + 1) * {es}, y + e * {es}, {es}); memcpy(y + e * {es}, t, {es}); }} memcpy(&c->vfp.d[{dd}], x, {nb}); memcpy(&c->vfp.d[{mm}], y, {nb});"
+            else:
+                loop = f"uint8_t z[32]; for (int e = 0; e < {nb // es}; e++) {{ memcpy(z + 2 * e * {es}, x + e * {es}, {es}); memcpy(z + (2 * e + 1) * {es}, y + e * {es}, {es}); }} memcpy(&c->vfp.d[{dd}], z, {nb}); memcpy(&c->vfp.d[{mm}], z + {nb}, {nb});"
+            return [f"{{ uint8_t x[16], y[16]; memcpy(x, &c->vfp.d[{dd}], {nb}); memcpy(y, &c->vfp.d[{mm}], {nb}); {loop} }}"]
         qm = re.fullmatch(r"vq(r?)shr(u?)n", mn)
         if (qm and len(ops) == 3 and ops[2].type == ARM_OP_IMM or mn in ("vqmovn", "vqmovun") and len(ops) == 2) \
                 and nregs[0][0] == "d" and nregs[1][0] == "q" and dm.group(1) in ("s", "u") and bits in (16, 32, 64):
@@ -1143,6 +1198,9 @@ class Fn:
             if k == "s":
                 return [f"c->vfp.s[{n}] = RD32({a});" if mn == "vldr" else f"WR32({a}, c->vfp.s[{n}]);"]
             return [f"c->vfp.d[{n}] = RD64({a});" if mn == "vldr" else f"WR64({a}, c->vfp.d[{n}]);"]
+        fx = {"fstmiax": "vstmia", "fldmiax": "vldmia", "fstmdbx": "vstmdb", "fldmdbx": "vldmdb"}.get(mn)
+        if fx:   # the deprecated FSTMX/FLDMX: doubles as vstm/vldm, the transfer one (unused) word longer
+            mn = fx
         if mn in ("vpush", "vpop", "vldmia", "vstmia", "vldmdb", "vstmdb", "vldm", "vstm"):
             if mn in ("vpush", "vpop"):
                 base, vr, wb, before, load = 13, regs, True, mn == "vpush", mn == "vpop"
@@ -1150,7 +1208,7 @@ class Fn:
                 base, vr, wb = GPR[md.reg_name(ops[0].reg)], regs[1:], i.writeback
                 before, load = mn.endswith("db"), mn.startswith("vld")
             sz = 4 if vr[0][0] == "s" else 8
-            tot = sz * len(vr)
+            tot = sz * len(vr) + (4 if fx else 0)
             out = [f"{{ uint32_t ea = c->r[{base}]{f' - {tot}' if before else ''};"]
             for k, (kind, n) in enumerate(vr):
                 f = "s" if kind == "s" else "d"
@@ -1160,6 +1218,13 @@ class Fn:
                 out.append(f" c->r[{base}] {'-' if before else '+'}= {tot};")
             out.append(" }")
             return ["".join(out)]
+        if mn in ("vorr", "vbic", "vmvn") and len(ops) == 2 and regs[0] and regs[0][0] in "dq" and ops[1].type == ARM_OP_IMM and dt in ("i16", "i32"):
+            # the immediate replicated into every element: OR'd in, cleared (vbic) or inverted into place (vmvn)
+            bits = int(dt[1:]); lane = ops[1].imm & ((1 << bits) - 1)
+            rep_ = sum(lane << (k * bits) for k in range(64 // bits))
+            nd = [2 * regs[0][1], 2 * regs[0][1] + 1] if regs[0][0] == "q" else [regs[0][1]]
+            e = {"vorr": "c->vfp.d[{x}] | 0x{r:x}ull", "vbic": "c->vfp.d[{x}] & ~0x{r:x}ull", "vmvn": "~0x{r:x}ull"}[mn]
+            return [" ".join(f"c->vfp.d[{x}] = {e.format(x=x, r=rep_)};" for x in nd)]
         if mn == "vmov" and len(ops) == 2 and regs[0] and regs[0][0] in "dq" and ops[1].type == ARM_OP_IMM:
             # vmov.i32/i16/i8/i64 dN|qN, #imm: the immediate replicated into every lane
             bits = int(dt[1:]) if dt[1:].isdigit() else 32
@@ -1197,6 +1262,10 @@ class Fn:
                 return [f"c->r[{regs[0][1]}] = (uint32_t)c->vfp.d[{regs[2][1]}]; c->r[{regs[1][1]}] = (uint32_t)(c->vfp.d[{regs[2][1]}] >> 32);"]
             if kinds == ["s", "s"]:
                 return [f"c->vfp.s[{regs[0][1]}] = c->vfp.s[{regs[1][1]}];"]
+            if kinds == ["r", "r", "s", "s"]:   # two consecutive singles to two core registers
+                return [f"{{ uint32_t a = c->vfp.s[{regs[2][1]}], b = c->vfp.s[{regs[3][1]}]; c->r[{regs[0][1]}] = a; c->r[{regs[1][1]}] = b; }}"]
+            if kinds == ["s", "s", "r", "r"]:
+                return [f"{{ uint32_t a = c->r[{regs[2][1]}], b = c->r[{regs[3][1]}]; c->vfp.s[{regs[0][1]}] = a; c->vfp.s[{regs[1][1]}] = b; }}"]
             if kinds == ["d", "d"]:
                 return [f"c->vfp.d[{regs[0][1]}] = c->vfp.d[{regs[1][1]}];"]
             if kinds == ["q", "q"]:
@@ -1211,16 +1280,16 @@ class Fn:
             e = f"{a} {op} {b}"
             if mn == "vnmul":
                 e = f"-({e})"
-            return [f"{self.fval(ops[0].reg)} = {e};"]
+            return [f"{self.fval(ops[0].reg)} = {'DNS' if dt == 'f32' else 'DND'}({e});"]   # (the default NaN: DNS/DND, rt.h)
         if mn in ("vmla", "vmls", "vnmla", "vnmls") and regs[0][0] in "sd":
             d, a, b = self.fval(ops[0].reg), self.fval(ops[1].reg), self.fval(ops[2].reg)
             e = {"vmla": f"{d} + {a} * {b}", "vmls": f"{d} - {a} * {b}", "vnmla": f"-{d} - {a} * {b}",
                  "vnmls": f"-{d} + {a} * {b}"}[mn]
-            return [f"{d} = {e};"]
+            return [f"{d} = {'DNS' if regs[0][0] == 's' else 'DND'}({e});"]
         if mn in ("vneg", "vabs", "vsqrt") and regs[0][0] in "sd":
             a = self.fval(ops[1].reg)
             fl = "f" if regs[0][0] == "s" else ""
-            e = {"vneg": f"-{a}", "vabs": f"fabs{fl}({a})", "vsqrt": f"sqrt{fl}({a})"}[mn]
+            e = {"vneg": f"-{a}", "vabs": f"fabs{fl}({a})", "vsqrt": f"{'DNS' if fl else 'DND'}(sqrt{fl}({a}))"}[mn]   # (vneg/vabs only move the sign, NaN or not)
             return [f"{self.fval(ops[0].reg)} = {e};"]
         if mn in ("vcmp", "vcmpe"):
             a = self.fval(ops[0].reg)
@@ -1232,6 +1301,12 @@ class Fn:
             return [f"{self.dst(ops[0].reg)} = c->fpscr;"]
         if mn == "vmsr":
             return [f"c->fpscr = {self.r(ops[1].reg, i)};"]
+        if mn == "vcvtr" and len(regs) == 2 and i.mnemonic.split(".")[1] in ("s32", "u32"):
+            # to an integer by FPSCR's rounding mode (round to nearest even, the console's), saturated, NaN 0
+            to, frm = i.mnemonic.split(".")[1:3]
+            src = f"(double)c->vfp.f[{regs[1][1]}]" if frm == "f32" else f"c->vfp.fd[{regs[1][1]}]"
+            f_ = "F2S" if to == "s32" else "F2U"
+            return [f"c->vfp.s[{regs[0][1]}] = (uint32_t){f_}(nearbyint({src}));"]
         if mn in ("vcvtb", "vcvtt") and len(regs) == 2 and regs[0][0] == "s" and regs[1][0] == "s":
             # half in the bottom (b) or top (t) 16 bits of a single register
             sh = 16 if mn == "vcvtt" else 0
@@ -1241,6 +1316,22 @@ class Fn:
                 return [f"c->vfp.s[{regs[0][1]}] = (c->vfp.s[{regs[0][1]}] & ~(0xffffu << {sh})) | ((uint32_t)F2H(c->vfp.s[{regs[1][1]}]) << {sh});"]
         if mn == "vcvt":
             parts = i.mnemonic.split(".")[1:]
+            if len(ops) == 3 and ops[2].type == ARM_OP_IMM and len(parts) == 2:
+                # between floating point and fixed point in place (vcvt.f32.s16 s0, s0, #16): the fixed operand is the low
+                # 16 or 32 bits; to fixed: toward zero, saturated, NaN 0, extended to the register's width
+                to, frm = parts; fb = ops[2].imm; r_ = regs[0]
+                fx = to if to[0] in "su" else frm; fl = frm if fx == to else to
+                size, sgn = int(fx[1:]), fx[0] == "s"
+                cell = f"c->vfp.d[{r_[1]}]" if r_[0] == "d" else f"c->vfp.s[{r_[1]}]"
+                if fx == frm:   # fixed -> float
+                    v = f"(int64_t)({'' if sgn else 'u'}int{size}_t){cell}"
+                    tgt = f"c->vfp.f[{r_[1]}]" if fl == "f32" else f"c->vfp.fd[{r_[1]}]"
+                    return [f"{tgt} = ({'float' if fl == 'f32' else 'double'})((double){v} / {float(1 << fb)!r});"]
+                src = f"(double)c->vfp.f[{r_[1]}]" if fl == "f32" else f"c->vfp.fd[{r_[1]}]"
+                lo, hi = (-(1 << (size - 1)), (1 << (size - 1)) - 1) if sgn else (0, (1 << size) - 1)
+                ext = (f"(uint64_t)(int64_t)r" if sgn else "(uint64_t)r")
+                put = f"{cell} = {ext};" if r_[0] == "d" else f"{cell} = (uint32_t){ext};"
+                return [f"{{ double x = {src} * {float(1 << fb)!r}; int64_t r = x != x ? 0 : x >= {hi}.0 ? {hi}LL : x <= {lo}.0 ? {lo}LL : (int64_t)x; {put} }}"]
             if len(ops) != 2:
                 raise Unsupported("vcvt fixed-point")
             to, frm = parts[0], parts[1]
