@@ -355,6 +355,8 @@ static void sched_tick(uint64_t now) {
 				Thread *h = sched_slot[i];
 				if (!h || !sched_allowed(w, i) || now - h->s_quiet < sched_quantum) continue;
 				if (w->prio > h->prio || (victim && h->prio <= victim->prio)) continue;   /* w outranks or ties it (a tie: its quantum is over) */
+				if (w->prio == h->prio && !sched_rr) continue;   /* run-to-block (RECOMP_SCHED_RR=0): an equal never takes the core. A holder the
+				                                                  * host OS had descheduled looked quiet for a quantum, and lost it (kernel_test 2b, loaded machine) */
 				victim = h; to = w;
 			}
 		if (!victim) break;
