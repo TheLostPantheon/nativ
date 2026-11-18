@@ -64,6 +64,10 @@ def unpredictable(i):
                                       "cdp", "cdp2", "mcr", "mrc", "mcr2", "mrc2"):
         return True   # (coprocessors other than VFP and NEON: a user-mode program has none)
     if "^" in ops: return True
+    st = insnsweep.stem(i.mnemonic)
+    if re.match(r"(u|s)?(mul|mla|mls|mull|mlal|maal|mmul|mmla|mmls|lad|lsd|uad|usd|lal|law|ulw|sad|ada)", st) and re.search(r"\bpc\b", ops):
+        return True   # multiplies naming pc
+    if re.search(r"\[\w+, -?pc\b", ops) or re.search(r"\], -?pc\b", ops): return True   # pc as a register offset
     if re.search(r"\[pc\](,|!|$)", ops) or re.search(r"\[pc, [^\]]*\]!", ops): return True   # a pc base written back
     m = re.match(r"(\w+)(?:, (\w+))?, \[(\w+)(\]|,[^\]]*\]!)", ops)   # a load into its own base, written back
     if m and i.mnemonic.startswith("ldr") and m.group(3) in (m.group(1), m.group(2)) and (m.group(4) == "]" and ops.endswith(tuple("0123456789abcdefxr")) and "]," in ops or m.group(4).endswith("!")): return True
