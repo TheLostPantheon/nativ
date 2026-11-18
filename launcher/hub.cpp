@@ -27,6 +27,7 @@
 #include "backends/imgui_impl_sdlgpu3.h"
 #include "ui_theme.h"   /* the look shared with the in-game overlay */
 #include "languages.h"   /* the language list the runtime answers from */
+#include "padbind.h"     /* the controller buttons' names and keys (the in-game menu rebinds them) */
 #include <ctime>
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -1253,6 +1254,23 @@ static void library_page(void) {
 		if (ImGui::IsItemDeactivatedAfterEdit()) { pct = (pct + 2) / 5 * 5; char b[16]; snprintf(b, sizeof b, "%.2f", pct / 100.0); prefs_set("ui_scale", b); apply_ui_scale(); }
 	}
 }
+/* Controls > Controller buttons: what the shared set has changed from the defaults (padbind.h), and a reset. Changing a button
+ * is the in-game menu's Controls page, where the buttons are pressed; a game with its own set (its own file) isn't touched here */
+static void controller_buttons_row(const SetTarget &t) {
+	ui::row("Controller buttons", "Which controller button presses which Vita button. Change them in a game: F10 (or the Guide button), Controls, Change.");
+	std::string changed; int n = 0;
+	for (int a = 0; a < PBA_N; a++) {
+		char k[24]; pb_key(a, k, sizeof k);
+		const std::string *v = ini_find(*t.x, k);
+		if (!v || v->empty() || pb_input_parse(v->c_str()) == -2) continue;
+		n++; if (!changed.empty()) changed += ", ";
+		changed += std::string(pb_action_names[a]) + " = " + *v;
+	}
+	ui::muted_wrapped(n ? changed.c_str() : "The defaults.");
+	ImGui::BeginDisabled(!n);
+	if (ImGui::Button("Reset controller buttons")) for (int a = 0; a < PBA_N; a++) { char k[24]; pb_key(a, k, sizeof k); if (ini_find(*t.x, k)) target_write(t, k, ""); }
+	ImGui::EndDisabled();
+}
 static void settings_modal(void) {
 	const ImGuiViewport *vp = ImGui::GetMainViewport();
 	const float em = ImGui::GetFontSize();
@@ -1299,7 +1317,8 @@ static void settings_modal(void) {
 			slider_row(t, "Mouse sensitivity", nullptr, "mouse_sens", 1.0, 0.1f, 5.0f, "%.2f×", 1, ImGuiSliderFlags_Logarithmic);
 			toggle_row(t, "Invert vertical look", nullptr, "mouse_invert", false);
 			{ const char *b, *tr; shoulder_names(&b, &tr); const std::string tl = std::string("Triggers (") + tr + ")", bl = std::string("Bumpers (") + b + ")";
-			  seg_row(t, "L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter). The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.", "shoulder_buttons", "triggers", {{"triggers", tl.c_str()}, {"bumpers", bl.c_str()}}); }
+			  seg_row(t, "L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter), unless you have set those buttons yourself below. The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.", "shoulder_buttons", "triggers", {{"triggers", tl.c_str()}, {"bumpers", bl.c_str()}}); }
+			controller_buttons_row(t);
 			slider_row(t, "Touch cursor speed", "Hold the shoulder pair that isn't L and R, and move a stick: the cursor is a finger on the touch screen.", "touch_cursor_speed", 1.0, 0.25f, 3.0f, "%.2f×");
 			toggle_row(t, "Gyro", "A controller's gyro as the Vita's motion sensor.", "gyro", true);
 			seg_row(t, "A level controller is a Vita held", "Upright, as in your hands, or flat on a table.", "gyro_pose", "upright", {{"upright", "Upright"}, {"flat", "Flat"}});
