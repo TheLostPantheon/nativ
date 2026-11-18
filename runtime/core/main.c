@@ -92,6 +92,39 @@ static void summary_threads(void) {
 		        (unsigned long long)lasts[i].at, lasts[i].name, lasts[i].r0, lasts[i].r1, lasts[i].lr);
 }
 void host_summary(const char *why);   /* window.c: the import-call histogram when the window is closed */
+
+/* ---- gaps.json: what a run reached that the host doesn't do. Each import with no implementation (its calls, the frame
+ * it was first called on, the caller, what it returned), and what stopped the run, if something did: a function the
+ * analysis missed (taken as one on the next run) or an instruction the recompiler doesn't translate. Rewritten as each
+ * new gap appears, so a run that crashes or hangs leaves it current; the call counts are brought up to date at the
+ * summary. `vitarecomp gaps <title>` reads it and Report a problem carries it. RECOMP_GAPS=<path> (default gaps.json
+ * in the run's folder; 0 writes none). The callers hold host_lock. */
+extern uint64_t display_frames(void);
+typedef struct { const char *name; uint64_t calls, frame; uint32_t lr, ret; } Gap;
+static Gap gaps[512];
+static int ngaps;
+static char gaps_stop[192];
+static void gaps_write(void) {
+	static const char *path = (const char *)1;
+	if (path == (const char *)1) { path = getenv("RECOMP_GAPS"); if (!path || !*path) path = "gaps.json"; else if (!strcmp(path, "0")) path = 0; }
+	if (!path) return;
+	FILE *f = fopen(path, "w"); if (!f) return;
+	const char *title = getenv("RECOMP_TITLE");
+	fprintf(f, "{\n  \"title\": \"%s\",\n  \"frames\": %llu,\n  \"stopped\": \"%s\",\n  \"imports\": [", title ? title : "", (unsigned long long)display_frames(), gaps_stop);
+	for (int i = 0; i < ngaps; i++)
+		fprintf(f, "%s\n    {\"name\": \"%s\", \"calls\": %llu, \"first_frame\": %llu, \"first_caller\": \"%#x\", \"returns\": \"%#x\"}", i ? "," : "",
+		        gaps[i].name, (unsigned long long)gaps[i].calls, (unsigned long long)gaps[i].frame, gaps[i].lr, gaps[i].ret);
+	fprintf(f, "%s]\n}\n", ngaps ? "\n  " : "");
+	fclose(f);
+}
+static void gaps_line(void) {   /* the summary's one line: how much of the game's system the host left undone */
+	char b[512]; int n = snprintf(b, sizeof b, "gaps: %d import%s not implemented", ngaps, ngaps == 1 ? "" : "s");
+	Gap *top[3] = {0}; for (int i = 0; i < ngaps; i++) for (int k = 0; k < 3; k++) if (!top[k] || gaps[i].calls > top[k]->calls) { for (int j = 2; j > k; j--) top[j] = top[j - 1]; top[k] = &gaps[i]; break; }
+	for (int k = 0; k < 3 && top[k] && n < (int)sizeof b - 80; k++) n += snprintf(b + n, sizeof b - n, "%s%s %llu", k ? ", " : " (most called: ", top[k]->name, (unsigned long long)top[k]->calls);
+	if (top[0] && n < (int)sizeof b - 2) n += snprintf(b + n, sizeof b - n, ")");
+	if (gaps_stop[0]) snprintf(b + n, sizeof b - n, "; stopped by %s", gaps_stop);
+	fprintf(stderr, "%s\n", b);
+}
 static void summary(const char *why) {
 	qsort(counts, ncounts, sizeof *counts, by_n);
 	fprintf(stderr, "\n== %s after %llu import calls; %d distinct:\n", why, (unsigned long long)ncalls, ncounts);
@@ -99,6 +132,7 @@ static void summary(const char *why) {
 		fprintf(stderr, "  %8llu  %s%s\n", (unsigned long long)counts[i].n, counts[i].name,
 		        hle_find(counts[i].name) ? "" : "   (stub)");
 	summary_threads();
+	gaps_line(); gaps_write();
 	{ extern void kernel_report_locks(void); kernel_report_locks(); }   /* who holds what the waiting threads want */
 	{ extern void gxm_sony_report(void); gxm_sony_report(); }   /* RECOMP_GXM_CHECK's findings */
 #ifdef RECOMP_VERIFY
@@ -342,6 +376,7 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 		const char *sp = getenv("RECOMP_SEEDS");
 		FILE *sf = addr >= 0x81000000u && addr < 0xa0000000u ? fopen(sp ? sp : "missed_functions.txt", "a") : 0;   /* (a call through a null or poisoned pointer is not a missed function) */
 		if (sf) { fprintf(sf, "%#x %s\n", addr & ~1u, (addr & 3) || (c->r[14] & 1) ? "thumb" : "arm"); fclose(sf); }
+		snprintf(gaps_stop, sizeof gaps_stop, "a call to %#x, code the analysis missed (called from %#x; taken as a function on the next build)", addr, c->r[14]);
 		summary("stopped"); exit(2);
 	}
 	uint32_t target; unsigned fl;
@@ -415,11 +450,11 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 		         || (nl >= 9 && !strcmp(name + nl - 9, "Terminate")) || (nl >= 8 && !strcmp(name + nl - 8, "Shutdown")) || (nl >= 8 && !strcmp(name + nl - 8, "Finalize"))
 		         || strstr(name, "Callback") || strstr(name, "RegisterHandler") || strstr(name, "InitWithParam") || strstr(name, "SetParam") || strstr(name, "Create") || strstr(name, "Delete") || strstr(name, "Destroy") || strstr(name, "Abort");
 		if (!zero && !setup) for (int i = 0; stub_errs[i].prefix; i++) if (!strncmp(name, stub_errs[i].prefix, strlen(stub_errs[i].prefix))) { stub_ret = stub_errs[i].err; break; }
-		/* said once per import, because a game feature that quietly does nothing (a ragdoll that freezes, a door that never opens, a silent gun) is usually one of these */
-		static const char *said[512]; static int nsaid; int seen = 0;
+		/* said once per import, because a game feature that quietly does nothing (a ragdoll that freezes, a door that never opens, a silent gun) is usually one of these; counted in gaps.json */
+		int seen = 0;
 		pthread_mutex_lock(&host_lock);
-		for (int i = 0; i < nsaid; i++) if (said[i] == name) { seen = 1; break; }
-		if (!seen && nsaid < 512) said[nsaid++] = name;
+		for (int i = 0; i < ngaps; i++) if (gaps[i].name == name) { seen = 1; gaps[i].calls++; break; }
+		if (!seen && ngaps < (int)(sizeof gaps / sizeof *gaps)) { gaps[ngaps++] = (Gap){ name, 1, display_frames(), c->r[14], stub_ret }; gaps_write(); }
 		pthread_mutex_unlock(&host_lock);
 		if (!seen) fprintf(stderr, "    import %s: not implemented -- returns %#x (first call from lr %#x, r0 %#x r1 %#x)\n", name, stub_ret, c->r[14], a0, a1);
 	}
@@ -460,6 +495,7 @@ uint32_t recomp_unimpl_at;
 void recomp_unimplemented(Cpu *c, uint32_t addr) {
 	pthread_mutex_lock(&host_lock);
 	fprintf(stderr, "unimplemented instruction at %#x (lr %#x)\n", addr, c->r[14]);
+	snprintf(gaps_stop, sizeof gaps_stop, "an instruction the recompiler doesn't translate, at %#x", addr);
 	if (*hle_last_format) fprintf(stderr, "last formatted string: %s\n", hle_last_format);
 	summary("stopped"); exit(2);
 }

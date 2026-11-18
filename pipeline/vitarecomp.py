@@ -48,6 +48,9 @@
                                             saves the TEST_FRAMES frame as test.png, and the
                                             graphics coverage map as gfxcov.json
   vitarecomp coverage  <title> ...          the gap table from those maps (gfxcov.py)
+  vitarecomp gaps      <title>              what the last play session and the last test reached that the host
+                                            doesn't do (their gaps.json): imports with no implementation, most called
+                                            first, and what stopped the run
   vitarecomp pgo       <title> <recording> [frames] [from]   profile-guided optimisation: an instrumented build plays the
                                             recording (a folder with input.txt and savedata0/, as dev/bench.sh), its
                                             counts go to recomp/pgo.profdata, and from then on every build of the game
@@ -1079,6 +1082,23 @@ def _machine():   # about.txt's lines on the computer: what the logs don't say
             ("memory", f"{ram / 2**30:.0f} GB" if ram else "unknown")]
 
 
+def cmd_gaps(g):
+    """the runtime's gaps.json (runtime/core/main.c) of the last play session and the last test, as a table"""
+    any_ = False
+    for label, path in (("play", os.path.join(g.OUT, "gaps.json")), ("test", os.path.join(g.OUT, g.TD, "gaps.json"))):
+        if not os.path.isfile(path): continue
+        try: d = json.load(open(path, encoding="utf-8"))
+        except (OSError, ValueError) as e: say(f"{label}: {path} unreadable ({e})"); continue
+        any_ = True
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
+        imps = sorted(d.get("imports", []), key=lambda i: -int(i.get("calls", 0)))
+        print(f"{label} ({when}, {d.get('frames', 0)} frames): {len(imps)} import{'s' if len(imps) != 1 else ''} not implemented")
+        for i in imps:
+            print(f"  {int(i.get('calls', 0)):>9}  {i.get('name', '?'):<44} first at frame {i.get('first_frame', '?')}, from {i.get('first_caller', '?')}, returns {i.get('returns', '?')}")
+        if d.get("stopped"): print(f"  stopped by {d['stopped']}")
+    if not any_: say(f"no gaps.json yet for {g.T}: play or test it first")
+
+
 def cmd_report(T):
     """a bug report: one zip of what a problem needs and nothing private: the game's last two session logs, the launcher's
     log, both settings files, the newest F5 frame history, and about.txt (versions, the computer). No game files, saves,
@@ -1097,7 +1117,8 @@ def cmd_report(T):
     def private(b): return b.replace(home.encode(), b"~").replace(home.replace("\\", "/").encode(), b"~")
     files = [(os.path.join(OUT, "session.log"), "session.log"), (os.path.join(OUT, "session.prev.log"), "session.prev.log"),
              (os.path.join(prefs_dir(ROOT), "launcher.log"), "launcher.log"), (os.path.join(prefs_dir(ROOT), "launcher.prev.log"), "launcher.prev.log"),
-             (os.path.join(OUT, "settings.ini"), "settings-game.ini"), (os.path.join(prefs_dir(ROOT), "settings.ini"), "settings.ini")]
+             (os.path.join(OUT, "settings.ini"), "settings-game.ini"), (os.path.join(prefs_dir(ROOT), "settings.ini"), "settings.ini"),
+             (os.path.join(OUT, "gaps.json"), "gaps.json")]
     f5 = sorted(glob.glob(os.path.join(glob.escape(OUT), "captures", "f5_*")), key=os.path.getmtime)
     f5 = f5[-1] if f5 else ""
     stamp = lambda p: time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
@@ -1131,7 +1152,7 @@ def main(argv):
     if cmd == "dist": cmd_dist(T); return 0
     if cmd == "library": cmd_library(argv[1:]); return 0
     if cmd == "report": cmd_report(T); return 0
-    if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions", "pgo", "steam"):
+    if cmd not in ("import", "analyze", "recompile", "build", "ready", "run", "test", "capture", "replay", "accept", "check", "coverage", "verify", "recipes", "versions", "pgo", "steam", "gaps"):
         usage(); return 1
     g = Game(T, cmd)
     arg3 = argv[2] if len(argv) > 2 else ""
@@ -1144,6 +1165,7 @@ def main(argv):
     elif cmd == "ready": cmd_ready(g)
     elif cmd == "run": cmd_run(g, arg3)
     elif cmd == "test": cmd_test(g)
+    elif cmd == "gaps": cmd_gaps(g)
     elif cmd == "pgo": cmd_pgo(g, arg3, argv[3] if len(argv) > 3 else "", argv[4] if len(argv) > 4 else "")
     elif cmd == "steam":
         exe = ENV.get("NATIV_LAUNCHER_EXE") or os.path.join(ROOT, "launcher", "nativ" + (".exe" if WINDOWS else ""))
