@@ -673,8 +673,33 @@ static int tab_step(void) {
 	if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_Tab, false))) return 1;
 	return 0;
 }
+/* a Steam Deck: its firmware names the board (Jupiter, the LCD model; Galileo, the OLED one) */
+static bool steam_deck(void) {
+	static int v = -1;
+	if (v < 0) {
+		v = 0;
+#ifdef __linux__
+		auto first_line = [](const char *path) { std::string s; if (FILE *f = fopen(path, "r")) { char b[64] = {0}; if (fgets(b, sizeof b, f)) s = b; fclose(f); } while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back(); return s; };
+		const std::string vendor = first_line("/sys/class/dmi/id/board_vendor"), product = first_line("/sys/class/dmi/id/product_name");
+		v = vendor == "Valve" && (product == "Jupiter" || product == "Galileo");
+#endif
+	}
+	return v != 0;
+}
+/* the first controller's own names for its shoulder buttons: an Xbox pad's, a Switch pad's, or the PlayStation names the
+ * games use. A Steam Deck's controls reach us as an Xbox pad through Steam, but its buttons are labelled L1 / R1 and L2 / R2 */
+static void shoulder_names(const char **bumpers, const char **triggers) {
+	*bumpers = "L1 / R1"; *triggers = "L2 / R2";
+	int n = 0; SDL_JoystickID *ids = SDL_GetGamepads(&n);
+	if (ids && n > 0 && !steam_deck()) {
+		const SDL_GamepadType ty = SDL_GetGamepadTypeForID(ids[0]);
+		if (ty == SDL_GAMEPAD_TYPE_XBOX360 || ty == SDL_GAMEPAD_TYPE_XBOXONE) { *bumpers = "LB / RB"; *triggers = "LT / RT"; }
+		else if (ty == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || ty == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR) { *bumpers = "L / R"; *triggers = "ZL / ZR"; }
+	}
+	SDL_free(ids);
+}
 static void tab_hint(void) {   /* (shown with a controller connected) */
-	if (SDL_HasGamepad()) { ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("L1 / R1"); }
+	if (SDL_HasGamepad()) { const char *b, *t; shoulder_names(&b, &t); ImGui::SameLine(); ImGui::AlignTextToFramePadding(); ImGui::TextDisabled("%s", b); }
 }
 
 /* ---- shared pieces of the setup and the dialogs */
@@ -1027,15 +1052,17 @@ static std::string game_settings_path(const std::string &id) { return g_dump + "
 static std::string fmt_g(double v) { char b[32]; snprintf(b, sizeof b, "%g", v); return b; }
 
 /* the starting point on a new machine: the look most players want from a PC version -- fullscreen, sharp for this display,
- * the full width of the screen, 60 fps, the mouse aiming 1:1, softer shadows (the games' own menus, and Settings, change it) */
+ * the full width of the screen, 60 fps, the mouse aiming 1:1, softer shadows (the games' own menus, and Settings, change it).
+ * A Steam Deck starts lighter: 1x (its 1280x800 screen is near it), 30 fps as on the Vita, the default shadows */
 static int recommended_scale(void) {
+	if (steam_deck()) return 1;
 	const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
 	float h = m ? m->h * (m->pixel_density > 0 ? m->pixel_density : 1.0f) : 1080;
 	int k = (int)lroundf(h / 544.0f); return k < 2 ? 2 : k > 4 ? 4 : k;
 }
 static void recommended_into(Ini &x) {
 	ini_set(x, "fullscreen", "1"); ini_set(x, "render_scale", std::to_string(recommended_scale())); ini_set(x, "aspect_ratio", "window");
-	ini_set(x, "frame_rate", "60"); ini_set(x, "raw_look", "1"); ini_set(x, "shadow_filter", "2");
+	ini_set(x, "frame_rate", steam_deck() ? "30" : "60"); ini_set(x, "raw_look", "1"); ini_set(x, "shadow_filter", steam_deck() ? "1" : "2");
 }
 /* once, when there is no shared file yet: it starts as what this library's games agree on (each key: the value most of
  * their files hold; a tie, the most recently changed file's), or the recommended set on a new install. Then, every
@@ -1143,7 +1170,7 @@ static std::string online_status_line(void) {
 	}
 	return b;
 }
-static const char *ONLINE_EXPL = "Games' online modes (Killzone: Mercenary, Unit 13) with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game.";
+static const char *ONLINE_EXPL = "Games' online modes (Killzone: Mercenary, Unit 13) with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. While it's on, these games look for other players as soon as they start, not only in their multiplayer menus: on your network, and through the public BitTorrent DHT, which lists your IP address. Turn it off to stay offline.";
 static bool online_name_ok(const std::string &n) {
 	return n.size() <= 10 && std::all_of(n.begin(), n.end(), [](char c) { return isalnum((unsigned char)c) || c == '-' || c == '_'; });
 }
@@ -1270,7 +1297,8 @@ static void settings_modal(void) {
 			seg_row(t, "Mouse aim", "Direct: the game turns exactly as far as the mouse moves (Uncharted, Unit 13, Killzone). Stick: the mouse moves the right stick. F8 switches in a game.", "raw_look", "1", {{"1", "Direct"}, {"0", "Stick"}});
 			slider_row(t, "Mouse sensitivity", nullptr, "mouse_sens", 1.0, 0.1f, 5.0f, "%.2f×", 1, ImGuiSliderFlags_Logarithmic);
 			toggle_row(t, "Invert vertical look", nullptr, "mouse_invert", false);
-			seg_row(t, "L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter). The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.", "shoulder_buttons", "triggers", {{"triggers", "Triggers (L2 / R2)"}, {"bumpers", "Bumpers (L1 / R1)"}});
+			{ const char *b, *tr; shoulder_names(&b, &tr); const std::string tl = std::string("Triggers (") + tr + ")", bl = std::string("Bumpers (") + b + ")";
+			  seg_row(t, "L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter). The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.", "shoulder_buttons", "triggers", {{"triggers", tl.c_str()}, {"bumpers", bl.c_str()}}); }
 			slider_row(t, "Touch cursor speed", "Hold the shoulder pair that isn't L and R, and move a stick: the cursor is a finger on the touch screen.", "touch_cursor_speed", 1.0, 0.25f, 3.0f, "%.2f×");
 			toggle_row(t, "Gyro", "A controller's gyro as the Vita's motion sensor.", "gyro", true);
 			seg_row(t, "A level controller is a Vita held", "Upright, as in your hands, or flat on a table.", "gyro_pose", "upright", {{"upright", "Upright"}, {"flat", "Flat"}});
