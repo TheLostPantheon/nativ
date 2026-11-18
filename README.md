@@ -133,6 +133,11 @@ reporting a bug.
 - [The shader compiler](docs/shader-compiler.md) and [the USSE instruction set](docs/usse-isa.md): the Vita's GPU
   shaders and how we translate them.
 
+## Contributing
+
+Pull requests are open only to the maintainer, so please send issues instead: bug reports with their logs, and ideas.
+[CONTRIBUTORS.md](CONTRIBUTORS.md) names everyone whose code, ideas or analysis went into Nativ.
+
 ## Licence
 
 Project Nativ is free software under the GNU General Public License, version 2 or (at your option) any later version:

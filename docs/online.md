@@ -54,6 +54,9 @@ Headless runs stay offline unless they ask for it (`RECOMP_ONLINE=1`, `RECOMP_ON
 - **On the internet**, copies meet through the public BitTorrent DHT. Each one announces itself under a hash of
   "Project Nativ online 1:" and the game's communication ID, then contacts the copies it finds. Both sides sending at
   once opens a path through most home routers (hole punching).
+- **When it starts:** with Play online on, both kinds of discovery begin as a supported game starts, before the player
+  opens its multiplayer menus, so rooms are already known by then. A player who wants to stay offline turns Play online
+  off before starting the game.
 - **UPnP** (settings `online_upnp=1`, off by default) asks the router to forward the port, which makes a copy reachable
   without punching.
 - **A relay** (`servers/nativ-node`) handles routers that won't let either side in; see below.

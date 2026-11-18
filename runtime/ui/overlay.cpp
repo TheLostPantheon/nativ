@@ -236,6 +236,7 @@ static void set_osd(int level) { metrics_osd_set(level); settings_set_int("osd",
 /* ---- the host's own hotkeys, one table: the Help page's Shortcuts list and the Controls page's second
  * table both draw it (the game's controls are window.c's ctrl_rows; these are the keys window.c binds
  * beside them -- keep in sync with its event loop). The bar's own shortcut texts name the same keys. */
+static void shoulder_names(const char **bumpers, const char **triggers);   /* (below, with pad_names) */
 static const char *const g_shortcuts[][3] = {
 	{"Menu bar", "Move the mouse to the top edge (Esc hides it)", "Tap the tab at the top centre (touch screen)"},
 	{"This menu (pauses the game)", "F10 (Esc closes it)", "Guide, or Back + Start together"},
@@ -380,7 +381,7 @@ static void page_game(void) {
 		if (ui::segmented(names, 3, &v)) { settings_set_int("controller_layout", v); settings_save(); }
 	}
 	if (game_option("online")) {
-		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. Applies the next time the game starts.");
+		ui::row("Play online", "The game's online modes with other Project Nativ players, on your network and over the internet. They see your online name and your computer's IP address, as in any peer-to-peer game. While it's on, the game looks for other players from the moment it starts (on your network, and through the public BitTorrent DHT, which lists your IP address), not only in its multiplayer menus. Applies the next time the game starts.");
 		if (net_online_needs()) { char t[128]; snprintf(t, sizeof t, "Needs update %s: this copy is another version, and rooms only match their own. Add the update in the launcher.", net_online_needs()); ImGui::TextWrapped("%s", t); }
 		else { bool on = settings_int("online", 1) != 0; if (ui::toggle("online", &on)) { settings_set_int("online", on ? 1 : 0); settings_save(); } }
 		if (net_online()) {   /* how it stands (status.c), every half second */
@@ -455,7 +456,8 @@ static void page_controls(void) {
 		ui::row("Invert vertical look");
 		{ bool inv = settings_int("mouse_invert", 0) != 0; if (ui::toggle("mi", &inv)) { settings_set_int("mouse_invert", inv ? 1 : 0); settings_save(); } }
 		ui::row("L and R buttons", "The shoulder pair that is the game's L and R (aim and fire in a shooter). The other pair holds the touch cursor, or is L2 and R2 in a PS TV layout.");
-		{ static const char *const names[2] = {"Triggers (L2 / R2)##sb", "Bumpers (L1 / R1)##sb"}; char cur[16]; int v = !strcmp(settings_str("shoulder_buttons", "triggers", cur, sizeof cur), "bumpers");
+		{ const char *b, *tr; shoulder_names(&b, &tr); char n0[40], n1[40]; snprintf(n0, sizeof n0, "Triggers (%s)##sb", tr); snprintf(n1, sizeof n1, "Bumpers (%s)##sb", b);
+		  const char *const names[2] = {n0, n1}; char cur[16]; int v = !strcmp(settings_str("shoulder_buttons", "triggers", cur, sizeof cur), "bumpers");
 		  if (ui::segmented(names, 2, &v)) { settings_set_str("shoulder_buttons", v ? "bumpers" : "triggers"); settings_save(); } }
 		ui::row("Touch cursor speed", "Hold the shoulder pair that isn't L and R, and move a stick: the cursor is a finger on the touch screen (Cross, L or R presses). Move both sticks for two fingers.");
 		ImGui::SetNextItemWidth(-FLT_MIN); if (ImGui::SliderFloat("##tcs", &P.tcs, 0.25f, 3.0f, "%.2f×")) set_tcs(P.tcs);
@@ -588,7 +590,8 @@ static void build_ui(void) {
 	/* the foot */
 	ImGui::Dummy(ImVec2(0, em * 0.15f));
 	if (ImGui::Button("Capture frame (F12)")) g_want_capture = true;
-	ImGui::SameLine(); ImGui::TextDisabled(SDL_HasGamepad() ? "L1 / R1: sections   Esc, F10 or the PS button closes this menu" : "Esc, F10 or the PS button closes this menu");
+	if (SDL_HasGamepad()) { const char *b, *tr; shoulder_names(&b, &tr); ImGui::SameLine(); ImGui::TextDisabled("%s: sections   Esc, F10 or the PS button closes this menu", b); }
+	else { ImGui::SameLine(); ImGui::TextDisabled("Esc, F10 or the PS button closes this menu"); }
 	const char *quit = quit_label();
 	float qw = ImGui::CalcTextSize(quit).x + ImGui::GetStyle().FramePadding.x * 2;
 	ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - qw);
@@ -1147,16 +1150,37 @@ static void prompt(ImDrawList *dl, int k, ImVec2 c, float size, ImU32 col) {   /
 	const ImVec2 p(roundf((c.x - size * 0.5f) * fb) / fb, roundf((c.y - size * 0.5f) * fb) / fb);   /* (on whole pixels: sharp) */
 	dl->AddImage(atlas->TexRef, p, ImVec2(p.x + size, p.y + size), uv, ImVec2(uv.x + d.x, uv.y + d.y), col);
 }
+/* a Steam Deck (its firmware names the board: Jupiter, the LCD model; Galileo, the OLED one). Its controls reach a game as an
+ * Xbox pad through Steam, with A / B / X / Y, but its shoulder buttons are labelled L1 / R1 and L2 / R2 */
+static bool steam_deck(void) {
+	static int v = -1;
+	if (v < 0) {
+		v = 0;
+#ifdef __linux__
+		char vendor[64] = {0}, product[64] = {0};
+		if (FILE *f = fopen("/sys/class/dmi/id/board_vendor", "r")) { if (!fgets(vendor, sizeof vendor, f)) vendor[0] = 0; fclose(f); }
+		if (FILE *f = fopen("/sys/class/dmi/id/product_name", "r")) { if (!fgets(product, sizeof product, f)) product[0] = 0; fclose(f); }
+		v = !strncmp(vendor, "Valve", 5) && (!strncmp(product, "Jupiter", 7) || !strncmp(product, "Galileo", 7));
+#endif
+	}
+	return v != 0;
+}
 static void pad_names(const char **l, const char **r, const char **a, bool *touchpad, int *fam) {   /* the first pad's own button names and icons */
 	*l = "L1"; *r = "R1"; *a = "Cross"; *touchpad = true; *fam = FAM_PS;   /* (the Vita's own names, and a DualShock 4's or DualSense's: unless the pad says otherwise) */
 	int n = 0; SDL_JoystickID *ids = SDL_GetGamepads(&n);
 	if (ids && n > 0) {
 		const SDL_GamepadType t = SDL_GetGamepadTypeForID(ids[0]);
-		if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) { *l = "LB"; *r = "RB"; *a = "A"; *touchpad = false; *fam = FAM_XBOX; }
+		if ((t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) && steam_deck()) { *a = "A"; *touchpad = false; *fam = FAM_XBOX; }
+		else if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) { *l = "LB"; *r = "RB"; *a = "A"; *touchpad = false; *fam = FAM_XBOX; }
 		else if (t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR) { *l = "L"; *r = "R"; *a = "B"; *touchpad = false; *fam = FAM_SWITCH; }
 		else if (t == SDL_GAMEPAD_TYPE_PS3) *touchpad = false;
 	}
 	SDL_free(ids);
+}
+static void shoulder_names(const char **bumpers, const char **triggers) {   /* the shoulder pairs by the same names: "L1 / R1", "LB / RB", "L / R" */
+	const char *l, *r, *a; bool tp; int fam; pad_names(&l, &r, &a, &tp, &fam);
+	*bumpers = fam == FAM_SWITCH ? "L / R" : !strcmp(l, "LB") ? "LB / RB" : "L1 / R1";
+	*triggers = fam == FAM_SWITCH ? "ZL / ZR" : !strcmp(l, "LB") ? "LT / RT" : "L2 / R2";
 }
 static float ease(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x * x * (3 - 2 * x); }
 /* one device's demonstration at p (its top-left), w x h: its buttons doing the touch, beside a small Vita screen whose

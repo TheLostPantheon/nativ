@@ -1169,6 +1169,22 @@ void window_run(void *(*fn)(void *), void *arg) {
 				if (!want) { if (gesture_drag) { gesture_drag = 0; touch_down = 0; } if (twist_drag) { twist_drag = 0; twist_down = twist_pad; } if (kbm_lmb) buttons &= ~RTRIG; if (kbm_rmb) buttons &= ~LTRIG; kbm_lmb = kbm_rmb = 0; __atomic_store_n(&mouse_dx_q8, 0, __ATOMIC_RELAXED); __atomic_store_n(&mouse_dy_q8, 0, __ATOMIC_RELAXED); }
 				rel_on = want;
 			}
+#ifdef _WIN32
+			/* Windows can drop the pointer's confinement behind relative mode while SDL still reports it on: a quick upward
+			 * look then carried the hidden pointer out over the title bar, where it showed, and a click (fire) there started
+			 * a window move that held the game still (issue 75). While captured, the pointer is confined to the middle of the
+			 * window, and brought back if it's outside anyway */
+			if (win && rel_on) {
+				static int rw, rh; int ww, wh, px, py; SDL_GetWindowSize(win, &ww, &wh); SDL_GetWindowPosition(win, &px, &py);
+				if ((!SDL_GetWindowMouseRect(win) || ww != rw || wh != rh) && ww > 8 && wh > 8) { SDL_Rect r = { ww / 4, wh / 4, ww / 2, wh / 2 }; SDL_SetWindowMouseRect(win, &r); rw = ww; rh = wh; }
+				float gx, gy; SDL_GetGlobalMouseState(&gx, &gy);
+				if (gx < px || gy < py || gx >= px + ww || gy >= py + wh) {
+					static int said; if (!said++) fprintf(stderr, "mouse: the pointer left the window while captured -- brought back\n");
+					SDL_SetWindowRelativeMouseMode(win, false); SDL_SetWindowRelativeMouseMode(win, true);
+					SDL_WarpMouseInWindow(win, ww * 0.5f, wh * 0.5f); rel_since_us = now_us();
+				}
+			} else if (win && SDL_GetWindowMouseRect(win)) SDL_SetWindowMouseRect(win, NULL);
+#endif
 			tilt_section_update();
 			if (dt > 0) {   /* the motion sensor's source, and the virtual pad's tilt */
 				/* keyboard + mouse, or a pad without a gyro: the virtual pad; a pad with one in hand: its gyro. A change
