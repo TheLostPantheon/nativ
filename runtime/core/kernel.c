@@ -70,6 +70,8 @@
 #define E_ILLEGAL_ATTR          0x8002000Eu
 #define E_WAIT_CANCEL           0x80028007u   /* CancelMsgPipe woke the waiter */
 #define E_UNKNOWN_CALLBACK_ID   0x800280A1u
+#define E_NOT_IMPLEMENTED       0x80020002u
+#define E_UNKNOWN_TIMER_ID      0x80028241u   /* vitasdk's value; not seen in firmware here */
 #define E_UNKNOWN_RW_LOCK_ID    0x800281E1u
 #define E_RW_LOCK_RECURSIVE     0x800281E2u   /* the writer locks a non-recursive lock again (or a reader asks to write) */
 #define E_RW_LOCK_NOT_OWNED     0x800281E4u   /* an unlock by a thread holding nothing that way */
@@ -708,7 +710,7 @@ static void h_abort_handler(Cpu *c) {   /* libc's abort() ends here; a stub that
 }
 
 /* ---- sync objects */
-enum { SEMA = 1, MUTEX, LWMUTEX, LWCOND, EVF, KCOND, SEVENT, RWLOCK, MSGPIPE, CALLBACK };
+enum { SEMA = 1, MUTEX, LWMUTEX, LWCOND, EVF, KCOND, SEVENT, RWLOCK, MSGPIPE, CALLBACK, TIMER };
 /* a thread blocked on an object: what it waits for and the condition variable it sleeps on (one
  * per host thread: a thread waits on one object at a time, and a pthread condition may serve
  * different mutexes over time), so a wake is one signal to one thread */
@@ -737,6 +739,7 @@ typedef struct {
 	struct { uint32_t tid; int n; } *readers; int nreaders, readers_cap;   /* a reader-writer lock's readers and their counts (owner/count: the writer) */
 	uint8_t *ring; int cap, used, rpos;   /* a message pipe's bytes: a ring of the created size */
 	uint32_t func, common, notify_arg, notifier; int ncount;   /* a callback: its function and common argument; the notifications not yet delivered */
+	uint64_t tbase; int trunning;   /* a timer: running, the guest clock at which its count was 0; stopped, the count itself */
 } Obj;
 static __thread pthread_cond_t *my_cv;
 static pthread_cond_t *wait_cv(void) { if (!my_cv) { my_cv = malloc(sizeof *my_cv); pthread_cond_init(my_cv, 0); } return my_cv; }
@@ -1742,6 +1745,89 @@ static void open_named(Cpu *c, int kind) {
 static void h_open_sema(Cpu *c) { open_named(c, SEMA); }
 static void h_open_mutex(Cpu *c) { open_named(c, MUTEX); }
 
+/* ---- timers: a counter in microseconds that runs while the timer is started, on the guest clock
+ * (guest_time_us, so RECOMP_CLOCK=fixed keeps it deterministic). Stopping keeps the count, starting
+ * continues from it, SetTimerTime replaces it. Start on a running timer returns 1 and Stop on a
+ * stopped one 0 (Vita3K's Timer, taken from there: the vitasdk headers have no SCE_KERNEL_ERROR_
+ * code for either and the firmware's own return was not read). The wide calls return the time in
+ * r0:r1 and, for a bad uid, the error code sign-extended (also assumed). The other half of a kernel
+ * timer, SetTimerEvent arming an event that threads waiting on the timer's uid are woken by, has no
+ * counterpart in this wait machinery yet: those calls say NOT_IMPLEMENTED, so a game that relies on
+ * the event fails visibly instead of waiting on a success that never fires. */
+static uint64_t timer_count(Obj *o) { return o->trunning ? guest_time_us() - o->tbase : o->tbase; }   /* o->m held */
+static uint64_t timer_err64(void) { return (uint64_t)(int64_t)(int32_t)E_UNKNOWN_TIMER_ID; }
+static void timer_ret64(Cpu *c, uint64_t v) { c->r[0] = (uint32_t)v; c->r[1] = (uint32_t)(v >> 32); }
+static void h_create_timer(Cpu *c) { Obj *o = new_obj(TIMER, A0, A1); RET(o->uid); }   /* (name, attr, opt) */
+static void h_delete_timer(Cpu *c) { h_delete_uid(c, TIMER, E_UNKNOWN_TIMER_ID); }
+static void h_open_timer(Cpu *c) { open_named(c, TIMER); }
+static void h_close_timer(Cpu *c) { RET(by_uid(A0, TIMER) ? 0 : E_UNKNOWN_TIMER_ID); }
+static void h_start_timer(Cpu *c) {
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	pthread_mutex_lock(&o->m);
+	if (o->trunning) RET(1);
+	else { o->tbase = guest_time_us() - o->tbase; o->trunning = 1; RET(0); }   /* the stored count becomes the clock's origin */
+	pthread_mutex_unlock(&o->m);
+}
+static void h_stop_timer(Cpu *c) {
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	pthread_mutex_lock(&o->m);
+	if (!o->trunning) RET(0);
+	else { o->tbase = timer_count(o); o->trunning = 0; RET(1); }
+	pthread_mutex_unlock(&o->m);
+}
+static uint64_t timer_get(Obj *o, int base) {   /* the count, or the base (the clock's origin while running, 0 stopped) */
+	pthread_mutex_lock(&o->m);
+	uint64_t v = base ? (o->trunning ? o->tbase : 0) : timer_count(o);
+	pthread_mutex_unlock(&o->m);
+	return v;
+}
+static uint64_t timer_set(Obj *o, uint64_t v) {   /* -> the old count */
+	pthread_mutex_lock(&o->m);
+	uint64_t old = timer_count(o);
+	o->tbase = o->trunning ? guest_time_us() - v : v;
+	pthread_mutex_unlock(&o->m);
+	return old;
+}
+static void h_get_timer_time_wide(Cpu *c) { Obj *o = by_uid(A0, TIMER); timer_ret64(c, o ? timer_get(o, 0) : timer_err64()); }
+static void h_get_timer_base_wide(Cpu *c) { Obj *o = by_uid(A0, TIMER); timer_ret64(c, o ? timer_get(o, 1) : timer_err64()); }
+static void timer_get_ptr(Cpu *c, int base) {   /* (uid, *SceKernelSysClock) */
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	if (!A1) { RET(E_ILLEGAL_ADDR); return; }
+	WR64(A1, timer_get(o, base)); RET(0);
+}
+static void h_get_timer_time(Cpu *c) { timer_get_ptr(c, 0); }
+static void h_get_timer_base(Cpu *c) { timer_get_ptr(c, 1); }
+static void h_set_timer_time(Cpu *c) {   /* (uid, *SceKernelSysClock): the new time in, the old one out */
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	if (!A1) { RET(E_ILLEGAL_ADDR); return; }
+	WR64(A1, timer_set(o, RD64(A1))); RET(0);
+}
+static void h_set_timer_time_wide(Cpu *c) {   /* (uid, time in r2:r3: a 64-bit argument starts on an even register) -> the old time */
+	Obj *o = by_uid(A0, TIMER);
+	timer_ret64(c, o ? timer_set(o, (uint64_t)A2 | ((uint64_t)A3 << 32)) : timer_err64());
+}
+static void h_get_timer_info(Cpu *c) {   /* (uid, *SceKernelTimerInfo 0x60): the event fields (schedule, interval, type, repeat, waiters) stay 0 until events exist */
+	Obj *o = by_uid(A0, TIMER);
+	if (!o) { RET(E_UNKNOWN_TIMER_ID); return; }
+	if (!A1 || RD32(A1) != 0x60) { RET(A1 ? E_INVALID_ARGUMENT_SIZE : E_ILLEGAL_ADDR); return; }
+	pthread_mutex_lock(&o->m);
+	memset(G(A1 + 4), 0, 0x5c);
+	WR32(A1 + 4, o->uid); memcpy(G(A1 + 8), o->name, 32); WR32(A1 + 0x28, o->attr); WR32(A1 + 0x2c, o->trunning);
+	WR64(A1 + 0x30, o->tbase); WR64(A1 + 0x38, timer_count(o));   /* base: the origin while running, the stored time while stopped */
+	pthread_mutex_unlock(&o->m);
+	RET(0);
+}
+static void h_timer_event_missing(Cpu *c) {   /* SetTimerEvent, CancelTimer, GetTimerEventRemainingTime */
+	static int said; if (said++ < 4) fprintf(stderr, "    kernel timer events are not implemented (lr %#x)\n", c->r[14]);
+	RET(E_NOT_IMPLEMENTED);
+}
+#define h_set_timer_event h_timer_event_missing
+#define h_cancel_timer h_timer_event_missing
+
 /* sceKernelGetTLSAddr(key): a word of per-thread storage per key (0..255; the C library keeps
  * errno and its per-thread state there) */
 /* __tls_get_addr(const TlsIndex *ti): the address, in the calling thread, of a module's thread-local
@@ -1788,6 +1874,12 @@ static void h_stderr(Cpu *c) { h_std_stream(c, 2); }
 static void h_random_number(Cpu *c) { if (!A0) { RET(0x80020001u); return; } plat_random(G(A0), A1); RET(0); }   /* sceKernelGetRandomNumber(buf, size): libssl seeds its RNG with it */
 const HleEntry hle_kernel[] = {
 	{"sceKernelGetRandomNumber", h_random_number},
+	{"sceKernelCreateTimer", h_create_timer}, {"sceKernelDeleteTimer", h_delete_timer}, {"sceKernelOpenTimer", h_open_timer}, {"sceKernelCloseTimer", h_close_timer},
+	{"sceKernelStartTimer", h_start_timer}, {"sceKernelStopTimer", h_stop_timer},
+	{"sceKernelGetTimerTime", h_get_timer_time}, {"sceKernelGetTimerTimeWide", h_get_timer_time_wide},
+	{"sceKernelGetTimerBase", h_get_timer_base}, {"sceKernelGetTimerBaseWide", h_get_timer_base_wide},
+	{"sceKernelSetTimerTime", h_set_timer_time}, {"sceKernelSetTimerTimeWide", h_set_timer_time_wide}, {"sceKernelGetTimerInfo", h_get_timer_info},
+	{"sceKernelSetTimerEvent", h_set_timer_event}, {"sceKernelCancelTimer", h_cancel_timer}, {"sceKernelGetTimerEventRemainingTime", h_timer_event_missing},
 	{"sceUltWaitingQueueResourcePoolGetWorkAreaSize", h_ult_pool_size}, {"_sceUltWaitingQueueResourcePoolCreate", h_zero_ok},
 	{"sceUltWaitingQueueResourcePoolDestroy", h_zero_ok},
 	{"_sceUltSemaphoreCreate", h_ult_sema_create}, {"sceUltSemaphoreAcquire", h_ult_sema_acquire},

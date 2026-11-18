@@ -20,6 +20,7 @@ Checks `runtime/core/kernel.c`, the thread manager, against the firmware's seman
   - deletion waking waiters with `WAIT_DELETE`.
 - **Threads:** info, priority, exit status and thread event handlers.
 - **Reader-writer locks:** recursive reads, writer preference, and the order an unlock grants in.
+- **Timers:** start, stop, set and read on a hand-set guest clock (the count continues across stop and start, the wide forms use r0:r1), the info structure, and the event calls refusing with `NOT_IMPLEMENTED`.
 - **Message pipes:** ASAP and FULL transfers, sender order, and `WAIT_CANCEL` from Cancel.
 - **Callbacks:** one notified while its owner sleeps in `WaitSemaCB`, `DelayThreadCB` or `WaitThreadEndCB` runs on the
   owner mid-wait with its arguments, and the wait carries on. Also `CheckCallback`, and a callback deleting itself by
