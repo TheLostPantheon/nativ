@@ -191,6 +191,19 @@ def main():
         print(f"   {total_forms} is far past the ~{form_cap} target for one run; sampling {len(forms)} forms "
               f"(set INSNSWEEP_FORM_CAP to change)", flush=True)
 
+    sweep(forms, blocks, trials, per_form)
+
+
+def sweep(forms, blocks, trials=64, per_form=3, quiet=False):
+    """test each form's instances (form -> [(address, arm)], their bytes in blocks [(start, bytes)]): every one translated
+    as recomp.py translates it, run natively and by Unicorn from the same random states, compared. Also dev/isacover.py's
+    engine. Returns {"ok": n, "bad": {form: why}, "unsupported": {form: why}, "untested": n, "crashed": {form: why}}"""
+    def code(a, n):
+        for s, b in blocks:
+            if s <= a and a + n <= s + len(b):
+                return b[a - s:a - s + n]
+        return None
+    say = (lambda *a, **k: None) if quiet else print
     # one test function per chosen instance, translated exactly as recomp.py translates it in a function
     chosen, csrc = [], ['#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
     unsupported = {}
@@ -206,22 +219,41 @@ def main():
             except recomp.Unsupported as e:
                 unsupported[f] = str(e)
                 continue
+            except Exception as e:   # the translator itself failing on a form: in a game, the recompile would stop there
+                unsupported[f] = f"TRANSLATOR ERROR {type(e).__name__}: {e}"
+                continue
             body = "\n\t".join(lines)
             if "goto L_" in body:
                 continue
+            if re.search(r"\bNone\b", body):   # (Python's None in C: a register the translator couldn't name)
+                unsupported[f] = f"TRANSLATOR ERROR: emitted None ({body[:120]})"
+                continue
             csrc.append(f"static void t_{a:08x}(Cpu *c) {{\n\t{body}\n\treturn;\njump:\n\tc->stop = 2;\n}}")
             chosen.append((f, a, arm, f"{i.mnemonic} {i.op_str}", i))
-    csrc.append("GuestFn recomp_lookup(uint32_t a) {\n\tswitch (a) {")
-    csrc += [f"\tcase 0x{a:x}u: return t_{a:08x};" for _, a, _, _, _ in chosen]
-    csrc.append("\t}\n\treturn 0;\n}")
-    csrc.append("const char *recomp_import_name(uint32_t a) { (void)a; return 0; }")
-    csrc.append("int recomp_is_arm(uint32_t a) { (void)a; return 0; }")
     tmp = tempfile.mkdtemp(prefix="insnsweep_")
     cpath = os.path.join(tmp, "sweep.c")
-    open(cpath, "w").write("\n".join(csrc) + "\n")
     lib_path = os.path.join(tmp, "sweep.dylib")
-    subprocess.run(["cc", "-O1", "-ffp-contract=off", "-w", "-fPIC", "-shared", "-I", HERE, "-I", os.path.join(HERE, "..", "recompiler"), cpath,
-                    os.path.join(HERE, "glue.c"), "-o", lib_path], check=True)
+    head, fns = csrc[:2], csrc[2:]   # (one test function per chosen instance, in chosen's order)
+    for attempt in range(8):   # generated C that doesn't compile is the translator's error for that form: dropped, said, rebuilt
+        lines_of, text, n = [], list(head), sum(t.count("\n") + 1 for t in head)
+        for (f, a, _, _, _), t in zip(chosen, fns):
+            lines_of.append((n + 1, n + t.count("\n") + 1, f)); text.append(t); n += t.count("\n") + 1
+        text.append("GuestFn recomp_lookup(uint32_t a) {\n\tswitch (a) {")
+        text += [f"\tcase 0x{a:x}u: return t_{a:08x};" for _, a, _, _, _ in chosen]
+        text += ["\t}\n\treturn 0;\n}", "const char *recomp_import_name(uint32_t a) { (void)a; return 0; }",
+                 "int recomp_is_arm(uint32_t a) { (void)a; return 0; }"]
+        open(cpath, "w").write("\n".join(text) + "\n")
+        r = subprocess.run(["cc", "-O1", "-ffp-contract=off", "-w", "-fPIC", "-shared", "-I", HERE, "-I", os.path.join(HERE, "..", "recompiler"),
+                            cpath, os.path.join(HERE, "glue.c"), "-o", lib_path], capture_output=True, text=True)
+        if r.returncode == 0: break
+        bad_lines = {int(m) for m in re.findall(r"sweep\.c:(\d+):\d+: error", r.stderr)}
+        bad_forms = {f for lo, hi, f in lines_of for l in bad_lines if lo <= l <= hi}
+        if not bad_forms: raise SystemExit("the sweep's harness doesn't compile:\n" + r.stderr[-3000:])
+        for f in bad_forms: unsupported[f] = "TRANSLATOR ERROR: its C doesn't compile (" + next((e for e in r.stderr.splitlines() if "error" in e), "")[-150:] + ")"
+        keep = [k for k, c in enumerate(chosen) if c[0] not in bad_forms]
+        chosen, fns = [chosen[k] for k in keep], [fns[k] for k in keep]
+    else:
+        raise SystemExit("the sweep's harness still doesn't compile after 8 rounds")
     lib = ctypes.CDLL(lib_path)
     lib.recomp_run.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     arena = mmap.mmap(-1, 1 << 32, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
@@ -406,7 +438,7 @@ def main():
                     results[f] = (f"CRASHED the sweep process ({why})", 0)
         return results
 
-    bad, ok, untested, crashed = {}, 0, 0, 0
+    bad, ok, untested, crashed, crashes = {}, 0, 0, 0, {}
     by_form = defaultdict(list)
     for f, a, arm, t, i in chosen:
         by_form[f].append((a, arm, t, i))
@@ -414,23 +446,24 @@ def main():
     for lo in range(0, len(items), BATCH):
         batch = items[lo:lo + BATCH]
         if os.environ.get("INSNSWEEP_TRACE"):
-            print(f"TRACE {batch[0][0]} .. {batch[-1][0]}", flush=True)
+            say(f"TRACE {batch[0][0]} .. {batch[-1][0]}", flush=True)
         for f, (verdict, compared) in run_batch_isolated(batch).items():
             if verdict and verdict.startswith("CRASHED"):
-                crashed += 1
-                print(f"CRASH {f}\n      {verdict}", flush=True)
+                crashed += 1; crashes[f] = verdict
+                say(f"CRASH {f}\n      {verdict}", flush=True)
             elif verdict:
                 bad[f] = verdict
-                print(f"DIFF  {f}\n      {verdict}", flush=True)
+                say(f"DIFF  {f}\n      {verdict}", flush=True)
             elif compared:
                 ok += 1
             else:
                 untested += 1
-    print(f"== {ok} forms identical, {len(bad)} differ, {untested} untested (every state faulted in the original), "
-          f"{crashed} crashed the sweep process, "
-          f"{len(unsupported)} unsupported by the translator")
+    say(f"== {ok} forms identical, {len(bad)} differ, {untested} untested (every state faulted in the original), "
+        f"{crashed} crashed the sweep process, "
+        f"{len(unsupported)} unsupported by the translator")
     for f, why in sorted(unsupported.items())[:40]:
-        print(f"   unsupported: {f} ({why})")
+        say(f"   unsupported: {f} ({why})")
+    return {"ok": ok, "bad": bad, "unsupported": unsupported, "untested": untested, "crashed": crashes}
 
 
 if __name__ == "__main__":

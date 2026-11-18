@@ -22,7 +22,8 @@ typedef struct Cpu {
 	uint32_t r[16];
 	uint32_t n, z, c, v;          /* APSR flags, 0 or 1 */
 	uint32_t q;                   /* sticky saturation */
-	uint32_t _pad;                /* keeps the VFP bank 8-aligned at a fixed offset (difftest mirrors this layout) */
+	uint32_t ge;                  /* the APSR's GE bits (3..0): set by the ARMv6 parallel adds and subtracts, read by sel. (It
+	                               * also keeps the VFP bank 8-aligned at a fixed offset; difftest and insnsweep mirror this layout) */
 	VfpRegs vfp;
 	uint32_t fpscr;               /* N Z C V in bits 31..28 */
 	uint32_t stop;                /* set by the runtime to unwind (unimplemented, fault) */
@@ -286,6 +287,42 @@ static inline float RECPS_F32(float a, float b) {
 /* saturation to a bits-wide signed/unsigned integer (vqadd/vqsub/vqshl; the Q flag isn't modelled) */
 static inline int64_t SATS(int64_t v, int bits) { int64_t mx = ((int64_t)1 << (bits - 1)) - 1; return v > mx ? mx : v < -mx - 1 ? -mx - 1 : v; }
 static inline uint64_t SATU(int64_t v, int bits) { int64_t mx = ((int64_t)1 << bits) - 1; return v < 0 ? 0 : v > mx ? (uint64_t)mx : (uint64_t)v; }
+/* VFP arithmetic with FPSCR.DN (RunFast, as the console runs): a NaN result is the default NaN. arm64 hosts do that
+ * in hardware (recomp_runfast sets FPCR.DN); x86 has no such mode and makes its own (0xffc00000 for 0/0), so there
+ * the result is replaced (isacover found vdiv.f32 s3, s3, s3 differing on x86) */
+#if defined(__aarch64__)
+#define DNS(x) (x)
+#define DND(x) (x)
+#else
+static inline float DNS(float x) { return x != x ? B2F(0x7fc00000u) : x; }
+static inline double DND(double x) { if (x != x) { uint64_t b = 0x7ff8000000000000ull; memcpy(&x, &b, 8); } return x; }
+#endif
+/* the rounding shifts by register (VRSHL / VQRSHL): the shift the signed low byte, left as VSHL, right rounded
+ * (floor((v + 2^(n-1)) / 2^n), in infinite precision; __int128 for the 64-bit elements) */
+static inline uint64_t RSHL_U(uint64_t v, int sh, int bits) {
+	if (sh >= 0) return sh >= bits ? 0 : (bits == 64 ? v << sh : (v << sh) & ((1ull << bits) - 1));
+	int n = -sh; if (n > bits) return 0;
+	return (uint64_t)(((unsigned __int128)v + ((unsigned __int128)1 << (n - 1))) >> n);
+}
+static inline int64_t RSHL_S(int64_t v, int sh, int bits) {
+	if (sh >= 0) return sh >= bits ? 0 : (int64_t)((uint64_t)v << sh);
+	int n = -sh; if (n > bits) return 0;
+	return (int64_t)(((__int128)v + ((__int128)1 << (n - 1))) >> n);
+}
+/* count leading sign bits (VCLS): the bits after the sign bit equal to it, in a bits-wide element */
+static inline uint32_t CLS(int64_t v, int bits) { uint64_t y = (uint64_t)(v < 0 ? ~v : v) & (bits == 64 ? ~0ull : (1ull << bits) - 1); int n = 0; while (n < bits && !(y >> (bits - 1 - n) & 1)) n++; return (uint32_t)(n - 1); }
+/* 64-bit saturating add and subtract (VQADD / VQSUB .s64 .u64) */
+static inline int64_t QADDS64(int64_t a, int64_t b) { int64_t r; return __builtin_add_overflow(a, b, &r) ? (b > 0 ? INT64_MAX : INT64_MIN) : r; }
+static inline int64_t QSUBS64(int64_t a, int64_t b) { int64_t r; return __builtin_sub_overflow(a, b, &r) ? (b < 0 ? INT64_MAX : INT64_MIN) : r; }
+static inline uint64_t SATU64U(uint64_t v, int bits) { uint64_t mx = bits >= 64 ? ~0ull : (1ull << bits) - 1; return v > mx ? mx : v; }   /* (unsigned in, unsigned out) */
+/* VQDMULL / VQDMLAL / VQDMLSL: twice a product of two bits-wide signed elements, saturated to 2 * bits (only
+ * MIN * MIN overflows), and the saturating accumulate into a 2 * bits element */
+static inline int64_t QDMULL(int64_t p, int bits) { return bits >= 32 ? (p > (INT64_MAX >> 1) ? INT64_MAX : 2 * p) : SATS(2 * p, 2 * bits); }
+static inline int64_t QACC(int64_t d, int64_t x, int sgn, int bits) {
+	if (bits < 32) return SATS((int64_t)(int32_t)d + (sgn > 0 ? x : -x), 2 * bits);
+	int64_t r; int o = sgn > 0 ? __builtin_add_overflow(d, x, &r) : __builtin_sub_overflow(d, x, &r);
+	return o ? ((sgn > 0) == (x > 0) ? INT64_MAX : INT64_MIN) : r;
+}
 /* VSHL/VQSHL by register: the shift is the signed low byte of the other operand's element, negative
  * shifts right (logical/arithmetic by sign), results truncated or saturated to the element */
 static inline uint32_t SHLR_U(uint32_t v, int sh, int bits) { return sh >= bits || sh <= -bits ? 0 : sh >= 0 ? v << sh : v >> -sh; }

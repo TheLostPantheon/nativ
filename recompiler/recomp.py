@@ -50,6 +50,17 @@ class Unsupported(Exception):
     pass
 
 
+class FoldedImm:
+    """an immediate operand made from two of capstone's (an ARM "#imm8, #rot" spelling): what the translator reads of one"""
+    type = ARM_OP_IMM
+    subtracted = False
+    vector_index = -1
+
+    def __init__(self, imm):
+        self.imm = imm
+        self.shift = type("Shift", (), {"type": 0, "value": 0})()
+
+
 class Fn:
     def __init__(self, entry, insns, entries, arm=False):
         self.entry, self.insns, self.entries, self.arm = entry, insns, entries, arm
@@ -91,19 +102,30 @@ class Fn:
         amt = (f"(c->r[{GPR[md.reg_name(o.shift.value)]}] & 0xff)" if st >= 6 else str(o.shift.value))
         return f"SHIFT(c, {v}, {st}, {amt}, {1 if setc else 0})"
 
+    @staticmethod
+    def shifted(idx, st, sh):
+        """an index register's value shifted as an addressing mode shifts it (capstone's shift types: 1 asr, 2 lsl,
+        3 lsr, 4 ror, 5 rrx)"""
+        if st == 2 and sh:
+            return f"({idx} << {sh})"
+        if st in (1, 3, 4, 5):
+            return f"SHIFT(c, {idx}, {st}, {sh if st != 5 else 1}u, 0)"
+        return idx
+
     def addr(self, op, insn):
         m = op.mem
         base = self.r(m.base, insn) if md.reg_name(m.base) != "pc" else f"0x{(insn.address + self.pc_off) & ~3:x}u"
         if m.index:
-            idx = self.r(m.index, insn)
             # this capstone reports [rN, rM, lsl #k] in the operand's shift, not mem.lshift. ARM mode
             # also has lsr/asr/ror/rrx offsets ([r5, sl, lsr #12] in libgxm): those went through as lsl
             st, sh = (op.shift.type, op.shift.value) if op.shift.type else ((2, m.lshift) if m.lshift else (0, 0))
-            if st == 2 and sh:
-                idx = f"({idx} << {sh})"
-            elif st in (1, 3, 4, 5):
-                idx = f"SHIFT(c, {idx}, {st}, {sh if st != 5 else 1}u, 0)"
-            return f"({base} {'-' if m.scale == -1 else '+'} {idx})"
+            idx = self.shifted(self.r(m.index, insn), st, sh)
+            # [rN, -rM]: capstone 5 says so in the operand's subtracted, not mem.scale (-1 in capstone 4): every
+            # ARM-mode subtracted register offset was added (isacover, 2026-11-17)
+            sub = getattr(op, "subtracted", False) or m.scale == -1
+            if self.arm and insn.size == 4:   # ARM's loads and stores carry the sign in the U bit (23); capstone drops it for some (ldrht)
+                sub = not (int.from_bytes(insn.bytes[:4], "little") >> 23) & 1
+            return f"({base} {'-' if sub else '+'} {idx})"
         return f"({base} + {m.disp})" if m.disp else base
 
     def emit(self, s):
@@ -119,7 +141,17 @@ class Fn:
                 if mn.endswith(cc) and len(mn) > len(cc):
                     mn = mn[:-len(cc)]
                     break
+        # the unprivileged loads and stores (ldrt, strbt...) are the plain ones in a user-mode program
+        mn = {"ldrt": "ldr", "ldrbt": "ldrb", "ldrht": "ldrh", "ldrsbt": "ldrsb", "ldrsht": "ldrsh", "strt": "str", "strbt": "strb",
+              "strht": "strh"}.get(mn, mn)
         ops = list(i.operands)
+        if self.arm and len(ops) >= 3 and ops[-1].type == ARM_OP_IMM and ops[-2].type == ARM_OP_IMM \
+                and (int.from_bytes(i.bytes[:4], "little") >> 25) & 7 == 0b001:
+            # an ARM data-processing immediate whose encoding capstone spells "#imm8, #rot" (a rotation it
+            # can't print as one constant): the value is imm8 rotated right by rot. Only the imm8 was used
+            # (eors r3, r9, #104, #10; isacover, 2026-11-17). imm_carry still reads C from the encoding
+            v, rot = ops[-2].imm & 0xff, ops[-1].imm & 31
+            ops = ops[:-2] + [FoldedImm(((v >> rot) | (v << (32 - rot))) & 0xffffffff if rot else v)]
         # capstone's update_flags is also true for some non-S forms (adc.w): trust the mnemonic's S
         S = i.update_flags and mn.endswith("s") and mn != "mls"
         nxt = i.address + i.size
@@ -150,7 +182,25 @@ class Fn:
         elif mn == "movt":
             d = self.dst(ops[0].reg)
             out = [f"{d} = ({d} & 0xffffu) | (0x{ops[1].imm & 0xffff:x}u << 16);"]
-        elif mn in ("add", "adds", "sub", "subs", "adc", "adcs", "sbc", "sbcs", "rsb", "rsbs", "addw", "subw"):
+        elif mn in ("ssat", "usat"):
+            # ssat/usat rd, #n, rm{, lsl|asr #s}: rm shifted (the operand's shift), saturated to an n-bit signed (1..32) or
+            # unsigned (0..31) range, Q set when it saturated (isacover, 2026-11-17: unsupported until then)
+            n_ = ops[1].imm; v = self.operand(ops[2], i)
+            lo, hi = (-(1 << (n_ - 1)), (1 << (n_ - 1)) - 1) if mn == "ssat" else (0, (1 << n_) - 1)
+            out = [f"{{ int64_t v = (int32_t){v}, r = v > {hi}LL ? {hi}LL : v < {lo}LL ? {lo}LL : v; if (r != v) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)r; }}"]
+        elif mn in ("ssat16", "usat16"):
+            # each halfword of rm saturated to n bits, signed (1..16) or unsigned (0..15); Q when either saturated
+            n_ = ops[1].imm; v = self.r(ops[2].reg, i)
+            lo, hi = (-(1 << (n_ - 1)), (1 << (n_ - 1)) - 1) if mn == "ssat16" else (0, (1 << n_) - 1)
+            sat = lambda h: f"({{ int32_t x = (int16_t)({v} >> {16 * h}), y = x > {hi} ? {hi} : x < {lo} ? {lo} : x; if (y != x) c->q = 1; (uint32_t)(uint16_t)y; }})"
+            out = [f"{self.dst(ops[0].reg)} = {sat(0)} | {sat(1)} << 16;"]
+        elif mn in ("pkhbt", "pkhtb"):
+            # pack halfwords: pkhbt keeps rn's bottom and takes the top of rm << n; pkhtb keeps rn's top and takes
+            # the bottom of rm asr n (the operand's shift)
+            a, b = self.r(ops[1].reg, i), self.operand(ops[2], i)
+            e = f"({a} & 0xffffu) | ({b} & 0xffff0000u)" if mn == "pkhbt" else f"({a} & 0xffff0000u) | ({b} & 0xffffu)"
+            out = [f"{self.dst(ops[0].reg)} = {e};"]
+        elif mn in ("add", "adds", "sub", "subs", "adc", "adcs", "sbc", "sbcs", "rsb", "rsbs", "rsc", "rscs", "addw", "subw"):
             # Thumb's pc-relative add/sub with an immediate (ADDW/SUBW T4, ADD T1/T3 from the pc: the ADR forms)
             # read the pc as Align(address + 4, 4), not address + 4 -- Killzone's MD5 formed each round's
             # continuation with `addw ip, pc, #0x4f` at a 2-aligned site and `bx ip` landed two bytes into
@@ -183,6 +233,8 @@ class Fn:
                 e = f"SUBC(c, {a}, {b}, c->c, {1 if S else 0})"
             elif base == "rsb":
                 e = f"SUBC(c, {b}, {a}, 1, {1 if S else 0})"
+            elif base == "rsc":   # (ARM only: reverse subtract with carry)
+                e = f"SUBC(c, {b}, {a}, c->c, {1 if S else 0})"
             else:
                 raise Unsupported(mn)
             out = [f"{self.dst(ops[0].reg)} = {e};"]
@@ -223,9 +275,122 @@ class Fn:
         elif mn in ("mul", "muls"):
             a = self.r(ops[1].reg, i); b = self.r(ops[2].reg if len(ops) == 3 else ops[0].reg, i)
             out = [f"{{ uint32_t t = {a} * {b}; {self.dst(ops[0].reg)} = t;" + (" NZ(c, t);" if S else "") + " }"]
-        elif mn in ("mla", "mls"):
-            e = f"{self.r(ops[3].reg, i)} {'+' if mn == 'mla' else '-'} {self.r(ops[1].reg, i)} * {self.r(ops[2].reg, i)}"
-            out = [f"{self.dst(ops[0].reg)} = {e};"]
+        elif mn in ("mla", "mls", "mlas"):
+            e = f"{self.r(ops[3].reg, i)} {'-' if mn == 'mls' else '+'} {self.r(ops[1].reg, i)} * {self.r(ops[2].reg, i)}"
+            out = [f"{{ uint32_t t = {e}; {self.dst(ops[0].reg)} = t;" + (" NZ(c, t);" if mn == "mlas" else "") + " }"]
+        elif mn in ("umulls", "smulls", "umlals", "smlals"):   # the flag-setting long multiplies: N and Z from the 64-bit result
+            lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            ty, cast = ("uint64_t", "(uint64_t)") if mn[0] == "u" else ("int64_t", "(int64_t)(int32_t)")
+            acc = f" + (({ty})(((uint64_t){hi} << 32) | {lo}))" if mn.startswith(("umlal", "smlal")) else ""
+            out = [f"{{ {ty} t = {cast}{a} * {cast}{b}{acc}; {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); c->n = (uint32_t)((uint64_t)t >> 63); c->z = t == 0; }}"]
+        elif mn in ("qadd", "qsub", "qdadd", "qdsub"):
+            # saturating 32-bit add and subtract (qd: rn doubled first, saturating too); Q set when anything saturated
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            dbl = mn.startswith("qd")
+            src = f"int64_t y = (int32_t){b}; int64_t yy = {'2 * y' if dbl else 'y'}; int64_t ys = yy > 0x7fffffffLL ? 0x7fffffffLL : yy < -0x80000000LL ? -0x80000000LL : yy; if (ys != yy) c->q = 1;"
+            op = "-" if mn.endswith("sub") else "+"
+            out = [f"{{ {src} int64_t r = (int64_t)(int32_t){a} {op} ys, rs = r > 0x7fffffffLL ? 0x7fffffffLL : r < -0x80000000LL ? -0x80000000LL : r; if (rs != r) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)rs; }}"]
+        elif re.fullmatch(r"(s|q|sh|u|uq|uh)(add16|sub16|asx|sax|add8|sub8)", mn):
+            # ARMv6 SIMD on core registers: two halfwords or four bytes at once, signed (s, q saturating, sh halving) or
+            # unsigned (u, uq, uh); asx adds the top and subtracts the bottom with M's halves exchanged, sax the reverse.
+            # The plain s and u forms set GE per lane (signed: result >= 0; unsigned add: a carry out; subtract: no borrow)
+            pm = re.fullmatch(r"(s|q|sh|u|uq|uh)(add16|sub16|asx|sax|add8|sub8)", mn)
+            pre, op = pm.group(1), pm.group(2)
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            sgn = pre in ("s", "q", "sh"); w = 8 if op.endswith("8") else 16; nl = 32 // w
+            ext = (lambda v, k: f"(int64_t)(int{w}_t)({v} >> {w * k})") if sgn else (lambda v, k: f"(int64_t)(uint{w}_t)({v} >> {w * k})")
+            lanes_ = []
+            for k in range(nl):
+                if op in ("asx", "sax"):   # lane 0 (bottom) and lane 1 (top) with M's halves exchanged
+                    o_ = ("-" if k == 0 else "+") if op == "asx" else ("+" if k == 0 else "-")
+                    lanes_.append((f"{ext(a, k)} {o_} {ext(b, 1 - k)}", o_))
+                else:
+                    o_ = "+" if op.startswith("add") else "-"
+                    lanes_.append((f"{ext(a, k)} {o_} {ext(b, k)}", o_))
+            parts, ge = [], []
+            for k, (e, o_) in enumerate(lanes_):
+                v = f"r{k}"
+                parts.append(f"int64_t {v} = {e};")
+                if pre == "q": res = f"(uint32_t)(uint{w}_t)SATS({v}, {w})"
+                elif pre == "uq": res = f"(uint32_t)(uint{w}_t)SATU({v}, {w})"
+                elif pre in ("sh", "uh"): res = f"(uint32_t)(uint{w}_t)({v} >> 1)"
+                else: res = f"(uint32_t)(uint{w}_t){v}"
+                parts.append(f"uint32_t o{k} = {res};")
+                if pre in ("s", "u"):
+                    cond = f"{v} >= 0" if pre == "s" or o_ == "-" else f"{v} >= 0x{1 << w:x}LL"
+                    bits_ = 0b11 if w == 16 else 1
+                    ge.append(f"(({cond}) ? 0x{bits_ << (k * (w // 8)):x}u : 0u)")
+            res = " | ".join(f"o{k} << {w * k}" for k in range(nl))
+            out = [f"{{ {' '.join(parts)} {self.dst(ops[0].reg)} = {res};" + (f" c->ge = {' | '.join(ge)};" if ge else "") + " }"]
+        elif mn == "sel":   # each byte from rn where its GE bit is set, else from rm
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            out = [f"{{ uint32_t m = (c->ge & 1 ? 0xffu : 0) | (c->ge & 2 ? 0xff00u : 0) | (c->ge & 4 ? 0xff0000u : 0) | (c->ge & 8 ? 0xff000000u : 0); {self.dst(ops[0].reg)} = ({a} & m) | ({b} & ~m); }}"]
+        elif re.fullmatch(r"sm(lad|lsd|uad|usd|lald|lsld)x?", mn):
+            # dual 16x16 multiplies: the bottom and top halves of rn times those of rm (x: rm's halves exchanged), their
+            # sum (ad) or difference (sd), plus an accumulator: 32-bit ra (Q set on the accumulation's overflow) or the
+            # 64-bit rdlo:rdhi (the l forms)
+            x = mn.endswith("x"); base_ = mn.rstrip("x")
+            long_ = base_ in ("smlald", "smlsld"); acc_ = base_ in ("smlad", "smlsd")
+            if long_: lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            else: a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            bb = f"(({b} >> 16) | ({b} << 16))" if x else b
+            p0, p1 = f"(int64_t)(int16_t){a} * (int16_t){bb}", f"(int64_t)(int16_t)({a} >> 16) * (int16_t)({bb} >> 16)"
+            sd = "-" if base_ in ("smlsd", "smusd", "smlsld") else "+"
+            if long_:
+                out = [f"{{ int64_t t = (int64_t)(((uint64_t){hi} << 32) | {lo}) + ({p0} {sd} {p1}); {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); }}"]
+            else:
+                ra = f" + (int32_t){self.r(ops[3].reg, i)}" if acc_ else ""
+                out = [f"{{ int64_t p = {p0} {sd} {p1}, t = p{ra}; if (t != (int32_t)t) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)t; }}"]
+        elif re.fullmatch(r"smm(ul|la|ls)r?", mn):
+            # most significant word: (ra << 32 +/- rn * rm, + 0x80000000 rounding for the r forms) >> 32
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            prod = f"(int64_t)(int32_t){a} * (int32_t){b}"
+            if mn.startswith("smmul"): e = prod
+            else:
+                ra = f"(int64_t)((uint64_t){self.r(ops[3].reg, i)} << 32)"
+                e = f"{ra} {'+' if mn.startswith('smmla') else '-'} {prod}"
+            rnd = " + 0x80000000LL" if mn.endswith("r") else ""
+            out = [f"{self.dst(ops[0].reg)} = (uint32_t)((uint64_t)((int64_t)(({e}){rnd})) >> 32);"]
+        elif re.fullmatch(r"sm(la|ul)w[bt]", mn):
+            # 32 x 16 (rm's bottom or top half, signed), the top 32 bits of the 48-bit product; smlaw adds ra, Q on overflow
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            h = f"(int16_t)({b} >> 16)" if mn.endswith("t") else f"(int16_t){b}"
+            p_ = f"(((int64_t)(int32_t){a} * {h}) >> 16)"
+            if mn.startswith("smlaw"):
+                out = [f"{{ int64_t t = {p_} + (int32_t){self.r(ops[3].reg, i)}; if (t != (int32_t)t) c->q = 1; {self.dst(ops[0].reg)} = (uint32_t)t; }}"]
+            else:
+                out = [f"{self.dst(ops[0].reg)} = (uint32_t){p_};"]
+        elif re.fullmatch(r"smlal[bt][bt]", mn):   # 16 x 16 halves into the 64-bit rdlo:rdhi
+            lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            ha = f"(int16_t)({a} >> 16)" if mn[-2] == "t" else f"(int16_t){a}"
+            hb = f"(int16_t)({b} >> 16)" if mn[-1] == "t" else f"(int16_t){b}"
+            out = [f"{{ int64_t t = (int64_t)(((uint64_t){hi} << 32) | {lo}) + (int64_t){ha} * {hb}; {lo} = (uint32_t)t; {hi} = (uint32_t)((uint64_t)t >> 32); }}"]
+        elif mn == "umaal":   # rdhi:rdlo = rn * rm + rdlo + rdhi (never overflows 64 bits)
+            lo, hi, a, b = self.dst(ops[0].reg), self.dst(ops[1].reg), self.r(ops[2].reg, i), self.r(ops[3].reg, i)
+            out = [f"{{ uint64_t t = (uint64_t){a} * {b} + {lo} + {hi}; {lo} = (uint32_t)t; {hi} = (uint32_t)(t >> 32); }}"]
+        elif mn in ("usad8", "usada8"):   # the sum of the four bytes' absolute differences (+ ra)
+            a, b = self.r(ops[1].reg, i), self.r(ops[2].reg, i)
+            terms = " + ".join(f"(uint32_t)abs((int)(uint8_t)({a} >> {8 * k}) - (int)(uint8_t)({b} >> {8 * k}))" for k in range(4))
+            ra = f" + {self.r(ops[3].reg, i)}" if mn == "usada8" else ""
+            out = [f"{self.dst(ops[0].reg)} = {terms}{ra};"]
+        elif mn in ("rrx", "rrxs"):   # rotate right through carry by one (C into bit 31); rrxs: C from bit 0, N and Z
+            v = self.r(ops[1].reg, i)
+            out = [f"{{ uint32_t s = {v}, t = (c->c << 31) | (s >> 1); {self.dst(ops[0].reg)} = t;" + (" c->c = s & 1; NZ(c, t);" if mn == "rrxs" else "") + " }"]
+        elif mn in ("sxtb16", "uxtb16") and len(ops) == 2:   # bytes 0 and 2 of rm (rotated: the operand's ror), extended to halfwords
+            v = self.operand(ops[1], i)
+            ext = (lambda k: f"(uint32_t)(uint16_t)(int16_t)(int8_t)({v} >> {16 * k})") if mn[0] == "s" else (lambda k: f"(uint32_t)(uint8_t)({v} >> {16 * k})")
+            out = [f"{self.dst(ops[0].reg)} = {ext(0)} | {ext(1)} << 16;"]
+        elif mn in ("uxtab16", "sxtab16"):
+            # rm (rotated by the operand's ror) bytes 0 and 2, zero- or sign-extended to halfwords, added to rn's halfwords
+            a, v = self.r(ops[1].reg, i), self.operand(ops[2], i)
+            ext = (lambda k: f"(uint32_t)(int32_t)(int8_t)({v} >> {16 * k})") if mn[0] == "s" else (lambda k: f"(uint32_t)(uint8_t)({v} >> {16 * k})")
+            out = [f"{self.dst(ops[0].reg)} = (uint32_t)(uint16_t)({a} + {ext(0)}) | (uint32_t)(uint16_t)(({a} >> 16) + {ext(1)}) << 16;"]
+        elif mn in ("swp", "swpb"):   # (deprecated) the word or byte at [rn] swapped with rm, the old value into rd
+            rd, rm_, rn_ = self.dst(ops[0].reg), self.r(ops[1].reg, i), self.r(ops[2].mem.base, i)
+            rd_, wr = ("RD32", "WR32") if mn == "swp" else ("RD8", "WR8")
+            out = [f"{{ uint32_t a = {rn_}, v = {rm_}; uint32_t t = {rd_}(a); {wr}(a, v); {rd} = t; }}"]
+        elif mn == "mrs" and len(ops) == 2 and ops[0].type == ARM_OP_REG:   # the APSR: N Z C V Q and GE
+            out = [f"{self.dst(ops[0].reg)} = c->n << 31 | c->z << 30 | c->c << 29 | c->v << 28 | (c->q ? 1u : 0u) << 27 | (c->ge & 15) << 16;"]
         elif mn in ("umull", "smull", "umlal", "smlal"):
             lo, hi, a, b = (self.dst(ops[k].reg) for k in range(2)), None, self.r(ops[2].reg, i), self.r(ops[3].reg, i)
             lo, hi = self.dst(ops[0].reg), self.dst(ops[1].reg)
@@ -295,7 +460,7 @@ class Fn:
             out = []   # hints
         elif mn == "adr":
             out = [f"{self.dst(ops[0].reg)} = 0x{((A + self.pc_off) & ~3) + ops[1].imm & 0xffffffff:x}u;"]
-        elif mn.startswith("v"):
+        elif mn.startswith("v") or mn in ("fstmiax", "fldmiax", "fstmdbx", "fldmdbx"):   # (the deprecated FSTMX/FLDMX: vfp() maps them)
             out = self.vfp(i, mn, dt, ops)
         else:
             raise Unsupported(mn)
@@ -325,6 +490,15 @@ class Fn:
         sz = {"ldr": 4, "str": 4, "ldrb": 1, "strb": 1, "ldrh": 2, "strh": 2, "ldrsb": 1, "ldrsh": 2,
               "ldrd": 4, "strd": 4, "ldrex": 4, "strex": 4}[mn]
         out = [f"{{ uint32_t ea = {a};"]
+        if post:   # the base's next value, from the offset register as it was before the load (ldrb fp, [r5], -fp: isacover)
+            po = ops[-1]
+            # (a register's own shift too: ldr r4, [r0], -r1, asr #31 dropped the asr; isacover, 2026-11-17)
+            inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.shifted(self.r(po.reg, i), po.shift.type, po.shift.value))
+            sub = getattr(po, "subtracted", False)
+            if self.arm:   # the sign is the encoding's U bit (23): capstone drops it for ldrht/ldrsht ("#-0x91", "-r0")
+                sub = not (int.from_bytes(i.bytes[:4], "little") >> 23) & 1
+                if po.type == ARM_OP_IMM: inc = f"0x{abs(po.imm) & 0xffffffff:x}u"
+            out.append(f" uint32_t nb = ea {'-' if sub else '+'} {inc};")
         for k, o in enumerate(regs):
             off = f" + {4 * k}" if k else ""
             if load:
@@ -337,9 +511,7 @@ class Fn:
                 wr = {4: "WR32", 2: "WR16", 1: "WR8"}[sz]
                 out.append(f" {wr}(ea{off}, {self.r(o.reg, i)});")
         if post:
-            po = ops[-1]
-            inc = (f"0x{po.imm & 0xffffffff:x}u" if po.type == ARM_OP_IMM else self.r(po.reg, i))
-            out.append(f" {self.dst(m.base)} = ea {'-' if getattr(po, 'subtracted', False) else '+'} {inc};")
+            out.append(f" {self.dst(m.base)} = nb;")
         elif i.writeback:
             out.append(f" {self.dst(m.base)} = ea;")
         out.append(" }")
@@ -477,6 +649,143 @@ class Fn:
             return ("q", int(n[1:]))
         return ("r", GPR[n]) if n in GPR else (None, None)
 
+    # per element (a: N's, b: M's or the scalar, d: the destination's before), as C over int64_t/uint64_t so nothing
+    # overflows: same width, long (q from d's) and narrowing (d from q). isacover found these unsupported
+    # (2026-11-17), the forms Luufen's fork listed among them
+    SAME = {
+        "vabd": "a > b ? a - b : b - a", "vaba": "d + (a > b ? a - b : b - a)",
+        "vqdmulh": "SATS((a * b) >> (BITS - 1), BITS)", "vqrdmulh": "SATS((a * b + (1LL << (BITS - 2))) >> (BITS - 1), BITS)",
+        "vmul": "a * b", "vmla": "d + a * b", "vmls": "d - a * b",
+    }
+    LONG = {
+        "vmull": "a * b", "vmlal": "d + a * b", "vmlsl": "d - a * b", "vabdl": "a > b ? a - b : b - a",
+        "vabal": "d + (a > b ? a - b : b - a)", "vqdmull": "QDMULL(a * b, BITS)", "vqdmlal": "QACC(d, QDMULL(a * b, BITS), 1, BITS)",
+        "vqdmlsl": "QACC(d, QDMULL(a * b, BITS), -1, BITS)",
+    }
+
+    def neon_elements(self, i, mn, dt, ops, regs):
+        """the element-array forms above, plus vshll, vqmovn/vqmovun and the saturating narrowing shifts (vq[r]shr[u]n),
+        vector or by scalar (dM[x], from the text); None for anything else"""
+        dm = re.fullmatch(r"([sui]?)(8|16|32|64)", dt)
+        if not dm or not regs or any(not r or r[0] not in "dq" for r in regs if r):
+            return None
+        sg, bits = dm.group(1) == "s", int(dm.group(2))
+        sm = re.search(r"d(\d+)\[(\d)\]$", i.op_str)
+        nregs = [r for r in regs if r]
+        def arr(name, r, ebits, signed):   # a C array of register r's elements, and its byte count
+            nb = 16 if r[0] == "q" else 8
+            return f"{'' if signed else 'u'}int{ebits}_t {name}[{nb * 8 // ebits}]; memcpy({name}, &c->vfp.d[{2 * r[1] if r[0] == 'q' else r[1]}], {nb});", nb
+        def put(name, r, nb):
+            return f"memcpy(&c->vfp.d[{2 * r[1] if r[0] == 'q' else r[1]}], {name}, {nb});"
+        def body(expr, cnt, scalar, signed_src):
+            # sources as int64_t or uint64_t by their sign (a product of two uint32 passes INT64_MAX); the destination's
+            # old value as uint64_t, so an accumulation wraps instead of overflowing (QACC takes it signed)
+            e = expr.replace("BITS", str(bits)).replace("QACC(d,", "QACC((int64_t)d,")
+            st = "int64_t" if signed_src else "uint64_t"
+            return (f"for (int k = 0; k < {cnt}; k++) {{ {st} a = A[k], b = {scalar or 'B[k]'}; uint64_t d = (uint64_t)D[k]; (void)b; (void)d;"
+                    f" O[k] = (__typeof__(O[0]))({e}); }}")
+        scal = ""
+        if sm and len(ops) == 3:
+            mreg, x = int(sm.group(1)), int(sm.group(2))
+            scal = f"({'' if sg or dm.group(1) == 'i' else 'u'}int{bits}_t)(c->vfp.d[{mreg}] >> {bits * x})"
+            if bits not in (16, 32): return None
+        elif len(ops) == 3 and len(nregs) < 3:
+            scal = None   # (an immediate third operand: the shift forms below)
+        signed = sg or dm.group(1) == "i"
+        if mn in self.SAME and len(ops) == 3 and nregs[0][0] == nregs[1][0] and bits <= 32 and (mn not in ("vmul", "vmla", "vmls") or (sm and dm.group(1) in ("i", "s", "u"))) \
+                and (mn not in ("vabd", "vaba", "vqdmulh", "vqrdmulh") or dm.group(1) in ("s", "u")) and (mn not in ("vqdmulh", "vqrdmulh") or sg) and scal is not None:
+            if not sm and len(nregs) < 3: return None
+            a_, nb = arr("A", nregs[1], bits, signed)
+            b_ = "" if sm else arr("B", nregs[2], bits, signed)[0]
+            d_ = arr("D", nregs[0], bits, signed)[0]
+            return [f"{{ {a_} {b_} {d_} {'' if signed else 'u'}int{bits}_t O[{nb * 8 // bits}]; {body(self.SAME[mn], nb * 8 // bits, scal, signed)} {put('O', nregs[0], nb)} }}"]
+        if mn in self.LONG and len(ops) == 3 and nregs[0][0] == "q" and nregs[1][0] == "d" and bits <= 32 and dm.group(1) in ("s", "u") \
+                and (not mn.startswith("vqd") or (sg and bits in (16, 32))) and (mn != "vmull" or sm) and scal is not None:
+            if not sm and (len(nregs) < 3 or nregs[2][0] != "d"): return None
+            a_, nb = arr("A", nregs[1], bits, sg)
+            b_ = "" if sm else arr("B", nregs[2], bits, sg)[0]
+            d_ = arr("D", nregs[0], 2 * bits, sg)[0]
+            return [f"{{ {a_} {b_} {d_} {'' if sg else 'u'}int{2 * bits}_t O[{nb * 8 // bits}]; {body(self.LONG[mn], nb * 8 // bits, scal, sg)} {put('O', nregs[0], 16)} }}"]
+        if mn == "vshll" and len(ops) == 3 and ops[2].type == ARM_OP_IMM and nregs[0][0] == "q" and nregs[1][0] == "d" and bits <= 32:
+            # each element widened (sign- or zero-extended; the .i form is the shift by the full width) and shifted left
+            sh = ops[2].imm; s_ = sg
+            a_, nb = arr("A", nregs[1], bits, s_)
+            return [f"{{ {a_} uint{2 * bits}_t O[{8 // (bits // 8)}]; for (int k = 0; k < {8 // (bits // 8)}; k++) O[k] = (uint{2 * bits}_t)((uint64_t)(int64_t)A[k] << {sh}); {put('O', nregs[0], 16)} }}"]
+        same_kind = len(nregs) >= 2 and all(r[0] == nregs[0][0] for r in nregs)
+        elem = lambda r: (16 if r[0] == "q" else 8) * 8 // bits   # elements of register r at this width
+        T = lambda s_: f"{'' if s_ else 'u'}int{bits}_t"
+        def same(expr, src_signed, regs3=True):   # O[k] = expr over A (N), B (M) and D, all this width
+            a_, nb = arr("A", nregs[1], bits, src_signed)
+            b_ = arr("B", nregs[2], bits, src_signed)[0] if regs3 else ""
+            d_ = arr("D", nregs[0], bits, src_signed)[0]
+            e = expr.replace("BITS", str(bits))
+            st = "int64_t" if src_signed else "uint64_t"
+            return [f"{{ {a_} {b_} {d_} {T(src_signed)} O[{elem(nregs[0])}]; for (int k = 0; k < {elem(nregs[0])}; k++) {{ {st} a = A[k]{', b = B[k]' if regs3 else ''};"
+                    f" uint64_t d = (uint64_t)D[k]; (void)d; O[k] = ({T(src_signed)})({e}); }} {put('O', nregs[0], nb)} }}"]
+        three = len(nregs) == 3 and len(ops) == 3 and same_kind
+        two_imm = len(nregs) == 2 and len(ops) == 3 and ops[2].type == ARM_OP_IMM and same_kind
+        # by register: the rounding shifts at every width, and the plain and saturating ones at 64 bits (shift: the signed
+        # low byte of M's element)
+        if three and dm.group(1) in ("s", "u") and (mn in ("vrshl", "vqrshl") or (mn in ("vqshl", "vshl") and bits == 64)):
+            sh = "(int8_t)b"
+            if mn == "vrshl": e = f"RSHL_{'S' if sg else 'U'}(a, {sh}, BITS)"
+            elif mn == "vqrshl": e = f"({sh} >= 0 ? QSHL{'S' if sg else 'U'}(a, {sh}, BITS) : RSHL_{'S' if sg else 'U'}(a, {sh}, BITS))"
+            elif mn == "vqshl": e = f"QSHL{'S' if sg else 'U'}(a, {sh}, BITS)"
+            else: e = (f"({sh} >= 0 ? ({sh} >= 64 ? 0 : (uint64_t)a << {sh}) : ({sh} <= -64 ? (uint64_t)(a >> 63) : (uint64_t)(a >> -{sh})))" if sg
+                       else f"({sh} >= 0 ? ({sh} >= 64 ? 0 : a << {sh}) : ({sh} <= -64 ? 0 : a >> -{sh}))")
+            return same(e, sg)
+        if three and mn in ("vqadd", "vqsub") and bits == 64 and dm.group(1) in ("s", "u"):
+            e = (f"{'QADDS64' if mn == 'vqadd' else 'QSUBS64'}(a, b)" if sg else ("(a + b < a ? ~0ull : a + b)" if mn == "vqadd" else "(a < b ? 0 : a - b)"))
+            return same(e, sg)
+        if two_imm and (mn in ("vqshlu",) or (mn in ("vshl", "vshr", "vqshl") and bits == 64) or (mn in ("vsli", "vsri") and bits in (8, 16))):
+            n_ = ops[2].imm; mask = (1 << bits) - 1
+            if mn == "vqshlu": e = f"(a < 0 ? 0 : QSHLU((uint64_t)a, {n_}, BITS))"; s_ = True
+            elif mn == "vshl": e = f"(uint64_t)a << {n_}"; s_ = False
+            elif mn == "vshr": e = (f"a >> {min(n_, 63)}" if sg else (f"a >> {n_}" if n_ < 64 else "0")); s_ = sg
+            elif mn == "vqshl": e = f"QSHL{'S' if sg else 'U'}(a, {n_}, 64)"; s_ = sg
+            elif mn == "vsli": e = f"((a << {n_}) & 0x{mask:x}u) | (d & 0x{(1 << n_) - 1:x}u)"; s_ = False
+            else: e = "d" if n_ >= bits else f"(a >> {n_}) | (d & 0x{mask & ~(mask >> n_):x}u)"; s_ = False
+            return same(e, s_, regs3=False)
+        if len(nregs) == 2 and len(ops) == 2 and same_kind and mn == "vclz" and bits in (8, 16):
+            return same("(a == 0 ? BITS : __builtin_clz((uint32_t)a) - (32 - BITS))", False, regs3=False)
+        if mn == "vpaddl" and len(nregs) == 2 and same_kind and dm.group(1) in ("s", "u") and bits == 32:   # pairwise add long, 32 -> 64
+            a_, nb = arr("A", nregs[1], 32, sg)
+            n2 = elem(nregs[0]) // 2
+            return [f"{{ {a_} {'' if sg else 'u'}int64_t O[{n2}]; for (int k = 0; k < {n2}; k++) O[k] = ({'' if sg else 'u'}int64_t)A[2 * k] + A[2 * k + 1]; {put('O', nregs[0], nb)} }}"]
+        if len(nregs) == 2 and len(ops) == 2 and same_kind and mn in ("vcls", "vqabs", "vqneg") and sg and bits <= 32:
+            e = {"vcls": "CLS(a, BITS)", "vqabs": "SATS(a < 0 ? -a : a, BITS)", "vqneg": "SATS(-a, BITS)"}[mn]
+            return same(e, True, regs3=False)
+        if mn == "vpadal" and len(nregs) == 2 and same_kind and dm.group(1) in ("s", "u") and bits <= 32:
+            # pairwise add long and accumulate: each pair of M's elements, widened, added into D's element of twice the width
+            a_, nb = arr("A", nregs[1], bits, sg); d_ = arr("D", nregs[0], 2 * bits, sg)[0]
+            n2 = elem(nregs[0]) // 2
+            return [f"{{ {a_} {d_} for (int k = 0; k < {n2}; k++) D[k] = ({'' if sg else 'u'}int{2 * bits}_t)((uint64_t)D[k] + (uint64_t)((int64_t)A[2 * k] + (int64_t)A[2 * k + 1])); {put('D', nregs[0], nb)} }}"]
+        if mn == "vrshrn" and len(ops) == 3 and ops[2].type == ARM_OP_IMM and nregs[0][0] == "d" and nregs[1][0] == "q" and bits in (16, 32, 64):
+            n_ = ops[2].imm; a_, _ = arr("A", nregs[1], bits, False)
+            return [f"{{ {a_} uint{bits // 2}_t O[{128 // bits}]; for (int k = 0; k < {128 // bits}; k++) O[k] = (uint{bits // 2}_t)((A[k] >> {n_}) + ((A[k] >> {n_ - 1}) & 1)); {put('O', nregs[0], 8)} }}"]
+        if mn in ("vtrn", "vzip") and len(nregs) == 2 and same_kind and dt in (("8", "16") if mn == "vtrn" else ("8", "16", "32")):
+            # vtrn: each pair's second element of D swapped with the first of M; vzip: D and M interleaved, the first half into D
+            es = bits // 8; nb = 16 if nregs[0][0] == "q" else 8
+            dd, mm = (2 * r[1] if r[0] == "q" else r[1] for r in nregs)
+            if mn == "vtrn":
+                loop = f"for (int e = 0; e < {nb // es}; e += 2) {{ uint8_t t[{es}]; memcpy(t, x + (e + 1) * {es}, {es}); memcpy(x + (e + 1) * {es}, y + e * {es}, {es}); memcpy(y + e * {es}, t, {es}); }} memcpy(&c->vfp.d[{dd}], x, {nb}); memcpy(&c->vfp.d[{mm}], y, {nb});"
+            else:
+                loop = f"uint8_t z[32]; for (int e = 0; e < {nb // es}; e++) {{ memcpy(z + 2 * e * {es}, x + e * {es}, {es}); memcpy(z + (2 * e + 1) * {es}, y + e * {es}, {es}); }} memcpy(&c->vfp.d[{dd}], z, {nb}); memcpy(&c->vfp.d[{mm}], z + {nb}, {nb});"
+            return [f"{{ uint8_t x[16], y[16]; memcpy(x, &c->vfp.d[{dd}], {nb}); memcpy(y, &c->vfp.d[{mm}], {nb}); {loop} }}"]
+        qm = re.fullmatch(r"vq(r?)shr(u?)n", mn)
+        if (qm and len(ops) == 3 and ops[2].type == ARM_OP_IMM or mn in ("vqmovn", "vqmovun") and len(ops) == 2) \
+                and nregs[0][0] == "d" and nregs[1][0] == "q" and dm.group(1) in ("s", "u") and bits in (16, 32, 64):
+            # narrowing: each element of qM (shifted right by the immediate, rounded for the r forms), saturated to half
+            # its width, signed or unsigned (the "u" forms: signed in, unsigned out)
+            half = bits // 2; uns = (qm and qm.group(2)) or mn == "vqmovun" or not sg
+            sh = ops[2].imm if qm else 0; rnd = bool(qm and qm.group(1))
+            a_, _ = arr("A", nregs[1], bits, sg)
+            if sh: v = f"(A[k] >> {sh}) + {'((A[k] >> ' + str(sh - 1) + ') & 1)' if rnd else '0'}"
+            else: v = "A[k]"
+            sat = f"SATU({v}, {half})" if uns and sg else f"SATU64U((uint64_t)({v}), {half})" if uns else f"SATS({v}, {half})"
+            return [f"{{ {a_} {'u' if uns else ''}int{half}_t O[{128 // bits}]; for (int k = 0; k < {128 // bits}; k++) O[k] = ({'u' if uns else ''}int{half}_t){sat}; {put('O', nregs[0], 8)} }}"]
+        return None
+
     def neon_lanes(self, i, mn, dt, ops, regs):
         """NEON ops on 32-bit lanes of d/q registers (lane k of dN is s[2N+k], of qN is s[4N+k]);
         every lane is computed into a temporary first, so a destination can also be a source"""
@@ -490,6 +799,9 @@ class Fn:
         n = 4 if q else 2
         def dbytes(r):   # (first d index, d count) of a d or q register
             return (2 * r[1], 2) if r[0] == "q" else (r[1], 1)
+        more = self.neon_elements(i, mn, dt, ops, regs)
+        if more is not None:
+            return more
         if mn == "vext" and len(ops) == 4 and ops[3].type == ARM_OP_IMM:
             # bytes of N (low) then M (high), from element imm: the register's width of them
             (dn, cnt), (an, _), (bn, _) = dbytes(regs[0]), dbytes(regs[1]), dbytes(regs[2])
@@ -503,6 +815,8 @@ class Fn:
             dd = regs[0][1]
             tab = [r[1] for r in regs[1:-1]]
             ix = regs[-1][1]
+            if None in tab or ix is None or dd is None:   # a list running past d31: UNPREDICTABLE (it emitted d[None])
+                raise Unsupported(f"{mn}: a register list past d31")
             n = 8 * len(tab)
             loads = " ".join(f"memcpy(t + {8 * k}, &c->vfp.d[{d}], 8);" for k, d in enumerate(tab))
             miss = f"o[k]" if mn == "vtbx" else "0"
@@ -821,6 +1135,8 @@ class Fn:
                 if mn in ("vsra", "vrsra"):
                     return pack(lambda j: f"({E(regs[0], j)} + {shr(j)})")
                 return pack(shr)
+        if mn == "vabd" and dt == "f32" and len(ops) == 3 and not imm0:   # |a - b|: the default NaN stays positive
+            return lanes(lambda k: f"F2B(fabsf(FZF({AF(k)} - {BF(k)})))")
         if mn in ("vacgt", "vacge") and dt == "f32":
             op = ">" if mn == "vacgt" else ">="
             return lanes(lambda k: f"(fabsf({AF(k)}) {op} fabsf({BF(k)}) ? 0xffffffffu : 0u)")
@@ -897,6 +1213,9 @@ class Fn:
             if k == "s":
                 return [f"c->vfp.s[{n}] = RD32({a});" if mn == "vldr" else f"WR32({a}, c->vfp.s[{n}]);"]
             return [f"c->vfp.d[{n}] = RD64({a});" if mn == "vldr" else f"WR64({a}, c->vfp.d[{n}]);"]
+        fx = {"fstmiax": "vstmia", "fldmiax": "vldmia", "fstmdbx": "vstmdb", "fldmdbx": "vldmdb"}.get(mn)
+        if fx:   # the deprecated FSTMX/FLDMX: doubles as vstm/vldm, the transfer one (unused) word longer
+            mn = fx
         if mn in ("vpush", "vpop", "vldmia", "vstmia", "vldmdb", "vstmdb", "vldm", "vstm"):
             if mn in ("vpush", "vpop"):
                 base, vr, wb, before, load = 13, regs, True, mn == "vpush", mn == "vpop"
@@ -904,7 +1223,7 @@ class Fn:
                 base, vr, wb = GPR[md.reg_name(ops[0].reg)], regs[1:], i.writeback
                 before, load = mn.endswith("db"), mn.startswith("vld")
             sz = 4 if vr[0][0] == "s" else 8
-            tot = sz * len(vr)
+            tot = sz * len(vr) + (4 if fx else 0)
             out = [f"{{ uint32_t ea = c->r[{base}]{f' - {tot}' if before else ''};"]
             for k, (kind, n) in enumerate(vr):
                 f = "s" if kind == "s" else "d"
@@ -914,6 +1233,13 @@ class Fn:
                 out.append(f" c->r[{base}] {'-' if before else '+'}= {tot};")
             out.append(" }")
             return ["".join(out)]
+        if mn in ("vorr", "vbic", "vmvn") and len(ops) == 2 and regs[0] and regs[0][0] in "dq" and ops[1].type == ARM_OP_IMM and dt in ("i16", "i32"):
+            # the immediate replicated into every element: OR'd in, cleared (vbic) or inverted into place (vmvn)
+            bits = int(dt[1:]); lane = ops[1].imm & ((1 << bits) - 1)
+            rep_ = sum(lane << (k * bits) for k in range(64 // bits))
+            nd = [2 * regs[0][1], 2 * regs[0][1] + 1] if regs[0][0] == "q" else [regs[0][1]]
+            e = {"vorr": "c->vfp.d[{x}] | 0x{r:x}ull", "vbic": "c->vfp.d[{x}] & ~0x{r:x}ull", "vmvn": "~0x{r:x}ull"}[mn]
+            return [" ".join(f"c->vfp.d[{x}] = {e.format(x=x, r=rep_)};" for x in nd)]
         if mn == "vmov" and len(ops) == 2 and regs[0] and regs[0][0] in "dq" and ops[1].type == ARM_OP_IMM:
             # vmov.i32/i16/i8/i64 dN|qN, #imm: the immediate replicated into every lane
             bits = int(dt[1:]) if dt[1:].isdigit() else 32
@@ -928,10 +1254,12 @@ class Fn:
             nd = [2 * regs[0][1], 2 * regs[0][1] + 1] if regs[0][0] == "q" else [regs[0][1]]
             return [" ".join(f"c->vfp.d[{x}] = 0x{rep64:x}ull;" for x in nd)]
         if mn == "vmov" and len(ops) == 2 and regs[0] and regs[0][0] == "d" and regs[1] and regs[1][0] == "r":
-            # vmov.32 dN[x], rT (capstone gives the lane in the operand's vector_index)
+            # vmov.<8|16|32> dN[x], rT (capstone gives the lane in the operand's vector_index): the low bits of rT into
+            # that element. The .8 and .16 forms were written as 32-bit lanes (vmov.8 d14[2] shifted by 64: isacover)
+            bits = int(dt) if dt in ("8", "16") else 32
             lane = ops[0].vector_index if ops[0].vector_index >= 0 else 0
-            sh = 32 * lane
-            return [f"c->vfp.d[{regs[0][1]}] = (c->vfp.d[{regs[0][1]}] & ~(0xffffffffull << {sh})) | ((uint64_t)c->r[{regs[1][1]}] << {sh});"]
+            sh, mask = bits * lane, (1 << bits) - 1
+            return [f"c->vfp.d[{regs[0][1]}] = (c->vfp.d[{regs[0][1]}] & ~(0x{mask:x}ull << {sh})) | ((uint64_t)(c->r[{regs[1][1]}] & 0x{mask:x}u) << {sh});"]
         if mn == "vmov" and dt in ("u8", "s8", "u16", "s16") and len(ops) == 2 and regs[0] and regs[0][0] == "r" and regs[1] and regs[1][0] == "d" and ops[1].vector_index >= 0:
             # vmov.u16 rT, dN[x]: one element of a D register to a core register, zero- or sign-extended
             bits = int(dt[1:]); sh = bits * ops[1].vector_index
@@ -949,6 +1277,10 @@ class Fn:
                 return [f"c->r[{regs[0][1]}] = (uint32_t)c->vfp.d[{regs[2][1]}]; c->r[{regs[1][1]}] = (uint32_t)(c->vfp.d[{regs[2][1]}] >> 32);"]
             if kinds == ["s", "s"]:
                 return [f"c->vfp.s[{regs[0][1]}] = c->vfp.s[{regs[1][1]}];"]
+            if kinds == ["r", "r", "s", "s"]:   # two consecutive singles to two core registers
+                return [f"{{ uint32_t a = c->vfp.s[{regs[2][1]}], b = c->vfp.s[{regs[3][1]}]; c->r[{regs[0][1]}] = a; c->r[{regs[1][1]}] = b; }}"]
+            if kinds == ["s", "s", "r", "r"]:
+                return [f"{{ uint32_t a = c->r[{regs[2][1]}], b = c->r[{regs[3][1]}]; c->vfp.s[{regs[0][1]}] = a; c->vfp.s[{regs[1][1]}] = b; }}"]
             if kinds == ["d", "d"]:
                 return [f"c->vfp.d[{regs[0][1]}] = c->vfp.d[{regs[1][1]}];"]
             if kinds == ["q", "q"]:
@@ -960,19 +1292,19 @@ class Fn:
         if mn in ("vadd", "vsub", "vmul", "vdiv", "vnmul") and dt in ("f32", "f64") and regs[0][0] in "sd":
             a, b = self.fval(ops[1].reg), self.fval(ops[2].reg)
             op = {"vadd": "+", "vsub": "-", "vmul": "*", "vdiv": "/", "vnmul": "*"}[mn]
-            e = f"{a} {op} {b}"
-            if mn == "vnmul":
-                e = f"-({e})"
-            return [f"{self.fval(ops[0].reg)} = {e};"]
+            dn = "DNS" if dt == "f32" else "DND"   # (the default NaN: DNS/DND, rt.h)
+            if mn == "vnmul":   # the product's default NaN, then negated: FPNeg flips a NaN's sign too (isacover, x86)
+                return [f"{self.fval(ops[0].reg)} = -{dn}({a} * {b});"]
+            return [f"{self.fval(ops[0].reg)} = {dn}({a} {op} {b});"]
         if mn in ("vmla", "vmls", "vnmla", "vnmls") and regs[0][0] in "sd":
             d, a, b = self.fval(ops[0].reg), self.fval(ops[1].reg), self.fval(ops[2].reg)
             e = {"vmla": f"{d} + {a} * {b}", "vmls": f"{d} - {a} * {b}", "vnmla": f"-{d} - {a} * {b}",
                  "vnmls": f"-{d} + {a} * {b}"}[mn]
-            return [f"{d} = {e};"]
+            return [f"{d} = {'DNS' if regs[0][0] == 's' else 'DND'}({e});"]
         if mn in ("vneg", "vabs", "vsqrt") and regs[0][0] in "sd":
             a = self.fval(ops[1].reg)
             fl = "f" if regs[0][0] == "s" else ""
-            e = {"vneg": f"-{a}", "vabs": f"fabs{fl}({a})", "vsqrt": f"sqrt{fl}({a})"}[mn]
+            e = {"vneg": f"-{a}", "vabs": f"fabs{fl}({a})", "vsqrt": f"{'DNS' if fl else 'DND'}(sqrt{fl}({a}))"}[mn]   # (vneg/vabs only move the sign, NaN or not)
             return [f"{self.fval(ops[0].reg)} = {e};"]
         if mn in ("vcmp", "vcmpe"):
             a = self.fval(ops[0].reg)
@@ -984,6 +1316,12 @@ class Fn:
             return [f"{self.dst(ops[0].reg)} = c->fpscr;"]
         if mn == "vmsr":
             return [f"c->fpscr = {self.r(ops[1].reg, i)};"]
+        if mn == "vcvtr" and len(regs) == 2 and i.mnemonic.split(".")[1] in ("s32", "u32"):
+            # to an integer by FPSCR's rounding mode (round to nearest even, the console's), saturated, NaN 0
+            to, frm = i.mnemonic.split(".")[1:3]
+            src = f"(double)c->vfp.f[{regs[1][1]}]" if frm == "f32" else f"c->vfp.fd[{regs[1][1]}]"
+            f_ = "F2S" if to == "s32" else "F2U"
+            return [f"c->vfp.s[{regs[0][1]}] = (uint32_t){f_}(nearbyint({src}));"]
         if mn in ("vcvtb", "vcvtt") and len(regs) == 2 and regs[0][0] == "s" and regs[1][0] == "s":
             # half in the bottom (b) or top (t) 16 bits of a single register
             sh = 16 if mn == "vcvtt" else 0
@@ -993,6 +1331,22 @@ class Fn:
                 return [f"c->vfp.s[{regs[0][1]}] = (c->vfp.s[{regs[0][1]}] & ~(0xffffu << {sh})) | ((uint32_t)F2H(c->vfp.s[{regs[1][1]}]) << {sh});"]
         if mn == "vcvt":
             parts = i.mnemonic.split(".")[1:]
+            if len(ops) == 3 and ops[2].type == ARM_OP_IMM and len(parts) == 2:
+                # between floating point and fixed point in place (vcvt.f32.s16 s0, s0, #16): the fixed operand is the low
+                # 16 or 32 bits; to fixed: toward zero, saturated, NaN 0, extended to the register's width
+                to, frm = parts; fb = ops[2].imm; r_ = regs[0]
+                fx = to if to[0] in "su" else frm; fl = frm if fx == to else to
+                size, sgn = int(fx[1:]), fx[0] == "s"
+                cell = f"c->vfp.d[{r_[1]}]" if r_[0] == "d" else f"c->vfp.s[{r_[1]}]"
+                if fx == frm:   # fixed -> float
+                    v = f"(int64_t)({'' if sgn else 'u'}int{size}_t){cell}"
+                    tgt = f"c->vfp.f[{r_[1]}]" if fl == "f32" else f"c->vfp.fd[{r_[1]}]"
+                    return [f"{tgt} = ({'float' if fl == 'f32' else 'double'})((double){v} / {float(1 << fb)!r});"]
+                src = f"(double)c->vfp.f[{r_[1]}]" if fl == "f32" else f"c->vfp.fd[{r_[1]}]"
+                lo, hi = (-(1 << (size - 1)), (1 << (size - 1)) - 1) if sgn else (0, (1 << size) - 1)
+                ext = (f"(uint64_t)(int64_t)r" if sgn else "(uint64_t)r")
+                put = f"{cell} = {ext};" if r_[0] == "d" else f"{cell} = (uint32_t){ext};"
+                return [f"{{ double x = {src} * {float(1 << fb)!r}; int64_t r = x != x ? 0 : x >= {hi}.0 ? {hi}LL : x <= {lo}.0 ? {lo}LL : (int64_t)x; {put} }}"]
             if len(ops) != 2:
                 raise Unsupported("vcvt fixed-point")
             to, frm = parts[0], parts[1]
@@ -1060,6 +1414,18 @@ class Fn:
             es = int(dt) // 8 if dt.isdigit() else 4
             lm = re.search(r"\{d\d+\[(\d+)\]", i.op_str)
             load = mn.startswith("vld")
+            if load and "[]" in i.op_str and len(ds) == nst:
+                # to all lanes: the structure's element k (at ea + k * size) into every lane of register k ({d20[], d22[]}
+                # filled only the first lane's bytes as a whole structure load; isacover, 2026-11-17)
+                base = GPR[md.reg_name(m_op.mem.base)]
+                out = [f"{{ uint32_t ea = c->r[{base}];"]
+                for k, dd in enumerate(ds):
+                    out.append(f" {{ uint8_t e[{es}]; memcpy(e, G(ea + {k * es}), {es}); for (int j = 0; j < 8; j += {es}) memcpy(((uint8_t *)&c->vfp.d[{dd}]) + j, e, {es}); }}")
+                post = [o for o in ops if o.type == ARM_OP_REG and md.reg_name(o.reg) in GPR and o is not ops[0]]
+                if i.writeback or post:
+                    out.append(f" c->r[{base}] = ea + {nst * es};" if not post else f" c->r[{base}] = ea + {self.r(post[-1].reg, i)};")
+                out.append(" }")
+                return ["".join(out)]
             if lm:
                 moves = [(int(lm.group(1)), dd) for dd in ds]
             else:
@@ -1108,14 +1474,14 @@ class Fn:
                     else:
                         out.append(f" memcpy(G(ea + {es * k}), {p_} + {lane * es}, {es});")
                 post = [o for o in ops if o.type == ARM_OP_REG and md.reg_name(o.reg) in GPR and o is not ops[0]]
-                if i.writeback:   # one element transferred either way
+                if i.writeback or post:   # one element transferred either way ("[rN], rM" isn't writeback to capstone 5)
                     out.append(f" c->r[{base}] = ea + {es if alld else es * len(ds)};" if not post else f" c->r[{base}] = ea + {self.r(post[-1].reg, i)};")
                 out.append(" }")
                 return ["".join(out)]
             for k, dn in enumerate(ds):
                 out.append(f" c->vfp.d[{dn}] = RD64(ea + {8 * k});" if mn == "vld1" else f" WR64(ea + {8 * k}, c->vfp.d[{dn}]);")
             post = [o for o in ops if o.type == ARM_OP_REG and md.reg_name(o.reg) in GPR and o is not ops[0]]
-            if i.writeback:
+            if i.writeback or post:   # ("[rN], rM": capstone 5 doesn't call that writeback; the base stayed put. isacover, 2026-11-17)
                 out.append(f" c->r[{base}] = ea + {8 * len(ds)};" if not post else f" c->r[{base}] = ea + {self.r(post[-1].reg, i)};")
             out.append(" }")
             return ["".join(out)]
