@@ -341,7 +341,7 @@ static void dec_vbw(uint64_t w, int sec, UOp *op) {
 	op->args[2] = (int32_t)BITS(w, 37, 36);     /* src2_exth */
 	op->mask = 0xF;
 	op->s0.bank = BK_NONE;
-	op->reps = 1; op->repmode = RM_EXTERNAL;
+	op->reps = (uint8_t)(BITS(w, 47, 44) + 1); op->repmode = RM_SLMSI;   /* the repeat count, stepped as SLMSI says, one word a step (Vita3K's vbw); it was read as 1 */
 }
 
 /* ---- SOP2 / SOP2M / SOP3 (§3.11): U8 RGBA blend-style sum of products ---- */
@@ -1015,9 +1015,12 @@ static void exec_vtstmsk(Ctx *cx, const UOp *op) {
 }
 static uint32_t rol32(uint32_t v, int s) { s &= 31; return s ? (v << s) | (v >> (32 - s)) : v; }
 static void exec_vbw(Ctx *cx, const UOp *op) {
-	uint32_t a = read_i32(cx, &op->s1, 0, 0), b;
+	static const int unit[4] = {1, 1, 1, 1};
+	for (int r = 0; r < op->reps; r++) {   /* (a repeat-2 OR #0 copies two words: an output pair's four halves) */
+	int off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit), off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
+	uint32_t a = read_i32(cx, &op->s1, off1, 0), b;
 	if (op->s2.bank == BK_IMM) b = (uint32_t)op->s2.num | ((uint32_t)op->imm << 7) | ((uint32_t)op->args[2] << 14);
-	else b = read_i32(cx, &op->s2, 0, 0);
+	else b = read_i32(cx, &op->s2, off2, 0);
 	int rot = op->args[0] & 31;
 	b = op->sub3 ? (uint32_t)(((b << (rot & 15)) | (b >> (16 - (rot & 15)))) & 0xFFFF) : rol32(b, rot);
 	if (op->args[1]) b = op->sub3 ? (~b & 0xFFFFu) : ~b;
@@ -1030,7 +1033,8 @@ static void exec_vbw(Ctx *cx, const UOp *op) {
 	default: result = a; break;
 	}
 	if (op->sub3) result &= 0xFFFFu;
-	write_raw_lane(cx, &op->dst, 0, 0, result);
+	write_raw_lane(cx, &op->dst, offd, 0, result);
+	}
 }
 static void u8_unpack(uint32_t w, float rgb[3], float *a) { rgb[0] = (w & 0xFF) / 255.0f; rgb[1] = ((w >> 8) & 0xFF) / 255.0f; rgb[2] = ((w >> 16) & 0xFF) / 255.0f; *a = ((w >> 24) & 0xFF) / 255.0f; }
 static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }

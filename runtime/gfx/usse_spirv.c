@@ -814,7 +814,10 @@ static void emit_vtstmsk(Gen *g, const UOp *op, int *ok) {
  * translate time when s2 is an immediate -- usse.c's exec_vbw */
 static void emit_vbw(Gen *g, const UOp *op, int *ok) {
 	Spv *s = &g->s;
-	uint32_t a = read_raw_comp(g, &op->s1, 0, 0, ok), b;
+	static const int unit[4] = {1, 1, 1, 1};
+	for (int rep = 0; rep < op->reps; rep++) {   /* usse.c's exec_vbw: the repeat count, SLMSI, one word a step */
+	int off1 = slot_off(g, op->repmode, op->s1.bank, rep, unit, 1, ok), off2 = slot_off(g, op->repmode, op->s2.bank, rep, unit, 2, ok), offd = slot_off(g, op->repmode, op->dst.bank, rep, unit, 3, ok);
+	uint32_t a = read_raw_comp(g, &op->s1, off1, 0, ok), b;
 	int rot = op->args[0] & 31;
 	if (op->s2.bank == BK_IMM) {
 		uint32_t bi = (uint32_t)op->s2.num | ((uint32_t)op->imm << 7) | ((uint32_t)op->args[2] << 14);
@@ -822,7 +825,7 @@ static void emit_vbw(Gen *g, const UOp *op, int *ok) {
 		if (op->args[1]) bi = op->sub3 ? (~bi & 0xFFFFu) : ~bi;
 		b = c_uint(s, bi);
 	} else {
-		b = read_raw_comp(g, &op->s2, 0, 0, ok);
+		b = read_raw_comp(g, &op->s2, off2, 0, ok);
 		if (op->sub3) {
 			int r16 = rot & 15;
 			b = r16 ? uop2(s, SpvOpBitwiseAnd, uop2(s, SpvOpBitwiseOr, uop2(s, SpvOpShiftLeftLogical, b, c_uint(s, (uint32_t)r16)), uop2(s, SpvOpShiftRightLogical, b, c_uint(s, (uint32_t)(16 - r16)))), c_uint(s, 0xFFFF))
@@ -840,7 +843,8 @@ static void emit_vbw(Gen *g, const UOp *op, int *ok) {
 	default: r = a; break;
 	}
 	if (op->sub3) r = uop2(s, SpvOpBitwiseAnd, r, c_uint(s, 0xFFFF));
-	write_raw_comp(g, &op->dst, 0, 0, r, ok);
+	write_raw_comp(g, &op->dst, offd, 0, r, ok);
+	}
 }
 /* usse.c's test_lane_raw: zero/nonzero/negative/negative-or-zero of a raw lane of `type` */
 static uint32_t test_lane_spv(Spv *s, uint32_t raw, int type, int cmpsel) {
