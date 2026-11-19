@@ -345,6 +345,12 @@ void gfxcov_draw(const GfxDraw *d) {
 	pthread_mutex_unlock(&lock);
 }
 
+void gfxcov_state(const char *key, const char *value, const char *note) {   /* libgxm state draw() settles itself: both renderers see it done */
+	if (!gfxcov_on()) return;
+	pthread_mutex_lock(&lock);
+	feat(key, value, YES, YES, note);
+	pthread_mutex_unlock(&lock);
+}
 void gfxcov_gap(const char *key, const char *value, int partial, const char *note) {
 	if (!gfxcov_on()) return;
 	pthread_mutex_lock(&lock);

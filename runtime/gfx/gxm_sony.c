@@ -275,7 +275,7 @@ static void decode_gaps(uint32_t cx, uint32_t vgxp, uint32_t fp, uint32_t front,
 	if (front & 0x800) {   /* +0x1c4 bit 11 two-sided: back faces use +0x1d0 (ISP word), +0x1d4 (bias), +0x1d8 (stencil) */
 		uint32_t back = RD32(cx + 0x1d0), diff = (back ^ front) & 0x01f001ffu;   /* stencil ref/enable, depth write, depth func */
 		int same = !diff && RD32(cx + 0x1d8) == RD32(cx + CX_FRONT_STENCIL) && ((RD32(cx + 0x1d4) ^ RD32(cx + CX_FRONT_VIS)) & 0x03ff0000u) == 0;
-		gfxcov_gap("two_sided", same ? "back state = front" : "back state differs", same, "back faces drawn with the front state");
+		gfxcov_state("two_sided", same ? "back state = front" : "back state differs", same ? 0 : "split by side in draw(): front faces, then back faces");
 	}
 	uint32_t pm = (front >> 15) & 7;   /* SceGxmPolygonMode >> 15 (gfx.h GfxDraw.polygon_mode) */
 	int kind = gfx_prim_kind(prim);
@@ -401,7 +401,7 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		}
 	}
 	d.prim = prim; d.index_format = index_format; d.indices = indices; d.count = count;
-	/* fixed function: the front ISP and stencil words (the renderer has no separate back-face state) */
+	/* fixed function: the front ISP and stencil words (two-sided state: below, before the draw goes out) */
 	uint32_t front = RD32(cx + CX_FRONT), st = RD32(cx + CX_FRONT_STENCIL), cull = RD32(cx + CX_CULL);
 	d.cull = (int)(cull & 3);
 	d.polygon_mode = (uint8_t)((front >> 15) & 7); d.point_line_width = (uint8_t)((front >> 28) + 1);
@@ -438,6 +438,30 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		static int stub = -1; if (stub < 0) { const char *e = getenv("RECOMP_VIS_SET"); stub = !(e && (!strcmp(e, "gpu") || !strcmp(e, "real"))); }
 		if (vis[i].set && stub) gfx_vis_write(vis[i].buf + 4u * vis[i].index, 1);
 		else { d.vis_addr = vis[i].buf + 4u * vis[i].index; d.vis_set = (uint8_t)vis[i].set; } } }
+	/* two-sided (+0x1c4 bit 11): back faces (clockwise in NDC, the face CULL_CW culls) take the back ISP word +0x1d0 and
+	 * stencil word +0x1d8, laid out as the front's. A renderer has one state a draw, so the draw is settled here: with one
+	 * side culled it takes the other side's state, and with both sides drawn and the states different it goes out as two
+	 * draws, the front faces with the front state and then the back faces with the back state, each culling the other
+	 * side. Every field counts that way (reference, masks, depth) on both renderers. What it changes is order: a draw's
+	 * front faces all come before its back faces, which a stencil volume (wrapping increments and decrements, the usual
+	 * use) doesn't notice. Back faces used the front state before (Resistance: Burning Skies, tens of thousands of draws) */
+	if (front & 0x800) {
+		uint32_t back = RD32(cx + 0x1d0), bst = RD32(cx + 0x1d8);
+		GfxDraw b = d;
+		b.depth_func = (back >> 22) & 7; b.depth_write = !(back & 0x100000); b.fp_disabled = (back & 0x200000) != 0;
+		b.stencil_fail = b.depth_fail = b.depth_pass = 0;
+		if (back & 0x100) {
+			b.stencil_func = (bst >> 25) & 7; b.stencil_fail = (bst >> 22) & 7; b.depth_fail = (bst >> 19) & 7; b.depth_pass = (bst >> 16) & 7;
+			b.stencil_cmask = (bst >> 8) & 0xff; b.stencil_wmask = bst & 0xff;
+		} else { b.stencil_func = 7; b.stencil_cmask = b.stencil_wmask = 0xff; }
+		b.stencil_ref = back & 0xff;
+		const int differs = b.depth_func != d.depth_func || b.depth_write != d.depth_write || b.fp_disabled != d.fp_disabled
+		                 || b.stencil_func != d.stencil_func || b.stencil_fail != d.stencil_fail || b.depth_fail != d.depth_fail
+		                 || b.depth_pass != d.depth_pass || b.stencil_cmask != d.stencil_cmask || b.stencil_wmask != d.stencil_wmask
+		                 || b.stencil_ref != d.stencil_ref;
+		if (differs && d.cull == 2) d = b;   /* the front faces culled: the back state is the draw's */
+		else if (differs && d.cull == 0) { d.cull = 1; b.cull = 2; gfx_draw(&d); d = b; }   /* front faces, then back faces */
+	}
 	gfx_draw(&d);
 	vis_record(cx, front);
 }
