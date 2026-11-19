@@ -136,10 +136,10 @@ static void named(char *buf, size_t n, const char *name, uint32_t raw) {
 static void draw_features(const GfxDraw *d, uint32_t units) {
 	char v[40];
 	/* SceGxmPrimitiveType (raw, gfx.h's gfx_prim_kind): both backends expand triangles, strips,
-	 * fans and triangle edges (filled) into triangles; points are point sprites on the software
-	 * path (the GPU path hands them to it); lines are dropped */
+	 * fans and triangle edges (filled) into triangles, points into sprites and lines into quads
+	 * (gfx.h's gfx_line_offset) */
 	static const char *const prim[] = {"TRIANGLES", "LINES", "POINTS", "TRIANGLE_STRIP", "TRIANGLE_FAN", "TRIANGLE_EDGES"};
-	int pk = gfx_prim_kind(d->prim), pok = (d->prim & ~0x1c000000u) == 0 && pk < 6 && pk != GFX_PRIM_LINES;
+	int pk = gfx_prim_kind(d->prim), pok = (d->prim & ~0x1c000000u) == 0 && pk < 6;
 	named(v, sizeof v, (d->prim & ~0x1c000000u) == 0 && pk < 6 ? prim[pk] : 0, d->prim);
 	feat("prim", v, pok, pok, pok ? 0 : "draw skipped");
 	feat("index", d->index_format ? "U32" : "U16", YES, YES, 0);

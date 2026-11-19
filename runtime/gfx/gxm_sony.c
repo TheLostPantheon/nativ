@@ -282,12 +282,12 @@ static void decode_gaps(uint32_t cx, uint32_t vgxp, uint32_t fp, uint32_t front,
 	int kind = gfx_prim_kind(prim);
 	if (pm) {
 		static const char *const n[] = {"fill", "line", "point_10uv", "point", "point_01uv", "triangle_line", "triangle_point", "7"};
-		int sprite = kind == GFX_PRIM_POINTS && pm >= 2 && pm <= 4;   /* a point draw's sprite mode: drawn as such */
-		gfxcov_gap("polygon_mode", n[pm], sprite, sprite ? "point sprites, expanded to quads by the software path" : "triangles filled");
+		int sprite = kind == GFX_PRIM_POINTS && pm >= 2 && pm <= 4, line = kind == GFX_PRIM_LINES && pm == 1;   /* a point draw's sprite mode, a line draw's LINE: drawn as such */
+		gfxcov_gap("polygon_mode", n[pm], sprite || line, sprite ? "point sprites, expanded to quads by both backends" : line ? "lines, drawn as quads by both backends" : "triangles filled");
 	}
 	if ((pm || kind == GFX_PRIM_LINES || kind == GFX_PRIM_POINTS) && (front >> 28)) {
 		snprintf(v, sizeof v, "%u", (front >> 28) + 1);
-		gfxcov_gap("point_line_width", v, kind == GFX_PRIM_POINTS, "lines are not drawn; a point whose vertex program writes no PSIZE takes this size");
+		gfxcov_gap("point_line_width", v, kind == GFX_PRIM_POINTS || kind == GFX_PRIM_LINES, "a line's width, and the size of a point whose vertex program writes no PSIZE; a triangle draw's polygon modes aren't modelled");
 	}
 	uint32_t pass = (front >> 25) & 7;   /* SceGxmPassType from the fragment program (+0x20) */
 	if (pass >= 2) {

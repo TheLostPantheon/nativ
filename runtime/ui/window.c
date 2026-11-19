@@ -516,11 +516,22 @@ void *window_handle(void) { return win; }
 static SDL_AudioStream *streams[8];
 static uint32_t afreq[8], achan[8];
 static int nstreams;
+static volatile int sfree[8];   /* a released port's stream (audio_close), still bound to the device, for the next open */
+static float av_audio_ms[8] = {10, 10, 10, 10, 10, 10, 10, 10};   /* the A/V sync's per-port terms (av_auto_delay) */
+static int av_applied[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 int audio_open(uint32_t freq, uint32_t channels, uint32_t samples) {
 	(void)samples;
-	if (!active || nstreams >= 8) return 0;
+	if (!active) return 0;
 	if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) return 0;
 	SDL_AudioSpec want = {SDL_AUDIO_S16, (int)channels, (int)freq};
+	/* a released port's stream first: the new port's format, nothing queued, its A/V terms started over */
+	for (int k = 0; k < nstreams; k++) if (sfree[k] && SDL_SetAudioStreamFormat(streams[k], &want, 0)) {
+		SDL_ClearAudioStream(streams[k]);
+		afreq[k] = freq; achan[k] = channels; av_audio_ms[k] = 10; av_applied[k] = -1;
+		sfree[k] = 0;
+		return k + 1;
+	}
+	if (nstreams >= 8) return 0;
 	/* the device's own buffer, in sample frames (before the first stream opens it): small, so what the
 	 * game hears as "played" is close to what the speakers play (RECOMP_AUDIO_FRAMES overrides) */
 	if (!nstreams) SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, getenv("RECOMP_AUDIO_FRAMES") ? getenv("RECOMP_AUDIO_FRAMES") : "256");
@@ -529,6 +540,20 @@ int audio_open(uint32_t freq, uint32_t channels, uint32_t samples) {
 	SDL_ResumeAudioStreamDevice(s);
 	streams[nstreams] = s; afreq[nstreams] = freq; achan[nstreams] = channels;
 	return ++nstreams;   /* 1-based handle; 0 means "failed to open" to callers */
+}
+/* the port was released (sceAudioOutReleasePort): what it still held is dropped, and its stream waits for the next open */
+void audio_close(int dev) {
+	if (dev < 1 || dev > nstreams) return;
+	SDL_ClearAudioStream(streams[dev - 1]);
+	sfree[dev - 1] = 1;
+}
+static int av_extra_bytes(int k) { return av_applied[k] > 0 ? (int)((uint64_t)av_applied[k] * afreq[k] / 1000) * (int)achan[k] * 2 : 0; }
+/* the bytes the game handed over that haven't played yet (sceAudioOutGetRestSample): the queue less the A/V delay this side
+ * holds, which the game's own timing never sees (audio_output) */
+int audio_rest_bytes(int dev) {
+	if (dev < 1 || dev > nstreams || sfree[dev - 1]) return 0;
+	int q = SDL_GetAudioStreamQueued(streams[dev - 1]) - av_extra_bytes(dev - 1);
+	return q > 0 ? q : 0;
 }
 /* ---- automatic A/V sync: the audio held back so that sound and picture of one moment of game time come
  * out together, from measured terms (no per-game or per-frame-rate tuning):
@@ -540,8 +565,6 @@ int audio_open(uint32_t freq, uint32_t channels, uint32_t samples) {
  * late; RECOMP_AV_BIAS_MS, default 10) + "audio_sync_trim_ms" (-100..100, settings.ini only, per game). Uncharted's cutscene dialogue ran ~47 ms ahead of the mouths with
  * none, and the right fixed value moved with the frame rate (2026-10-09). */
 static volatile float av_video_ms = 25.0f;   /* flip -> submit + compositor, averaged (the present loop) */
-static float av_audio_ms[8] = {10, 10, 10, 10, 10, 10, 10, 10};
-static int av_applied[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 int window_audio_auto_delay_ms(void) { return av_applied[0] < 0 ? 0 : av_applied[0]; }
 static int av_auto_delay(int port) {
 	extern float display_frame_period_ms(void);
@@ -555,7 +578,7 @@ static int av_auto_delay(int port) {
 	return av_applied[port];
 }
 void audio_output(int dev, const void *buf, uint32_t bytes) {
-	if (dev < 1 || dev > nstreams) return;
+	if (dev < 1 || dev > nstreams || sfree[dev - 1]) return;
 	SDL_AudioStream *s = streams[dev - 1];
 	/* the overlay is open, or the menu bar's Game > Pause is on: the game is paused (display.c's vblank
 	 * wait parks it; see that file's comment), but a buffer already queued before the pause would

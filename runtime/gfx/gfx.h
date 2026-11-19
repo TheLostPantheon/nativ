@@ -175,9 +175,8 @@ static inline int gfx_sample_space(const GfxTarget *t, GfxDraw *d) {
 
 enum { GFX_PRIM_TRIANGLES, GFX_PRIM_LINES, GFX_PRIM_POINTS, GFX_PRIM_STRIP, GFX_PRIM_FAN, GFX_PRIM_EDGES };
 static inline int gfx_prim_kind(uint32_t prim) { return (int)((prim >> 26) & 7); }
-/* how many triangles `count` indices make (0 for lines, which neither backend draws, and for points:
- * the software path rasterises those as point sprites, render_points_interp, and the GPU path hands
- * them to it).
+/* how many triangles `count` indices make (0 for points and lines: each backend draws those as quads
+ * of its own, below and render_points_interp / render_lines_interp in gfx_soft.c).
  * TRIANGLE_EDGES is a triangle list whose edges carry per-edge flags for line/edge rendering
  * modes; filled, it is the triangle list itself. */
 static inline uint32_t gfx_prim_tris(uint32_t prim, uint32_t count) {
@@ -186,6 +185,23 @@ static inline uint32_t gfx_prim_tris(uint32_t prim, uint32_t count) {
 	case GFX_PRIM_STRIP: case GFX_PRIM_FAN: return count >= 3 ? count - 2 : 0;
 	default: return 0;
 	}
+}
+/* SCE_GXM_PRIMITIVE_LINES, the rule both backends draw by: each pair of indices a segment, drawn as a quad widened by
+ * the draw's point/line width (sceGxmSetFrontPointLineWidth) across the segment's major axis on screen, half to each
+ * side -- the usual rasterisation of aliased wide lines (the SGX's own is unverified). gfx_line_pixels: target pixels
+ * per unit of x/w and of y/w, the viewport mapping (raw positions are pixels with the viewport disabled; tw, th the
+ * target's size when no viewport is set); gfx_line_offset: one side's offset in target pixels, for a segment that runs
+ * dx, dy pixels on screen (the other side's is its negative) */
+static inline void gfx_line_pixels(const GfxDraw *d, uint32_t tw, uint32_t th, float *kx, float *ky) {
+	if (d->viewport_set && d->viewport_disabled) *kx = *ky = 1;
+	else if (d->viewport_set) { *kx = d->vp_xscale < 0 ? -d->vp_xscale : d->vp_xscale; *ky = d->vp_yscale < 0 ? -d->vp_yscale : d->vp_yscale; }
+	else { *kx = (float)tw * 0.5f; *ky = (float)th * 0.5f; }
+	if (!(*kx > 0)) *kx = 1;
+	if (!(*ky > 0)) *ky = 1;
+}
+static inline void gfx_line_offset(const GfxDraw *d, float dx, float dy, float *ox, float *oy) {
+	float half = 0.5f * (float)(d->point_line_width ? d->point_line_width : 1);
+	if ((dx < 0 ? -dx : dx) >= (dy < 0 ? -dy : dy)) { *ox = 0; *oy = half; } else { *ox = half; *oy = 0; }
 }
 /* triangle t's three positions in the index stream: a strip's odd triangles swap their first two
  * vertices so every triangle keeps the strip's winding (culling depends on it); a fan's triangles
@@ -262,6 +278,10 @@ int gfx_bounds_prepare(GfxBoundsJob *j, const GfxDraw *d);
 void gfx_bounds_run(GfxBoundsJob *j);
 int gfx_bounds_result(GfxBoundsJob *j, float out[6]);   /* a draw's NDC extent and w range, its vertex program run on the CPU for up to `samples` of its vertices (gfx_soft.c) */
 void gfx_fetch_vertex_pa_words(const GfxDraw *d, const UsseVertexLayout *vl, uint32_t ix, uint32_t *out, int npa);   /* the first npa PA words only (gfx_gpu.c's vertex record) */
+/* one packed record (npa PA words) through the draw's vertex program on the CPU, for its position (x, y, z, w as the program
+ * writes it): gfx_gpu.c's lines, which need the way each one runs on screen. vd: the draw's registers after its secondary
+ * program. 0 when the interpreter can't run the program */
+int gfx_vertex_position(const UsseProgram *vp, UsseDraw *vd, const GfxTexture *vtex, const uint32_t *pa, int npa, float pos[4]);
 /* the same packing with the per-draw decisions (slot lookups, types, strides) made once: a plan per
  * attribute, then one call per vertex writing npa words -- the GPU backend packs hundreds of
  * thousands of vertices a frame */

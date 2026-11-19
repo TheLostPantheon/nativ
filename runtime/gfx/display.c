@@ -431,6 +431,8 @@ static uint32_t port_len[8], port_freq[8], port_ch[8];
 static int port_dev[8];
 int audio_open(uint32_t freq, uint32_t channels, uint32_t samples);
 void audio_output(int dev, const void *buf, uint32_t bytes);
+void audio_close(int dev);
+int audio_rest_bytes(int dev);
 static uint64_t port_next[8];
 static uint32_t port_vol[8][2];   /* sceAudioOutSetVolume: 0..0x8000 (SCE_AUDIO_VOLUME_0DB) per channel */
 static void h_audio_open(Cpu *c) {   /* (type, samples per buffer, frequency, mode) */
@@ -445,11 +447,19 @@ static void h_audio_open(Cpu *c) {   /* (type, samples per buffer, frequency, mo
 }
 /* RECOMP_AUDIO_WAV=<file>: port 1's output as a WAV file (the header's sizes are patched as it grows);
  * RECOMP_AUDIO_WAV_DIR=<dir>: every port's buffers, each to <dir>/port<i>_<rate>Hz_<ch>ch.wav in its
- * own format, as the game hands them over (before the port's volume) */
+ * own format, as the game hands them over (before the port's volume); a port opened again after a
+ * release writes port<i>-<n>_... */
+static FILE *wav_f[8]; static uint32_t wav_bytes[8], wav_gen[8]; static const char *wav_dir;
 static void wav_write(uint32_t i, const void *pcm) {
-	static FILE *f[8]; static int tried; static uint32_t bytes[8]; static const char *dir;
-	if (!tried) { tried = 1; if (getenv("RECOMP_AUDIO_WAV")) f[0] = fopen(getenv("RECOMP_AUDIO_WAV"), "wb"); dir = getenv("RECOMP_AUDIO_WAV_DIR"); }
-	if (dir && !f[i]) { char path[1024]; snprintf(path, sizeof path, "%s/port%u_%uHz_%uch.wav", dir, i, port_freq[i], port_ch[i]); f[i] = fopen(path, "wb"); if (!f[i]) dir = 0; }
+	FILE **f = wav_f; uint32_t *bytes = wav_bytes; const char *dir; static int tried;
+	if (!tried) { tried = 1; if (getenv("RECOMP_AUDIO_WAV")) f[0] = fopen(getenv("RECOMP_AUDIO_WAV"), "wb"); wav_dir = getenv("RECOMP_AUDIO_WAV_DIR"); }
+	dir = wav_dir;
+	if (dir && !f[i]) {
+		char path[1024], gen[16] = "";
+		if (wav_gen[i]) snprintf(gen, sizeof gen, "-%u", wav_gen[i]);
+		snprintf(path, sizeof path, "%s/port%u%s_%uHz_%uch.wav", dir, i, gen, port_freq[i], port_ch[i]);
+		f[i] = fopen(path, "wb"); if (!f[i]) wav_dir = 0;
+	}
 	if (!f[i]) return;
 	uint32_t n = port_len[i] * port_ch[i] * 2, rate = port_freq[i], ch = port_ch[i];
 	if (!bytes[i]) {
@@ -538,6 +548,31 @@ static void h_audio_output(Cpu *c) {   /* (port, buffer) */
 	if (port_next[i] > t) { int b = sched_block_begin(); usleep((useconds_t)(port_next[i] - t)); if (b) sched_block_end(); }
 	port_next[i] += len;
 	RET(result);
+}
+/* sceAudioOutReleasePort(port): the port is free for the next OpenPort, what it still held dropped. Persona 4 Golden,
+ * Resistance and WipEout release their movie ports when a movie ends; with the port kept, every replay of Persona's
+ * title movie took two or three of the eight, and once they were gone the movies after it played silent */
+static void h_audio_release(Cpu *c) {
+	uint32_t i = A0 - 1;
+	if (i >= 8 || !port_len[i]) { RET(0x80260003u); return; }
+	if (port_dev[i]) audio_close(port_dev[i]);
+	if (wav_dir && wav_f[i]) { fclose(wav_f[i]); wav_f[i] = 0; wav_bytes[i] = 0; wav_gen[i]++; }
+	port_dev[i] = 0; port_next[i] = port_vnext[i] = 0;
+	port_len[i] = 0;   /* (last: the slot is OpenPort's to take from here) */
+	RET(0);
+}
+/* sceAudioOutGetRestSample(port): the samples handed over and not played yet, at most the buffer playing and the one
+ * waiting; on the guest clock under RECOMP_CLOCK=fixed, else the port's own queue (less the A/V delay, which the
+ * game's timing never sees: window.c audio_output). Resistance asks */
+static void h_audio_rest(Cpu *c) {
+	uint32_t i = A0 - 1;
+	if (i >= 8 || !port_len[i]) { RET(0x80260003u); return; }
+	uint64_t rest;
+	if (clock_fixed()) { uint64_t now = guest_vblank_us(); rest = port_vnext[i] > now ? (port_vnext[i] - now) * port_freq[i] / 1000000 : 0; }
+	else if (port_dev[i]) rest = (uint64_t)audio_rest_bytes(port_dev[i]) / (port_ch[i] * 2);
+	else { uint64_t t = now_us(); rest = port_next[i] > t ? (port_next[i] - t) * port_freq[i] / 1000000 : 0; }
+	if (rest > 2ull * port_len[i]) rest = 2ull * port_len[i];
+	RET((uint32_t)rest);
 }
 
 /* ---- input: nothing pressed yet */
@@ -978,6 +1013,7 @@ const HleEntry hle_display[] = {
 	{"sceDisplayWaitSetFrameBufCB", h_wait_setbuf_cb}, {"sceDisplayWaitSetFrameBufMultiCB", h_wait_setbuf_multi_cb},
 	{"sceDisplayRegisterVblankStartCallback", h_register_vblank_cb}, {"sceDisplayUnregisterVblankStartCallback", h_unregister_vblank_cb},
 	{"sceAudioOutOpenPort", h_audio_open}, {"sceAudioOutOutput", h_audio_output}, {"sceAudioOutSetVolume", h_audio_set_volume},
+	{"sceAudioOutReleasePort", h_audio_release}, {"sceAudioOutGetRestSample", h_audio_rest},
 	{"sceCtrlPeekBufferPositive", h_ctrl_peek}, {"sceTouchPeek", h_touch_peek},
 	{"sceCtrlReadBufferPositive", h_ctrl_read}, {"sceTouchRead", h_touch_read}, {"sceTouchGetPanelInfo", h_touch_panel_info},
 	/* the "2" reads (Killzone 1.12): the same SceCtrlData, on a handheld only from port 0 -- the PS TV's paired pads are ports 1-4,
