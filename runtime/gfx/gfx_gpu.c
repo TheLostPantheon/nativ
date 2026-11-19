@@ -595,6 +595,7 @@ static int predict_on(void) {   /* (Metal by default, where the shader library i
  * shadow-map texels apart at 1x, whatever the render scale -- and averages its own compare over them. The Vita
  * takes one tap: at a PC resolution every sunlit leaf showed hard, texel-sized steps. */
 static int g_points_draw;   /* gfx_gpu_draw: this draw is SCE_GXM_PRIMITIVE_POINTS sprites (get_shader picks the point-sprite variants) */
+static int g_lines_draw;    /* ... SCE_GXM_PRIMITIVE_LINES: the vertex shader's lines variant (usse_spirv_set_points 2), whose records are two words wider */
 static int g_motion_draw;   /* gfx_gpu_draw: get_shader wants a vertex program's motion variant (usse_spirv_set_motion; the motion pass, RECOMP_MV) */
 static int g_fzero_draw;    /* gfx_gpu_draw: this draw's fragment program's framebuffer blend goes to the blend unit -- its usse_fragment_fb_blend class (get_shader picks that variant) */
 static int shadow_filter_want(void) {
@@ -990,13 +991,14 @@ static ShaderEntry *get_shader(uint32_t addr, const UsseProgram *prog, const Uss
 	uint32_t hash = usse_program_hash(prog), hash2 = vprog && !canon_vary_on() ? usse_program_hash(vprog) : 0;
 	usse_spirv_key(prog, fl, sa_tex_unit, &kind, &cube_mask, &snap_mask);   /* (only what changes the module: one shader for the variants that don't) */
 	int pcf_unit = kind >= 0 ? shadow_unit(addr, hash) : -1, pcf = pcf_unit >= 0 && shadow_filter_want() ? 16 : 0;   /* (fragment programs: kind is the target's) */
-	ShaderEntry *x = shader_find(hash, hash2, kind, cube_mask, snap_mask, layout_hash, pcf, g_points_draw, g_fzero_draw);
+	const int pts = g_points_draw ? 1 : g_lines_draw && !usse_is_fragment(prog) ? 2 : 0;   /* (a line's fragment program is the plain one) */
+	ShaderEntry *x = shader_find(hash, hash2, kind, cube_mask, snap_mask, layout_hash, pcf, pts, g_fzero_draw);
 	if (x) {
 		if (x->prebuilt) recipe_used_shader(x, addr, prog, vl, fl, sa_tex_unit, vf);
 		if (x->low) { x->low = 0; if (shader_pending(x)) bq_promote(x, 0); }
 		return x;
 	}
-	ShaderEntry *e = shader_new(addr, prog, hash, hash2, vl, fl, sa_tex_unit, kind, cube_mask, snap_mask, vf, layout_hash, pcf_unit, pcf, g_points_draw, g_fzero_draw, 0);
+	ShaderEntry *e = shader_new(addr, prog, hash, hash2, vl, fl, sa_tex_unit, kind, cube_mask, snap_mask, vf, layout_hash, pcf_unit, pcf, pts, g_fzero_draw, 0);
 	if (e && !e->motion && (shader_pending(e) || e->ok)) recipe_note_shader(e, usse_is_fragment(prog), sa_tex_unit, vf);   /* (motion variants aren't recorded: the motion pass is a setting) */
 	if (e && kind >= 0 && rc.warm_phase == 5 && rc.p_frag && e->wkey && !*rc_slot(e->wkey ^ WTAG_S)) {   /* a fragment shader neither predicted nor built before, after the predicted pass: say how it differs */
 		static uint32_t told[256]; static int ntold; int seen = 0;
@@ -1010,7 +1012,7 @@ static ShaderEntry *get_shader(uint32_t addr, const UsseProgram *prog, const Uss
 			uint32_t rd[8]; usse_spirv_sa_read(rd);   /* (the entries shader_new's translation read: its samplers) */
 			int sa_differ = 0; for (int i = 0; i < 256; i++) sa_differ += (rd[i >> 5] >> (i & 31) & 1) && (sa[i] & 0xFF) != (sa_tex_unit[i] & 0xFF);
 			fprintf(stderr, "    gpu: predicted shaders: fragment %#x (%08x) drawn in a variant not predicted -- cube %#x (predicted %#x), snap %#x, points %d, fzero %d, %d of its samplers not where its own tables put them; built now and recorded for next time\n",
-			        addr, hash, cube_mask, pcube, snap_mask, g_points_draw, g_fzero_draw, sa_differ);
+			        addr, hash, cube_mask, pcube, snap_mask, pts, g_fzero_draw, sa_differ);
 		}
 	}
 	return e;
@@ -4670,11 +4672,12 @@ static void vf_plan(const GfxDraw *d, const UsseVertexLayout *vl, int npa, VfPla
 	memset(p, 0, sizeof *p);
 	uint32_t n = d->count; p->ntri = gfx_prim_tris(d->prim, n); p->nidx = 3 * p->ntri;
 	if (g_points_draw) { p->ntri = 2 * n; p->nidx = 6 * n; }   /* (a point is two triangles: the CPU packer, each point's record six times) */
+	if (g_lines_draw) { p->ntri = 2 * (n / 2); p->nidx = 6 * (n / 2); }   /* (a line too: each endpoint's record three times) */
 	uint32_t lo = ~0u, hi = 0; const uint8_t *ib = G(d->indices);   /* the index range, both paths need it */
 	if (d->index_format) for (uint32_t i = 0; i < n; i++) { uint32_t ix; memcpy(&ix, ib + 4 * i, 4); if (ix < lo) lo = ix; if (ix > hi) hi = ix; }
 	else for (uint32_t i = 0; i < n; i++) { uint16_t ix; memcpy(&ix, ib + 2 * i, 2); if (ix < lo) lo = ix; if (ix > hi) hi = ix; }
 	p->lo = lo; p->hi = hi;
-	if (cpu_vfetch() || !p->ntri || g_points_draw) return;
+	if (cpu_vfetch() || !p->ntri || g_points_draw || g_lines_draw) return;
 	GfxVertexPacker pk; gfx_vertex_packer_init(&pk, d, vl, npa);
 	if (pk.slow) return;
 	UsseVfLayout *vf = &p->vf; int j = 0;   /* the packer's plan, attribute by attribute, plus the stream each one reads (its j-th slotted attribute) */
@@ -5575,6 +5578,14 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		if (soft_points) { soft_fallback(d, "point sprites"); return; }   /* RECOMP_GPU_SOFT_POINTS=1: the software path's sprites, as before */
 		g_points_draw = 1;   /* on the GPU: six vertices a point, the corner offsets in the vertex shader (usse_spirv_set_points) */
 	}
+	/* SCE_GXM_PRIMITIVE_LINES: a quad each (gfx.h's gfx_line_offset), six records a line and each moved across it by the
+	 * vertex shader. RECOMP_GPU_NO_LINES=1 drops them, as both backends did before 2026-11 */
+	g_lines_draw = 0;
+	if (gfx_prim_kind(d->prim) == GFX_PRIM_LINES) {
+		static int no_lines = -1; if (no_lines < 0) no_lines = getenv("RECOMP_GPU_NO_LINES") != 0;
+		if (no_lines) return;
+		g_lines_draw = 1;
+	}
 	uint64_t td0 = us_now(), tf0 = t_flush;
 	const UsseProgram *vp = usse_get(d->vprog), *fp = usse_get(d->fprog);
 	const UsseVertexLayout *vl = usse_vertex_layout(vp);
@@ -5678,7 +5689,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * convention culls the full-screen ambient pass entirely. RECOMP_GPU_CULL_SWAP=1: that other
 	 * convention, for diagnosis. */
 	static int swap = -1; if (swap < 0) swap = getenv("RECOMP_GPU_CULL_SWAP") != 0;
-	int cull_sdl = g_points_draw ? SDL_GPU_CULLMODE_NONE : d->cull == 1 ? (swap ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK)
+	int cull_sdl = g_points_draw || g_lines_draw ? SDL_GPU_CULLMODE_NONE : d->cull == 1 ? (swap ? SDL_GPU_CULLMODE_FRONT : SDL_GPU_CULLMODE_BACK)
 	             : d->cull == 2 ? (swap ? SDL_GPU_CULLMODE_BACK : SDL_GPU_CULLMODE_FRONT) : SDL_GPU_CULLMODE_NONE;
 	uint64_t tp0 = us_now();
 	PipeEntry *pipe = get_pipeline(d, vs, fs, scene_target.depth != 0, scene_entry->kind, ds_depth_ok, ds_stencil_ok, cull_sdl, -1, 0);
@@ -5734,6 +5745,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	if (!ntri) { free(check_pre); return; }
 	uint64_t tv0 = us_now();
 	uint32_t npa = (uint32_t)vs->pa_words, nverts, need_words;
+	const uint32_t rec = npa + (g_lines_draw ? 2 : 0);   /* a record's words: a line's carry its offset after the program's */
 	if (!vring) {
 		SDL_GPUBufferCreateInfo rci = { .usage = SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ, .size = VRING_WORDS * 4 };
 		vring = SDL_CreateGPUBuffer(gpu(), &rci);
@@ -5744,17 +5756,17 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	uint32_t lo = plan.lo, hi = plan.hi, nuniq = hi - lo + 1, nidx = plan.nidx, nrec = 0;
 	int kind = gfx_prim_kind(d->prim), indexed, isize = 4;   /* isize: the index ring's element size for this draw */
 	if (plan.gpu) { indexed = 1; need_words = plan.words; if (!d->index_format && (kind == GFX_PRIM_TRIANGLES || kind == GFX_PRIM_EDGES)) isize = 2; }
-	else { indexed = !g_points_draw && nuniq <= nidx && nidx <= IRING_WORDS && !no_indexed(); nrec = indexed ? nuniq : nidx; need_words = nrec * npa; }
+	else { indexed = !g_points_draw && !g_lines_draw && nuniq <= nidx && nidx <= IRING_WORDS && !no_indexed(); nrec = indexed ? nuniq : nidx; need_words = nrec * rec; }
 	if (need_words > VRING_WORDS) { free(check_pre); soft_fallback(d, "draw larger than the vertex ring"); return; }
 	if (indexed && !iring) {
 		SDL_GPUBufferCreateInfo ici = { .usage = SDL_GPU_BUFFERUSAGE_INDEX, .size = IRING_WORDS * 4 };
 		iring = SDL_CreateGPUBuffer(gpu(), &ici);
 		SDL_GPUTransferBufferCreateInfo ixi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = IRING_WORDS * 4 };
 		iring_xfer = SDL_CreateGPUTransferBuffer(gpu(), &ixi);
-		if (!iring || !iring_xfer) { if (plan.gpu) { free(check_pre); soft_fallback(d, "no index ring"); return; } indexed = 0, nrec = nidx, need_words = nrec * npa; }
+		if (!iring || !iring_xfer) { if (plan.gpu) { free(check_pre); soft_fallback(d, "no index ring"); return; } indexed = 0, nrec = nidx, need_words = nrec * rec; }
 	}
 	uint32_t iwords = indexed ? (isize == 2 ? (nidx + 1) / 2 : nidx) : 0;   /* the index ring words this draw takes: 16-bit indices two to a word, every draw's region word-aligned */
-	if (!plan.gpu) { uint32_t al = g_points_draw ? 6 * npa : npa; vring_pos = (vring_pos + al - 1) / al * al; }   /* records of this width start at a multiple of it (point sprites: of six of them, gl_VertexIndex % 6 is the corner) */
+	if (!plan.gpu) { uint32_t al = g_points_draw ? 6 * npa : rec; vring_pos = (vring_pos + al - 1) / al * al; }   /* records of this width start at a multiple of it (point sprites: of six of them, gl_VertexIndex % 6 is the corner) */
 	/* the GPU may still read the ring's start: wait (once per wrap; the ring holds several frames) --
 	 * after submitting the pending draws, whose records are where the ring ends (an idle wait doesn't
 	 * cover work not yet submitted, and their batch's one upload must not span the wrap) */
@@ -5765,7 +5777,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		else ring_wait_region(1, iring_pos, iwords, 0);
 	}
 	uint64_t tm0 = us_now();
-	uint32_t first_vertex = plan.gpu ? 0 : vring_pos / npa, *vmap = (uint32_t *)SDL_MapGPUTransferBuffer(gpu(), vring_xfer, false) + vring_pos, *vp_out = vmap;
+	uint32_t first_vertex = plan.gpu ? 0 : vring_pos / rec, *vmap = (uint32_t *)SDL_MapGPUTransferBuffer(gpu(), vring_xfer, false) + vring_pos, *vp_out = vmap;
 	t_map += us_now() - tm0;
 	uint32_t iring_off = 0, vf_stream_w[16] = {0};   /* vf_stream_w: each stream copy's ring word offset (UsseDrawUniforms.stream) */
 	if (plan.gpu) {
@@ -5786,6 +5798,25 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			iring_off = iring_pos * 4; iring_pos += iwords;
 		} else if (g_points_draw) {   /* each point's record six times: the vertex shader takes its corner from gl_VertexIndex % 6 */
 			for (uint32_t i = 0; i < d->count; i++) { gfx_vertex_pack(&pk, index_at(d, i), vp_out); for (int k = 1; k < 6; k++) memcpy(vp_out + (size_t)k * npa, vp_out, 4u * npa); vp_out += 6 * npa; }
+		} else if (g_lines_draw) {   /* each line's two triangles, six records (a-, a+, b-, a+, b+, b-): its endpoint's record and after it the
+			 * corner's offset across the line in target pixels. Which way the line runs on screen takes both endpoints'
+			 * positions: the vertex program runs here for them (gfx_soft.c), on a copy of the draw's registers */
+			static UsseDraw lvd; lvd = vdraw;
+			float kx, ky; gfx_line_pixels(d, scene_target.width, scene_target.height, &kx, &ky);
+			static const float side[6] = { -1, 1, -1, 1, 1, -1 };
+			for (uint32_t i = 0; i + 1 < d->count; i += 2, vp_out += 6 * rec) {
+				uint32_t *a = vp_out, *b = vp_out + 2 * rec;
+				gfx_vertex_pack(&pk, index_at(d, i), a); gfx_vertex_pack(&pk, index_at(d, i + 1), b);
+				float pa[4], pb[4], ox = 0, oy = 0;
+				if (gfx_vertex_position(vp, &lvd, d->vtex, a, (int)npa, pa) && gfx_vertex_position(vp, &lvd, d->vtex, b, (int)npa, pb) && pa[3] > 0 && pb[3] > 0)
+					gfx_line_offset(d, (pb[0] / pb[3] - pa[0] / pa[3]) * kx, (pb[1] / pb[3] - pa[1] / pa[3]) * ky, &ox, &oy);
+				else {   /* (the program beyond the interpreter, or an endpoint behind the eye: taken as running across) */
+					gfx_line_offset(d, 1, 0, &ox, &oy);
+					static int said; if (!said++) fprintf(stderr, "    gpu: a line drawn without its endpoints' positions (vertex program %#x beyond the interpreter, or behind the eye): widened as a horizontal one\n", d->vprog);
+				}
+				memcpy(vp_out + rec, a, 4u * npa); memcpy(vp_out + 3 * rec, a, 4u * npa); memcpy(vp_out + 4 * rec, b, 4u * npa); memcpy(vp_out + 5 * rec, b, 4u * npa);
+				for (int k = 0; k < 6; k++) { float o[2] = { side[k] * ox, side[k] * oy }; memcpy(vp_out + (size_t)k * rec + npa, o, sizeof o); }
+			}
 		} else {
 			for (uint32_t t = 0; t < ntri; t++) { gfx_prim_tri(d->prim, t, pos); for (int k = 0; k < 3; k++, vp_out += npa) gfx_vertex_pack(&pk, index_at(d, pos[k]), vp_out); }
 		}
@@ -5809,7 +5840,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * motion would cover the scene's) */
 	const int lit_after = (const void *)scene_entry == mv_lit && mv_lit != mv_main_entry && mv_lit_index >= 1 && mv_main_entry && d->count > 6
 	                      && (d->depth_func == 1 || d->depth_func == 3 || d->depth_func == 4 || d->depth_func == 6);   /* (GXM LESS, LESS_EQUAL, GREATER, GREATER_EQUAL) */
-	const int mv_want = mv_scene && (pipe->depth_write || lit_after) && pipe->has_depth && pipe->depth_ok && !fs->fzero && !g_points_draw && !(d->blend.present && (d->blend.color_func || d->blend.alpha_func));
+	const int mv_want = mv_scene && (pipe->depth_write || lit_after) && pipe->has_depth && pipe->depth_ok && !fs->fzero && !g_points_draw && !g_lines_draw && !(d->blend.present && (d->blend.color_func || d->blend.alpha_func));
 	const uint32_t *mv_psa = 0; uint32_t mv_pwin[8][4]; int mv_npwin = 0; const uint8_t *mv_psrc[8];
 	if (mv_want) {
 		uint32_t csa[256]; for (int i = 0; i < 256; i++) csa[i] = vdraw.sa[i].u;
@@ -6002,6 +6033,10 @@ void gfx_gpu_draw(const GfxDraw *d) {
 			float size = d->point_line_width ? (float)d->point_line_width : 1.0f, flip = d->polygon_mode == 2 ? 1.0f : 0.0f;   /* POINT_10UV */
 			memcpy(&b->vu.vfetch[0], &size, 4); memcpy(&b->vu.vfetch[1], &flip, 4);
 		}
+		if (g_lines_draw) {   /* lines: x/w and y/w units per target pixel (gfx.h's gfx_line_pixels), for the offsets in their records */
+			float kx, ky; gfx_line_pixels(d, scene_target.width, scene_target.height, &kx, &ky);
+			float sx = 1.0f / kx, sy = 1.0f / ky; memcpy(&b->vu.vfetch[0], &sx, 4); memcpy(&b->vu.vfetch[1], &sy, 4);
+		}
 		memset(b->vu.win, 0, sizeof b->vu.win); memset(b->fu.win, 0, sizeof b->fu.win); memcpy(b->vu.win, win, (size_t)nwin * sizeof win[0]);
 		if (fs->nldst) memcpy(b->fu.win, ldst_win, (size_t)(fs->nldst < 8 ? fs->nldst : 8) * sizeof ldst_win[0]);   /* the fragment LDST targets (emit_ldst_target) */
 		b->fu.tex_srgb[0] = srgb_dec; b->fu.tex_srgb[1] = srgb_enc; b->fu.tex_srgb[2] = scaled_units;
@@ -6019,7 +6054,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		if (plan.gpu) { b->vu.vfetch[0] = lo; b->vu.vfetch[1] = (uint32_t)plan.nst;   /* (point sprites never fetch on the GPU: vf_plan) */ for (int m = 0; m < plan.nst; m++) { b->vu.stream[plan.st[m].s][0] = vf_stream_w[plan.st[m].s]; b->vu.stream[plan.st[m].s][1] = d->stride[plan.st[m].s]; } }
 	}
 	if (b->mv) {   /* the motion pass's vertex shader (the program's motion variant) and the draw's SA of the previous frame */
-		g_motion_draw = 1; ShaderEntry *mvs = g_points_draw ? 0 : get_shader(d->vprog, vp, 0, vl, 0, vsa_for_smp, -1, vcube_mask, 0, plan.gpu ? &plan.vf : 0, plan.hash); g_motion_draw = 0;
+		g_motion_draw = 1; ShaderEntry *mvs = g_points_draw || g_lines_draw ? 0 : get_shader(d->vprog, vp, 0, vl, 0, vsa_for_smp, -1, vcube_mask, 0, plan.gpu ? &plan.vf : 0, plan.hash); g_motion_draw = 0;
 		if (mvs) {
 			pipe->mv_vse = mvs; b->pvu = b->vu;
 			if (mv_psa) memcpy(b->pvu.sa, mv_psa, sizeof b->pvu.sa);

@@ -1633,6 +1633,15 @@ static void fetch_interp(const GfxDraw *d, const UsseProgram *vprog, const UsseV
 	int n = vl->total_o > PC_U ? PC_U : vl->total_o;
 	for (int k = 0; k < n; k++) o->vary[k] = inst.o[k].f;
 }
+int gfx_vertex_position(const UsseProgram *vp, UsseDraw *vd, const GfxTexture *vtex, const uint32_t *pa, int npa, float pos[4]) {
+	if (!vp || !usse_supported(vp)) return 0;
+	static UsseInst inst;   /* (static: big; the render thread's only) */
+	memset(&inst, 0, sizeof inst);
+	for (int w = 0; w < npa && w < 160; w++) inst.pa[w].u = pa[w];
+	usse_run_primary(vp, &inst, vd, (void *)vtex, usse_texfn);
+	for (int c = 0; c < 4; c++) pos[c] = inst.o[c].f;
+	return 1;
+}
 /* a draw's extent on screen: its own vertex program run here (gfx_gpu.c's native-shape HUD, which needs to know where an
  * element lands to decide what it stays anchored to) for up to `samples` of its indices, spread evenly from the first to
  * the last -- enough to place an element, a text string's first and last glyphs included. out: min x, max x, min y,
@@ -2323,6 +2332,26 @@ static void render_points_interp(const GfxDraw *d, const UsseProgram *vp, DrawRe
 		record_tri(&q[0], &q[1], &q[2]); record_tri(&q[1], &q[3], &q[2]);
 	}
 }
+/* SCE_GXM_PRIMITIVE_LINES: each segment a quad (gfx.h's gfx_line_offset, the rule gfx_gpu.c draws by too): its two
+ * endpoints' vertices moved apart across the line by half the width each way -- target pixels over the viewport's
+ * scale, times w, as render_points_interp moves a sprite's corners -- recorded as two triangles. Both backends dropped
+ * lines until 2026-11: Persona 4 Golden draws four one-pixel ones every frame */
+static void render_lines_interp(const GfxDraw *d, const UsseProgram *vp, DrawRec *r) {
+	const UsseVertexLayout *vl = r->vlayout;
+	r->d.cull = 0;   /* a line has no winding */
+	float kx, ky; gfx_line_pixels(d, scene_target.width, scene_target.height, &kx, &ky);
+	for (uint32_t i = 0; i + 1 < d->count; i += 2) {
+		Vert a, b; fetch_interp(d, vp, vl, &r->vdraw, index_at(d, i), &a); fetch_interp(d, vp, vl, &r->vdraw, index_at(d, i + 1), &b);
+		float wa = a.w ? a.w : 1, wb = b.w ? b.w : 1, ox, oy;
+		gfx_line_offset(d, (b.x / wb - a.x / wa) * kx, (b.y / wb - a.y / wa) * ky, &ox, &oy);
+		Vert q[4] = { a, a, b, b };   /* a's two sides, then b's */
+		for (int c = 0; c < 4; c++) {
+			float s = (c & 1) ? 1.0f : -1.0f, w = c < 2 ? wa : wb;
+			q[c].x += s * ox / kx * w; q[c].y += s * oy / ky * w;
+		}
+		record_tri(&q[0], &q[1], &q[2]); record_tri(&q[1], &q[3], &q[2]);
+	}
+}
 /* RECOMP_SHADERS=interp: run the draw's own vertex/fragment GXP programs. Returns 0 (caller
  * should fall back to the stand-in path) if either program uses an instruction usse.c doesn't
  * support yet. */
@@ -2347,6 +2376,7 @@ static int render_interp(const GfxDraw *d) {
 	memset(&scratch, 0, sizeof scratch); usse_run_secondary(fp, &scratch, &r->fdraw);
 	if (tr) { usse_set_trace(0); trace_vprog = vp; }
 	if (gfx_prim_kind(d->prim) == GFX_PRIM_POINTS) { render_points_interp(d, vp, r); return 1; }
+	if (gfx_prim_kind(d->prim) == GFX_PRIM_LINES) { render_lines_interp(d, vp, r); return 1; }
 	/* triangles, strips (alternate ones rewound) and fans: gfx.h's gfx_prim_tri, as gfx_gpu.c expands them */
 	uint32_t ntri = gfx_prim_tris(d->prim, d->count), pos[3];
 	Vert a, b, cc;

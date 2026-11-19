@@ -196,7 +196,8 @@ typedef struct {
 	uint32_t var_vprobe; /* RECOMP_PROBE=T|P|O... (vertex mode): the vertex's snapshot travels to the fragment as a flat varying at Location nvary */
 	uint32_t probe_id;   /* RECOMP_PROBE ...@k: the register word loaded after primary instruction k (emit_frag_epilogue shows it) */
 	int pcf_unit; uint32_t pcf_du, pcf_dv;
-	int points; uint32_t var_point;   /* usse_spirv_set_points: the point-sprite variant, and its sprite-coordinate varying (vertex Output, fragment Input) */   /* usse_spirv_set_pcf: the shadow map's unit (-1 none) and this tap's UV offset (float ids, 0 for no offset) */
+	int points; uint32_t var_point;   /* usse_spirv_set_points: the point-sprite variant, and its sprite-coordinate varying (vertex Output, fragment Input) */
+	int lines; uint32_t rec_npa, rec_stride;   /* usse_spirv_set_points(2): the lines variant; a record's program words and its width (two more: the offset) */   /* usse_spirv_set_pcf: the shadow map's unit (-1 none) and this tap's UV offset (float ids, 0 for no offset) */
 	/* FRAGCOLOR_USED: gl_FragCoord, the framebuffer copy's sampled image, the 2D image type */
 	uint32_t var_frag_depth;              /* fragment: Output float FragDepth, if used */
 	int uses_depth;
@@ -1705,11 +1706,11 @@ void usse_spirv_set_fetch_zero(int mode) { fetch_zero_next = mode; }
 void usse_spirv_set_pcf(int unit, int taps) { pcf_unit_next = unit; pcf_taps_next = taps; }
 static int motion_next;
 void usse_spirv_set_motion(int on) { motion_next = on; }
-static int points_next;   /* usse_spirv_set_points: the next translation's */
+static int points_next;   /* usse_spirv_set_points: the next translation's (1 point sprites, 2 lines) */
 static int probe_off_next;   /* usse_spirv_set_probe_off: the next translation leaves RECOMP_PROBE out (RECOMP_PROBE_FPROG names another program) */
 void usse_spirv_set_probe_off(int off) { probe_off_next = off != 0; }
 static const char *probe_env(void) { return probe_off_next ? 0 : getenv("RECOMP_PROBE"); }
-void usse_spirv_set_points(int on) { points_next = on != 0; }
+void usse_spirv_set_points(int on) { points_next = on == 2 ? 2 : on != 0; }
 /* a colour (vec4) into the colour register lanes in their declared type (integer types normalized): usse_preload_color */
 static void emit_frag_color_preload(Gen *g, uint32_t texel, int *ok) {
 	const UsseFragLayout *fl = g->fl; Spv *s = &g->s;
@@ -1824,6 +1825,19 @@ static void emit_vert_epilogue(Gen *g, int *ok) {
 	uint32_t vz = load(s, t_vec(s, t_float(s), 4), pz);
 	uint32_t zoff = composite_extract1(s, t_float(s), vz, 0), zscale = composite_extract1(s, t_float(s), vz, 1);
 	pos[2] = fop2(s, SpvOpFAdd, fop2(s, SpvOpFMul, zoff, pos[3]), fop2(s, SpvOpFMul, zscale, pos[2]));
+	if (g->lines && !g->pos_only) {   /* lines (usse_spirv_set_points 2): this corner's offset across its line, in target pixels, from the two
+		 * words after its record's program words (gfx_gpu.c packs them), into x/w and y/w units by the draw's pixel scale
+		 * (SA slot 4's first two words), times w; before the disabled viewport's pixel mapping below, as gfx_soft.c's
+		 * render_lines_interp moves its vertices */
+		uint32_t tu = t_uint(s), tf = t_float(s);
+		uint32_t base = uop2(s, SpvOpIAdd, uop2(s, SpvOpIMul, g->vindex, c_uint(s, g->rec_stride)), c_uint(s, g->rec_npa));
+		for (int k = 0; k < 2; k++) {
+			uint32_t off = result1(s, &s->func, SpvOpBitcast, tf, load(s, tu, access2(s, g->ptr_vin_u, g->var_vin, c_uint(s, 0), uop2(s, SpvOpIAdd, base, c_uint(s, (uint32_t)k)))));
+			uint32_t pw = nid(s); INS(&s->func, SpvOpAccessChain, g->ptr_sa_u, pw, g->var_sa, c_uint(s, 4), c_uint(s, (uint32_t)k));
+			uint32_t scale = result1(s, &s->func, SpvOpBitcast, tf, load(s, tu, pw));
+			pos[k] = fop2(s, SpvOpFAdd, pos[k], fop2(s, SpvOpFMul, fop2(s, SpvOpFMul, off, scale), pos[3]));
+		}
+	}
 	if (!g->points) {   /* SCE_GXM_VIEWPORT_DISABLED (gfx_gpu.c gives the draw the whole target as its viewport and 2/W, 2/H in
 		 * viewport_z[2..3]): the position is in target pixels, y down, and becomes clip space here, x*2/W - w and w - y*2/H.
 		 * Taken 1:1 through a (-1,-1,2,2) viewport, the host clipped it to |x|,|y| <= w first: a 960x544 quad kept a pixel */
@@ -2206,9 +2220,10 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 		 * real bug here, caught by SDL_GPU's Metal backend refusing the resulting pipeline */
 		uint32_t npa = (uint32_t)usse_program_pa_words(prog);   /* the record is only as wide as the program reads: 160 words a vertex was 640 bytes uploaded per vertex */
 		m.pa_words = (int)npa;
+		g.rec_npa = npa; g.rec_stride = npa + (points_next == 2 ? 2u : 0u);   /* (a line's record: its offset after the program's words) */
 		if (vf) emit_vertex_fetch(&g, vf, (int)npa, &ok);   /* the raw streams, converted here (the module is specialised on the layout) */
 		else for (uint32_t w = 0; w < npa; w++) {
-			uint32_t word = uop2(s, SpvOpIAdd, uop2(s, SpvOpIMul, g.vindex, c_uint(s, npa)), c_uint(s, w));
+			uint32_t word = uop2(s, SpvOpIAdd, uop2(s, SpvOpIMul, g.vindex, c_uint(s, g.rec_stride)), c_uint(s, w));
 			uint32_t v = load(s, t_u, access2(s, g.ptr_vin_u, g.var_vin, c_uint(s, 0), word));
 			store(s, access1(s, g.ptr_priv_u, g.var_pa, c_uint(s, w)), v);
 		}
@@ -2239,7 +2254,7 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 			INS(&s->decos, SpvOpDecorate, g.var_vprobe, SpvDecorationFlat);
 		}
 	}
-	g.points = points_next;
+	g.points = points_next == 1; g.lines = points_next == 2;
 	if (g.points) {   /* the sprite coordinate: the location after the varyings (and the probe's) */
 		uint32_t storage = g.is_fragment ? SpvStorageInput : SpvStorageOutput;
 		g.var_point = global_var(s, t_ptr(s, storage, t_v4), storage, 0);
