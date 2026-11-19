@@ -950,15 +950,14 @@ static void imad_offsets(Gen *g, const UOp *op, int r, int off[4], int *ok) {
 	off[2] = slot_off(g, op->repmode, op->s2.bank, r, unit, 2, ok); off[3] = slot_off(g, op->repmode, op->dst.bank, r, unit, 3, ok);
 }
 /* component 0 of the operand in its decoded type, as usse.c's read_i32(.., 0): the whole word for
- * I32MAD's S32 operands, lane 0 for I16MAD's U16 and I8MAD's U8 (the interpreter is the reference;
- * whether I8MAD should see the full packed word is a question for it, not this port) */
+ * I32MAD's S32 operands, lane 0 for I16MAD's U16 (I8MAD and the SOPs read whole packed words: packed_read) */
 static uint32_t read_word(Gen *g, const UOperand *o, int off, int *ok) { return read_raw_comp(g, o, off, 0, ok); }
 static void write_word(Gen *g, const UOperand *o, int off, uint32_t v, int *ok) { write_raw_comp(g, o, off, 0, v, ok); }
 /* SOP2 / SOP2M / SOP3: usse.c's exec_sop2 / exec_sop2m / exec_sop3, op for op. Each operand is a whole RGBA word
- * (sop_word there): its bytes as floats 0..1, colour factors and alpha factors picked by the selectors, optionally
+ * (packed_word there, as I8MAD's): its bytes as floats 0..1, colour factors and alpha factors picked by the selectors, optionally
  * complemented, times the operand, combined by add, subtract, min or max, and packed back rounded and clamped */
-static uint32_t sop_read(Gen *g, const UOperand *o, int off, int *ok) { UOperand w = *o; w.type = TY_U32; w.negabs = 0; return read_raw_comp(g, &w, off, 0, ok); }
-static void sop_write(Gen *g, const UOperand *o, int off, uint32_t v, int *ok) { UOperand w = *o; w.type = TY_U32; write_raw_comp(g, &w, off, 0, v, ok); }
+static uint32_t packed_read(Gen *g, const UOperand *o, int off, int *ok) { UOperand w = *o; w.type = TY_U32; w.negabs = 0; return read_raw_comp(g, &w, off, 0, ok); }
+static void packed_write(Gen *g, const UOperand *o, int off, uint32_t v, int *ok) { UOperand w = *o; w.type = TY_U32; write_raw_comp(g, &w, off, 0, v, ok); }
 static void sop_unpack(Gen *g, uint32_t w, uint32_t v[4]) {
 	Spv *s = &g->s;
 	for (int k = 0; k < 4; k++) v[k] = fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertUToF, t_float(s), ubits(s, w, 8 * k, 8)), c_float(s, 255.0f));
@@ -981,7 +980,7 @@ static void emit_sop2(Gen *g, const UOp *op, int *ok) {
 	uint32_t zero = c_float(&g->s, 0.0f);
 	for (int r = 0; r < op->reps; r++) {
 		int off1 = slot_off(g, op->repmode, op->s1.bank, r, unit, 1, ok), off2 = slot_off(g, op->repmode, op->s2.bank, r, unit, 2, ok), offd = slot_off(g, op->repmode, op->dst.bank, r, unit, 3, ok);
-		uint32_t w1 = sop_read(g, &op->s1, off1, ok), w2 = sop_read(g, &op->s2, off2, ok);
+		uint32_t w1 = packed_read(g, &op->s1, off1, ok), w2 = packed_read(g, &op->s2, off2, ok);
 		if (!*ok) return;
 		uint32_t v1[4], v2[4]; sop_unpack(g, w1, v1); sop_unpack(g, w2, v2);
 		if (op->s1.negabs & 1) for (int k = 0; k < 4; k++) v1[k] = sop_cmp(g, v1[k]);
@@ -997,12 +996,12 @@ static void emit_sop2(Gen *g, const UOp *op, int *ok) {
 		uint32_t af1 = asel1 == 1 ? v1[3] : asel1 == 2 ? v2[3] : zero, af2 = asel2 == 1 ? v1[3] : asel2 == 2 ? v2[3] : zero;
 		if (amod1) af1 = sop_cmp(g, af1); if (amod2) af2 = sop_cmp(g, af2);
 		out[3] = sop_cop(g, op->sub2, fop2(&g->s, SpvOpFMul, af1, v1[3]), fop2(&g->s, SpvOpFMul, af2, v2[3]));
-		sop_write(g, &op->dst, offd, sop_pack(g, out), ok);
+		packed_write(g, &op->dst, offd, sop_pack(g, out), ok);
 	}
 }
 static void emit_sop2m(Gen *g, const UOp *op, int *ok) {
 	uint32_t zero = c_float(&g->s, 0.0f);
-	uint32_t w1 = sop_read(g, &op->s1, 0, ok), w2 = sop_read(g, &op->s2, 0, ok), wd = sop_read(g, &op->dst, 0, ok);
+	uint32_t w1 = packed_read(g, &op->s1, 0, ok), w2 = packed_read(g, &op->s2, 0, ok), wd = packed_read(g, &op->dst, 0, ok);
 	if (!*ok) return;
 	uint32_t v1[4], v2[4], old[4]; sop_unpack(g, w1, v1); sop_unpack(g, w2, v2); sop_unpack(g, wd, old);
 	int sel1 = op->args[0] & 0xFF, mod1 = op->args[0] & 0x100, sel2 = op->args[1] & 0xFF, mod2 = op->args[1] & 0x100;
@@ -1014,11 +1013,11 @@ static void emit_sop2m(Gen *g, const UOp *op, int *ok) {
 		t1[k] = fop2(&g->s, SpvOpFMul, f1, v1[k]); t2[k] = fop2(&g->s, SpvOpFMul, f2, v2[k]);
 	}
 	for (int k = 0; k < 4; k++) fin[k] = (op->mask & (1 << k)) ? sop_cop(g, k < 3 ? op->sub : op->sub2, t1[k], t2[k]) : old[k];
-	sop_write(g, &op->dst, 0, sop_pack(g, fin), ok);
+	packed_write(g, &op->dst, 0, sop_pack(g, fin), ok);
 }
 static void emit_sop3(Gen *g, const UOp *op, int *ok) {
 	uint32_t zero = c_float(&g->s, 0.0f);
-	uint32_t w0 = sop_read(g, &op->s0, 0, ok), w1 = sop_read(g, &op->s1, 0, ok), w2 = sop_read(g, &op->s2, 0, ok);
+	uint32_t w0 = packed_read(g, &op->s0, 0, ok), w1 = packed_read(g, &op->s1, 0, ok), w2 = packed_read(g, &op->s2, 0, ok);
 	if (!*ok) return;
 	uint32_t v0[4], v1[4], v2[4]; sop_unpack(g, w0, v0); sop_unpack(g, w1, v1); sop_unpack(g, w2, v2);
 	int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
@@ -1034,14 +1033,14 @@ static void emit_sop3(Gen *g, const UOp *op, int *ok) {
 	uint32_t af2 = (csel2 == 2 || csel2 == 3) ? v1[3] : (csel2 == 4 || csel2 == 5) ? v0[3] : (csel2 == 6 || csel2 == 7) ? v2[3] : zero;
 	if (amod1) af1 = sop_cmp(g, af1); if (cmod2) af2 = sop_cmp(g, af2);   /* (cmod2 for the second alpha factor too, as Vita3K) */
 	out[3] = sop_cop(g, op->sub2, fop2(&g->s, SpvOpFMul, af1, v1[3]), fop2(&g->s, SpvOpFMul, af2, v2[3]));
-	sop_write(g, &op->dst, 0, sop_pack(g, out), ok);
+	packed_write(g, &op->dst, 0, sop_pack(g, out), ok);
 }
 static void emit_i8mad(Gen *g, const UOp *op, int *ok) {
 	Spv *s = &g->s;
 	for (int r = 0; r < op->reps; r++) {
 		int off[4]; imad_offsets(g, op, r, off, ok);
-		UOperand s0 = op->s0; s0.negabs = 0;   /* s0's negate selects subtract below, as usse.c */
-		uint32_t w0 = read_word(g, &s0, off[0], ok), w1 = read_word(g, &op->s1, off[1], ok), w2 = read_word(g, &op->s2, off[2], ok);
+		/* whole packed words in and out, s0's negate selecting subtract below (usse.c's packed_word) */
+		uint32_t w0 = packed_read(g, &op->s0, off[0], ok), w1 = packed_read(g, &op->s1, off[1], ok), w2 = packed_read(g, &op->s2, off[2], ok);
 		if (!*ok) return;
 		int csel0 = op->sub & 3, asel0 = op->sub2 & 1, csel1 = (op->sub2 >> 1) & 1, csel2 = (op->sub2 >> 2) & 1;
 		uint32_t rep = c_uint(s, 0x010101u), rep4 = c_uint(s, 0x01010101u);
@@ -1060,7 +1059,7 @@ static void emit_i8mad(Gen *g, const UOp *op, int *ok) {
 			uint32_t cl = result3(s, &s->func, SpvOpSelect, t_uint(s), result2(s, &s->func, SpvOpUGreaterThan, t_bool(s), lo, c_uint(s, 255)), c_uint(s, 255), lo);
 			result = uop2(s, SpvOpBitwiseOr, result, uop2(s, SpvOpShiftLeftLogical, cl, c_uint(s, 8u * lane)));
 		}
-		write_word(g, &op->dst, off[3], result, ok);
+		packed_write(g, &op->dst, off[3], result, ok);
 	}
 }
 static void emit_i16mad(Gen *g, const UOp *op, int *ok) {

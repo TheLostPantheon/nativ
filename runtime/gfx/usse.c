@@ -1039,18 +1039,19 @@ static uint32_t u8_pack4(const float v[4]) {
 	uint32_t b = (uint32_t)(clamp01(v[2]) * 255.0f + 0.5f), a = (uint32_t)(clamp01(v[3]) * 255.0f + 0.5f);
 	return r | (g << 8) | (b << 16) | (a << 24);
 }
-/* SOP2 / SOP2M / SOP3 work on whole RGBA words: each operand's four U8 lanes are its colour (bytes 0-2) and alpha
- * (byte 3), as Vita3K's translator loads them (all four lanes). Read through the operand's U8 type, component 0 was
- * byte 0 alone (green, blue and alpha came out 0) and only byte 0 of the result was written; and read_i32 negated the
- * word for SOP2's src1 complement flag, which exec_sop2 then applied again to the lanes */
-static uint32_t sop_word(Ctx *cx, const UOperand *o, int off) { UOperand w = *o; w.type = TY_U32; w.negabs = 0; return read_i32(cx, &w, off, 0); }
-static void sop_store(Ctx *cx, const UOperand *o, int off, uint32_t v) { UOperand w = *o; w.type = TY_U32; write_raw_lane(cx, &w, off, 0, v); }
+/* The packed-U8 instructions (SOP2 / SOP2M / SOP3, I8MAD) work on whole words: an operand's four U8 lanes are its
+ * colour (bytes 0-2) and alpha (byte 3), as Vita3K's translator loads them (all four lanes). Read through the operand's
+ * U8 type, component 0 was byte 0 alone (green, blue and alpha came out 0) and only byte 0 of a result was written; and
+ * read_i32 negated the word for a negate flag, which these instructions use as a modifier of their own (SOP2's src1
+ * complement, I8MAD's subtract) */
+static uint32_t packed_word(Ctx *cx, const UOperand *o, int off) { UOperand w = *o; w.type = TY_U32; w.negabs = 0; return read_i32(cx, &w, off, 0); }
+static void packed_store(Ctx *cx, const UOperand *o, int off, uint32_t v) { UOperand w = *o; w.type = TY_U32; write_raw_lane(cx, &w, off, 0, v); }
 static float cop_eval(int op, float x, float y) { switch (op) { case 0: return x + y; case 1: return x - y; case 2: return x < y ? x : y; default: return x > y ? x : y; } }
 static void exec_sop2(Ctx *cx, const UOp *op) {
 	static const int unit[4] = {1, 1, 1, 1};
 	for (int r = 0; r < op->reps; r++) {
 		int off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit), off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
-		uint32_t w1 = sop_word(cx, &op->s1, off1), w2 = sop_word(cx, &op->s2, off2);
+		uint32_t w1 = packed_word(cx, &op->s1, off1), w2 = packed_word(cx, &op->s2, off2);
 		float c1[3], a1, c2[3], a2; u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 		if (op->s1.negabs & 1) { for (int k = 0; k < 3; k++) c1[k] = 1 - c1[k]; a1 = 1 - a1; }
 		int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
@@ -1066,11 +1067,11 @@ static void exec_sop2(Ctx *cx, const UOp *op) {
 		float out[4];
 		for (int k = 0; k < 3; k++) out[k] = cop_eval(op->sub, cf1[k] * c1[k], cf2[k] * c2[k]);
 		out[3] = cop_eval(op->sub2, af1 * a1, af2 * a2);
-		sop_store(cx, &op->dst, offd, u8_pack4(out));
+		packed_store(cx, &op->dst, offd, u8_pack4(out));
 	}
 }
 static void exec_sop2m(Ctx *cx, const UOp *op) {
-	uint32_t w1 = sop_word(cx, &op->s1, 0), w2 = sop_word(cx, &op->s2, 0);
+	uint32_t w1 = packed_word(cx, &op->s1, 0), w2 = packed_word(cx, &op->s2, 0);
 	float c1[3], a1, c2[3], a2; u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 	float s1v[4] = {c1[0], c1[1], c1[2], a1}, s2v[4] = {c2[0], c2[1], c2[2], a2};
 	int sel1 = op->args[0] & 0xFF, mod1 = op->args[0] & 0x100, sel2 = op->args[1] & 0xFF, mod2 = op->args[1] & 0x100;
@@ -1083,13 +1084,13 @@ static void exec_sop2m(Ctx *cx, const UOp *op) {
 	}
 	for (int k = 0; k < 3; k++) res[k] = cop_eval(op->sub, t1[k], t2[k]);
 	res[3] = cop_eval(op->sub2, t1[3], t2[3]);
-	uint32_t old = sop_word(cx, &op->dst, 0); float oldc[3], olda; u8_unpack(old, oldc, &olda);
+	uint32_t old = packed_word(cx, &op->dst, 0); float oldc[3], olda; u8_unpack(old, oldc, &olda);
 	float finalv[4] = {oldc[0], oldc[1], oldc[2], olda};
 	for (int k = 0; k < 4; k++) if (op->mask & (1 << k)) finalv[k] = res[k];
-	sop_store(cx, &op->dst, 0, u8_pack4(finalv));
+	packed_store(cx, &op->dst, 0, u8_pack4(finalv));
 }
 static void exec_sop3(Ctx *cx, const UOp *op) {
-	uint32_t w0 = sop_word(cx, &op->s0, 0), w1 = sop_word(cx, &op->s1, 0), w2 = sop_word(cx, &op->s2, 0);
+	uint32_t w0 = packed_word(cx, &op->s0, 0), w1 = packed_word(cx, &op->s1, 0), w2 = packed_word(cx, &op->s2, 0);
 	float c0[3], a0, c1[3], a1, c2[3], a2; u8_unpack(w0, c0, &a0); u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 	int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
 	int asel1 = op->args[2] & 0xFF, amod1 = op->args[2] & 0x100;
@@ -1107,14 +1108,14 @@ static void exec_sop3(Ctx *cx, const UOp *op) {
 	float out[4];
 	for (int k = 0; k < 3; k++) out[k] = cop_eval(op->sub, cf1[k] * c1[k], cf2[k] * c2[k]);
 	out[3] = cop_eval(op->sub2, af1 * a1, af2 * a2);
-	sop_store(cx, &op->dst, 0, u8_pack4(out));
+	packed_store(cx, &op->dst, 0, u8_pack4(out));
 }
 static void exec_i8mad(Ctx *cx, const UOp *op) {
 	static const int unit[4] = {1, 1, 1, 1};
 	for (int r = 0; r < op->reps; r++) {
 		int off0 = slot_offset(cx, op->repmode, op->s0.bank, 0, r, unit), off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit);
 		int off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
-		uint32_t w0 = read_i32(cx, &op->s0, off0, 0), w1 = read_i32(cx, &op->s1, off1, 0), w2 = read_i32(cx, &op->s2, off2, 0);
+		uint32_t w0 = packed_word(cx, &op->s0, off0), w1 = packed_word(cx, &op->s1, off1), w2 = packed_word(cx, &op->s2, off2);
 		int csel0 = op->sub & 3, asel0 = op->sub2 & 1, csel1 = (op->sub2 >> 1) & 1, csel2 = (op->sub2 >> 2) & 1;
 		uint32_t addrgb = csel0 == 0 ? (w0 & 0xFFFFFF) : csel0 == 1 ? (w1 & 0xFFFFFF) : csel0 == 2 ? ((w0 >> 24) * 0x010101u) : ((w1 >> 24) * 0x010101u);
 		uint32_t adda = asel0 == 0 ? (w0 >> 24) : (w1 >> 24);
@@ -1127,7 +1128,7 @@ static void exec_i8mad(Ctx *cx, const UOp *op) {
 			if (v < 0) v = 0; if (v > 255) v = 255;
 			result |= ((uint32_t)v & 0xFF) << (8 * lane);
 		}
-		write_raw_lane(cx, &op->dst, offd, 0, result);
+		packed_store(cx, &op->dst, offd, result);
 	}
 }
 static void exec_i16mad(Ctx *cx, const UOp *op) {
