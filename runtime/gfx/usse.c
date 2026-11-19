@@ -555,7 +555,7 @@ static UOp decode_one(uint64_t w, int secondary) {
 			uint32_t fc = BITS(w, 40, 38);
 			if (fc == 5) { op.op = OP_NOP; return op; }               /* NOP */
 			if (fc == 0 || fc == 1) { dec_br(w, &op); return op; }    /* BR */
-			if (fc == 2) { op.op = OP_NOP; return op; }               /* return: treated as end-of-program (interpreter stops at instr_count) */
+			if (fc == 2) { op.op = OP_NOP; op.sub = USSE_NOP_RET; return op; }   /* return: a subroutine's end where the program has calls (usse_code_entry), else a no-op */
 			op.op = OP_UNSUPPORTED; return op;
 		}
 		if (opcat == 1 && op2 == 2) { dec_smlsi(w, &op); return op; }
@@ -657,6 +657,7 @@ struct UsseProgram {
 	int is_fragment, supported;
 	int pa_words;          /* vertex: PA words the program can read (header's primary register count, the attribute slots, the index/instance registers), rounded up to 4 -- the GPU backend's per-vertex record */
 	UOp *sec, *prim; int nsec, nprim;
+	int sec_entry, prim_entry;   /* usse_code_entry's answer per stage: -1 no calls */
 	UsseVertexLayout vl;
 	UsseFragLayout fl;
 	uint32_t literal_addr, literal_words;   /* container 16's data, for the uniform-buffer-address table */
@@ -1420,14 +1421,34 @@ static void exec_instruction(Ctx *cx, const UOp *op) {
 	default: break;   /* NOP and everything we treat as a no-op */
 	}
 }
+/* USSE subroutines. A compiler puts a subroutine at the start of the code, ending in a return, and the program's body
+ * after it; each call is a branch to the subroutine that saves the return address in the link register, and the
+ * return goes back there. Execution starts after the last return (Vita3K's analyser reads programs the same way). A
+ * call that ran as a plain jump (as before) went back into the subroutine and on through the body again, until the
+ * 100000-branch guard, for every vertex or pixel; and the GPU translator refused the program. Here a call saves pc + 1,
+ * a return with a saved address jumps to it, and one without ends the program: any number of calls, predicated or not.
+ * Returns the entry, or -1 for a program without calls (it starts at 0, and a return there stays a no-op). */
+int usse_code_entry(const UOp *c, int n) {
+	int last_ret = -1;
+	for (int i = 0; i < n; i++) if (c[i].op == OP_NOP && c[i].sub == USSE_NOP_RET) last_ret = i;
+	if (last_ret < 0) return -1;
+	for (int i = 0; i < n; i++) if (usse_is_call(&c[i], i, last_ret)) return last_ret + 1;
+	return -1;
+}
+int usse_program_entry(const UsseProgram *p, int secondary) { return secondary ? p->sec_entry : p->prim_entry; }
 static const char *opname(int op);
-static void run_program(Ctx *cx, const UOp *code, int n) {
+static void run_program(Ctx *cx, const UOp *code, int n, int entry) {
 	for (int s = 0; s < 4; s++) for (int r = 0; r <= 16; r++) cx->inc[s][r] = (int8_t)r;
-	int guard = 0;
-	for (int pc = 0; pc < n && !cx->t->killed; ) {
+	int guard = 0, link = -1, last_ret = entry > 0 ? entry - 1 : -1;
+	for (int pc = entry > 0 ? entry : 0; pc < n && !cx->t->killed; ) {
 		const UOp *op = &code[pc];
+		if (entry >= 0 && op->op == OP_NOP && op->sub == USSE_NOP_RET) {   /* a subroutine's return: back after its call, or the program's end */
+			if (link < 0) break;
+			pc = link; link = -1; continue;
+		}
 		if (op->op == OP_BR) {
 			if (pred_true(cx, op)) {
+				if (entry >= 0 && usse_is_call(op, pc, last_ret)) link = pc + 1;
 				pc = pc + op->imm;
 				if (++guard > 100000) break;   /* a runaway backward branch; stop rather than hang the pixel/vertex */
 				continue;
@@ -1493,11 +1514,11 @@ static void run_program(Ctx *cx, const UOp *code, int n) {
 void usse_set_trace(int on) { g_trace_force = on; }
 void usse_run_secondary(const UsseProgram *p, UsseInst *inst, UsseDraw *d) {
 	Ctx cx = {0}; cx.t = inst; cx.d = d; cx.secondary = 1;
-	run_program(&cx, p->sec, p->nsec);
+	run_program(&cx, p->sec, p->nsec, p->sec_entry);
 }
 void usse_run_primary(const UsseProgram *p, UsseInst *inst, UsseDraw *d, void *texctx, UsseTexFn texfn) {
 	Ctx cx = {0}; cx.t = inst; cx.d = d; cx.texctx = texctx; cx.texfn = texfn;
-	run_program(&cx, p->prim, p->nprim);
+	run_program(&cx, p->prim, p->nprim, p->prim_entry);
 }
 /* ---------------------------------------------------------------- 4/7. program cache + layouts */
 static int gxp_param_type_for(int cat_type) {   /* §1.3 type code -> our TY_* */
@@ -1637,6 +1658,7 @@ static void decode_program(UsseProgram *p, uint32_t prog_addr, uint32_t hash, ui
 	p->nprim = (int)pn; p->nsec = sn;
 	p->prim = decode_slice(pc, (int)pn, 0, &p->supported);
 	p->sec = decode_slice(sc, sn, 1, &p->supported);
+	p->prim_entry = usse_code_entry(p->prim, p->nprim); p->sec_entry = usse_code_entry(p->sec, p->nsec);
 	if (p->is_fragment) parse_fragment_layout(prog_addr, &p->fl); else parse_vertex_layout(prog_addr, &p->vl);
 	{	int n = RD16(prog_addr + H_PRIM_REGS);
 		if (!p->is_fragment) {

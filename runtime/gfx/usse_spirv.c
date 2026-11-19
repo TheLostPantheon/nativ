@@ -176,7 +176,7 @@ typedef struct {
 	uint32_t var_r, var_pa, var_o, var_i;        /* Private arrays */
 	uint32_t var_sa;                               /* Uniform block instance (SA) */
 	uint32_t var_p;                                 /* Private bool[4] predicates (always false: VTST/VTSTMSK unsupported here) */
-	uint32_t var_pc, var_steps;                     /* Private uints: a branching program's pc and step count (the loop-and-switch form) */
+	uint32_t var_pc, var_steps, var_link;           /* Private uints: a branching program's pc, step count and return address (the loop-and-switch form) */
 	uint32_t var_idx;                                /* Private uint[2] index registers idx1/idx2 (UsseInst.idx), zero-initialised */
 	uint32_t smp_sampler[16];                          /* UniformConstant sampled-image vars actually used, 0 if unused */
 	uint32_t t_simg, t_simg_cube;                        /* their OpTypeSampledImage (2D, and a 6-layer 2D array for cube units), to OpLoad through */
@@ -2343,11 +2343,13 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	 * loop around a switch on its pc, one case a basic block, as usse.c's run_program steps it -- a taken branch sets
 	 * pc to its target, anything else falls through to the next block, and the loop ends when pc passes the last
 	 * instruction (or after run_program's 100000 steps, so a runaway loop ends instead of hanging the GPU). Only
-	 * programs the structured form can't take go this way: the rest translate as before. Not taken this way:
-	 * link-saving calls (run_program doesn't model their return either), a branch before the program's start, and
+	 * programs the structured form can't take go this way: the rest translate as before. Subroutines too
+	 * (usse_code_entry): pc starts at the program's entry, a call saves its return address in a link variable and a
+	 * return goes back to it (or ends the program). Not taken this way: a branch before the program's start, and
 	 * SMLSI/SMBO past the first block (their repeat steps are fixed at translate time, in program order) */
-	int sm = 0; uint8_t *sm_lead = 0; uint32_t *sm_lbl = 0;
-	{
+	const int entry = usse_program_entry(prog, 0), last_ret = entry > 0 ? entry - 1 : -1;
+	int sm = entry >= 0; uint8_t *sm_lead = 0; uint32_t *sm_lbl = 0;
+	if (!sm) {
 		struct { int end; } st[8]; int nb = 0;
 		for (int i = 0; i < n; i++) {
 			while (nb && st[nb - 1].end <= i) nb--;
@@ -2360,15 +2362,21 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 	{ static int off = -1; if (off < 0) off = getenv("RECOMP_GPU_NO_JUMPS") != 0; if (off) sm = 0; }   /* RECOMP_GPU_NO_JUMPS=1: not this way (those programs back on the CPU path, for an A/B) */
 	if (sm) {
 		sm_lead = calloc((size_t)n + 1, 1); sm_lbl = calloc((size_t)n + 1, sizeof *sm_lbl); sm_lead[0] = 1;
-		for (int i = 0; i < n && sm; i++) if (code[i].op == OP_BR) {
+		if (entry > 0 && entry < n) sm_lead[entry] = 1;
+		for (int i = 0; i < n && sm; i++) {
+			if (entry >= 0 && code[i].op == OP_NOP && code[i].sub == USSE_NOP_RET && i + 1 < n) sm_lead[i + 1] = 1;
+			if (code[i].op != OP_BR) continue;
 			int target = i + (int)code[i].imm;
-			if (code[i].args[0] || target < 0) sm = 0;
+			if (target < 0) sm = 0;
 			if (i + 1 < n) sm_lead[i + 1] = 1;
 			if (target >= 0 && target < n) sm_lead[target] = 1;
 		}
 		int first = 1; while (first < n && !sm_lead[first]) first++;
 		for (int i = first; i < n && sm; i++) if (code[i].op == OP_SMLSI || code[i].op == OP_SMBO) sm = 0;
-		if (sm && !g.var_pc) { g.var_pc = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0)); g.var_steps = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0)); }
+		if (sm && !g.var_pc) {
+			g.var_pc = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0)); g.var_steps = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0));
+			g.var_link = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, ~0u));
+		}
 	}
 	for (int tap = 0; tap < taps && ok; tap++) {
 		if (taps > 1) {
@@ -2386,7 +2394,7 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 		if (sm) {
 			sm_hdr = nid(s); sm_swm = nid(s); sm_cont = nid(s); sm_end = nid(s); sm_dflt = nid(s);
 			uint32_t body = nid(s), *sw = malloc(((size_t)n * 2 + 2) * sizeof *sw); int nsw = 0;
-			store(s, g.var_pc, c_uint(s, 0)); store(s, g.var_steps, c_uint(s, 0));
+			store(s, g.var_pc, c_uint(s, (uint32_t)(entry > 0 ? entry : 0))); store(s, g.var_steps, c_uint(s, 0)); store(s, g.var_link, c_uint(s, ~0u));
 			INS(&s->func, SpvOpBranch, sm_hdr); INS(&s->func, SpvOpLabel, sm_hdr);
 			INS(&s->func, SpvOpLoopMerge, sm_end, sm_cont, 0 /*None*/);
 			INS(&s->func, SpvOpBranch, body); INS(&s->func, SpvOpLabel, body);
@@ -2402,13 +2410,22 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 				INS(&s->func, SpvOpLabel, sm_lbl[i]); sm_open = 1;
 			}
 			while (nbr && brstack[nbr - 1].end <= i) { INS(&s->func, SpvOpBranch, brstack[nbr - 1].merge); INS(&s->func, SpvOpLabel, brstack[nbr - 1].merge); nbr--; }
-			if (op->op == OP_BR && sm) {   /* the block's end: pc = the target if taken, else the next instruction */
-				int target = i + (int)op->imm; uint32_t tv = c_uint(s, (uint32_t)(target > n ? n : target)), nv = tv;
+			if (sm && entry >= 0 && op->op == OP_NOP && op->sub == USSE_NOP_RET) {   /* a return: to the saved address, or the end */
+				uint32_t lk = load(s, t_uint(s), g.var_link);
+				uint32_t none = result2(s, &s->func, SpvOpIEqual, t_bool(s), lk, c_uint(s, ~0u));
+				store(s, g.var_pc, result3(s, &s->func, SpvOpSelect, t_uint(s), none, c_uint(s, (uint32_t)n), lk)); store(s, g.var_link, c_uint(s, ~0u));
+				INS(&s->func, SpvOpBranch, sm_swm); sm_open = 0;
+				continue;
+			}
+			if (op->op == OP_BR && sm) {   /* the block's end: pc = the target if taken, else the next instruction (a call saves that) */
+				int target = i + (int)op->imm; uint32_t tv = c_uint(s, (uint32_t)(target > n ? n : target)), nv = tv, next = c_uint(s, (uint32_t)(i + 1));
+				int call = entry >= 0 && usse_is_call(op, i, last_ret);
 				if (op->pred_kind != 0) {
 					uint32_t p = load(s, t_bool(s), pred_ptr(&g, op->pred_reg));
 					uint32_t taken = op->pred_kind == 1 ? p : result1(s, &s->func, SpvOpLogicalNot, t_bool(s), p);
-					nv = result3(s, &s->func, SpvOpSelect, t_uint(s), taken, tv, c_uint(s, (uint32_t)(i + 1)));
-				}
+					nv = result3(s, &s->func, SpvOpSelect, t_uint(s), taken, tv, next);
+					if (call) store(s, g.var_link, result3(s, &s->func, SpvOpSelect, t_uint(s), taken, next, load(s, t_uint(s), g.var_link)));
+				} else if (call) store(s, g.var_link, next);
 				store(s, g.var_pc, nv); INS(&s->func, SpvOpBranch, sm_swm); sm_open = 0;
 				continue;
 			}
