@@ -664,11 +664,12 @@ static int play_motion(float a[3], float g[3], float q[4]) {   /* the latest rec
 }
 /* pad2: a PS TV's paired pad (the "2" reads of port 1): a DualShock's buttons, L1/R1 and L2/R2 apart and the stick clicks
  * (window_input_pad2); every other read gets the handheld's (window_input) */
+#define SCE_CTRL_DATA_SIZE 32   /* SceCtrlData: timeStamp 8, buttons 4, lx ly rx ry 4, reserved 16 (the records of a read follow each other at this stride) */
 static void ctrl_peek(Cpu *c, int pad2) {   /* (port, SceCtrlData *, count): timestamp, buttons, sticks centred */
 	input_rec_init();
 	for (uint32_t i = 0; i < A2; i++) {
-		uint32_t p = A1 + 64 * i;
-		memset(G(p), 0, 64);
+		uint32_t p = A1 + SCE_CTRL_DATA_SIZE * i;
+		memset(G(p), 0, SCE_CTRL_DATA_SIZE);
 		WR64(p, guest_time_us());
 		extern void window_input(uint32_t *b, uint8_t s[4]); extern void window_input_pad2(uint32_t *b, uint8_t s[4]);
 		uint32_t b; uint8_t st[4];
