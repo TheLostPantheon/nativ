@@ -3689,6 +3689,16 @@ static SDL_GPUGraphicsPipeline *view_pipeline_for(int from_depth, const ViewU *u
 static TexEntry views[MAXVIEW]; static int nviews;
 static void views_release_samplers(void) { for (int i = 0; i < nviews; i++) tex_release_samplers(&views[i]); }
 static int no_views(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_VIEWS") != 0; return v; }   /* RECOMP_GPU_NO_VIEWS=1: the guest-memory path for every render-target read (an A/B check) */
+/* a four-component target of any swizzle (U8x4, F16x4): its GPU texture holds the colour as drawn (r, g, b, a), its memory
+ * the components in the order gfx_soft.c's target_write_of stores for the swizzle (component i = colour enc[s][i]: ABGR,
+ * ARGB, RGBA, BGRA), and the texture's selectors index that memory, so the view's selectors are the two composed. ABGR
+ * alone had a view before: every other swizzle took the guest-memory path, a synchronous download per read (WipEout
+ * 2048's 480x272 ARGB target, every frame) */
+static void view_swz_stored(uint32_t tgt_fmt, uint32_t swz[4]) {
+	static const uint8_t enc[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
+	const uint8_t *e = enc[(tgt_fmt >> 20) & 3];
+	for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = e[swz[k]];
+}
 /* which decode the view shader runs for a target's format read by a texture's base format (-1: none known); tex_bpp: the texture's bytes per texel */
 static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp, uint32_t swz[4]) {
 	uint32_t tb = tgt_fmt & 0xF1800000u, xb = tex->format & 0xff000000u, sw = (tex->format >> 12) & 7;
@@ -3708,22 +3718,14 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	case 0x10800000u: return xb == 0x12000000u ? 6 : -1;                                        /* F32 as F32 (mode 5's decode at full precision: Uncharted's
 	                                                                                               * shadow mask went through guest memory, its lighting read
 	                                                                                               * it at 1x and every lit silhouette got a 1x-pixel halo) */
-	case 0x01000000u: *tex_bpp = 8; return xb == 0x1b000000u ? 0 : -1;                          /* F16F16F16F16 as F16F16F16F16 */
+	case 0x01000000u: *tex_bpp = 8; if (xb != 0x1b000000u) return -1;                         /* F16F16F16F16 as F16F16F16F16 */
+		view_swz_stored(tgt_fmt, swz); return 0;
 	case 0x21000000u: return xb == 0x1a000000u ? 1 : -1;                                        /* F11F11F10 as F11F11F10 */
 	case 0x41000000u: return xb == 0x9a000000u ? 2 : -1;                                        /* U2F10F10F10 as U2F10F10F10 */
 	case 0x11000000u: return xb == 0x0c000000u ? 3 : xb == 0x0d000000u ? 4 : -1;                /* F32F32 as U8U8U8U8 / S8S8S8S8 bytes */
-	case 0x00000000u: {                                                                        /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
-		/* any target swizzle: its GPU texture holds the colour as drawn (r, g, b, a), its memory the bytes gfx_soft.c's
-		 * target_write_of stores for the swizzle (byte i = colour enc[s][i]: ABGR, ARGB, RGBA, BGRA), and the texture's
-		 * selectors index those bytes, so the view's selectors are the two composed. ABGR alone had a view before: every
-		 * other swizzle took the guest-memory path, a synchronous download per read (WipEout 2048's 480x272 ARGB target,
-		 * every frame) */
-		static const uint8_t enc[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
+	case 0x00000000u:                                                                          /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
 		if (xb != 0x0c000000u) return -1;
-		const uint8_t *e = enc[(tgt_fmt >> 20) & 3];
-		for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = e[swz[k]];
-		return 0;
-	}
+		view_swz_stored(tgt_fmt, swz); return 0;
 	}
 	return -1;
 }
