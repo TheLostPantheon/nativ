@@ -341,7 +341,7 @@ static void dec_vbw(uint64_t w, int sec, UOp *op) {
 	op->args[2] = (int32_t)BITS(w, 37, 36);     /* src2_exth */
 	op->mask = 0xF;
 	op->s0.bank = BK_NONE;
-	op->reps = 1; op->repmode = RM_EXTERNAL;
+	op->reps = (uint8_t)(BITS(w, 47, 44) + 1); op->repmode = RM_SLMSI;   /* the repeat count, stepped as SLMSI says, one word a step (Vita3K's vbw); it was read as 1 */
 }
 
 /* ---- SOP2 / SOP2M / SOP3 (§3.11): U8 RGBA blend-style sum of products ---- */
@@ -555,7 +555,7 @@ static UOp decode_one(uint64_t w, int secondary) {
 			uint32_t fc = BITS(w, 40, 38);
 			if (fc == 5) { op.op = OP_NOP; return op; }               /* NOP */
 			if (fc == 0 || fc == 1) { dec_br(w, &op); return op; }    /* BR */
-			if (fc == 2) { op.op = OP_NOP; return op; }               /* return: treated as end-of-program (interpreter stops at instr_count) */
+			if (fc == 2) { op.op = OP_NOP; op.sub = USSE_NOP_RET; return op; }   /* return: a subroutine's end where the program has calls (usse_code_entry), else a no-op */
 			op.op = OP_UNSUPPORTED; return op;
 		}
 		if (opcat == 1 && op2 == 2) { dec_smlsi(w, &op); return op; }
@@ -657,6 +657,7 @@ struct UsseProgram {
 	int is_fragment, supported;
 	int pa_words;          /* vertex: PA words the program can read (header's primary register count, the attribute slots, the index/instance registers), rounded up to 4 -- the GPU backend's per-vertex record */
 	UOp *sec, *prim; int nsec, nprim;
+	int sec_entry, prim_entry;   /* usse_code_entry's answer per stage: -1 no calls */
 	UsseVertexLayout vl;
 	UsseFragLayout fl;
 	uint32_t literal_addr, literal_words;   /* container 16's data, for the uniform-buffer-address table */
@@ -1015,9 +1016,12 @@ static void exec_vtstmsk(Ctx *cx, const UOp *op) {
 }
 static uint32_t rol32(uint32_t v, int s) { s &= 31; return s ? (v << s) | (v >> (32 - s)) : v; }
 static void exec_vbw(Ctx *cx, const UOp *op) {
-	uint32_t a = read_i32(cx, &op->s1, 0, 0), b;
+	static const int unit[4] = {1, 1, 1, 1};
+	for (int r = 0; r < op->reps; r++) {   /* (a repeat-2 OR #0 copies two words: an output pair's four halves) */
+	int off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit), off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
+	uint32_t a = read_i32(cx, &op->s1, off1, 0), b;
 	if (op->s2.bank == BK_IMM) b = (uint32_t)op->s2.num | ((uint32_t)op->imm << 7) | ((uint32_t)op->args[2] << 14);
-	else b = read_i32(cx, &op->s2, 0, 0);
+	else b = read_i32(cx, &op->s2, off2, 0);
 	int rot = op->args[0] & 31;
 	b = op->sub3 ? (uint32_t)(((b << (rot & 15)) | (b >> (16 - (rot & 15)))) & 0xFFFF) : rol32(b, rot);
 	if (op->args[1]) b = op->sub3 ? (~b & 0xFFFFu) : ~b;
@@ -1030,7 +1034,8 @@ static void exec_vbw(Ctx *cx, const UOp *op) {
 	default: result = a; break;
 	}
 	if (op->sub3) result &= 0xFFFFu;
-	write_raw_lane(cx, &op->dst, 0, 0, result);
+	write_raw_lane(cx, &op->dst, offd, 0, result);
+	}
 }
 static void u8_unpack(uint32_t w, float rgb[3], float *a) { rgb[0] = (w & 0xFF) / 255.0f; rgb[1] = ((w >> 8) & 0xFF) / 255.0f; rgb[2] = ((w >> 16) & 0xFF) / 255.0f; *a = ((w >> 24) & 0xFF) / 255.0f; }
 static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
@@ -1039,12 +1044,19 @@ static uint32_t u8_pack4(const float v[4]) {
 	uint32_t b = (uint32_t)(clamp01(v[2]) * 255.0f + 0.5f), a = (uint32_t)(clamp01(v[3]) * 255.0f + 0.5f);
 	return r | (g << 8) | (b << 16) | (a << 24);
 }
+/* The packed-U8 instructions (SOP2 / SOP2M / SOP3, I8MAD) work on whole words: an operand's four U8 lanes are its
+ * colour (bytes 0-2) and alpha (byte 3), as Vita3K's translator loads them (all four lanes). Read through the operand's
+ * U8 type, component 0 was byte 0 alone (green, blue and alpha came out 0) and only byte 0 of a result was written; and
+ * read_i32 negated the word for a negate flag, which these instructions use as a modifier of their own (SOP2's src1
+ * complement, I8MAD's subtract) */
+static uint32_t packed_word(Ctx *cx, const UOperand *o, int off) { UOperand w = *o; w.type = TY_U32; w.negabs = 0; return read_i32(cx, &w, off, 0); }
+static void packed_store(Ctx *cx, const UOperand *o, int off, uint32_t v) { UOperand w = *o; w.type = TY_U32; write_raw_lane(cx, &w, off, 0, v); }
 static float cop_eval(int op, float x, float y) { switch (op) { case 0: return x + y; case 1: return x - y; case 2: return x < y ? x : y; default: return x > y ? x : y; } }
 static void exec_sop2(Ctx *cx, const UOp *op) {
 	static const int unit[4] = {1, 1, 1, 1};
 	for (int r = 0; r < op->reps; r++) {
 		int off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit), off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
-		uint32_t w1 = read_i32(cx, &op->s1, off1, 0), w2 = read_i32(cx, &op->s2, off2, 0);
+		uint32_t w1 = packed_word(cx, &op->s1, off1), w2 = packed_word(cx, &op->s2, off2);
 		float c1[3], a1, c2[3], a2; u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 		if (op->s1.negabs & 1) { for (int k = 0; k < 3; k++) c1[k] = 1 - c1[k]; a1 = 1 - a1; }
 		int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
@@ -1060,11 +1072,11 @@ static void exec_sop2(Ctx *cx, const UOp *op) {
 		float out[4];
 		for (int k = 0; k < 3; k++) out[k] = cop_eval(op->sub, cf1[k] * c1[k], cf2[k] * c2[k]);
 		out[3] = cop_eval(op->sub2, af1 * a1, af2 * a2);
-		write_raw_lane(cx, &op->dst, offd, 0, u8_pack4(out));
+		packed_store(cx, &op->dst, offd, u8_pack4(out));
 	}
 }
 static void exec_sop2m(Ctx *cx, const UOp *op) {
-	uint32_t w1 = read_i32(cx, &op->s1, 0, 0), w2 = read_i32(cx, &op->s2, 0, 0);
+	uint32_t w1 = packed_word(cx, &op->s1, 0), w2 = packed_word(cx, &op->s2, 0);
 	float c1[3], a1, c2[3], a2; u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 	float s1v[4] = {c1[0], c1[1], c1[2], a1}, s2v[4] = {c2[0], c2[1], c2[2], a2};
 	int sel1 = op->args[0] & 0xFF, mod1 = op->args[0] & 0x100, sel2 = op->args[1] & 0xFF, mod2 = op->args[1] & 0x100;
@@ -1077,13 +1089,13 @@ static void exec_sop2m(Ctx *cx, const UOp *op) {
 	}
 	for (int k = 0; k < 3; k++) res[k] = cop_eval(op->sub, t1[k], t2[k]);
 	res[3] = cop_eval(op->sub2, t1[3], t2[3]);
-	uint32_t old = read_i32(cx, &op->dst, 0, 0); float oldc[3], olda; u8_unpack(old, oldc, &olda);
+	uint32_t old = packed_word(cx, &op->dst, 0); float oldc[3], olda; u8_unpack(old, oldc, &olda);
 	float finalv[4] = {oldc[0], oldc[1], oldc[2], olda};
 	for (int k = 0; k < 4; k++) if (op->mask & (1 << k)) finalv[k] = res[k];
-	write_raw_lane(cx, &op->dst, 0, 0, u8_pack4(finalv));
+	packed_store(cx, &op->dst, 0, u8_pack4(finalv));
 }
 static void exec_sop3(Ctx *cx, const UOp *op) {
-	uint32_t w0 = read_i32(cx, &op->s0, 0, 0), w1 = read_i32(cx, &op->s1, 0, 0), w2 = read_i32(cx, &op->s2, 0, 0);
+	uint32_t w0 = packed_word(cx, &op->s0, 0), w1 = packed_word(cx, &op->s1, 0), w2 = packed_word(cx, &op->s2, 0);
 	float c0[3], a0, c1[3], a1, c2[3], a2; u8_unpack(w0, c0, &a0); u8_unpack(w1, c1, &a1); u8_unpack(w2, c2, &a2);
 	int csel1 = op->args[0] & 0xFF, cmod1 = op->args[0] & 0x100, csel2 = op->args[1] & 0xFF, cmod2 = op->args[1] & 0x100;
 	int asel1 = op->args[2] & 0xFF, amod1 = op->args[2] & 0x100;
@@ -1101,14 +1113,14 @@ static void exec_sop3(Ctx *cx, const UOp *op) {
 	float out[4];
 	for (int k = 0; k < 3; k++) out[k] = cop_eval(op->sub, cf1[k] * c1[k], cf2[k] * c2[k]);
 	out[3] = cop_eval(op->sub2, af1 * a1, af2 * a2);
-	write_raw_lane(cx, &op->dst, 0, 0, u8_pack4(out));
+	packed_store(cx, &op->dst, 0, u8_pack4(out));
 }
 static void exec_i8mad(Ctx *cx, const UOp *op) {
 	static const int unit[4] = {1, 1, 1, 1};
 	for (int r = 0; r < op->reps; r++) {
 		int off0 = slot_offset(cx, op->repmode, op->s0.bank, 0, r, unit), off1 = slot_offset(cx, op->repmode, op->s1.bank, 1, r, unit);
 		int off2 = slot_offset(cx, op->repmode, op->s2.bank, 2, r, unit), offd = slot_offset(cx, op->repmode, op->dst.bank, 3, r, unit);
-		uint32_t w0 = read_i32(cx, &op->s0, off0, 0), w1 = read_i32(cx, &op->s1, off1, 0), w2 = read_i32(cx, &op->s2, off2, 0);
+		uint32_t w0 = packed_word(cx, &op->s0, off0), w1 = packed_word(cx, &op->s1, off1), w2 = packed_word(cx, &op->s2, off2);
 		int csel0 = op->sub & 3, asel0 = op->sub2 & 1, csel1 = (op->sub2 >> 1) & 1, csel2 = (op->sub2 >> 2) & 1;
 		uint32_t addrgb = csel0 == 0 ? (w0 & 0xFFFFFF) : csel0 == 1 ? (w1 & 0xFFFFFF) : csel0 == 2 ? ((w0 >> 24) * 0x010101u) : ((w1 >> 24) * 0x010101u);
 		uint32_t adda = asel0 == 0 ? (w0 >> 24) : (w1 >> 24);
@@ -1121,7 +1133,7 @@ static void exec_i8mad(Ctx *cx, const UOp *op) {
 			if (v < 0) v = 0; if (v > 255) v = 255;
 			result |= ((uint32_t)v & 0xFF) << (8 * lane);
 		}
-		write_raw_lane(cx, &op->dst, offd, 0, result);
+		packed_store(cx, &op->dst, offd, result);
 	}
 }
 static void exec_i16mad(Ctx *cx, const UOp *op) {
@@ -1409,14 +1421,34 @@ static void exec_instruction(Ctx *cx, const UOp *op) {
 	default: break;   /* NOP and everything we treat as a no-op */
 	}
 }
+/* USSE subroutines. A compiler puts a subroutine at the start of the code, ending in a return, and the program's body
+ * after it; each call is a branch to the subroutine that saves the return address in the link register, and the
+ * return goes back there. Execution starts after the last return (Vita3K's analyser reads programs the same way). A
+ * call that ran as a plain jump (as before) went back into the subroutine and on through the body again, until the
+ * 100000-branch guard, for every vertex or pixel; and the GPU translator refused the program. Here a call saves pc + 1,
+ * a return with a saved address jumps to it, and one without ends the program: any number of calls, predicated or not.
+ * Returns the entry, or -1 for a program without calls (it starts at 0, and a return there stays a no-op). */
+int usse_code_entry(const UOp *c, int n) {
+	int last_ret = -1;
+	for (int i = 0; i < n; i++) if (c[i].op == OP_NOP && c[i].sub == USSE_NOP_RET) last_ret = i;
+	if (last_ret < 0) return -1;
+	for (int i = 0; i < n; i++) if (usse_is_call(&c[i], i, last_ret)) return last_ret + 1;
+	return -1;
+}
+int usse_program_entry(const UsseProgram *p, int secondary) { return secondary ? p->sec_entry : p->prim_entry; }
 static const char *opname(int op);
-static void run_program(Ctx *cx, const UOp *code, int n) {
+static void run_program(Ctx *cx, const UOp *code, int n, int entry) {
 	for (int s = 0; s < 4; s++) for (int r = 0; r <= 16; r++) cx->inc[s][r] = (int8_t)r;
-	int guard = 0;
-	for (int pc = 0; pc < n && !cx->t->killed; ) {
+	int guard = 0, link = -1, last_ret = entry > 0 ? entry - 1 : -1;
+	for (int pc = entry > 0 ? entry : 0; pc < n && !cx->t->killed; ) {
 		const UOp *op = &code[pc];
+		if (entry >= 0 && op->op == OP_NOP && op->sub == USSE_NOP_RET) {   /* a subroutine's return: back after its call, or the program's end */
+			if (link < 0) break;
+			pc = link; link = -1; continue;
+		}
 		if (op->op == OP_BR) {
 			if (pred_true(cx, op)) {
+				if (entry >= 0 && usse_is_call(op, pc, last_ret)) link = pc + 1;
 				pc = pc + op->imm;
 				if (++guard > 100000) break;   /* a runaway backward branch; stop rather than hang the pixel/vertex */
 				continue;
@@ -1482,11 +1514,11 @@ static void run_program(Ctx *cx, const UOp *code, int n) {
 void usse_set_trace(int on) { g_trace_force = on; }
 void usse_run_secondary(const UsseProgram *p, UsseInst *inst, UsseDraw *d) {
 	Ctx cx = {0}; cx.t = inst; cx.d = d; cx.secondary = 1;
-	run_program(&cx, p->sec, p->nsec);
+	run_program(&cx, p->sec, p->nsec, p->sec_entry);
 }
 void usse_run_primary(const UsseProgram *p, UsseInst *inst, UsseDraw *d, void *texctx, UsseTexFn texfn) {
 	Ctx cx = {0}; cx.t = inst; cx.d = d; cx.texctx = texctx; cx.texfn = texfn;
-	run_program(&cx, p->prim, p->nprim);
+	run_program(&cx, p->prim, p->nprim, p->prim_entry);
 }
 /* ---------------------------------------------------------------- 4/7. program cache + layouts */
 static int gxp_param_type_for(int cat_type) {   /* §1.3 type code -> our TY_* */
@@ -1626,6 +1658,7 @@ static void decode_program(UsseProgram *p, uint32_t prog_addr, uint32_t hash, ui
 	p->nprim = (int)pn; p->nsec = sn;
 	p->prim = decode_slice(pc, (int)pn, 0, &p->supported);
 	p->sec = decode_slice(sc, sn, 1, &p->supported);
+	p->prim_entry = usse_code_entry(p->prim, p->nprim); p->sec_entry = usse_code_entry(p->sec, p->nsec);
 	if (p->is_fragment) parse_fragment_layout(prog_addr, &p->fl); else parse_vertex_layout(prog_addr, &p->vl);
 	{	int n = RD16(prog_addr + H_PRIM_REGS);
 		if (!p->is_fragment) {

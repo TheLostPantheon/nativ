@@ -3689,6 +3689,16 @@ static SDL_GPUGraphicsPipeline *view_pipeline_for(int from_depth, const ViewU *u
 static TexEntry views[MAXVIEW]; static int nviews;
 static void views_release_samplers(void) { for (int i = 0; i < nviews; i++) tex_release_samplers(&views[i]); }
 static int no_views(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_VIEWS") != 0; return v; }   /* RECOMP_GPU_NO_VIEWS=1: the guest-memory path for every render-target read (an A/B check) */
+/* a four-component target of any swizzle (U8x4, F16x4): its GPU texture holds the colour as drawn (r, g, b, a), its memory
+ * the components in the order gfx_soft.c's target_write_of stores for the swizzle (component i = colour enc[s][i]: ABGR,
+ * ARGB, RGBA, BGRA), and the texture's selectors index that memory, so the view's selectors are the two composed. ABGR
+ * alone had a view before: every other swizzle took the guest-memory path, a synchronous download per read (WipEout
+ * 2048's 480x272 ARGB target, every frame) */
+static void view_swz_stored(uint32_t tgt_fmt, uint32_t swz[4]) {
+	static const uint8_t enc[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
+	const uint8_t *e = enc[(tgt_fmt >> 20) & 3];
+	for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = e[swz[k]];
+}
 /* which decode the view shader runs for a target's format read by a texture's base format (-1: none known); tex_bpp: the texture's bytes per texel */
 static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp, uint32_t swz[4]) {
 	uint32_t tb = tgt_fmt & 0xF1800000u, xb = tex->format & 0xff000000u, sw = (tex->format >> 12) & 7;
@@ -3708,11 +3718,14 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	case 0x10800000u: return xb == 0x12000000u ? 6 : -1;                                        /* F32 as F32 (mode 5's decode at full precision: Uncharted's
 	                                                                                               * shadow mask went through guest memory, its lighting read
 	                                                                                               * it at 1x and every lit silhouette got a 1x-pixel halo) */
-	case 0x01000000u: *tex_bpp = 8; return xb == 0x1b000000u ? 0 : -1;                          /* F16F16F16F16 as F16F16F16F16 */
+	case 0x01000000u: *tex_bpp = 8; if (xb != 0x1b000000u) return -1;                         /* F16F16F16F16 as F16F16F16F16 */
+		view_swz_stored(tgt_fmt, swz); return 0;
 	case 0x21000000u: return xb == 0x1a000000u ? 1 : -1;                                        /* F11F11F10 as F11F11F10 */
 	case 0x41000000u: return xb == 0x9a000000u ? 2 : -1;                                        /* U2F10F10F10 as U2F10F10F10 */
 	case 0x11000000u: return xb == 0x0c000000u ? 3 : xb == 0x0d000000u ? 4 : -1;                /* F32F32 as U8U8U8U8 / S8S8S8S8 bytes */
-	case 0x00000000u: return (tgt_fmt & 0x00300000u) == 0 && xb == 0x0c000000u ? 0 : -1;      /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
+	case 0x00000000u:                                                                          /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
+		if (xb != 0x0c000000u) return -1;
+		view_swz_stored(tgt_fmt, swz); return 0;
 	}
 	return -1;
 }
@@ -5852,7 +5865,9 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		vp2.w = 2.0f * d->vp_xscale; vp2.x = d->vp_xoff - d->vp_xscale;
 		vp2.h = -2.0f * d->vp_yscale; vp2.y = d->vp_yoff + d->vp_yscale;
 		vp2.min_depth = 0.0f; vp2.max_depth = 1.0f;   /* z is mapped in the vertex shader (zOffset + zScale * z/w): the depth range stays the full [0,1] */
-	} else if (d->viewport_set) {   /* SCE_GXM_VIEWPORT_DISABLED: clip position IS the device position, 1:1 */
+	} else if (d->viewport_set && !g_points_draw) {   /* SCE_GXM_VIEWPORT_DISABLED: positions in target pixels, mapped to clip space by the vertex epilogue (viewport_z[2..3], below) */
+		vp2 = (SDL_GPUViewport){ 0, 0, (float)vw, (float)scene_entry->height, 0.0f, 1.0f };
+	} else if (d->viewport_set) {   /* (DISABLED point sprites: clip position as the device position, as before) */
 		vp2 = (SDL_GPUViewport){ -1.0f, -1.0f, 2.0f, 2.0f, 0.0f, 1.0f };
 	} else vp2 = (SDL_GPUViewport){ 0, 0, (float)vw, (float)scene_entry->height, 0.0f, 1.0f };   /* never set: the old implicit full-target mapping */
 	{ float kx = (float)scene_sx, ky = (float)scene_sy; vp2.x *= kx; vp2.y *= ky; vp2.w *= kx; vp2.h *= ky; }   /* render scale: the target's pixels are n x n (DISABLED's 1:1 device mapping too: (-n,-n,2n,2n) puts clip x at n*x) */
@@ -5960,6 +5975,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		int vz_on = d->viewport_set && !d->viewport_disabled;
 		b->vu.viewport_z[0] = b->fu.viewport_z[0] = vz_on ? d->vp_zoff : 0.0f; b->vu.viewport_z[1] = b->fu.viewport_z[1] = vz_on ? d->vp_zscale : 1.0f;
 		b->vu.viewport_z[2] = b->vu.viewport_z[3] = b->fu.viewport_z[2] = b->fu.viewport_z[3] = 0;
+		if (d->viewport_set && d->viewport_disabled && !g_points_draw) { b->vu.viewport_z[2] = 2.0f / (float)vw; b->vu.viewport_z[3] = 2.0f / (float)scene_entry->height; }   /* (emit_vert_epilogue's pixel -> clip mapping) */
 		if (g_points_draw) {   /* point sprites: half a target pixel in NDC per axis, signed for the screen's directions (gfx_soft.c's render_points_interp) */
 			float kx, ky; int ydown, xleft = 0;
 			if (d->viewport_set && d->viewport_disabled) { kx = ky = 1; ydown = 1; }

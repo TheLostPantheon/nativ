@@ -15,4 +15,5 @@ void gfxcov_write(void);
  * seen set to something other than its default -- a gap no backend can report, never seeing it.
  * partial: 1 approximated, 0 ignored */
 void gfxcov_gap(const char *key, const char *value, int partial, const char *note);
+void gfxcov_state(const char *key, const char *value, const char *note);   /* state gxm_sony.c draw() settles for the renderers (two-sided) */
 #endif

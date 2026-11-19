@@ -70,6 +70,11 @@ static const uint32_t usse_fpconst[64][2] = {
 /* the decoded micro-op array for a program's primary (vertex/fragment) or secondary (uniform
  * setup) code, straight from usse_get's cache -- the same array usse_run_primary/secondary walk. */
 const UOp *usse_program_code(const UsseProgram *p, int secondary, int *count);
+/* subroutines (usse.c usse_code_entry): where a program with calls starts, -1 for one without (it starts at 0 and a
+ * return there is a no-op); a call is a branch that saves the link, or one to instruction 0 after the last return */
+enum { USSE_NOP_RET = 1 };   /* OP_NOP's sub for a return (flow-control function 2) */
+int usse_program_entry(const UsseProgram *p, int secondary);
+static inline int usse_is_call(const UOp *op, int i, int last_ret) { return op->op == OP_BR && (op->args[0] || (last_ret >= 0 && i > last_ret && i + op->imm == 0)); }
 
 /* VDUAL (§3.5) has more operand roles than a UOp has slots -- a unified-store source (US, any
  * bank), three internal-register sources (I0-I2), a unified and an internal destination -- so its

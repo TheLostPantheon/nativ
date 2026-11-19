@@ -1227,7 +1227,7 @@ static uint32_t target_index(const GfxTarget *t, int x, int y) {
 	}
 	return (uint32_t)y * t->stride + (uint32_t)x;
 }
-/* U4U4U4U4 targets: output channel k (R, G, B, A) is nibble u4_order[swizzle][k] -- ABGR, ARGB,
+/* U4U4U4U4 and F16F16F16F16 targets: output channel k (R, G, B, A) is nibble (half) u4_order[swizzle][k] -- ABGR, ARGB,
  * RGBA, BGRA, the byte orders of the 8-bit default case (R in the low nibble, as the texture
  * decode reads the format) */
 static const uint8_t u4_order[4][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {3, 2, 1, 0}, {1, 2, 3, 0}};
@@ -1244,7 +1244,12 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 	uint32_t a = t->data + target_bpp_of(t) * target_index(t, x, y);
 	switch (target_base_of(t)) {
 	case 0x30000000u: { uint16_t p = RD16(a); c[0] = (p >> 11) / 31.f; c[1] = ((p >> 5) & 63) / 63.f; c[2] = (p & 31) / 31.f; c[3] = 1; return; }
-	case 0x01000000u: for (int k = 0; k < 4; k++) c[k] = half_to_float_soft(RD16(a + 2 * k)); return;
+	case 0x01000000u: {   /* F16x4: the channel order of the swizzle, as the 8-bit formats (u4_order: channel k at half o[k]) */
+		const uint8_t *o = u4_order[(t->format >> 20) & 3]; float p[4];
+		for (int k = 0; k < 4; k++) p[k] = half_to_float_soft(RD16(a + 2 * k));
+		for (int k = 0; k < 4; k++) c[k] = p[o[k]];
+		return;
+	}
 	case 0x00800000u: c[0] = half_to_float_soft(RD16(a)); c[1] = half_to_float_soft(RD16(a + 2)); c[2] = 0; c[3] = 1; return;
 	case 0x11000000u: { uint32_t r = RD32(a), g = RD32(a + 4); memcpy(&c[0], &r, 4); memcpy(&c[1], &g, 4); c[2] = 0; c[3] = 1; return; }
 	case 0x10800000u: { uint32_t r = RD32(a); memcpy(&c[0], &r, 4); c[1] = c[2] = 0; c[3] = 1; return; }
@@ -1296,7 +1301,12 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	uint32_t a = t->data + target_bpp_of(t) * target_index(t, x, y);
 	switch (target_base_of(t)) {
 	case 0x30000000u: { uint32_t r = to8(c[0]) >> 3, g = to8(c[1]) >> 2, b = to8(c[2]) >> 3; WR16(a, (uint16_t)(r << 11 | g << 5 | b)); return; }
-	case 0x01000000u: for (int k = 0; k < 4; k++) WR16(a + 2 * k, float_to_half_soft(c[k])); return;
+	case 0x01000000u: {   /* F16x4 in the swizzle's channel order (u4_order), as the 8-bit formats: ABGR alone was kept before */
+		const uint8_t *o = u4_order[(t->format >> 20) & 3]; float p[4];
+		for (int k = 0; k < 4; k++) p[o[k]] = c[k];
+		for (int k = 0; k < 4; k++) WR16(a + 2 * k, float_to_half_soft(p[k]));
+		return;
+	}
 	case 0x00800000u: WR16(a, float_to_half_soft(c[0])); WR16(a + 2, float_to_half_soft(c[1])); return;
 	case 0x11000000u: { uint32_t r, g; memcpy(&r, &c[0], 4); memcpy(&g, &c[1], 4); WR32(a, r); WR32(a + 4, g); return; }
 	case 0x10800000u: { uint32_t r; memcpy(&r, &c[0], 4); WR32(a, r); return; }

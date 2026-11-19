@@ -275,7 +275,7 @@ static void decode_gaps(uint32_t cx, uint32_t vgxp, uint32_t fp, uint32_t front,
 	if (front & 0x800) {   /* +0x1c4 bit 11 two-sided: back faces use +0x1d0 (ISP word), +0x1d4 (bias), +0x1d8 (stencil) */
 		uint32_t back = RD32(cx + 0x1d0), diff = (back ^ front) & 0x01f001ffu;   /* stencil ref/enable, depth write, depth func */
 		int same = !diff && RD32(cx + 0x1d8) == RD32(cx + CX_FRONT_STENCIL) && ((RD32(cx + 0x1d4) ^ RD32(cx + CX_FRONT_VIS)) & 0x03ff0000u) == 0;
-		gfxcov_gap("two_sided", same ? "back state = front" : "back state differs", same, "back faces drawn with the front state");
+		gfxcov_state("two_sided", same ? "back state = front" : "back state differs", same ? 0 : "split by side in draw(): front faces, then back faces");
 	}
 	uint32_t pm = (front >> 15) & 7;   /* SceGxmPolygonMode >> 15 (gfx.h GfxDraw.polygon_mode) */
 	int kind = gfx_prim_kind(prim);
@@ -330,6 +330,7 @@ static int8_t clamp8(int v) { return (int8_t)(v < -128 ? -128 : v > 127 ? 127 : 
 /* a diagnostic switch, read once: getenv walks the environment, and the draw observers called it on every draw (1.4% of
  * Uncharted's main thread, 2026-11-01) */
 static int env_flag(const char *name, int *v) { if (*v < 0) *v = getenv(name) != 0; return *v; }
+static int ts_after;   /* (RECOMP_GXM_TWOSIDED_LOG: the stencil tests after a logged draw) */
 static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t index_format, uint32_t indices, uint32_t count) {
 	GfxDraw d;
 	memset(&d, 0, sizeof d);
@@ -401,7 +402,7 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		}
 	}
 	d.prim = prim; d.index_format = index_format; d.indices = indices; d.count = count;
-	/* fixed function: the front ISP and stencil words (the renderer has no separate back-face state) */
+	/* fixed function: the front ISP and stencil words (two-sided state: below, before the draw goes out) */
 	uint32_t front = RD32(cx + CX_FRONT), st = RD32(cx + CX_FRONT_STENCIL), cull = RD32(cx + CX_CULL);
 	d.cull = (int)(cull & 3);
 	d.polygon_mode = (uint8_t)((front >> 15) & 7); d.point_line_width = (uint8_t)((front >> 28) + 1);
@@ -438,6 +439,48 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		static int stub = -1; if (stub < 0) { const char *e = getenv("RECOMP_VIS_SET"); stub = !(e && (!strcmp(e, "gpu") || !strcmp(e, "real"))); }
 		if (vis[i].set && stub) gfx_vis_write(vis[i].buf + 4u * vis[i].index, 1);
 		else { d.vis_addr = vis[i].buf + 4u * vis[i].index; d.vis_set = (uint8_t)vis[i].set; } } }
+	/* two-sided (+0x1c4 bit 11): back faces take the back ISP word +0x1d0 and
+	 * stencil word +0x1d8, laid out as the front's. A renderer has one state a draw, so the draw is settled here: with one
+	 * side culled it takes the other side's state, and with both sides drawn and the states different it goes out as two
+	 * draws, the front faces with the front state and then the back faces with the back state, each culling the other
+	 * side. Every field counts that way (reference, masks, depth) on both renderers. What it changes is order: a draw's
+	 * front faces all come before its back faces, which a stencil volume (wrapping increments and decrements, the usual
+	 * use) doesn't notice. Back faces used the front state before (Resistance: Burning Skies, tens of thousands of draws) */
+	if (ts_after > 0 && !(front & 0x800) && d.stencil_func != 7) { ts_after--; fprintf(stderr, "    two-sided: then a stencil test func %u ref %u cmask %#x (ops %u/%u/%u) cull %d\n", d.stencil_func, d.stencil_ref, d.stencil_cmask, d.stencil_fail, d.depth_fail, d.depth_pass, d.cull); }
+	if (front & 0x800) {
+		uint32_t back = RD32(cx + 0x1d0), bst = RD32(cx + 0x1d8);
+		GfxDraw b = d;
+		b.depth_func = (back >> 22) & 7; b.depth_write = !(back & 0x100000); b.fp_disabled = (back & 0x200000) != 0;
+		b.stencil_fail = b.depth_fail = b.depth_pass = 0;
+		if (back & 0x100) {
+			b.stencil_func = (bst >> 25) & 7; b.stencil_fail = (bst >> 22) & 7; b.depth_fail = (bst >> 19) & 7; b.depth_pass = (bst >> 16) & 7;
+			b.stencil_cmask = (bst >> 8) & 0xff; b.stencil_wmask = bst & 0xff;
+		} else { b.stencil_func = 7; b.stencil_cmask = b.stencil_wmask = 0xff; }
+		b.stencil_ref = back & 0xff;
+		const int differs = b.depth_func != d.depth_func || b.depth_write != d.depth_write || b.fp_disabled != d.fp_disabled
+		                 || b.stencil_func != d.stencil_func || b.stencil_fail != d.stencil_fail || b.depth_fail != d.depth_fail
+		                 || b.depth_pass != d.depth_pass || b.stencil_cmask != d.stencil_cmask || b.stencil_wmask != d.stencil_wmask
+		                 || b.stencil_ref != d.stencil_ref;
+		/* Which side is the back: counter-clockwise in NDC, the side CULL_CCW culls. That is the opposite of culling's sense
+		 * (a game culls its back faces with CULL_CW), because the stencil's facing is decided after the viewport, whose y flip
+		 * mirrors the winding. Resistance: Burning Skies shows it: its light volumes count with INCR_WRAP on the front state's
+		 * depth fail and DECR_WRAP on the back state's, then light where 4 < stencil and put 4 back. A pixel inside a volume
+		 * fails depth on the volume's far faces only, its clockwise ones, so those must take the front state: the other way
+		 * round every count went down and no light ever passed (Tzeentchnet's #77 had it this way; Vita3K the other).
+		 * RECOMP_GXM_BACK_FACE=cw: the other way round, for an A/B */
+		static int swapf = -1; if (swapf < 0) { const char *e = getenv("RECOMP_GXM_BACK_FACE"); swapf = e && !strcmp(e, "cw"); }
+		const int cull_back = swapf ? 1 : 2, cull_front = swapf ? 2 : 1;   /* (SceGxmCullMode values culling the back side, the front side) */
+		{	/* RECOMP_GXM_TWOSIDED_LOG=n: the first n two-sided draws whose sides differ, both states (and the next draws' stencil
+			 * tests below), to see what a game's stencil passes do with them */
+			static int left = -1; if (left < 0) { const char *e = getenv("RECOMP_GXM_TWOSIDED_LOG"); left = e ? atoi(e) : 0; }
+			if (differs && left > 0) { left--; ts_after = 3;
+				fprintf(stderr, "    two-sided: cull %d prim %u count %u | front func %u fail %u zfail %u zpass %u ref %u cmask %#x wmask %#x depth %u/%d fp %d | back func %u fail %u zfail %u zpass %u ref %u cmask %#x wmask %#x depth %u/%d fp %d\n",
+				        d.cull, prim, count, d.stencil_func, d.stencil_fail, d.depth_fail, d.depth_pass, d.stencil_ref, d.stencil_cmask, d.stencil_wmask, d.depth_func, d.depth_write, d.fp_disabled,
+				        b.stencil_func, b.stencil_fail, b.depth_fail, b.depth_pass, b.stencil_ref, b.stencil_cmask, b.stencil_wmask, b.depth_func, b.depth_write, b.fp_disabled); }
+		}
+		if (differs && d.cull == cull_front) d = b;   /* the front faces culled: the back state is the draw's */
+		else if (differs && d.cull == 0) { d.cull = cull_back; b.cull = cull_front; gfx_draw(&d); d = b; }   /* front faces, then back faces */
+	}
 	gfx_draw(&d);
 	vis_record(cx, front);
 }
