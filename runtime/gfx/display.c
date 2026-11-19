@@ -505,6 +505,9 @@ static void audio_wait_guest(uint32_t i, uint64_t len) {
 static void h_audio_output(Cpu *c) {   /* (port, buffer) */
 	uint32_t i = A0 - 1;
 	if (i >= 8 || !port_len[i]) { RET(0x80260003u); return; }
+	/* the result of an output on an open port is the samples it registered: the port's grain for a buffer, 0 for a NULL one (a
+	 * wait for the output to drain). A sound thread that checks for its grain (`cmp r0, #0x200; bne exit`) quit after its first buffer */
+	const uint32_t result = A1 ? port_len[i] : 0;
 	if (A1) wav_write(i, G(A1));
 	if (port_dev[i]) {
 		if (A1) {
@@ -519,7 +522,7 @@ static void h_audio_output(Cpu *c) {   /* (port, buffer) */
 			}
 		}
 		if (clock_fixed()) audio_wait_guest(i, (uint64_t)port_len[i] * 1000000 / port_freq[i]);
-		RET(0); return;
+		RET(result); return;
 	}
 	if (getenv("RECOMP_AUDIO_STATS") && A1) {   /* how loud the buffers are (silent while NGS is missing?) */
 		static uint64_t nb; int16_t *pcm = (int16_t *)G(A1); double sum = 0; uint32_t n = port_len[i] * port_ch[i];
@@ -527,12 +530,12 @@ static void h_audio_output(Cpu *c) {   /* (port, buffer) */
 		if (nb++ % 200 == 0) fprintf(stderr, "    audio port %u: buffer %llu rms %.1f\n", i, (unsigned long long)nb, sqrt(sum / n));
 	}
 	uint64_t len = (uint64_t)port_len[i] * 1000000 / port_freq[i];
-	if (clock_fixed()) { audio_wait_guest(i, len); RET(0); return; }
+	if (clock_fixed()) { audio_wait_guest(i, len); RET(result); return; }
 	uint64_t t = now_us();
 	if (!port_next[i] || port_next[i] + len < t) port_next[i] = t;
 	if (port_next[i] > t) { int b = sched_block_begin(); usleep((useconds_t)(port_next[i] - t)); if (b) sched_block_end(); }
 	port_next[i] += len;
-	RET(0);
+	RET(result);
 }
 
 /* ---- input: nothing pressed yet */
