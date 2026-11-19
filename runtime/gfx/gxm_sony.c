@@ -459,8 +459,11 @@ static void draw(uint32_t cx, const uint32_t *stream, uint32_t prim, uint32_t in
 		                 || b.stencil_func != d.stencil_func || b.stencil_fail != d.stencil_fail || b.depth_fail != d.depth_fail
 		                 || b.depth_pass != d.depth_pass || b.stencil_cmask != d.stencil_cmask || b.stencil_wmask != d.stencil_wmask
 		                 || b.stencil_ref != d.stencil_ref;
-		if (differs && d.cull == 2) d = b;   /* the front faces culled: the back state is the draw's */
-		else if (differs && d.cull == 0) { d.cull = 1; b.cull = 2; gfx_draw(&d); d = b; }   /* front faces, then back faces */
+		/* RECOMP_GXM_BACK_FACE=ccw (an A/B of the convention): the back state for the faces CULL_CCW culls instead */
+		static int swapf = -1; if (swapf < 0) { const char *e = getenv("RECOMP_GXM_BACK_FACE"); swapf = e && !strcmp(e, "ccw"); }
+		const int cull_back = swapf ? 2 : 1, cull_front = swapf ? 1 : 2;   /* (SceGxmCullMode values culling the back side, the front side) */
+		if (differs && d.cull == cull_front) d = b;   /* the front faces culled: the back state is the draw's */
+		else if (differs && d.cull == 0) { d.cull = cull_back; b.cull = cull_front; gfx_draw(&d); d = b; }   /* front faces, then back faces */
 	}
 	gfx_draw(&d);
 	vis_record(cx, front);
