@@ -127,7 +127,7 @@ void gfxcap_scene(const GfxTarget *t) {
 void gfxcap_draw(const GfxDraw *d) {
 	if (want == -1) return;
 	pthread_mutex_lock(&lock);
-	if (capturing() && out) { sync_memory(); record("DRAW", d, sizeof *d); }
+	if (capturing() && out) { sync_memory(); record("DRW2", d, sizeof *d); }   /* DRW2: GfxTexture with its palette (gfxreplay.c reads DRAW too) */
 	pthread_mutex_unlock(&lock);
 }
 void gfxcap_end_scene(void) {

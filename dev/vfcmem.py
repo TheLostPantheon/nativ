@@ -23,7 +23,7 @@ while True:
         if a<base+size and a+raw>base:
             d=zlib.decompress(pay[8:]); lo=max(a,base); hi=min(a+raw,base+size)
             mem[lo-base:hi-base]=d[lo-a:hi-a]
-    elif tag==b'DRAW':
+    elif tag in (b'DRAW', b'DRW2'):   # (DRW2: the GfxDraw with each texture's palette; counted alike)
         draw+=1
         if draw in want: save(draw)
     elif tag==b'DONE': break
