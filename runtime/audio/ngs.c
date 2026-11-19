@@ -27,14 +27,19 @@
 #include "third_party/libatrac9/libatrac9.h"   /* MIT, vendored unmodified */
 
 
-enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM_AT9, DEF_COMPRESSOR, DEF_SIDECHAIN };
+enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM_AT9, DEF_COMPRESSOR, DEF_SIDECHAIN, DEF_TEMPLATE1, DEF_ATRAC9 };
+/* DEF_TEMPLATE1 (sceNgsVoiceDefGetTemplate1) and DEF_ATRAC9 (sceNgsVoiceDefGetAtrac9Voice): the long voices, a PCM player or an ATRAC9
+ * decoder and then generator, mixer, equalizer, envelope, distortion and four more equalizers (Vita3K's BUSS_NORMAL_PLAYER, BUSS_ATRAC9).
+ * The stages are found by their parameter blocks' ids (stage_module), not their places, so they run as the shorter voices' do. Asked for
+ * by CRI's ADX2 on its NGS path (Persona 4 Golden): the definitions came back 0, its racks were made of silent voices */
 /* a bus that passes what reaches it through (no dynamics yet): the compressor, and the side-chain
  * compressor -- the same with a second input (1) carrying the key signal that drives its gain
  * reduction, which is never part of its output */
 #define PASS_BUS(d) ((d) == DEF_COMPRESSOR || (d) == DEF_SIDECHAIN)
 /* voices whose module 0 is a PCM player (the simple voice FMOD uses; Sony's Scream library's) */
-#define PCM_PLAYER(d) ((d) == DEF_SIMPLE || (d) == DEF_SCREAM)
-#define PLAYER_VOICE(d) (PCM_PLAYER(d) || (d) == DEF_SCREAM_AT9)   /* a voice that plays data and can finish */
+#define PCM_PLAYER(d) ((d) == DEF_SIMPLE || (d) == DEF_SCREAM || (d) == DEF_TEMPLATE1)
+#define AT9_VOICE(d) ((d) == DEF_SCREAM_AT9 || (d) == DEF_ATRAC9)   /* a voice whose module 0 is the ATRAC9 decoder */
+#define PLAYER_VOICE(d) (PCM_PLAYER(d) || AT9_VOICE(d))   /* a voice that plays data and can finish */
 /* ATRAC9 player parameters: descriptor, four buffers of 16 bytes {data, bytes, s16 loops, s16 next,
  * s16 discard at start, s16 at end}, +72 float frequency, +76 float scalar, +88 s8 channels,
  * +92 the codec's configuration word */
@@ -43,7 +48,7 @@ enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM
 #define A_SCALAR 76
 #define A_CHANNELS 88
 #define A_CONFIG 92
-#define MAX_MODULES 8
+#define MAX_MODULES 10   /* (the long voices: DEF_TEMPLATE1, DEF_ATRAC9) */
 /* player parameter layout (see render_player) */
 #define P_BUF(i) (8 + 12 * (i))
 #define P_FREQ 56
@@ -289,7 +294,7 @@ static void dump_setup(void) {
 static void dump_log_line(Voice *v, const char *what, const char *extra) {
 	if (!dump_log) return;
 	VStat *st = &vstat[VIDX(v)]; uint32_t pp = v->params[0];
-	int at9 = v->def == DEF_SCREAM_AT9;
+	int at9 = AT9_VOICE(v->def);
 	float freq, scal; memcpy(&freq, G(pp + (at9 ? A_FREQ : P_FREQ)), 4); memcpy(&scal, G(pp + (at9 ? A_SCALAR : P_SCALAR)), 4);
 	fprintf(dump_log, "upd %llu v %d def %u %s buf %u pos %u freq %.1f scal %.4f ch %d type %d start %u lead %u limit %u startbytes %u map %u %u src_off %u out_off %u%s\n",
 	        (unsigned long long)updates, VIDX(v), v->def, what, v->buffer, v->byte_pos, freq, scal,
@@ -322,6 +327,8 @@ static void h_def_scream(Cpu *c) { RET(defn(DEF_SCREAM)); }
 static void h_def_scream_at9(Cpu *c) { RET(defn(DEF_SCREAM_AT9)); }
 static void h_def_compressor(Cpu *c) { RET(defn(DEF_COMPRESSOR)); }
 static void h_def_sidechain(Cpu *c) { RET(defn(DEF_SIDECHAIN)); }
+static void h_def_template1(Cpu *c) { RET(defn(DEF_TEMPLATE1)); }
+static void h_def_atrac9(Cpu *c) { RET(defn(DEF_ATRAC9)); }
 
 /* ---- system and racks */
 static void h_sys_mem(Cpu *c) { WR32(A1, 0x10000); RET(0); }   /* (params, *size) */
@@ -435,7 +442,7 @@ static void h_voice_play(Cpu *c) {
 		uint32_t pp = v->params[0]; if (pp && PCM_PLAYER(v->def)) v->buffer = ngs_player_start((int8_t)RD8(pp + P_START)); }
 	dump_setup();
 	if (v && dump_dir && PLAYER_VOICE(v->def)) {
-		VStat *st = &vstat[VIDX(v)]; uint32_t pp = v->params[0]; int at9 = v->def == DEF_SCREAM_AT9;
+		VStat *st = &vstat[VIDX(v)]; uint32_t pp = v->params[0]; int at9 = AT9_VOICE(v->def);
 		st->plays++; st->last_type = at9 ? 9 : RD8(pp + P_TYPE); st->last_ch = RD8(pp + (at9 ? A_CHANNELS : P_CHANNELS));
 		memcpy(&st->last_freq, G(pp + (at9 ? A_FREQ : P_FREQ)), 4); memcpy(&st->last_scal, G(pp + (at9 ? A_SCALAR : P_SCALAR)), 4);
 		dump_log_line(v, "play", 0);
@@ -446,9 +453,9 @@ static void h_voice_play(Cpu *c) {
 		for (int i = 0; i < 24; i++) fprintf(stderr, " %08x", RD32(pp + 4 * i));
 		fprintf(stderr, "\n");
 	}
-	if (v && v->def == DEF_SCREAM_AT9) at9_polls[VIDX(v)] = 0;
+	if (v && AT9_VOICE(v->def)) at9_polls[VIDX(v)] = 0;
 	if (v && PCM_PLAYER(v->def) && vo_log_on()) vo_audible[VIDX(v)] = 0;
-	if (v && v->def == DEF_SCREAM_AT9 && vo_log_on()) {
+	if (v && AT9_VOICE(v->def) && vo_log_on()) {
 		vo_audible[VIDX(v)] = 0;
 		char chain[400]; vo_chain(chain, sizeof chain);
 		fprintf(stderr, "    vo: v%d play handle %#x us %llu upd %llu lr %#x from %s\n", VIDX(v), A0, (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14], chain);
@@ -457,7 +464,7 @@ static void h_voice_play(Cpu *c) {
 }
 static void h_voice_kill(Cpu *c) {   /* stopped dead: no callback */
 	Voice *v = voice_of(A0);
-	if (v && v->def == DEF_SCREAM_AT9 && vo_log_on()) fprintf(stderr, "    vo: v%d kill us %llu upd %llu lr %#x\n", VIDX(v), (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14]);
+	if (v && AT9_VOICE(v->def) && vo_log_on()) fprintf(stderr, "    vo: v%d kill us %llu upd %llu lr %#x\n", VIDX(v), (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14]);
 	if (v) { v->playing = 0; v->started = 0; v->finishing = 0; v->releasing = v->released_out = 0; }
 	RET(0);
 }
@@ -468,7 +475,7 @@ static void h_voice_kill(Cpu *c) {   /* stopped dead: no callback */
 static void h_voice_keyoff(Cpu *c) {
 	pthread_mutex_lock(&lock);
 	Voice *v = voice_of(A0);
-	if (v && v->def == DEF_SCREAM_AT9 && vo_log_on()) fprintf(stderr, "    vo: v%d keyoff us %llu upd %llu lr %#x\n", VIDX(v), (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14]);
+	if (v && AT9_VOICE(v->def) && vo_log_on()) fprintf(stderr, "    vo: v%d keyoff us %llu upd %llu lr %#x\n", VIDX(v), (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14]);
 	if (v && v->playing && !v->paused && PLAYER_VOICE(v->def) && !stages_off() && stage_module(v, ENV_ID) >= 0) {
 		if (!v->releasing) { v->releasing = 1; v->rel_ms = 0; v->rel_from = v->env_level; }
 	} else if (v) { if (v->playing && PLAYER_VOICE(v->def)) v->finishing = 1; v->playing = 0; v->started = 0; v->releasing = 0; }
@@ -504,7 +511,7 @@ static void h_voice_info(Cpu *c) {
 	Voice *v = voice_of(A0);
 	memset(G(A1), 0, 24);
 	if (v) { WR32(A1, v->playing ? 1u | (v->paused ? 0x20u : 0) | (v->releasing ? 0x40u : 0) : 0); WR32(A1 + 4, 4);   /* SceNgsVoiceState bits: ACTIVE 1, PAUSED 0x20, KEY_OFF 0x40 (4, written for paused before, is FINALIZE) */ WR32(A1 + 8, 1); WR32(A1 + 12, 1); WR32(A1 + 16, 4); WR32(A1 + 20, v->playing ? v->upd_active : 0); }
-	if (v && v->def == DEF_SCREAM_AT9 && at9_log_on() && at9_polls[VIDX(v)] < 12) { at9_polls[VIDX(v)]++; fprintf(stderr, "    at9 v%d upd %llu GetInfo (lr %#x) -> state %u\n", VIDX(v), (unsigned long long)updates, c->r[14], RD32(A1)); }
+	if (v && AT9_VOICE(v->def) && at9_log_on() && at9_polls[VIDX(v)] < 12) { at9_polls[VIDX(v)]++; fprintf(stderr, "    at9 v%d upd %llu GetInfo (lr %#x) -> state %u\n", VIDX(v), (unsigned long long)updates, c->r[14], RD32(A1)); }
 	RET(0);
 }
 /* (voice, module, params interface id, SceNgsBufferInfo* out): the module's parameter block */
@@ -553,7 +560,7 @@ static void h_voice_set_block(Cpu *c) {
 			for (uint32_t k = 8; k < psize; k += 4) { float f; uint32_t w = RD32(at + 8 + k); memcpy(&f, &w, 4); fprintf(stderr, " %g/%#x", f, w); }
 			fprintf(stderr, "\n");
 		}
-		if (module == 0 && v->def == DEF_SCREAM_AT9 && at9_log_on()) {   /* the buffer table as the game changes it: when each chunk is queued and chained */
+		if (module == 0 && AT9_VOICE(v->def) && at9_log_on()) {   /* the buffer table as the game changes it: when each chunk is queued and chained */
 			uint32_t op = v->params[0], np = at + 8; int changed = 0;
 			for (int i = 0; i < 4 && 8 + 16 * (uint32_t)(i + 1) <= psize; i++) if (RD32(op + A_BUF(i)) != RD32(np + A_BUF(i)) || RD32(op + A_BUF(i) + 4) != RD32(np + A_BUF(i) + 4) || RD16(op + A_BUF(i) + 10) != RD16(np + A_BUF(i) + 10)) changed = 1;
 			if (changed) {
@@ -589,13 +596,13 @@ static int ndue;
  * 0x01015ce6 -> 0x5ce6), or the player's own id while no parameters are set */
 static uint32_t module_id(Voice *v, int m) {
 	uint32_t id = RD32(v->params[m]) & 0xffff;
-	return id ? id : m ? 0 : v->def == DEF_SCREAM_AT9 ? 0x5caa : 0x5ce6;
+	return id ? id : m ? 0 : AT9_VOICE(v->def) ? 0x5caa : 0x5ce6;
 }
 /* the player module's events: END_OF_DATA 0, SWAPPED_BUFFER 1 (reason 2 the previous buffer, the
  * pointer the new one's data), LOOPED_BUFFER (2 for PCM, 4 for ATRAC9; reason 2 the loop count),
  * ATRAC9's DECODE_ERROR 3 (reason 2 the byte position) */
 enum { EV_END = 0, EV_SWAPPED = 1, EV_DECODE_ERROR = 3 };
-#define EV_LOOPED(v) ((v)->def == DEF_SCREAM_AT9 ? 4u : 2u)
+#define EV_LOOPED(v) (AT9_VOICE((v)->def) ? 4u : 2u)
 static void player_event(Voice *v, uint32_t reason, uint32_t reason2, uint32_t ptr) {
 	if (dump_log) { char ex[64]; snprintf(ex, sizeof ex, " reason2 %u ptr %#x", reason2, ptr); dump_log_line(v, reason == EV_END ? "END" : reason == EV_SWAPPED ? "SWAP" : reason == EV_DECODE_ERROR ? "DECODE_ERROR" : "LOOP", ex); }
 	if (!v->mod_cb[0] || ndue >= 256) return;
@@ -1057,13 +1064,13 @@ static void h_system_update(Cpu *c) {
 	for (int i = 0; i < nvoices; i++) {
 		Voice *v = &voices[i];
 		if (!v->playing || v->paused) continue;
-		if (!PCM_PLAYER(v->def) && v->def != DEF_SCREAM_AT9) continue;
+		if (!PCM_PLAYER(v->def) && !AT9_VOICE(v->def)) continue;
 		memset(tmp, 0, sizeof(float) * 2 * gn);
 		int had = ndue;
-		if (v->def == DEF_SCREAM_AT9) render_at9(v, tmp); else render_player(v, tmp);
-		if ((v->def == DEF_SCREAM_AT9 || PCM_PLAYER(v->def)) && vo_log_on() && !vo_audible[i] && v->samples_gen) {
+		if (AT9_VOICE(v->def)) render_at9(v, tmp); else render_player(v, tmp);
+		if ((AT9_VOICE(v->def) || PCM_PLAYER(v->def)) && vo_log_on() && !vo_audible[i] && v->samples_gen) {
 			vo_audible[i] = 1;
-			const int at9 = v->def == DEF_SCREAM_AT9;
+			const int at9 = AT9_VOICE(v->def);
 			const uint32_t pp = v->params[0], b0 = RD32(pp + (at9 ? A_BUF(0) : P_BUF(0))), n0 = RD32(pp + (at9 ? A_BUF(0) : P_BUF(0)) + 4); uint32_t h = 2166136261u;   /* (FNV-1a of its first 256 bytes: the same sound started twice hashes the same) */
 			for (uint32_t k = 0; b0 && k < 256 && k < n0; k++) h = (h ^ RD8(b0 + k)) * 16777619u;
 			extern uint64_t display_frames(void);
@@ -1084,13 +1091,13 @@ static void h_system_update(Cpu *c) {
 			if (uf[i]) { uint32_t u = (uint32_t)updates; fwrite(&u, 4, 1, uf[i]); fflush(uf[i]); }
 		}
 		route(v, tmp, gn);
-		if (!v->playing && v->def == DEF_SCREAM_AT9) at9_log(v, v->params[0], v->buffer, "stopped");
+		if (!v->playing && AT9_VOICE(v->def)) at9_log(v, v->params[0], v->buffer, "stopped");
 		if (!v->playing) {   /* it ran out of data (or failed) during this granule: END_OF_DATA unless the decoder already said why */
-			int failed = 0; for (int k = had; k < ndue; k++) failed |= due[k].voice == v->handle && due[k].reason == EV_DECODE_ERROR && v->def == DEF_SCREAM_AT9;
+			int failed = 0; for (int k = had; k < ndue; k++) failed |= due[k].voice == v->handle && due[k].reason == EV_DECODE_ERROR && AT9_VOICE(v->def);
 			if (!failed) player_event(v, EV_END, 0, 0);
-			if (vo_log_on() && v->def == DEF_SCREAM_AT9) fprintf(stderr, "    vo: v%d callbacks at its end: module %#x finished %#x (queued %d)\n", i, v->mod_cb[0], v->fin_cb, ndue);
-			if (v->def == DEF_SCREAM_AT9) at9_polls[i] = 0;   /* (RECOMP_NGS_AT9_LOG: the engine's next polls -- how it takes the end, e.g. a line it then plays again) */
-			if (vo_log_on() && (v->def == DEF_SCREAM_AT9 || PCM_PLAYER(v->def))) { extern uint64_t display_frames(void); fprintf(stderr, "    vo: v%d def %u ended (out of data%s) frame %llu us %llu samples_gen %u\n", i, v->def, failed ? ", a decode error" : "", (unsigned long long)display_frames(), (unsigned long long)vo_us(), v->samples_gen); }
+			if (vo_log_on() && AT9_VOICE(v->def)) fprintf(stderr, "    vo: v%d callbacks at its end: module %#x finished %#x (queued %d)\n", i, v->mod_cb[0], v->fin_cb, ndue);
+			if (AT9_VOICE(v->def)) at9_polls[i] = 0;   /* (RECOMP_NGS_AT9_LOG: the engine's next polls -- how it takes the end, e.g. a line it then plays again) */
+			if (vo_log_on() && (AT9_VOICE(v->def) || PCM_PLAYER(v->def))) { extern uint64_t display_frames(void); fprintf(stderr, "    vo: v%d def %u ended (out of data%s) frame %llu us %llu samples_gen %u\n", i, v->def, failed ? ", a decode error" : "", (unsigned long long)display_frames(), (unsigned long long)vo_us(), v->samples_gen); }
 			v->finishing = 1;
 		}
 	}
@@ -1138,7 +1145,7 @@ static void h_system_update(Cpu *c) {
 		static uint64_t nu; if (nu++ % 300 == 0) {
 			for (int i = 0; i < nvoices; i++) {
 				Voice *v = &voices[i];
-				if (!v->playing || (!v->acc && !PCM_PLAYER(v->def) && v->def != DEF_SCREAM_AT9)) continue;
+				if (!v->playing || (!v->acc && !PCM_PLAYER(v->def) && !AT9_VOICE(v->def))) continue;
 				uint32_t pp = v->params[0], data = RD32(pp + P_BUF(0)), bytes = RD32(pp + P_BUF(0) + 4), nz = 0;
 				for (uint32_t k = 0; data && k < bytes && k < 8192; k += 2) nz += RD16(data + k) != 0;
 				double e = 0; if (v->acc) for (uint32_t k = 0; k < 2 * gn; k++) e += v->acc[k] * v->acc[k];
@@ -1178,7 +1185,7 @@ static void h_system_update(Cpu *c) {
 			 * after a healthy line's end the engine polls the voice in that same update; before a doubled one it never polls and
 			 * plays the line again 0.7 s later. Was the callback delivered, and when?) */
 			Voice *dv = vo_log_on() && d->reason == EV_END ? voice_of(d->voice) : 0;
-			if (dv && dv->def == DEF_SCREAM_AT9) fprintf(stderr, "    vo: v%d callback %s %#x delivered upd %llu\n", (int)VIDX(dv), d->fn == dv->fin_cb ? "finished" : "END", d->fn, (unsigned long long)updates);
+			if (dv && AT9_VOICE(dv->def)) fprintf(stderr, "    vo: v%d callback %s %#x delivered upd %llu\n", (int)VIDX(dv), d->fn == dv->fin_cb ? "finished" : "END", d->fn, (unsigned long long)updates);
 			guest_call(c, d->fn, info, 0);
 		}
 	}
@@ -1199,8 +1206,8 @@ static void h_voice_state(Cpu *c) {
 		 * left the dialogue running ahead of the lips by however long the window was */
 		WR32(A2, v->byte_pos); WR32(A2 + 4, v->buffer); WR32(A2 + 8, v->samples_gen);
 		WR32(A2 + 12, v->bytes_consumed); WR32(A2 + 16, v->samples_gen); WR32(A2 + 20, v->bytes_consumed);
-		if (v->def == DEF_SCREAM_AT9 && vo_log_on()) vo_state_log(v, c->r[14], vo_us());
-		if (v->def == DEF_SCREAM_AT9 && at9_log_on() && at9_polls[VIDX(v)] < 12) { at9_polls[VIDX(v)]++; fprintf(stderr, "    at9 v%d upd %llu GetStateData (lr %#x) -> bytepos %u buf %u samples %u consumed %u (playing %d)\n", VIDX(v), (unsigned long long)updates, c->r[14], v->byte_pos, v->buffer, v->samples_gen, v->bytes_consumed, v->playing); }
+		if (AT9_VOICE(v->def) && vo_log_on()) vo_state_log(v, c->r[14], vo_us());
+		if (AT9_VOICE(v->def) && at9_log_on() && at9_polls[VIDX(v)] < 12) { at9_polls[VIDX(v)]++; fprintf(stderr, "    at9 v%d upd %llu GetStateData (lr %#x) -> bytepos %u buf %u samples %u consumed %u (playing %d)\n", VIDX(v), (unsigned long long)updates, c->r[14], v->byte_pos, v->buffer, v->samples_gen, v->bytes_consumed, v->playing); }
 	} else memset(G(A2), 0, A3);
 	RET(0);
 }
@@ -1229,7 +1236,7 @@ const HleEntry hle_ngs[] = {
 	{"sceNgsVoiceDefGetMasterBuss", h_def_master}, {"sceNgsVoiceDefGetSimpleVoice", h_def_simple},
 	{"sceNgsVoiceDefGetReverbBuss", h_def_reverb}, {"sceNgsVoiceDefGetScreamVoice", h_def_scream},
 	{"sceNgsVoiceDefGetScreamAtrac9Voice", h_def_scream_at9}, {"sceNgsVoiceDefGetCompressorBuss", h_def_compressor},
-	{"sceNgsVoiceDefGetCompressorSideChainBuss", h_def_sidechain},
+	{"sceNgsVoiceDefGetCompressorSideChainBuss", h_def_sidechain}, {"sceNgsVoiceDefGetTemplate1", h_def_template1}, {"sceNgsVoiceDefGetAtrac9Voice", h_def_atrac9},
 	{"sceNgsVoiceSetFinishedCallback", h_voice_finished_cb}, {"sceNgsVoiceSetModuleCallback", h_voice_module_cb},
 	{"sceNgsVoiceGetParamsOutOfRange", h_params_out_of_range}, {"sceNgsVoiceInit", h_ok}, {"sceNgsPatchGetInfo", h_patch_info},
 	{"sceNgsAT9GetSectionDetails", h_at9_section},
