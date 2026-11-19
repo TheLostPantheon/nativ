@@ -670,6 +670,24 @@ static void fentry_e(Cpu *c) {
 	fe_strexd = STREXD(fe_word, 0x1122334455667788ull);
 	c->r[0] = 0; c->r[1] = 0; h_fiber_return(c);
 }
+/* a context-less fiber has a stack of its own: not a carve below its caller, whose own frames (a thread's, or a
+ * fiber's with a context) go on using that memory while the fiber is parked mid-entry */
+static uint32_t fg_sp, fg_starts, fib_g, ctx_f;
+static void fentry_g(Cpu *c) { fg_sp = c->r[13]; fg_starts++; c->r[0] = 0; c->r[1] = 0; h_fiber_return(c); }
+static void fentry_f(Cpu *c) { c->r[0] = fib_g; c->r[1] = 0; c->r[2] = 0; h_fiber_switch(c); c->r[0] = 0; c->r[1] = 0; h_fiber_return(c); }
+static void test_fiber_stacks(uint32_t name, uint32_t ret) {
+	guest_fns[12] = fentry_f; guest_fns[13] = fentry_g;
+	fib_g = guest_alloc(128, 8); uint32_t fib_f = guest_alloc(128, 8); ctx_f = guest_alloc(0x4000, 8);
+	CHECKEQ(call(h_fiber_init, 7, fib_g, name, 0x1034, 0, 0, 0, 0), 0);
+	CHECKEQ(call(h_fiber_init, 7, fib_f, name, 0x1030, 0, ctx_f, 0x4000, 0), 0);
+	/* run from a thread: well clear of that thread's stack (the call's own sp is my_sp) */
+	CHECKEQ(call(h_fiber_run, 3, fib_g, 0, ret), 0); CHECKEQ(fg_starts, 1);
+	CHECK(fg_sp < my_sp - 0x1000 || fg_sp > my_sp + 0x1000);
+	/* switched to from a fiber that has a context: outside that fiber's stack, which it goes on using */
+	CHECKEQ(call(h_fiber_run, 3, fib_f, 0, ret), 0); CHECKEQ(fg_starts, 2);
+	CHECK(fg_sp < ctx_f || fg_sp >= ctx_f + 0x4000);
+	CHECKEQ(call(h_fiber_finalize, 1, fib_f), 0); CHECKEQ(call(h_fiber_finalize, 1, fib_g), 0);
+}
 static void test_fibers(void) {
 	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "fib");
 	guest_fns[7] = fentry_a; guest_fns[8] = fentry_b; guest_fns[9] = fentry_c; guest_fns[10] = fentry_d; guest_fns[11] = fentry_e;
@@ -705,6 +723,7 @@ static void test_fibers(void) {
 	  CHECKEQ(call(h_fiber_run, 3, fib_e, 0, ret), 0); CHECKEQ(call(h_fiber_run, 3, fib_e, 0, ret), 0); CHECKEQ((uint32_t)fe_strex, 1); CHECKEQ(RD32(fe_word), 0);
 	  CHECKEQ(call(h_fiber_run, 3, fib_e, 0, ret), 0); CHECKEQ((uint32_t)fe_strexd, 1); CHECKEQ(RD32(fe_word), 0);
 	  CHECKEQ(call(h_fiber_finalize, 1, fib_e), 0); }
+	test_fiber_stacks(name, ret);
 	/* info; finalize the parked ones; a finalized fiber is no longer one */
 	uint32_t info = guest_alloc(0x170, 8);
 	CHECKEQ(call(h_fiber_info, 2, fib_b, info), 0); CHECKEQ(RD32(info), 0x1020); CHECKEQ(RD32(info + 4), 8); CHECKEQ(RD32(info + 8), ctx_b); CHECKEQ(RD32(info + 12), 0x4000);
