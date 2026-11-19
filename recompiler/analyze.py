@@ -312,6 +312,30 @@ class Analyser:
     def cond(i):
         return i.cc not in (ARM_CC_AL, ARM_CC_INVALID)
 
+    def in_it(self, a):
+        """Thumb: the instruction at a sits in an IT block, so it is conditional although a lone decode says it is
+        not (capstone takes the condition from the IT before it, which a one-instruction decode never sees). The
+        EABI divide helpers' `subs r2, r1, #1; it eq; bxeq lr; <divide>` was taken for a three-instruction function.
+        An IT (0xbfXY, X the condition, Y a non-zero mask) covers one to four instructions after it; the block
+        found is the one whose instruction chain from the IT lands exactly on a."""
+        for back in range(2, 14, 2):
+            hw = self.half(a - back)
+            if hw is None or hw & 0xff00 != 0xbf00 or not hw & 0xf or hw >> 4 & 0xf == 14:
+                continue
+            x = a - back + 2
+            for _ in range(4 - ((hw & -hw & 0xf).bit_length() - 1)):   # the block's length: below the mask's lowest set bit
+                if x == a:
+                    return True
+                j = self.insn(x, False)
+                if j is None:
+                    break
+                x += j.size
+        return False
+
+    def conditional(self, i, arm):
+        """i runs only on a condition: its own, or (Thumb) its IT block's"""
+        return self.cond(i) or (not arm and self.in_it(i.address))
+
     @staticmethod
     def imm_target(i):
         ops = i.operands
@@ -469,7 +493,7 @@ class Analyser:
                     if t in self.noreturn or (not arm and self.noreturn_after(a + i.size)):   # a call that doesn't come back
                         break
                 elif op in (A.ARM_INS_B, A.ARM_INS_CBZ, A.ARM_INS_CBNZ) and t is not None:
-                    conditional = self.cond(i) or op != A.ARM_INS_B
+                    conditional = op != A.ARM_INS_B or self.conditional(i, arm)
                     if t in entries and t != entry:   # a tail call
                         calls.add((t, arm))
                     elif self.in_text(t):
@@ -483,7 +507,7 @@ class Analyser:
                     targets, (tlo, thi) = self.table_targets(i, prev, arm)
                     todo += targets
                     ranges.append((tlo, thi))
-                    if not self.cond(i):
+                    if not self.conditional(i, arm):
                         break
                 elif arm and op == A.ARM_INS_ADD and len(ops) == 3 and ops[0].type == ARM_OP_REG and ops[0].reg == ARM_REG_PC \
                         and ops[1].type == ARM_OP_REG and ops[1].reg == ARM_REG_PC and ops[2].type == ARM_OP_REG:
@@ -498,10 +522,10 @@ class Analyser:
                         slots.append(t); k += 1
                     todo += slots
                     self.jumps.update(slots)
-                    if not self.cond(i):
+                    if not self.conditional(i, arm):
                         break
                 elif op == A.ARM_INS_BX or writes_pc or op in (A.ARM_INS_UDF, A.ARM_INS_BKPT):
-                    if not self.cond(i):
+                    if not self.conditional(i, arm):
                         break
                 prev.append(i)
                 a += i.size
@@ -554,7 +578,7 @@ class Analyser:
             if p is not None and p.address + p.size == a:
                 stop = p.id in (A.ARM_INS_BX, A.ARM_INS_B) or (p.id in LDM and "pc" in p.op_str)
                 i = self.insn(a, False)
-                return stop and not self.cond(p) and i is not None and i.mnemonic != "nop" and self.half(a) != 0
+                return stop and not self.conditional(p, False) and i is not None and i.mnemonic != "nop" and self.half(a) != 0
         return False
 
     def noreturn_after(self, a):
@@ -569,7 +593,7 @@ class Analyser:
             i = self.insn(x, arm)
             if i is None:
                 return False
-            if i.id in (A.ARM_INS_BX, A.ARM_INS_B, A.ARM_INS_POP) and not self.cond(i):
+            if i.id in (A.ARM_INS_BX, A.ARM_INS_B, A.ARM_INS_POP) and not self.conditional(i, arm):
                 return True
             x += i.size
         return True

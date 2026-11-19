@@ -475,6 +475,7 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 	}
 	uint32_t wv[4]; watch_snap(wv);
 	if (fn) fn(c); else c->r[0] = stub_ret;
+	recomp_excl_valid = 0;   /* an import is a system call: the exception's return leaves no exclusive monitor set, so a strex across it fails and the loop reads again */
 	watch_check(wv, name, c);
 	{	/* RECOMP_LOG_IMPORTS=name[,name...]: those imports (any whose name contains one of them) logged as they return -- the
 		 * thread, the arguments, the result, the caller and the frame -- without the millions of the rest (RECOMP_LOG) */

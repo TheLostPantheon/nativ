@@ -72,6 +72,14 @@ def link(obj):
                 lo = (lo & 0xd000) | (j1 << 13) | (j2 << 11) | ((off >> 1) & 0x7ff)
                 if t == 10 and not (s & 1): lo &= ~0x1000   # (BLX to ARM code: none here)
                 struct.pack_into("<HH", buf, at, hi, lo)
+            elif t == 102:   # R_ARM_THM_JUMP11: a 16-bit B to S
+                hw, = struct.unpack_from("<H", buf, at); p = base + r["r_offset"]
+                struct.pack_into("<H", buf, at, (hw & 0xf800) | ((((s & ~1) - (p + 4)) >> 1) & 0x7ff))
+            elif t == 51:   # R_ARM_THM_JUMP19: a conditional B.W to S
+                hi, lo = struct.unpack_from("<HH", buf, at); p = base + r["r_offset"]; off = ((s & ~1) - (p + 4)) & 0x1fffff
+                hi = (hi & 0xfbc0) | ((off >> 20) << 10) | ((off >> 12) & 0x3f)
+                lo = (lo & 0xd000) | (((off >> 18) & 1) << 13) | (((off >> 19) & 1) << 11) | ((off >> 1) & 0x7ff)
+                struct.pack_into("<HH", buf, at, hi, lo)
             else:
                 raise SystemExit(f"relocation type {t} at {r['r_offset']:#x} ({sym.name}): not handled")
     return {BASES[k]: bytes(v) for k, v in data.items() if v}, fns
@@ -106,7 +114,7 @@ int main(int argc, char **argv) {
 	unsigned fn, a, b, c3, d;
 	while (fscanf(cases, "%x %x %x %x %x", &fn, &a, &b, &c3, &d) == 5) {
 		memcpy(mem + dlo, pristine, dhi - dlo);
-		Cpu c; memset(&c, 0, sizeof c); c.r[0] = a; c.r[1] = b; c.r[2] = c3; c.r[3] = d; c.r[13] = 0x82000000u; c.r[14] = 0x7fff0000u; c.fpscr = 0x03000000;
+		Cpu c; memset(&c, 0, sizeof c); c.r[0] = a; c.r[1] = b; c.r[2] = c3; c.r[3] = d; c.r[13] = 0x82000000u; c.r[14] = 0x7fff0001u; c.fpscr = 0x03000000;
 		recomp_unimpl_at = 0;
 		recomp_run(&c, fn & ~1u);
 		uint32_t h = 2166136261u;   /* (the data and bss blocks, as written) */

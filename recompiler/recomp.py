@@ -21,7 +21,7 @@ has none) -- for a constant a function builds mid-body (a pack's IHOOKS).
 --unordered-loads: plain loads everywhere (A/B only). By default a function that uses exclusives or
 barriers (lock-free code) gets ordered loads (rt.h RD32A...); see SYNC_MN.
 """
-import bisect, json, os, re, sys
+import array, bisect, json, os, re, sys
 from capstone import Cs, CS_ARCH_ARM, CS_MODE_THUMB, CS_MODE_ARM
 from capstone.arm import (ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM, ARM_OP_FP, ARM_SFT_INVALID)
 
@@ -634,13 +634,17 @@ class Fn:
             out.append("return;")
         return ["".join(out)]
 
-    def call(self, target, nxt):
+    def call(self, target, nxt, link=True):
+        """a call to target; link=False for a plain branch out of the function (a tail jump): it doesn't set LR, which
+        is live guest data across the edge (a tree insert keeps its hint node there) and the callee returns to the
+        caller's caller through it"""
         t = target & ~1
+        lr = f"c->r[14] = 0x{nxt | self.tbit:x}u; " if link else ""
         if t in self.entries:
-            return [f"c->r[14] = 0x{nxt | self.tbit:x}u; fn_{t:08x}(c); if (c->stop) return;"]
+            return [f"{lr}fn_{t:08x}(c); if (c->stop) return;"]
         if t in SETJMP_STUBS:   # 0 now; a guest longjmp to this buffer comes back here with its value
             return [f"c->r[14] = 0x{nxt | self.tbit:x}u; {{ RecompJmp *rj = recomp_setjmp_begin(c); if (!_setjmp(rj->host)) c->r[0] = 0; }} if (c->stop) return;"]
-        return [f"c->r[14] = 0x{nxt | self.tbit:x}u; recomp_call_external(c, 0x{target:x}u); if (c->stop) return;"]
+        return [f"{lr}recomp_call_external(c, 0x{target:x}u); if (c->stop) return;"]
 
     def branch(self, i, mn, ops):
         nxt = i.address + i.size
@@ -650,14 +654,14 @@ class Fn:
             if t in self.addrs:
                 body = [f"goto L_{t:08x};"]
             else:   # a tail call into another function
-                body = self.call(t, nxt) + ["return;"]
+                body = self.call(t, nxt, link=False) + ["return;"]
             return body if cc == 15 else [f"if (COND(c, {cc})) {{"] + body + ["}"]
         if mn in ("cbz", "cbnz"):
             r, t = self.r(ops[0].reg, i), ops[1].imm & 0xffffffff
             test = f"{r} {'==' if mn == 'cbz' else '!='} 0"
             if t in self.addrs:
                 return [f"if ({test}) goto L_{t:08x};"]
-            return [f"if ({test}) {{"] + self.call(t, nxt) + ["return; }"]
+            return [f"if ({test}) {{"] + self.call(t, nxt, link=False) + ["return; }"]
         if mn == "bl" or (mn == "blx" and ops[0].type == ARM_OP_IMM):
             body = self.call(ops[0].imm & 0xffffffff, nxt)
             return body if cc == 15 else [f"if (COND(c, {cc})) {{"] + body + ["}"]
@@ -1599,7 +1603,12 @@ class Fn:
         lines.append("\tswitch (c->r[15]) {")
         for i in self.insns:
             lines.append(f"\tcase 0x{i.address:x}u: goto L_{i.address:08x};")
-        lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
+        if any("JUMP(" in x for x in lines):
+            # a computed jump to another function's entry (a table case that is a split-off entry) is a tail call: run it
+            # and return, as a branch there would; anything else is code the analysis never saw
+            lines.append("\tdefault: { GuestFn f = recomp_lookup_here(c->r[15]); if (f) { f(c); return; } } recomp_unimplemented(c, c->r[15]); return;")
+        else:
+            lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
         lines.append("\t}")
         lines.append("}")
         return reg_locals(lines, 3 if hook else 2) if REG_LOCALS[0] else lines
@@ -1713,7 +1722,16 @@ def main():
     entries = sorted({v & ~1 for v in d["functions"].values()})
     # body ranges: [first, last byte] (Ghidra), or [first, last, owner entry] (analyze.py, which knows)
     bodies = sorted(tuple(b) for b in d["bodies"])
+    # --module NAME: a module loaded with the main program (a .suprx): its tables are suffixed and register themselves
+    # with the host (main.c's module registry) before main() runs
+    mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
+    sfx = f"_{mod}" if mod else ""
     out = ["#define RECOMP_GENERATED 1", '#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
+    # a computed jump's target is looked up in this file's own table first: a module's functions are in its own
+    # recomp_lookup_<module>, which the main program's recomp_lookup knows nothing of
+    out += ([f"GuestFn recomp_lookup{sfx}(uint32_t a);",
+             f"static inline GuestFn recomp_lookup_here(uint32_t a) {{ GuestFn f = recomp_lookup{sfx}(a); return f ? f : recomp_lookup(a); }}"]
+            if mod else ["#define recomp_lookup_here recomp_lookup"])
     fns, total, bad = [], 0, []
     # a function can be several code chunks: each chunk belongs to its owner when the export says,
     # else (Ghidra's ranges) to itself if it's an entry, else the nearest entry before it
@@ -1792,19 +1810,40 @@ def main():
         for i in f.insns:
             if i.mnemonic == mnem and i.operands and i.operands[0].type == ARM_OP_IMM:
                 yield i.operands[0].imm & 0xffffffff
-    todo = [t for f in fns for t in calls(f, "blx") if t in by_entry]
+    # Only Thumb code's blx counts: the Thumb decode of a function the analysis knows as ARM is noise, and a "blx #imm"
+    # read out of it turned a Thumb function ARM (its real calls come from its ARM decode below). And the image's own
+    # function pointers carry the mode: a word entry|1 is the linker saying Thumb (an init table's pointer, the code that
+    # runs), which beats a blx #imm elsewhere that reads as ARM.
+    known_arm = set(d.get("arm", []))
+    thumb_refs = set()
+    for s0, bb in blocks.items():
+        o = (-s0) % 4
+        words = array.array("I", bb[o:o + (len(bb) - o) // 4 * 4])
+        if sys.byteorder != "little":
+            words.byteswap()
+        thumb_refs.update(v & ~1 for v in set(words) if v & 1 and (v & ~1) in by_entry)
+    todo = [t for f in fns if f.entry not in known_arm for t in calls(f, "blx") if t in by_entry and t not in thumb_refs]
     todo += [a for a in d.get("arm", []) if a in by_entry]   # the analysis decoded these as ARM (its exports and calls say so)
-    for f in fns:
-        if junk(f.insns) and not junk(decode(fspans[f.entry], True)):
-            todo.append(f.entry)
-    while todo:
-        e = todo.pop()
-        if e in arm or e not in by_entry:
-            continue
-        arm.add(e)
-        f = Fn(e, decode(fspans[e], True), eset, arm=True)
-        by_entry[e] = f
-        todo += [t for t in calls(f, "bl") if t in by_entry]
+    # the guess: Thumb decode with coprocessor instructions no Vita code has, ARM decode without. An ARM instruction
+    # starts on a word, so an entry with bit 1 set is Thumb whatever its decode looks like (a literal pool read as ldc)
+    maybe_arm = [f.entry for f in fns if not f.entry & 3 and junk(f.insns) and not junk(decode(fspans[f.entry], True))]
+
+    def propagate():
+        while todo:
+            e = todo.pop()
+            if e in arm or e not in by_entry or e & 3:
+                continue
+            arm.add(e)
+            f = Fn(e, decode(fspans[e], True), eset, arm=True)
+            by_entry[e] = f
+            todo.extend(t for t in calls(f, "bl") if t in by_entry)
+    propagate()
+    # a Thumb "bl" keeps the state: an entry that certain Thumb code (not ARM, not a guess itself) calls with "bl" is
+    # Thumb, whatever its own decode looks like, so the guess yields to it
+    guessed = set(maybe_arm)
+    thumb_bl = {t for f in fns if f.entry not in arm and f.entry not in guessed for t in calls(f, "bl")}
+    todo.extend(e for e in maybe_arm if e not in thumb_bl)
+    propagate()
     fns = [by_entry[f.entry] for f in fns]
     if arm:
         print(f"{len(arm)} ARM-mode functions")
@@ -1896,10 +1935,6 @@ def main():
             out += body
     for n, part in enumerate(parts):
         write_if_changed(f"{base}_part{n}.c", "\n".join([f'#include "{os.path.basename(base)}.h"', preamble_tag] + part) + "\n")
-    # --module NAME: a module loaded with the main program (a .suprx): its tables are suffixed and
-    # register themselves with the host (main.c's module registry) before main() runs
-    mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
-    sfx = f"_{mod}" if mod else ""
     # the import stubs and the functions by address: lists hashed before main() (rt.h RecompAddrMap)
     out.append(f"static const RecompAddrEntry import_list{sfx}[] = {{")
     out += [f'\t{{0x{a:x}u, "{names[a]}"}},' for a in sorted(stubs)]

@@ -244,7 +244,11 @@ static void sched_hand(int slot, Thread *from, int why) {
 	pthread_cond_signal(&n->s_cv);
 }
 static void sched_release(Thread *t, int why) { int slot = t->s_slot; sched_slot[slot] = 0; sched_hand(slot, t, why); }   /* sched_m held, t in S_RUN */
-static void sched_wait_turn(Thread *t) { while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m); }   /* sched_m held */
+/* A context switch clears the exclusive monitor (the firmware's scheduler, like any exception return, leaves none set), so
+ * an ldrex before a thread or fiber was switched out and a strex after it must fail and the loop read again. The monitor is
+ * per host thread here, so the points where a guest thread or fiber is switched back in drop it. */
+static void excl_drop(void) { recomp_excl_valid = 0; }
+static void sched_wait_turn(Thread *t) { while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m); excl_drop(); }   /* sched_m held */
 static void sched_get_slot(Thread *t, int front) {   /* sched_m held: a free slot it may use (nobody waiting can use it), else the list */
 	int slot = sched_free_slot(t);
 	if (slot >= 0) sched_take(t, slot);
@@ -1587,7 +1591,7 @@ typedef struct Fiber {
 	int started, go, finalize;        /* started: it has a host thread; go: it may run; finalize: it must end */
 	Thread *thread;                   /* the thread it runs under: its identity */
 	uint32_t run_arg, run_arg_p;      /* the argOnRun handed to it by the Run/Switch resuming it, and where it asked for it to be written */
-	uint32_t sp0;                     /* a context-less fiber's stack (below the thread's) */
+	uint32_t sp0;                     /* a context-less fiber's stack: guest memory of its own, 64 KB (fiber_stack_private) */
 	pthread_cond_t cv;
 	Cpu cpu;
 } Fiber;
@@ -1605,7 +1609,7 @@ static void fiber_identity(Fiber *f) {   /* the fiber's host thread is the threa
 }
 static void fiber_park(Fiber *f) {   /* flock held: until a Run/Switch resumes it; a finalize ends the host thread (its guest stack is abandoned) */
 	while (!f->go && !f->finalize) pthread_cond_wait(&f->cv, &flock);
-	f->go = 0;
+	f->go = 0; excl_drop();
 	if (f->finalize) { pthread_mutex_unlock(&flock); pthread_cond_destroy(&f->cv); free(f); pthread_exit(0); }
 	fiber_identity(f);
 	if (f->run_arg_p) WR32(f->run_arg_p, f->run_arg);
@@ -1670,6 +1674,19 @@ static uint32_t fiber_init(Cpu *c, uint32_t fiber, uint32_t name, uint32_t entry
 }
 static void h_fiber_init(Cpu *c) { RET(fiber_init(c, A0, A1, A2, A3, STK(0), STK(1))); }   /* (fiber, name, entry, argOnInitialize, addrContext, sizeContext, params[, sdk version]) */
 static void h_fiber_opt_param_init(Cpu *c) { if (!A0) { RET(E_FIBER_NULL); return; } memset(G(A0), 0, 128); RET(0); }
+/* A context-less fiber (no addrContext) starts over at every Run and has no stack of the game's: it gets 64 KB of its own,
+ * kept across its restarts (the incarnation a restart ends never runs guest code again, so the new one may reuse it) and
+ * handed on when the fiber is finalized. The memory below the caller's sp is not safe for it: a fiber switched to from a
+ * fiber that has a context, or parked mid-entry while its caller goes on, has frames there that the caller's own calls
+ * overwrite (a user-level thread library's job strands, saved registers smashed). The game cannot see where it is:
+ * sceFiberInfo reports no context. */
+#define FIBER_STACK 0x10000
+static uint32_t fiber_stack_free[16]; static int fiber_stack_nfree;   /* flock held */
+static void fiber_stack_private(Fiber *f) {
+	if (f->sp0) return;
+	uint32_t base = fiber_stack_nfree ? fiber_stack_free[--fiber_stack_nfree] : guest_alloc(FIBER_STACK, 16);
+	f->sp0 = (base + FIBER_STACK) & ~7u;
+}
 static void h_fiber_run(Cpu *c) {   /* (fiber, argOnRunTo, *argOnReturn): from a thread */
 	Fiber *f = fiber_of(A0);
 	if (!A0) { RET(E_FIBER_NULL); return; }
@@ -1679,17 +1696,17 @@ static void h_fiber_run(Cpu *c) {   /* (fiber, argOnRunTo, *argOnReturn): from a
 	pthread_mutex_lock(&flock);
 	if (f->state == F_RUNNING) { pthread_mutex_unlock(&flock); RET(E_FIBER_STATE); return; }
 	t->tls = recomp_tpidruro;   /* this host thread IS the thread: its TLS is what its fibers share */
-	if (!f->ctx) {   /* context-less: a fresh start every run, on this thread's stack below the caller */
+	if (!f->ctx) {   /* context-less: a fresh start every run, on its own stack */
 		if (f->started) {   /* its previous run is parked mid-entry: that incarnation ends; a new host thread starts the entry over */
 			Fiber *old = f; f = calloc(1, sizeof *f); *f = *old; f->started = f->go = 0; pthread_cond_init(&f->cv, 0);
 			WR64(f->addr + 8, (uint64_t)(uintptr_t)f);
 			old->finalize = 1; pthread_cond_broadcast(&old->cv);
 		}
-		f->sp0 = (c->r[13] - 512) & ~7u;
+		fiber_stack_private(f);
 	}
 	fiber_resume(f, t, A1);
 	while (!t->fgo) pthread_cond_wait(thread_fcv(t), &flock);
-	t->fgo = 0;
+	t->fgo = 0; excl_drop();
 	if (t->fexit) { pthread_mutex_unlock(&flock); pthread_exit(0); }   /* the fiber ended the thread */
 	uint32_t ret = t->fret_arg;
 	pthread_mutex_unlock(&flock);
@@ -1715,7 +1732,7 @@ static void h_fiber_switch(Cpu *c) {   /* (fiber, argOnRunTo, *argOnRun): from a
 	if (g->state == F_RUNNING) { pthread_mutex_unlock(&flock); RET(E_FIBER_STATE); return; }
 	if (!g->ctx) {
 		if (g->started) { Fiber *old = g; g = calloc(1, sizeof *g); *g = *old; g->started = g->go = 0; pthread_cond_init(&g->cv, 0); WR64(g->addr + 8, (uint64_t)(uintptr_t)g); old->finalize = 1; pthread_cond_broadcast(&old->cv); }
-		g->sp0 = (c->r[13] - 512) & ~7u;   /* below this fiber's own stack (the thread's, if this one is context-less too) */
+		fiber_stack_private(g);
 	}
 	f->state = F_SUSPENDED; f->run_arg_p = A2;
 	fiber_resume(g, f->thread, A1);
@@ -1731,6 +1748,7 @@ static void h_fiber_finalize(Cpu *c) {
 	pthread_mutex_lock(&flock);
 	if (f->state == F_RUNNING) { pthread_mutex_unlock(&flock); RET(E_FIBER_STATE); return; }
 	WR32(f->addr, 0); WR64(f->addr + 8, 0);
+	if (f->sp0 && fiber_stack_nfree < 16) fiber_stack_free[fiber_stack_nfree++] = f->sp0 - FIBER_STACK;   /* (a parked run is abandoned: it never runs again) */
 	if (f->started) { f->finalize = 1; pthread_cond_broadcast(&f->cv); }   /* its parked host thread frees it */
 	else { pthread_cond_destroy(&f->cv); free(f); }
 	pthread_mutex_unlock(&flock);

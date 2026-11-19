@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include "hle.h"
+#include "ngs_rules.h"
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -49,11 +50,12 @@ enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM
 #define P_SCALAR 60
 #define P_CHANNELS 76
 #define P_TYPE 79
-#define P_START 80
+#define P_START NGS_PLAYER_START_BUFFER   /* +81, not +80 (ngs_rules.h) */
 #define PARAMS_SIZE 512
 typedef struct Voice {
 	uint32_t handle, def;
 	int playing, paused;
+	int started;                           /* the game has played a voice the runtime runs from its creation (master, reverb, bus): ngs_voice_play */
 	uint32_t params[MAX_MODULES];          /* guest memory: each module's parameter block */
 	int bypass[MAX_MODULES];
 	/* player state */
@@ -421,12 +423,16 @@ static void vo_state_log(Voice *v, uint32_t lr, uint64_t us) {
 /* ---- voices */
 static void h_voice_play(Cpu *c) {
 	Voice *v = voice_of(A0);
+	if (v && ngs_voice_play(PLAYER_VOICE(v->def), &v->playing, &v->started)) {   /* already playing: left as it is */
+		static uint8_t said[512]; if (!said[VIDX(v)]) { said[VIDX(v)] = 1; fprintf(stderr, "    ngs: Play on voice %d, which plays already: left as it is (SCE_NGS_ERROR)\n", VIDX(v)); }
+		RET(NGS_ERROR); return;
+	}
 	if (v) { v->playing = 1; v->paused = 0; v->buffer = 0; v->byte_pos = 0; v->samples_gen = v->bytes_consumed = 0; v->loops_done = 0; v->upd_active = 0;
 		v->frac = 1; memset(v->rs_h, 0, sizeof v->rs_h); v->rs_i = 0;   /* (1: the first output fetches the first source sample) */
 		v->pcm_len = v->pcm_pos = 0; v->at9_cfg = 0; v->stage_on = 0;   /* (a fresh decoder: ATRAC9 frames carry state) */
 		v->ad_valid = 0; v->ad_idx = 0; memset(v->ad_hist, 0, sizeof v->ad_hist);
 		v->at9_waited = v->at9_decoded = 0; v->env_pt = 0; v->env_ms = 0; v->env_level = 0; v->releasing = v->released_out = 0; v->rel_ms = 0; memset(v->bq, 0, sizeof v->bq);
-		uint32_t pp = v->params[0]; if (pp && PCM_PLAYER(v->def)) { v->buffer = (uint8_t)RD8(pp + P_START); if (v->buffer > 3) v->buffer = 0; } }
+		uint32_t pp = v->params[0]; if (pp && PCM_PLAYER(v->def)) v->buffer = ngs_player_start((int8_t)RD8(pp + P_START)); }
 	dump_setup();
 	if (v && dump_dir && PLAYER_VOICE(v->def)) {
 		VStat *st = &vstat[VIDX(v)]; uint32_t pp = v->params[0]; int at9 = v->def == DEF_SCREAM_AT9;
@@ -452,7 +458,7 @@ static void h_voice_play(Cpu *c) {
 static void h_voice_kill(Cpu *c) {   /* stopped dead: no callback */
 	Voice *v = voice_of(A0);
 	if (v && v->def == DEF_SCREAM_AT9 && vo_log_on()) fprintf(stderr, "    vo: v%d kill us %llu upd %llu lr %#x\n", VIDX(v), (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14]);
-	if (v) { v->playing = 0; v->finishing = 0; v->releasing = v->released_out = 0; }
+	if (v) { v->playing = 0; v->started = 0; v->finishing = 0; v->releasing = v->released_out = 0; }
 	RET(0);
 }
 /* key-off = release: a voice with an envelope module plays on through its release (voice_stages) and
@@ -465,7 +471,7 @@ static void h_voice_keyoff(Cpu *c) {
 	if (v && v->def == DEF_SCREAM_AT9 && vo_log_on()) fprintf(stderr, "    vo: v%d keyoff us %llu upd %llu lr %#x\n", VIDX(v), (unsigned long long)vo_us(), (unsigned long long)updates, c->r[14]);
 	if (v && v->playing && !v->paused && PLAYER_VOICE(v->def) && !stages_off() && stage_module(v, ENV_ID) >= 0) {
 		if (!v->releasing) { v->releasing = 1; v->rel_ms = 0; v->rel_from = v->env_level; }
-	} else if (v) { if (v->playing && PLAYER_VOICE(v->def)) v->finishing = 1; v->playing = 0; v->releasing = 0; }
+	} else if (v) { if (v->playing && PLAYER_VOICE(v->def)) v->finishing = 1; v->playing = 0; v->started = 0; v->releasing = 0; }
 	pthread_mutex_unlock(&lock);
 	RET(v ? 0 : 0x804a0005u);
 }
@@ -603,7 +609,7 @@ static void voice_finished(Voice *v) {
 /* ---- the player (module 0 of a simple voice), layout as FMOD fills it (84 bytes, id 0x01015ce6):
  *   +0 descriptor {id, size}; +8 four buffers {data, bytes, s16 loops (-1 forever), s16 next (-1 none)};
  *   +56 float playback frequency; +60 float scalar; +64 lead-in; +68 sample limit; +72 start bytes;
- *   +76 s8 channels; +77 channel map[2]; +79 s8 type (0 PCM s16); +80 s8 start buffer */
+ *   +76 s8 channels; +77 channel map[2]; +79 s8 type (0 PCM s16); +80 reserved; +81 s8 start buffer */
 /* one HE-VAG frame (16 bytes, third_party/hevag/hevag_coefs.h) into 28 samples, carrying the
  * channel's history */
 #include "third_party/hevag/hevag_coefs.h"
