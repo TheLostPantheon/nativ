@@ -118,6 +118,18 @@ still finds its pipelines once the folder is gone. A macOS update that changes e
 
 It prints `all passed`.
 
+## NGS voice rules: `ngs_rules_test.c`
+
+Checks `runtime/audio/ngs_rules.h`, two small rules of the NGS voices: the start buffer of a player is the signed byte at
++81 of its parameters (Vita3K's layout; +80 is reserved), and `sceNgsVoicePlay` starts a voice that is at rest but leaves
+a playing one alone and answers `SCE_NGS_ERROR`, so a game that calls Play on its music voice every update does not restart
+it each time. The voices the runtime runs from their creation (master, reverb, buses) count as at rest until the game's own
+first Play.
+
+    cc -O1 -g -Wall $INC ngs_rules_test.c -o /tmp/ngs_rules_test && /tmp/ngs_rules_test
+
+It prints `all N passed`.
+
 ## The audio decoder: `audiodec_test.c`
 
 Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`
