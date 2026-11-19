@@ -1603,7 +1603,12 @@ class Fn:
         lines.append("\tswitch (c->r[15]) {")
         for i in self.insns:
             lines.append(f"\tcase 0x{i.address:x}u: goto L_{i.address:08x};")
-        lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
+        if any("JUMP(" in x for x in lines):
+            # a computed jump to another function's entry (a table case that is a split-off entry) is a tail call: run it
+            # and return, as a branch there would; anything else is code the analysis never saw
+            lines.append("\tdefault: { GuestFn f = recomp_lookup_here(c->r[15]); if (f) { f(c); return; } } recomp_unimplemented(c, c->r[15]); return;")
+        else:
+            lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
         lines.append("\t}")
         lines.append("}")
         return reg_locals(lines, 3 if hook else 2) if REG_LOCALS[0] else lines
@@ -1717,7 +1722,16 @@ def main():
     entries = sorted({v & ~1 for v in d["functions"].values()})
     # body ranges: [first, last byte] (Ghidra), or [first, last, owner entry] (analyze.py, which knows)
     bodies = sorted(tuple(b) for b in d["bodies"])
+    # --module NAME: a module loaded with the main program (a .suprx): its tables are suffixed and register themselves
+    # with the host (main.c's module registry) before main() runs
+    mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
+    sfx = f"_{mod}" if mod else ""
     out = ["#define RECOMP_GENERATED 1", '#include "rt.h"', "#define JUMP(t) do { c->r[15] = (t); goto jump; } while (0)"]
+    # a computed jump's target is looked up in this file's own table first: a module's functions are in its own
+    # recomp_lookup_<module>, which the main program's recomp_lookup knows nothing of
+    out += ([f"GuestFn recomp_lookup{sfx}(uint32_t a);",
+             f"static inline GuestFn recomp_lookup_here(uint32_t a) {{ GuestFn f = recomp_lookup{sfx}(a); return f ? f : recomp_lookup(a); }}"]
+            if mod else ["#define recomp_lookup_here recomp_lookup"])
     fns, total, bad = [], 0, []
     # a function can be several code chunks: each chunk belongs to its owner when the export says,
     # else (Ghidra's ranges) to itself if it's an entry, else the nearest entry before it
@@ -1921,10 +1935,6 @@ def main():
             out += body
     for n, part in enumerate(parts):
         write_if_changed(f"{base}_part{n}.c", "\n".join([f'#include "{os.path.basename(base)}.h"', preamble_tag] + part) + "\n")
-    # --module NAME: a module loaded with the main program (a .suprx): its tables are suffixed and
-    # register themselves with the host (main.c's module registry) before main() runs
-    mod = sys.argv[sys.argv.index("--module") + 1] if "--module" in sys.argv else None
-    sfx = f"_{mod}" if mod else ""
     # the import stubs and the functions by address: lists hashed before main() (rt.h RecompAddrMap)
     out.append(f"static const RecompAddrEntry import_list{sfx}[] = {{")
     out += [f'\t{{0x{a:x}u, "{names[a]}"}},' for a in sorted(stubs)]

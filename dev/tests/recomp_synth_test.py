@@ -90,6 +90,38 @@ AFN t_acall_links
 END t_acall_links
 '''
 
+# a table case that is another function's entry (a split-off entry reached by tbb) runs it as a tail call
+JUMP_ENTRY = PRELUDE + r'''
+.thumb
+TFN t_tbb
+ cmp r0, #1
+ bhi 9f
+ tbb [pc, r0]
+.Ltbl:
+ .byte (.Lcase0 - .Ltbl) / 2, (.Lother - .Ltbl) / 2
+.Lcase0:
+ movs r0, #10
+ bx lr
+9:
+ movs r0, #99
+ bx lr
+END t_tbb
+.p2align 1
+.Lother:
+TFN g_other
+ movs r0, #20
+ bx lr
+END g_other
+'''
+
+# the harness of a module build (recomp.py --module): its functions are in its own table, which a module registers with
+# the host; the main program's lookup knows none of them
+MODULE_HARNESS = rx.HARNESS.replace("int main(", r'''static GuestFn (*modlk)(uint32_t);
+void recomp_register_module(const char *n, GuestFn (*lk)(uint32_t), const char *(*in)(uint32_t), int (*ar)(uint32_t)) { modlk = lk; }
+GuestFn recomp_lookup(uint32_t a) { return 0; }
+int main(''', 1).replace("recomp_run(&c, fn & ~1u);", "{ GuestFn mf = modlk(fn & ~1u); if (mf) mf(&c); else recomp_unimplemented(&c, fn); }", 1)
+assert "modlk(fn" in MODULE_HARNESS
+
 fails = checks = 0
 
 
@@ -204,6 +236,8 @@ def mode_cases(tmp):
 def main():
     with tempfile.TemporaryDirectory(prefix="recomp_synth_") as tmp:
         run_case("lr_tail", LR_TAIL, tmp)
+        run_case("jump_entry", JUMP_ENTRY, tmp)
+        run_case("jump_entry_module", JUMP_ENTRY, tmp, flags=("--module", "m"), harness=MODULE_HARNESS)
         mode_cases(tmp)
     print(f"{checks} checks, {fails} failed")
     return 1 if fails else 0
