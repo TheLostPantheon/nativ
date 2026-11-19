@@ -18,6 +18,7 @@ step "copies and versions (packs.py selftest)" env PYTHONPATH=decrypt $PY pipeli
 step "spin waits (spin_loads_test.py)" $PY dev/tests/spin_loads_test.py
 step "function analysis (analyze_test.py)" $PY dev/tests/analyze_test.py
 step "recompiler against the CPU (recomp_exec_test.py)" $PY dev/tests/recomp_exec_test.py $([ "${1:-}" = quick ] && echo 20 || echo 60)
+step "recompiler on hand-written assembly (recomp_synth_test.py)" $PY dev/tests/recomp_synth_test.py
 
 INC="-I runtime/core -I runtime/gfx -I runtime/audio -I runtime/media -I runtime/input -I runtime/net -I runtime/ui -I runtime/platform -I runtime/debug -I recompiler -I ."
 unit() { local t=$1; shift; (cd runtime/tests && $CC -O1 -g -w -D_GNU_SOURCE ${INC//-I /-I ../../} "$t.c" "$@" -o "$TMP/$t") && "$TMP/$t"; }
