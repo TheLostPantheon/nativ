@@ -389,8 +389,10 @@ static void page_performance(void) {
 static void page_game(void) {
 	prefs_load();
 	if (!ui::rows_begin("game")) return;
-	ui::row("Frame rate", "60 is experimental: parts of a game timed in fixed 1/30 s steps can run fast.");
-	{ static const char *const names[2] = {"30##fr", "60##fr"}; int v = P.fr >= 60; if (ui::segmented(names, 2, &v)) set_frame_rate(v ? 60 : 30); }
+	if (game_option("frame_rate")) {   /* (a game whose pack has hooks for its 1/30 s steps: display.c honours the setting there only) */
+		ui::row("Frame rate", "60 is experimental: parts of a game timed in fixed 1/30 s steps can run fast.");
+		{ static const char *const names[2] = {"30##fr", "60##fr"}; int v = P.fr >= 60; if (ui::segmented(names, 2, &v)) set_frame_rate(v ? 60 : 30); }
+	}
 	{	static const char *labels[1 + game_language_count]; static int keys[1 + game_language_count], n = -1;   /* (the languages the game was checked in) */
 		if (n < 0) { n = 1; labels[0] = "Automatic (English)"; keys[0] = -1; for (int i = 0; i < game_language_count; i++) if (game_language_allowed(game_languages[i].key)) { labels[n] = game_languages[i].label; keys[n++] = i; } }
 		if (n > 1) {
@@ -727,7 +729,7 @@ static void menu_view(void) {
 	if (game_option("view_distance")) { ImGui::TextDisabled("View distance"); ImGui::SetNextItemWidth(170); if (ImGui::SliderFloat("##view", &P.view, 1.0f, 3.0f, "%.2fx")) set_view(P.view); }
 	if (game_option("scenery_detail")) { ImGui::TextDisabled("Scenery detail"); ImGui::SetNextItemWidth(170); if (ImGui::SliderFloat("##scen", &P.scen, 1.0f, 8.0f, "%.1fx")) set_scen(P.scen); }
 	if (game_option("character_detail")) { ImGui::TextDisabled("Character detail"); ImGui::SetNextItemWidth(170); if (ImGui::SliderFloat("##chr", &P.chr, 1.0f, 8.0f, "%.1fx")) set_chr(P.chr); }
-	if (ImGui::BeginMenu("Frame rate")) {
+	if (game_option("frame_rate") && ImGui::BeginMenu("Frame rate")) {
 		if (ImGui::MenuItem("30", nullptr, P.fr < 60)) set_frame_rate(30);
 		if (ImGui::MenuItem("60 (experimental)", nullptr, P.fr >= 60)) set_frame_rate(60);
 		ImGui::EndMenu();
