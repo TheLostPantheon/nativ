@@ -244,7 +244,11 @@ static void sched_hand(int slot, Thread *from, int why) {
 	pthread_cond_signal(&n->s_cv);
 }
 static void sched_release(Thread *t, int why) { int slot = t->s_slot; sched_slot[slot] = 0; sched_hand(slot, t, why); }   /* sched_m held, t in S_RUN */
-static void sched_wait_turn(Thread *t) { while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m); }   /* sched_m held */
+/* A context switch clears the exclusive monitor (the firmware's scheduler, like any exception return, leaves none set), so
+ * an ldrex before a thread or fiber was switched out and a strex after it must fail and the loop read again. The monitor is
+ * per host thread here, so the points where a guest thread or fiber is switched back in drop it. */
+static void excl_drop(void) { recomp_excl_valid = 0; }
+static void sched_wait_turn(Thread *t) { while (t->s_state != S_RUN) pthread_cond_wait(&t->s_cv, &sched_m); excl_drop(); }   /* sched_m held */
 static void sched_get_slot(Thread *t, int front) {   /* sched_m held: a free slot it may use (nobody waiting can use it), else the list */
 	int slot = sched_free_slot(t);
 	if (slot >= 0) sched_take(t, slot);
@@ -1605,7 +1609,7 @@ static void fiber_identity(Fiber *f) {   /* the fiber's host thread is the threa
 }
 static void fiber_park(Fiber *f) {   /* flock held: until a Run/Switch resumes it; a finalize ends the host thread (its guest stack is abandoned) */
 	while (!f->go && !f->finalize) pthread_cond_wait(&f->cv, &flock);
-	f->go = 0;
+	f->go = 0; excl_drop();
 	if (f->finalize) { pthread_mutex_unlock(&flock); pthread_cond_destroy(&f->cv); free(f); pthread_exit(0); }
 	fiber_identity(f);
 	if (f->run_arg_p) WR32(f->run_arg_p, f->run_arg);
@@ -1689,7 +1693,7 @@ static void h_fiber_run(Cpu *c) {   /* (fiber, argOnRunTo, *argOnReturn): from a
 	}
 	fiber_resume(f, t, A1);
 	while (!t->fgo) pthread_cond_wait(thread_fcv(t), &flock);
-	t->fgo = 0;
+	t->fgo = 0; excl_drop();
 	if (t->fexit) { pthread_mutex_unlock(&flock); pthread_exit(0); }   /* the fiber ended the thread */
 	uint32_t ret = t->fret_arg;
 	pthread_mutex_unlock(&flock);
