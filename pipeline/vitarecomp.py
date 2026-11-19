@@ -646,16 +646,26 @@ def cmd_recompile(g):
     with open(os.path.join(OUT, ".recompile_inputs"), "w", newline="\n") as f: f.write(recompile_inputs(g) + "\n")   # (ready's)
 
 
-def recompile_inputs(g):
-    """what a title's generated code was made from: recompiler/ and its pack.toml (HOOKS, IHOOKS, MODULES, FUNCTION_SEEDS ...),
-    as git hashes a blob of their contents in path order -- dev/build-all.sh's formula before this, so its stamps
-    (recomp/.recompile_inputs) stay valid -- and computed without git, so an install has it too"""
+def pack_codegen_bytes(path):
+    """a pack.toml as far as the generated code is concerned: its lines less the comment lines, the headless test route
+    (TEST_*) and GENERATED -- so a pack's notes and test route can change without the game being made again (adding a
+    route to a generated pack would otherwise have regenerated it, minutes of a game's next launch)"""
+    keep = [l for l in open(path, "rb").read().splitlines(keepends=True)
+            if not re.match(rb"\s*(#|$)", l) and not re.match(rb"\s*(TEST_[A-Z_]+|GENERATED)\s*=", l)]
+    return b"".join(keep)
+
+
+def recompile_inputs(g, legacy=False):
+    """what a title's generated code was made from: recompiler/ and its pack.toml (HOOKS, IHOOKS, MODULES, FUNCTION_SEEDS ...;
+    pack_codegen_bytes), as git hashes a blob of their contents in path order, computed without git so an install has it too.
+    legacy: the whole pack.toml, the formula before 2026-11-19 (dev/build-all.sh's before that), which ready still accepts"""
     files = {f"packs/{g.PACK}/pack.toml": g.CONF} if os.path.isfile(g.CONF) else {}   # (a generated pack's, from the library)
     for d, sub, names in os.walk(RECOMPILER):
         sub[:] = [x for x in sub if x != "__pycache__" and not x.startswith(".")]
         # (hidden files aren't the recompiler's: a tar from a Mac leaves ._ metadata beside each file, 2026-10-26)
         files.update((os.path.relpath(os.path.join(d, n), ROOT).replace(os.sep, "/"), os.path.join(d, n)) for n in names if not n.endswith(".pyc") and not n.startswith("."))
-    data = b"".join(open(files[f], "rb").read() for f in sorted(files, key=lambda f: f.encode()))
+    data = b"".join(pack_codegen_bytes(files[f]) if f.endswith("/pack.toml") and not legacy else open(files[f], "rb").read()
+                    for f in sorted(files, key=lambda f: f.encode()))
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
@@ -678,7 +688,10 @@ def cmd_ready(g):
         return open(f, encoding="utf-8").read().strip() if os.path.isfile(f) else ""
     if not os.path.isfile(os.path.join(g.W, "elf", g.ELF)): die(f"{g.T}: not added yet (vitarecomp add, or + Add game in the launcher)")
     remade = False
-    if stamp(".recompile_inputs") != recompile_inputs(g):
+    inputs = recompile_inputs(g)
+    if stamp(".recompile_inputs") != inputs and stamp(".recompile_inputs") == recompile_inputs(g, legacy=True):   # (code made under the old formula from these same inputs: only the stamp moves)
+        with open(os.path.join(g.OUT, ".recompile_inputs"), "w", newline="\n") as f: f.write(inputs + "\n")
+    if stamp(".recompile_inputs") != inputs:
         say(f"{g.T}: the recompiler or the game's pack changed since its code was made: making it again")
         run(SELF + ["analyze", g.T]); run(SELF + ["recompile", g.T]); remade = True
     ver = tools_version()

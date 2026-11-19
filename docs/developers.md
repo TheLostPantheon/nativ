@@ -67,7 +67,8 @@ The packs in `packs/` are the **Enhanced** tier: tested with each release, with 
   starts when it's only a launcher, as Uncharted's is), and `MODULES`: the Sony modules exporting the libraries the
   program imports, followed through their own imports (`RECOMPILED` in `packs.py`). The online modules are left out, so
   the game plays offline. The pack is made again at each import while it says `GENERATED = "1"`; delete that line to
-  keep your edits. It's the starting point for a game's own pack.
+  keep your edits. It's the starting point for a game's own pack. Its comments and test route (`TEST_*`) can change
+  without the game's code being made again; any other line regenerates it at the next `ready`.
 - **A release its pack doesn't play.** `import` refuses it and leaves `<title>/unsupported` for the launcher's **Try it
   anyway**, which runs `import <title> --experimental` (kept as `<title>/experimental`). The copy's version is then
   `unknown`: it gets the pack's settings for every version and none of `HOOKS`, `IHOOKS`, `GAME_ADDRS` or

@@ -4,7 +4,7 @@
 # 1. On a clean main, pulls (fast-forward only); a topic branch or local changes are left as they are.
 # 2. Builds the launcher (launcher/nativ, swapped in whole, so a running launcher keeps its old file).
 # 3. Each title (default: every title in the library with a pack; copies like PCSA00107_np aside) made ready, as the
-#    launcher's Play does (vitarecomp ready): its code regenerated when recompiler/ or its pack.toml changed since the
+#    launcher's Play does (vitarecomp ready): its code regenerated when recompiler/ or its pack.toml (less comments and TEST_*) changed since the
 #    last regeneration (uncommitted edits count too), then built when the tools did.
 # Refuses while a game runs (relinking a running binary can take it down), and skips a title whose game started since.
 # NATIV_BUILD_ALL_NOPULL=1: no pull (release.sh: the checkout is the release's tag and stays so).
