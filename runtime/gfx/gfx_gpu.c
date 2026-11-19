@@ -5852,7 +5852,9 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		vp2.w = 2.0f * d->vp_xscale; vp2.x = d->vp_xoff - d->vp_xscale;
 		vp2.h = -2.0f * d->vp_yscale; vp2.y = d->vp_yoff + d->vp_yscale;
 		vp2.min_depth = 0.0f; vp2.max_depth = 1.0f;   /* z is mapped in the vertex shader (zOffset + zScale * z/w): the depth range stays the full [0,1] */
-	} else if (d->viewport_set) {   /* SCE_GXM_VIEWPORT_DISABLED: clip position IS the device position, 1:1 */
+	} else if (d->viewport_set && !g_points_draw) {   /* SCE_GXM_VIEWPORT_DISABLED: positions in target pixels, mapped to clip space by the vertex epilogue (viewport_z[2..3], below) */
+		vp2 = (SDL_GPUViewport){ 0, 0, (float)vw, (float)scene_entry->height, 0.0f, 1.0f };
+	} else if (d->viewport_set) {   /* (DISABLED point sprites: clip position as the device position, as before) */
 		vp2 = (SDL_GPUViewport){ -1.0f, -1.0f, 2.0f, 2.0f, 0.0f, 1.0f };
 	} else vp2 = (SDL_GPUViewport){ 0, 0, (float)vw, (float)scene_entry->height, 0.0f, 1.0f };   /* never set: the old implicit full-target mapping */
 	{ float kx = (float)scene_sx, ky = (float)scene_sy; vp2.x *= kx; vp2.y *= ky; vp2.w *= kx; vp2.h *= ky; }   /* render scale: the target's pixels are n x n (DISABLED's 1:1 device mapping too: (-n,-n,2n,2n) puts clip x at n*x) */
@@ -5960,6 +5962,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		int vz_on = d->viewport_set && !d->viewport_disabled;
 		b->vu.viewport_z[0] = b->fu.viewport_z[0] = vz_on ? d->vp_zoff : 0.0f; b->vu.viewport_z[1] = b->fu.viewport_z[1] = vz_on ? d->vp_zscale : 1.0f;
 		b->vu.viewport_z[2] = b->vu.viewport_z[3] = b->fu.viewport_z[2] = b->fu.viewport_z[3] = 0;
+		if (d->viewport_set && d->viewport_disabled && !g_points_draw) { b->vu.viewport_z[2] = 2.0f / (float)vw; b->vu.viewport_z[3] = 2.0f / (float)scene_entry->height; }   /* (emit_vert_epilogue's pixel -> clip mapping) */
 		if (g_points_draw) {   /* point sprites: half a target pixel in NDC per axis, signed for the screen's directions (gfx_soft.c's render_points_interp) */
 			float kx, ky; int ydown, xleft = 0;
 			if (d->viewport_set && d->viewport_disabled) { kx = ky = 1; ydown = 1; }

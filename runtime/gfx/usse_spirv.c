@@ -1824,6 +1824,14 @@ static void emit_vert_epilogue(Gen *g, int *ok) {
 	uint32_t vz = load(s, t_vec(s, t_float(s), 4), pz);
 	uint32_t zoff = composite_extract1(s, t_float(s), vz, 0), zscale = composite_extract1(s, t_float(s), vz, 1);
 	pos[2] = fop2(s, SpvOpFAdd, fop2(s, SpvOpFMul, zoff, pos[3]), fop2(s, SpvOpFMul, zscale, pos[2]));
+	if (!g->points) {   /* SCE_GXM_VIEWPORT_DISABLED (gfx_gpu.c gives the draw the whole target as its viewport and 2/W, 2/H in
+		 * viewport_z[2..3]): the position is in target pixels, y down, and becomes clip space here, x*2/W - w and w - y*2/H.
+		 * Taken 1:1 through a (-1,-1,2,2) viewport, the host clipped it to |x|,|y| <= w first: a 960x544 quad kept a pixel */
+		uint32_t tf = t_float(s), tb = t_bool(s), kx = composite_extract1(s, tf, vz, 2), ky = composite_extract1(s, tf, vz, 3);
+		uint32_t on = result2(s, &s->func, SpvOpFOrdNotEqual, tb, kx, c_float(s, 0.0f));
+		pos[0] = result3(s, &s->func, SpvOpSelect, tf, on, fop2(s, SpvOpFSub, fop2(s, SpvOpFMul, pos[0], kx), pos[3]), pos[0]);
+		pos[1] = result3(s, &s->func, SpvOpSelect, tf, on, fop2(s, SpvOpFSub, pos[3], fop2(s, SpvOpFMul, pos[1], ky)), pos[1]);
+	}
 	if (g->pos_only) {   /* the motion variant's second run: its position, nothing else */
 		uint32_t id = nid(s); INS(&s->func, SpvOpCompositeConstruct, t_vec(s, t_float(s), 4), id, pos[0], pos[1], pos[2], pos[3]);
 		store(s, g->var_mv_prev, id); return;
