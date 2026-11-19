@@ -9,6 +9,7 @@ someone carries a `Co-authored-by` line, so GitHub lists them as a contributor a
 |---|---|
 | [Tzeentchnet](https://github.com/Tzeentchnet) | The Windows firmware secure-module report fix (#6) and the Windows source-checkout docs (#5). The wording that says when online discovery starts (#4). The plan for running the tests that need no game in CI (#84). The analysis that made FSR's half precision safe to turn on (#99). Finding that SOP2, SOP2M, SOP3 and I8MAD work on whole packed words, the back faces' stencil state, and the F16 render targets' channel order (#77). |
 | [Luufen](https://github.com/Luufen) | Compiling the runtime to cached objects (#73), the idea behind the faster rebuilds in #105. The idea of the kernel timer imports (#35). The idea of the audio decoder (sceAudiodec) for ATRAC9 and AAC (#54). Finds in their fork, reimplemented here: VBW's repeat count, USSE subroutine calls, draws with the viewport disabled, GPU views of render targets of any swizzle, Thumb IT-block returns, tail jumps that set LR, ARM/Thumb classification, computed jumps to another function, the sceCtrl record size, the exclusive monitor on context switches, sceAudioOutOutput's result, fiber stacks, and the NGS player's start buffer and Play. |
+| [Ecstatic-Magician](https://github.com/Ecstatic-Magician) | Palettized textures (P4, P8), found in their Persona 4: Dancing All Night work. |
 
 Everyone who files an issue with its logs helps as much as code does: most fixes start from a report.
 

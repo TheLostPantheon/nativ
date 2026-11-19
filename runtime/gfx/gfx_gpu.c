@@ -1026,6 +1026,8 @@ typedef struct { uint32_t addr, format, width, height; int layout; int stale, bc
 	 * re-hashes every page (and closes them again); nchk: re-checks in frame chk_frame */
 	uint32_t span, wclock, nph; uint64_t *ph; int hot, streak, calm, full, nchk; uint64_t big_frame, chk_frame;
 	uint64_t chash; int levels; uint64_t bytes;
+	uint32_t palette; uint64_t phash;   /* P4 / P8: the palette's address (part of the key: the same indices under another palette are
+	                                     * another texture) and a hash of its entries (rewritten in place: decoded again) */
 	uint8_t sx, sy; } TexEntry;   /* sx, sy: a view's texels a guest pixel (its source's scale: target_scale) */   /* chash/levels: the uploaded bytes' hash over the whole span and its mip count (get_texture: a texture that moved) */   /* samp[min][mag][addrmode_u][addrmode_v]; layout: GfxTexture's (3 = cube: a 6-layer cube texture) */
 /* The texture table: up to MAXTEX entries and tex_budget() bytes of GPU textures (an estimate per entry, TexEntry.bytes), the
  * least recently used one replaced past either. It was a fixed 512 entries: a Killzone area that samples more than that a
@@ -1444,16 +1446,28 @@ static void tex_policy(TexEntry *e, uint32_t changed) {
 		if (e->calm >= 30) { e->hot = 0; e->streak = 0; e->full = 1; if (trace_sync()) fprintf(stderr, "gpu trace: texture %#x %ux%u stable again: watched\n", e->addr, e->width, e->height); }
 	}
 }
+/* a P4 / P8 texture's palette entries, hashed (0 for every other format): the page watch covers the indices only */
+static uint64_t tex_palette_hash(const GfxTexture *t) {
+	const uint32_t b = t->format & 0xff000000u;
+	if (!t->palette || (b != 0x94000000u && b != 0x95000000u)) return 0;
+	return hash_bytes(G(t->palette), b == 0x94000000u ? 64 : 1024) | 1;
+}
 static TexEntry *get_texture(const GfxTexture *t) {
 	uint64_t th0 = us_now();
 	int layout = (t->u_mode >> 4) & 3, watch = gwatch_on();
 	n_tex_binds++;
 	TexEntry *e = 0;   /* one entry per (address, format, size): a layout change re-decodes it in place */
 	const unsigned key = tex_key(t);
-	#define TEX_MATCH(x) ((x)->addr == t->data && (x)->format == t->format && (x)->width == t->width && (x)->height == t->height)
+	#define TEX_MATCH(x) ((x)->addr == t->data && (x)->format == t->format && (x)->width == t->width && (x)->height == t->height && (x)->palette == t->palette)
 	{ int hint = tex_index[key] - 1; if (hint >= 0 && hint < ntextures && TEX_MATCH(&textures[hint])) e = &textures[hint]; }
 	if (!e) for (int i = 0; i < ntextures; i++) { TexEntry *x = &textures[i]; if (TEX_MATCH(x)) { e = x; tex_index[key] = (uint16_t)(i + 1); break; } }
 	#undef TEX_MATCH
+	const uint64_t pal = tex_palette_hash(t);
+	if (e && e->ph && e->layout == layout && e->phash != pal && e->span == tex_span(t)) {   /* its palette rewritten: the same indices, decoded again */
+		e->phash = pal; e->used = ++tex_clock; e->checked_frame = gpu_frame_no + 1; n_tex_changed++; t_texhash += us_now() - th0;
+		uint64_t tu0 = us_now(); upload_texture(e, t); tex_account(e); t_texup += us_now() - tu0;
+		return e;
+	}
 	if (e && e->ph && e->layout == layout && !e->full) {   /* the common case: nothing written over it since its last check */
 		int fresh = watch && !e->hot ? gwatch_unchanged(e->addr, e->span, &e->wclock) && (!tex_verify() || e->checked_frame == gpu_frame_no + 1)
 		                             : e->checked_frame == gpu_frame_no + 1;   /* hot, or no watch: once a frame */
@@ -1503,7 +1517,7 @@ static TexEntry *get_texture(const GfxTexture *t) {
 		 * and a hash of the whole span, as uploaded -- takes the new address instead: its GPU texture is already right. */
 		ch = hash_bytes(G(t->data), span); int lv = layout == 3 ? gfx_texture_cube_levels(t) : gfx_texture_levels(t);
 		for (int i = 1; i < ntextures && !moved; i++) { TexEntry *x = &textures[i];
-			if (x->tex && x->chash == ch && x->span == span && x->format == t->format && x->width == t->width && x->height == t->height && x->layout == layout && x->levels == lv) moved = x; }
+			if (x->tex && x->chash == ch && x->span == span && x->format == t->format && x->width == t->width && x->height == t->height && x->layout == layout && x->levels == lv && x->palette == t->palette && x->phash == pal) moved = x; }
 		if (moved) {
 			if (trace_sync()) fprintf(stderr, "gpu trace: texture %#x fmt %#x %ux%u u%#x: the same bytes as the one at %#x -- moved, not uploaded\n", t->data, t->format, t->width, t->height, t->u_mode, moved->addr);
 			e = moved; free(e->ph); e->ph = 0; e->addr = t->data; e->stale = 0; n_tex_moved++;
@@ -1524,9 +1538,10 @@ static TexEntry *get_texture(const GfxTexture *t) {
 			free(e->ph);
 		}
 		if (trace_sync()) fprintf(stderr, "gpu trace: texture %#x fmt %#x %ux%u u%#x uploaded: new\n", t->data, t->format, t->width, t->height, t->u_mode);
-		memset(e, 0, sizeof *e); e->addr = t->data; e->format = t->format; e->width = t->width; e->height = t->height; n_tex_new++;
+		memset(e, 0, sizeof *e); e->addr = t->data; e->format = t->format; e->width = t->width; e->height = t->height; e->palette = t->palette; e->phash = pal; n_tex_new++;
 	}
 	tex_index[key] = (uint16_t)(e - textures + 1);
+	e->palette = t->palette; e->phash = pal;
 	e->span = span; e->nph = tex_pages(t->data, span); e->ph = calloc(e->nph ? e->nph : 1, sizeof *e->ph);
 	e->hot = e->streak = e->calm = e->full = 0; e->big_frame = 0;
 	if (watch) e->wclock = gwatch_protect(e->addr, span);   /* before the bytes are hashed and decoded */

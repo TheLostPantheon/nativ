@@ -76,6 +76,7 @@ static GfxTexture texture_words(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t 
 	GfxTexture g = {0};
 	g.data = w2 & ~3u;
 	g.format = (w0 & 0x80000000u) | (w1 & 0x1f000000u) | ((w3 >> 16) & 0x7000u) | (srgb_on() ? ((w0 >> 27) & 3u) << 16 : 0);   /* + the gamma mode (gfx.h GFX_TEX_GAMMA), opt-in */
+	if ((g.format & 0xff000000u) == 0x94000000u || (g.format & 0xff000000u) == 0x95000000u) g.palette = (w3 & 0x03ffffffu) << 6;   /* P4 / P8: sceGxmTextureSetPalette's address */
 	int log2size = type == 0 || type == 0x40000000u;   /* swizzled and cube store log2 sizes */
 	g.width = (uint16_t)(log2size ? 1u << ((w1 >> 16) & 15) : ((w1 >> 12) & 0xfff) + 1);
 	g.height = (uint16_t)(log2size ? 1u << (w1 & 15) : (w1 & 0xfff) + 1);

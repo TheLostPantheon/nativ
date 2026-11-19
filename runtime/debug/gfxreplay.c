@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -158,8 +159,15 @@ int main(int argc, char **argv) {
 			}
 			gfx_begin_scene(&cur);
 		}
-		else if (!memcmp(tag, "DRAW", 4)) {
-			GfxDraw d; memset(&d, 0, sizeof d); memcpy(&d, buf, len < sizeof d ? len : sizeof d);   /* older captures: a shorter GfxDraw */
+		else if (!memcmp(tag, "DRAW", 4) || !memcmp(tag, "DRW2", 4)) {
+			GfxDraw d; memset(&d, 0, sizeof d);
+			if (tag[3] == '2') memcpy(&d, buf, len < sizeof d ? len : sizeof d);   /* older captures: a shorter GfxDraw */
+			else {   /* DRAW: from before GfxTexture had its palette, 16 bytes a texture: the head as it is, each texture widened, the rest after */
+				const size_t tex_at = offsetof(GfxDraw, tex), old_tex = 16, ntex = sizeof d.tex / sizeof d.tex[0], old_tail = tex_at + ntex * old_tex;
+				memcpy(&d, buf, len < tex_at ? len : tex_at);
+				for (size_t k = 0; k < ntex && tex_at + (k + 1) * old_tex <= len; k++) memcpy(&d.tex[k], (const uint8_t *)buf + tex_at + k * old_tex, old_tex);
+				if (len > old_tail) { size_t n = len - old_tail, room = sizeof d - (tex_at + sizeof d.tex); memcpy((uint8_t *)&d + tex_at + sizeof d.tex, (const uint8_t *)buf + old_tail, n < room ? n : room); }
+			}
 			if (dump) {
 				printf("draw %d: v %#x f %#x prim %#x ix %#x/%#x n %u  attr", ++draws, d.vprog, d.fprog, d.prim, d.index_format, d.indices, d.count);
 				for (int k = 0; k < d.nattr; k++) printf(" %u:%u+%u f%#x c%u r%u", k, d.attr[k].stream, d.attr[k].offset, d.attr[k].format, d.attr[k].comps, d.attr[k].reg);
