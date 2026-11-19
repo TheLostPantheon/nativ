@@ -333,7 +333,9 @@ static int frame_rate_60(void) {
 	static long until = -2;
 	if (until == -2) { const char *e = getenv("RECOMP_FRAME_RATE_UNTIL"); until = e && *e ? atol(e) : -1; }
 	if (until >= 0) return frames < (uint64_t)until;
-	return (env >= 0 ? env : settings_int("frame_rate", 30)) >= 60;
+	/* the setting counts only in a game whose pack offers it (RECOMP_GAME_OPTIONS frame_rate: hooks for its 1/30 s steps). In any other,
+	 * presenting every vblank ran its own fixed steps at twice the speed: the menu offered 60 to every game, experimental ones too */
+	return (env >= 0 ? env : settings_game_option("frame_rate") ? settings_int("frame_rate", 30) : 30) >= 60;
 }
 int display_frame_rate_60(void) { return frame_rate_60(); }
 float display_frame_dt(void) { uint64_t e = __atomic_load_n(clock_fixed() ? &frame_edges_g : &frame_edges, __ATOMIC_RELAXED); return (float)(e < 1 ? 1 : e > 2 ? 2 : e) / 60.0f; }   /* 1/60..1/30 s (hooks.c: a game's fixed 1/30 steps at 60 fps) */

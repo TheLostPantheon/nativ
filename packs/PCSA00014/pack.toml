@@ -14,7 +14,7 @@ TEST_TOUCH = "675-690:400,620;1200-1215:260,480;1500-1515:960,610"   # (frames x
 # RECOMP_SRGB=1: the game's lighting is gamma-correct -- its albedo textures are sRGB (decoded to linear
 # when sampled) and its tonemap writes an sRGB surface the final pass copies raw. Without the modes
 # the sunlit sand lit at ~2.5 instead of ~0.85 and the filmic curve (x2 after it) clipped it to white
-RUN_ENV = "RECOMP_GAME_OPTIONS=fov,online RECOMP_ADDCONT_MARKERS=UNIT13ONLINEPASS/unlock.dat RECOMP_SRGB=1 RECOMP_ASPECT_HOOK=1 RECOMP_TARGET_SCALE=720x408:1.3333"   # play: the GPU renderer (which always runs the real shaders), the real clock
+RUN_ENV = "RECOMP_GAME_OPTIONS=fov,online,frame_rate RECOMP_ADDCONT_MARKERS=UNIT13ONLINEPASS/unlock.dat RECOMP_SRGB=1 RECOMP_ASPECT_HOOK=1 RECOMP_TARGET_SCALE=720x408:1.3333"   # play: the GPU renderer (which always runs the real shaders), the real clock
 TEST_ENV = "RECOMP_GFX=soft RECOMP_SHADERS=interp RECOMP_CLOCK=fixed RECOMP_SRGB=1 RECOMP_ADDCONT_MARKERS=UNIT13ONLINEPASS/unlock.dat"   # the gate renders on the interpreter: the reference the GPU path is measured against
 TEST_FRAMES = 1050        # the main menu (SOLO MISSIONS / ONLINE COOPERATIVE / HIGH VALUE TARGETS / DAILY CHALLENGE)
 TEST_TOLERANCE = 5         # the menu is animated (its scrolling ticker and scan line): with the fixed test clock the frame was identical run to run for days, then drifted to 1.63% on 2026-10-16 with unchanged code -- only the ticker's and scan line's phase; 5% passes that and still fails a broken frame
