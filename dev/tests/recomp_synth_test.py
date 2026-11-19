@@ -6,7 +6,7 @@ that must leave LR alone.
 
     dev/tests/recomp_synth_test.py       (needs clang with the ARM target, unicorn, pyelftools and capstone: requirements.txt)
 Prints "N checks, M failed" and exits 1 on any mismatch."""
-import os, random, struct, subprocess, sys, tempfile
+import json, os, random, re, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recomp_exec_test as rx
 
@@ -131,9 +131,80 @@ def run_case(name, src, tmp, flags=(), harness=None, n=12):
         rx.HARNESS = saved
 
 
+def thumb_branch(at, target, link_arm):
+    """a Thumb bl (link_arm: blx #imm, which switches to ARM and rounds the base to a word) at address at"""
+    off = target - ((at + 4) & ~3 if link_arm else at + 4)
+    sgn, i1, i2 = (off >> 24) & 1, (off >> 23) & 1, (off >> 22) & 1
+    j1, j2 = ~(i1 ^ sgn) & 1, ~(i2 ^ sgn) & 1
+    lo = 0xc000 | (((off >> 2) & 0x3ff) << 1) if link_arm else 0xd000 | ((off >> 1) & 0x7ff)
+    return struct.pack("<HH", 0xf000 | sgn << 10 | ((off >> 12) & 0x3ff), lo | j1 << 13 | j2 << 11)
+
+
+def thumb_bl(at, target): return thumb_branch(at, target, False)
+def thumb_blx(at, target): return thumb_branch(at, target, True)
+
+
+def arm_set(c_text):
+    body = c_text[c_text.index("int recomp_is_arm("):]
+    body = body[:body.index("default:")]
+    return {int(x, 16) for x in re.findall(r"case 0x([0-9a-f]+)u:", body)}
+
+
+def check(what, ok):
+    global fails, checks
+    checks += 1; fails += not ok
+    print(("ok   " if ok else "FAIL ") + what)
+
+
+def mode_cases(tmp):
+    """which functions come out ARM, from a hand-laid image and the analysis' ARM list (recomp.py main)"""
+    base = 0x81000000
+    text = bytearray(0x200)
+    def put(off, data): text[off:off + len(data)] = data
+    movs1_bx = struct.pack("<HH", 0x2001, 0x4770)   # movs r0, #1; bx lr
+    bx_lr = struct.pack("<H", 0x4770)
+    junk_fn = struct.pack("<HHH", 0xed90, 0x3300, 0x4770)   # Thumb: ldc p3, c3, [r0]; bx lr. ARM: an ordinary data-processing word
+    F = {n: base + o for n, o in dict(
+        ptr=0x00, c_ptr=0x20, noptr=0x40, c_noptr=0x60, odd=0x82, guess_bl=0xa0, c_bl=0xc0, guess=0xe0,
+        noise_arm=0x100, noise_t=0x140).items()}
+    put(0x00, movs1_bx)                              # F.ptr: Thumb, and a word in .rodata holds F.ptr | 1
+    put(0x20, thumb_blx(F["c_ptr"], F["ptr"]) + bx_lr)   # calls it with blx #imm (which reads as ARM)
+    put(0x40, movs1_bx)                              # F.noptr: the same, no pointer: ARM by its caller's blx
+    put(0x60, thumb_blx(F["c_noptr"], F["noptr"]) + bx_lr)
+    put(0x82, junk_fn)                               # F.odd: 2-aligned, so never ARM whatever it decodes like
+    put(0xa0, junk_fn)                               # F.guess_bl: the guess says ARM; a Thumb bl caller says Thumb
+    put(0xc0, thumb_bl(F["c_bl"], F["guess_bl"]) + bx_lr)
+    put(0xe0, junk_fn)                               # F.guess: the same with no caller: the guess stands (ARM)
+    # F.noise_arm is ARM (the analysis says so); read as Thumb, its first word is a blx #imm to F.noise_t, a Thumb function
+    put(0x100, struct.pack("<I", 0)); w = thumb_blx(F["noise_arm"], F["noise_t"]); put(0x100, struct.pack("<I", w[0] | w[1] << 8 | w[2] << 16 | w[3] << 24))
+    put(0x104, struct.pack("<I", 0xe12fff1e))        # bx lr
+    put(0x140, movs1_bx)
+    sizes = {"ptr": 4, "c_ptr": 6, "noptr": 4, "c_noptr": 6, "odd": 6, "guess_bl": 6, "c_bl": 6, "guess": 6, "noise_arm": 8, "noise_t": 4}
+    rodata = struct.pack("<I", F["ptr"] | 1)
+    d = {"blocks": [{"start": base, "size": len(text), "init": True, "bytes": bytes(text).hex(), "name": ".text"},
+                    {"start": base + 0x1000, "size": len(rodata), "init": True, "bytes": rodata.hex(), "name": ".rodata"}],
+         "functions": {n: a | (0 if n == "noise_arm" else 1) for n, a in F.items()},
+         "bodies": [[a, a + sizes[n] - 1] for n, a in F.items()], "relocs": [], "module": "m", "exports": [], "variables": [],
+         "arm": [F["noise_arm"]]}
+    js = os.path.join(tmp, "mode.json"); json.dump(d, open(js, "w"))
+    out = os.path.join(tmp, "mode.c")
+    r = subprocess.run([sys.executable, os.path.join(rx.ROOT, "recompiler", "recomp.py"), js, out], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit("recomp.py failed:\n" + r.stdout[-2000:] + r.stderr[-2000:])
+    arm = arm_set(open(out).read())
+    check("mode: a blx #imm to an entry that a word in the image points at with the Thumb bit stays Thumb", F["ptr"] not in arm)
+    check("mode: ... and without such a word the blx makes it ARM", F["noptr"] in arm)
+    check("mode: an entry that is not 4-aligned is never ARM", F["odd"] not in arm)
+    check("mode: the coprocessor guess yields to a Thumb bl from certain Thumb code", F["guess_bl"] not in arm)
+    check("mode: ... and stands without one", F["guess"] in arm)
+    check("mode: a blx #imm read from a function the analysis knows as ARM does not make its target ARM", F["noise_t"] not in arm)
+    check("mode: the analysis' own ARM list is kept", F["noise_arm"] in arm)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="recomp_synth_") as tmp:
         run_case("lr_tail", LR_TAIL, tmp)
+        mode_cases(tmp)
     print(f"{checks} checks, {fails} failed")
     return 1 if fails else 0
 

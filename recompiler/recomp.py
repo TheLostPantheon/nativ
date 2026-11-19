@@ -21,7 +21,7 @@ has none) -- for a constant a function builds mid-body (a pack's IHOOKS).
 --unordered-loads: plain loads everywhere (A/B only). By default a function that uses exclusives or
 barriers (lock-free code) gets ordered loads (rt.h RD32A...); see SYNC_MN.
 """
-import bisect, json, os, re, sys
+import array, bisect, json, os, re, sys
 from capstone import Cs, CS_ARCH_ARM, CS_MODE_THUMB, CS_MODE_ARM
 from capstone.arm import (ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM, ARM_OP_FP, ARM_SFT_INVALID)
 
@@ -1796,19 +1796,40 @@ def main():
         for i in f.insns:
             if i.mnemonic == mnem and i.operands and i.operands[0].type == ARM_OP_IMM:
                 yield i.operands[0].imm & 0xffffffff
-    todo = [t for f in fns for t in calls(f, "blx") if t in by_entry]
+    # Only Thumb code's blx counts: the Thumb decode of a function the analysis knows as ARM is noise, and a "blx #imm"
+    # read out of it turned a Thumb function ARM (its real calls come from its ARM decode below). And the image's own
+    # function pointers carry the mode: a word entry|1 is the linker saying Thumb (an init table's pointer, the code that
+    # runs), which beats a blx #imm elsewhere that reads as ARM.
+    known_arm = set(d.get("arm", []))
+    thumb_refs = set()
+    for s0, bb in blocks.items():
+        o = (-s0) % 4
+        words = array.array("I", bb[o:o + (len(bb) - o) // 4 * 4])
+        if sys.byteorder != "little":
+            words.byteswap()
+        thumb_refs.update(v & ~1 for v in set(words) if v & 1 and (v & ~1) in by_entry)
+    todo = [t for f in fns if f.entry not in known_arm for t in calls(f, "blx") if t in by_entry and t not in thumb_refs]
     todo += [a for a in d.get("arm", []) if a in by_entry]   # the analysis decoded these as ARM (its exports and calls say so)
-    for f in fns:
-        if junk(f.insns) and not junk(decode(fspans[f.entry], True)):
-            todo.append(f.entry)
-    while todo:
-        e = todo.pop()
-        if e in arm or e not in by_entry:
-            continue
-        arm.add(e)
-        f = Fn(e, decode(fspans[e], True), eset, arm=True)
-        by_entry[e] = f
-        todo += [t for t in calls(f, "bl") if t in by_entry]
+    # the guess: Thumb decode with coprocessor instructions no Vita code has, ARM decode without. An ARM instruction
+    # starts on a word, so an entry with bit 1 set is Thumb whatever its decode looks like (a literal pool read as ldc)
+    maybe_arm = [f.entry for f in fns if not f.entry & 3 and junk(f.insns) and not junk(decode(fspans[f.entry], True))]
+
+    def propagate():
+        while todo:
+            e = todo.pop()
+            if e in arm or e not in by_entry or e & 3:
+                continue
+            arm.add(e)
+            f = Fn(e, decode(fspans[e], True), eset, arm=True)
+            by_entry[e] = f
+            todo.extend(t for t in calls(f, "bl") if t in by_entry)
+    propagate()
+    # a Thumb "bl" keeps the state: an entry that certain Thumb code (not ARM, not a guess itself) calls with "bl" is
+    # Thumb, whatever its own decode looks like, so the guess yields to it
+    guessed = set(maybe_arm)
+    thumb_bl = {t for f in fns if f.entry not in arm and f.entry not in guessed for t in calls(f, "bl")}
+    todo.extend(e for e in maybe_arm if e not in thumb_bl)
+    propagate()
     fns = [by_entry[f.entry] for f in fns]
     if arm:
         print(f"{len(arm)} ARM-mode functions")
