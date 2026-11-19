@@ -3712,7 +3712,18 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	case 0x21000000u: return xb == 0x1a000000u ? 1 : -1;                                        /* F11F11F10 as F11F11F10 */
 	case 0x41000000u: return xb == 0x9a000000u ? 2 : -1;                                        /* U2F10F10F10 as U2F10F10F10 */
 	case 0x11000000u: return xb == 0x0c000000u ? 3 : xb == 0x0d000000u ? 4 : -1;                /* F32F32 as U8U8U8U8 / S8S8S8S8 bytes */
-	case 0x00000000u: return (tgt_fmt & 0x00300000u) == 0 && xb == 0x0c000000u ? 0 : -1;      /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
+	case 0x00000000u: {                                                                        /* U8U8U8U8 as U8U8U8U8 (a sub-rectangle; the exact case binds the target itself) */
+		/* any target swizzle: its GPU texture holds the colour as drawn (r, g, b, a), its memory the bytes gfx_soft.c's
+		 * target_write_of stores for the swizzle (byte i = colour enc[s][i]: ABGR, ARGB, RGBA, BGRA), and the texture's
+		 * selectors index those bytes, so the view's selectors are the two composed. ABGR alone had a view before: every
+		 * other swizzle took the guest-memory path, a synchronous download per read (WipEout 2048's 480x272 ARGB target,
+		 * every frame) */
+		static const uint8_t enc[4][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {3,0,1,2} };
+		if (xb != 0x0c000000u) return -1;
+		const uint8_t *e = enc[(tgt_fmt >> 20) & 3];
+		for (int k = 0; k < 4; k++) if (swz[k] < 4) swz[k] = e[swz[k]];
+		return 0;
+	}
 	}
 	return -1;
 }
