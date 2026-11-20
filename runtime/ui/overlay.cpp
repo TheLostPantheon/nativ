@@ -367,6 +367,8 @@ static void page_display(void) {
 		ImGui::SetNextItemWidth(-FLT_MIN);
 		if (ImGui::SliderFloat("##sharp", &sh, 0.0f, 100.0f, sh <= 0.0f ? "Off" : "%.0f%%")) { settings_set_float("sharpen", sh / 100.0f); settings_save(); }
 	}
+	ui::row("Frame generation", "Makes a frame between each two of the game's, for smoother motion where the display refreshes faster than the game draws (a 30 fps game on a 60 Hz display). Adds a little delay to the picture.");
+	{ bool fg = settings_int("frame_gen", 0) != 0; if (ui::toggle("fgen", &fg)) { settings_set_int("frame_gen", fg ? 1 : 0); settings_save(); } }
 	ui::row("Texture filtering", "Keeps textures crisp when seen at an angle.");
 	{	static const int an[5] = {1, 2, 4, 8, 16}; static const char *const names[5] = {"Off##af", "2×##af", "4×##af", "8×##af", "16×##af"};
 		int cur = settings_int("anisotropy", 16), v = 4; for (int i = 0; i < 5; i++) if (an[i] == cur) v = i;

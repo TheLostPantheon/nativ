@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The generated frame at time t: each pixel the previous frame at -t*v blended with the current one at +(1-t)*v,
+// v its pixel's vector at the working size (scaled up). A cut (the frames don't match as a whole) gets no blend:
+// the nearer frame as it is.
+//   a.xy  frame size      a.zw  working size      b.x  scale (frame pixels per working pixel)
+//   c.xy  1 / frame size      c.z  t      c.w  the mean difference above which it's a cut
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D prv;
+layout(set = 0, binding = 1) uniform sampler2D cur;
+layout(set = 0, binding = 2) uniform sampler2D pix;
+layout(set = 0, binding = 3) uniform sampler2D stat;
+layout(set = 1, binding = 0, rgba8) uniform writeonly image2D outp;
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= u.a.x || p.y >= u.a.y) return;
+	float t = u.c.z; vec2 uv = (vec2(p) + 0.5) * u.c.xy;
+	if (texelFetch(stat, ivec2(0), 0).r > u.c.w) { imageStore(outp, p, vec4((t < 0.5 ? textureLod(prv, uv, 0.0) : textureLod(cur, uv, 0.0)).rgb, 1.0)); return; }
+	vec2 v = texelFetch(pix, clamp(p / u.b.x, ivec2(0), u.a.zw - 1), 0).xy * float(u.b.x) * u.c.xy;
+	vec3 a = textureLod(prv, uv - t * v, 0.0).rgb, c = textureLod(cur, uv + (1.0 - t) * v, 0.0).rgb;
+	imageStore(outp, p, vec4(mix(a, c, t), 1.0));
+}
