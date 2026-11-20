@@ -109,11 +109,22 @@ static std::string now_stamp(void) {
 	time_t now = time(nullptr); struct tm t = *localtime(&now); char b[32];
 	snprintf(b, sizeof b, "%04d%02d%02d-%02d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec); return b;
 }
-static bool same_version(const std::string &a, const std::string &b) {   /* "01.08" is "1.08" */
-	int a1 = -1, a2 = -1, b1 = -2, b2 = -2;
-	return sscanf(a.c_str(), "%d.%d", &a1, &a2) == 2 && sscanf(b.c_str(), "%d.%d", &b1, &b2) == 2 && a1 == b1 && a2 == b2;
+static int version_cmp(const std::string &a, const std::string &b) {   /* -1, 0, 1 ("01.08" is "1.08"); 2: either isn't a version */
+	int a1, a2, b1, b2;
+	if (sscanf(a.c_str(), "%d.%d", &a1, &a2) != 2 || sscanf(b.c_str(), "%d.%d", &b1, &b2) != 2) return 2;
+	return a1 != b1 ? (a1 < b1 ? -1 : 1) : a2 != b2 ? (a2 < b2 ? -1 : 1) : 0;
 }
 static std::string plain_version(const std::string &v) { int a, b; char o[16]; if (sscanf(v.c_str(), "%d.%d", &a, &b) != 2) return v; snprintf(o, sizeof o, "%d.%02d", a, b); return o; }
+/* a save goes to the same version of its game or a newer one, never an older one: an update reads the saves before it,
+ * but an older version may not read a newer one's (Shovel Knight: the Vita's patched game writes save version 8, 1.00
+ * reads 5). Empty: the copy may go; else why not. */
+static std::string version_blocks(const std::string &vita, const std::string &nativ, bool to_vita) {
+	int c = version_cmp(vita, nativ);
+	if (c == 2) return "Version differs (Vita " + plain_version(vita) + ", Nativ " + plain_version(nativ) + ")";
+	if (to_vita && c < 0) return "Made with " + plain_version(nativ) + " here, the Vita has " + plain_version(vita) + ": update it there to send it";
+	if (!to_vita && c > 0) return "Made with " + plain_version(vita) + " on the Vita, Nativ has " + plain_version(nativ) + ": add the update here to fetch it";
+	return "";
+}
 
 /* ---- JSON (the Vita's replies) ---- */
 struct J {
@@ -496,6 +507,11 @@ static Side vita_side(const J &m) {
 }
 
 /* ---- deciding and copying ---- */
+static std::string vita_version(Conn &c, const std::string &id) {   /* the game's version on the Vita ("" when it doesn't say) */
+	J list; if (!c.req_json("LIST " + id, list)) return "";
+	for (auto &x : list["games"].a) if (x["id"].str() == id) return x["version"].str();
+	return "";
+}
 static Check decide(Conn &c, const Game &g) {
 	Check r; J list, m;
 	if (!c.req_json("LIST " + g.id, list)) { r.why = "The Vita didn't answer: " + c.err; return r; }
@@ -504,7 +520,7 @@ static Check decide(Conn &c, const Game &g) {
 	const J &v = *vp;
 	if (!v["save"].b) { r.why = v["name"].str().empty() ? "Not on the Vita" : "No save on the Vita yet"; return r; }
 	if (g.version.empty() || g.version == "-" || g.version == "unknown") { r.why = "Nativ doesn't know this game's version"; return r; }
-	if (!same_version(v["version"].str(), g.version)) { r.why = "Version differs (Vita " + plain_version(v["version"].str()) + ", Nativ " + plain_version(g.version) + ")"; return r; }
+	if (version_cmp(v["version"].str(), g.version) == 2) { r.why = version_blocks(v["version"].str(), g.version, false); return r; }
 	if (!c.req_json("MANIFEST " + g.id, m)) { r.why = c.err == "busy" ? "Playing on the Vita" : "The Vita couldn't read it: " + c.err; return r; }
 	Manifest local = local_manifest(g.save_dir);
 	std::string vh = m["hash"].str(), ph = local.hash, base = base_of(g.id);
@@ -515,6 +531,10 @@ static Check decide(Conn &c, const Game &g) {
 	else if (ph == base) r.kind = PULL;
 	else if (vh == base) r.kind = PUSH;
 	else r.kind = CONFLICT;
+	if (r.kind == PULL || r.kind == PUSH) {   /* (a conflict is still shown: the choice that would go to an older version is refused when made) */
+		std::string no = version_blocks(v["version"].str(), g.version, r.kind == PUSH);
+		if (!no.empty()) { r.kind = SKIP; r.why = no; }
+	}
 	return r;
 }
 static void prune(const fs::path &dir) {
@@ -524,6 +544,7 @@ static void prune(const fs::path &dir) {
 	for (size_t i = 0; i + KEEP_BACKUPS < all.size(); i++) fs::remove_all(all[i], ec);
 }
 static bool do_pull(Conn &c, const Game &g, std::string &err) {
+	{ std::string no = version_blocks(vita_version(c, g.id), g.version, false); if (!no.empty()) { err = no; return false; } }
 	J m; if (!c.req_json("MANIFEST " + g.id, m)) { err = c.err == "busy" ? "the game is running on the Vita" : c.err; return false; }
 	std::error_code ec; fs::path save = P(g.save_dir), fresh = P(g.save_dir + ".vita-sync-new");
 	fs::remove_all(fresh, ec); fs::create_directories(fresh, ec);
@@ -560,6 +581,7 @@ static bool do_pull(Conn &c, const Game &g, std::string &err) {
 	return true;
 }
 static bool do_push(Conn &c, const Game &g, std::string &err) {
+	{ std::string no = version_blocks(vita_version(c, g.id), g.version, true); if (!no.empty()) { err = no; return false; } }
 	Manifest local = local_manifest(g.save_dir); J there;
 	if (!c.req_json("MANIFEST " + g.id, there)) { err = c.err == "busy" ? "the game is running on the Vita" : c.err; return false; }
 	std::map<std::string, std::string> have; std::map<long long, std::string> have_s;

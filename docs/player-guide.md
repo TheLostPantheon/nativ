@@ -212,8 +212,10 @@ Your Vita needs the Nativ Sync app (from VitaDB), and both need to be on the sam
 From then on a game syncs before it starts and after it closes, here and on the Vita. When both sides have new
 progress, Nativ asks which save to keep, showing each one's time and the game's own description of it, and the Vita
 asks the same when you start the game there. The save you don't keep is backed up: Nativ's in
-`backups/vita-sync/<title id>/` in your library, the Vita's on the Vita. A game syncs only when both run the same
-version of it, and only once it has a save on the Vita (play it there once). Settings, Vita sync turns it off for one
+`backups/vita-sync/<title id>/` in your library, the Vita's on the Vita. A save goes to the same version of its game or
+a newer one, never an older one: an update reads the saves before it, but an older version may not read a newer one's.
+So with an update on one side only, saves still move from the older side to the updated one. A game syncs once it has a
+save on the Vita (play it there once). Settings, Vita sync turns it off for one
 game or all of them.
 
 ## Reporting a bug
