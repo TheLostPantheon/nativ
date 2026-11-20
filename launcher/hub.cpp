@@ -17,7 +17,8 @@
  * ATIV_PREFS=<dir>: the launcher's own files and the shared settings there instead of the user's app folder (a test).
  * ATIV_DUMP=<dir>: the library (games, firmware, licences, builds, saves) there instead of the usual one, library_dir (a
  * fresh library to try setup on; the stages it runs inherit it). ATIV_SHOT=f.ppm (a verification aid, no visible window): renders the hub once into f.ppm and exits;
- * ATIV_SHOT_UI=library|setup:<0-4>|add|settings:<0-4>|game:<title>|sac|sac:again|vplay:<title> picks what is on screen, ATIV_SHOT_SIZE=WxH the size (1280x800),
+ * ATIV_SHOT_UI=library|setup:<0-4>|add|settings:<0-4>|game:<title>|sac|sac:again|vplay:<title> picks what is on screen (ATIV_VSYNC_ANSWER=vita|pc|later
+ * answers Vita sync's choice before a game starts, for a test), ATIV_SHOT_SIZE=WxH the size (1280x800),
  * ATIV_SHOT_SCAN=<rows> a folder search's results (vitarecomp scan's output) in the Add dialog.
  * ATIV_TASK=play:<title>|build:<title>|scan:<folder>|licences:<folder>|firmware:<file> (a verification aid, no window): that
  * task run as its button runs it, its log printed, the exit status its outcome; ATIV_TASK_CANCEL=<seconds>: Cancel then.
@@ -1365,6 +1366,12 @@ static void vplay_modal(void) {
 		ImGui::Dummy(ImVec2(0, em * 0.4f));
 		if (ImGui::Button("Play without syncing")) skip();
 	} else if (ph == VP_CHOICE) {
+		if (const char *ans = getenv("ATIV_VSYNC_ANSWER")) {   /* (a test's answer: vita, pc or later, as the buttons below) */
+			int gen = g_vplay.gen; std::string a = ans;
+			if (a == "vita") { vplay_set(gen, VP_COPY, "Getting your save from " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, true); }
+			else if (a == "pc") { vplay_set(gen, VP_COPY, "Sending this PC's save to " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, false); }
+			else skip();
+		}
 		ui::muted_wrapped(("Your Vita and this PC both have new progress since the last sync. Which save should " + name + " continue from?").c_str());
 		ImGui::Dummy(ImVec2(0, em * 0.3f));
 		const float cw = (ImGui::GetContentRegionAvail().x - em) * 0.5f;

@@ -691,6 +691,7 @@ int cli(int argc, char **argv) {
 		std::string why = pair(v, argv[2]); printf("%s\n", why.empty() ? ("paired with " + vita_name()).c_str() : why.c_str()); return why.empty() ? 0 : 1;
 	}
 	if (cmd == "unpair") { unpair(); return 0; }
+	if ((cmd == "on" || cmd == "off") && argc >= 2) { set_game_on(argv[1], cmd == "on"); if (cmd == "off") std::this_thread::sleep_for(std::chrono::seconds(4)); printf("%s %s\n", argv[1], cmd.c_str()); return 0; }
 	if (cmd == "status") { Conn c; printf("%s\n", line().c_str()); if (paired() && connect_vita(c, 3000)) printf("connected; account %s\n", account_id().c_str()); else if (paired()) printf("not connected: %s\n", c.err.c_str()); return 0; }
 	if ((cmd == "check" || cmd == "pull" || cmd == "push") && argc >= 4) {
 		Game g{argv[1], argv[1], argv[2], argv[3]};
@@ -703,7 +704,7 @@ int cli(int argc, char **argv) {
 		std::string err; bool ok = cmd == "pull" ? pull(g, err) : push(g, err);
 		printf("%s%s\n", ok ? "done" : "failed: ", err.c_str()); return ok ? 0 : 1;
 	}
-	printf("nativ --vita-sync find | pair <address> <code> | unpair | status | check|pull|push <TITLE> <version> <savedata0 folder>\n");
+	printf("nativ --vita-sync find | pair <address> <code> | unpair | status | on|off <TITLE> | check|pull|push <TITLE> <version> <savedata0 folder>\n");
 	return 2;
 }
 }
