@@ -546,6 +546,7 @@ static bool do_pull(Conn &c, const Game &g, std::string &err) {
 	}
 	if (local_manifest(U(fresh)).hash != m["hash"].str()) { err = "the copy didn't match the Vita's"; return false; }
 	fs::path bdir = P(g_backups) / g.id / now_stamp();
+	for (int n = 2; fs::exists(bdir, ec); n++) bdir = P(g_backups) / g.id / (now_stamp() + "-" + std::to_string(n));   /* (two in one second) */
 	if (fs::exists(save, ec)) { fs::create_directories(bdir.parent_path(), ec); fs::copy(save, bdir, fs::copy_options::recursive, ec); if (ec) { err = "couldn't back up Nativ's save: " + ec.message(); return false; } }
 	fs::remove_all(save, ec); fs::create_directories(save.parent_path(), ec);
 	fs::rename(fresh, save, ec);
@@ -623,6 +624,7 @@ void mark_conflict(const Game &g, const Check &k) {
 	c.req("GUARD " + g.id, body, o);
 }
 void after_play(const Game &g) {
+	{ std::lock_guard<std::mutex> l(mu); vita_wins.erase(g.id); }   /* (a choice for the Vita's save made while it played here: this session changed it again, so ask afresh) */
 	Check k = check(g, 3000); std::string err;
 	if (k.kind == PUSH) { if (!push(g, err)) set_status(g.id, "Couldn't send: " + err, 2); }
 	else if (k.kind == PULL) { if (!pull(g, err)) set_status(g.id, "Couldn't fetch: " + err, 2); }
@@ -641,15 +643,27 @@ static void catch_up(void) {   /* on connecting: bring each game up to date wher
 		else if (k.kind == CONFLICT) mark_conflict(g, k);
 	}
 }
-static void on_event(Conn &ev, const J &e) {
-	std::string kind = e["kind"].str(), id = e["id"].str(), choice = e["choice"].str(), err; Game g;
+/* a choice the player made at the Vita (at a launch there, or in its app): "pc" sends this save (a launch waiting
+ * for it is let go by the commit), "vita" takes the Vita's: at once when the game isn't running there, else when it stops */
+static void act_choice(Conn &ev, const std::string &id, const std::string &choice) {
+	std::string err; Game g;
 	if (!find_game(id, g) || !game_on(id)) return;
-	if (kind == "started") set_status(id, "Playing on the Vita", 0);
-	else if (kind == "choice" && choice == "pc") {   /* the launch waits there for this save; the commit lets it go */
+	if (choice == "pc") {
 		bool ok = id != now_playing() && push(g, err);
 		std::string o; if (!ok) ev.req("RELEASE " + id + " 0", "", o);
 		if (!ok) set_status(id, "Couldn't send: " + (err.empty() ? "it's running in Nativ" : err), 2);
-	} else if (kind == "choice" && choice == "vita") { std::lock_guard<std::mutex> l(mu); vita_wins.insert(id); set_status(id, "Taking the Vita's save after it closes", 0); }
+	} else if (choice == "vita") {
+		if (id != now_playing() && pull(g, err)) return;
+		if (id != now_playing() && err != "the game is running on the Vita") { set_status(id, "Couldn't fetch: " + err, 2); return; }
+		{ std::lock_guard<std::mutex> l(mu); vita_wins.insert(id); }   /* (set_status takes the lock itself) */
+		set_status(id, "Taking the Vita's save after it closes", 0);
+	}
+}
+static void on_event(Conn &ev, const J &e) {
+	std::string kind = e["kind"].str(), id = e["id"].str(), choice = e["choice"].str(), pc = e["pc"].str(), err; Game g;
+	if (kind == "choice") { if (pc.empty() || pc == get("pc_id")) act_choice(ev, id, choice); return; }   /* (another computer's conflict: its own) */
+	if (!find_game(id, g) || !game_on(id)) return;
+	if (kind == "started") set_status(id, "Playing on the Vita", 0);
 	else if (kind == "stopped" && id != now_playing()) {
 		bool wins; { std::lock_guard<std::mutex> l(mu); wins = vita_wins.count(id) > 0; }
 		if (wins) { if (!pull(g, err)) set_status(id, "Couldn't fetch: " + err, 2); return; }
@@ -670,6 +684,8 @@ static void loop(void) {
 			idle++; continue;
 		}
 		idle = 0; is_online = true;
+		J ch;   /* first the choices made at the Vita while this computer was away (before catch_up flags them again) */
+		if (ev.req_json("CHOICES", ch)) for (auto &x : ch["choices"].a) act_choice(ev, x["id"].str(), x["choice"].str());
 		catch_up();
 		J r;
 		while (run && paired() && enabled() && ev.req_json("EVENTS 4000", r)) {
@@ -691,6 +707,12 @@ int cli(int argc, char **argv) {
 		std::string why = pair(v, argv[2]); printf("%s\n", why.empty() ? ("paired with " + vita_name()).c_str() : why.c_str()); return why.empty() ? 0 : 1;
 	}
 	if (cmd == "unpair") { unpair(); return 0; }
+	if (cmd == "choices" && argc >= 4) {   /* the background side's first step: choices kept at the Vita, carried out (for one game) */
+		set_library({Game{argv[1], argv[1], argv[2], argv[3]}});
+		Conn c; J ch; if (!connect_vita(c, 3000) || !c.req_json("CHOICES", ch)) { printf("failed: %s\n", c.err.c_str()); return 1; }
+		for (auto &x : ch["choices"].a) { act_choice(c, x["id"].str(), x["choice"].str()); printf("%s %s: %s\n", x["id"].str().c_str(), x["choice"].str().c_str(), status(x["id"].str()).text.c_str()); }
+		return 0;
+	}
 	if ((cmd == "on" || cmd == "off") && argc >= 2) { set_game_on(argv[1], cmd == "on"); if (cmd == "off") std::this_thread::sleep_for(std::chrono::seconds(4)); printf("%s %s\n", argv[1], cmd.c_str()); return 0; }
 	if (cmd == "status") { Conn c; printf("%s\n", line().c_str()); if (paired() && connect_vita(c, 3000)) printf("connected; account %s\n", account_id().c_str()); else if (paired()) printf("not connected: %s\n", c.err.c_str()); return 0; }
 	if ((cmd == "check" || cmd == "pull" || cmd == "push") && argc >= 4) {
@@ -704,7 +726,7 @@ int cli(int argc, char **argv) {
 		std::string err; bool ok = cmd == "pull" ? pull(g, err) : push(g, err);
 		printf("%s%s\n", ok ? "done" : "failed: ", err.c_str()); return ok ? 0 : 1;
 	}
-	printf("nativ --vita-sync find | pair <address> <code> | unpair | status | on|off <TITLE> | check|pull|push <TITLE> <version> <savedata0 folder>\n");
+	printf("nativ --vita-sync find | pair <address> <code> | unpair | status | on|off <TITLE> | check|pull|push|choices <TITLE> <version> <savedata0 folder>\n");
 	return 2;
 }
 }
