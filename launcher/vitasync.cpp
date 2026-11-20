@@ -44,7 +44,7 @@ typedef int sock_t;
 namespace fs = std::filesystem;
 namespace vsync {
 
-static const int PORT = 1340;
+static int port(void) { const char *p = getenv("ATIV_VSYNC_PORT"); return p && atoi(p) > 0 ? atoi(p) : NSYNC_PORT; }   /* (another for a test's stand-in Vita) */
 static const size_t CHUNK = NSYNC_PLAIN_MAX - 512;   /* file bytes per frame, the request line besides */
 static const int SLOT_PARAM = 0x34C;
 static const int KEEP_BACKUPS = 10;
@@ -264,7 +264,7 @@ static bool set_timeout(sock_t s, int ms) {
 #endif
 }
 static sock_t dial(const std::string &addr, int ms) {   /* a TCP connection, or BAD_SOCK within ms */
-	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(PORT);
+	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port());
 	if (inet_pton(AF_INET, addr.c_str(), &a.sin_addr) != 1) return BAD_SOCK;
 	sock_t s = socket(AF_INET, SOCK_STREAM, 0); if (s == BAD_SOCK) return s;
 #ifdef _WIN32
@@ -303,7 +303,7 @@ std::vector<Vita> find(int ms) {   /* broadcast, and the paired Vita's last addr
 	std::vector<Vita> out;
 	sock_t s = socket(AF_INET, SOCK_DGRAM, 0); if (s == BAD_SOCK) return out;
 	int one = 1; setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
-	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(PORT);
+	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port());
 	a.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 	sendto(s, "NSYNC1?", 7, 0, (struct sockaddr *)&a, sizeof a);
 	std::string last = get("vita_addr");

@@ -14,6 +14,7 @@ step() { local name=$1; shift; echo "== $name"; if "$@"; then echo "   ok"; else
 step "game packs (packconf.py --check)" $PY pipeline/packconf.py --check
 step "the README's games table (packconf.py --table)" $PY pipeline/packconf.py --table --check README.md
 step "Steam shortcuts (steam.py selftest)" $PY pipeline/steam.py selftest
+step "Vita sync against a stand-in Vita (vitasync_test.py)" $PY dev/tests/vitasync_test.py
 step "copies and versions (packs.py selftest)" env PYTHONPATH=decrypt $PY pipeline/packs.py selftest
 step "spin waits (spin_loads_test.py)" $PY dev/tests/spin_loads_test.py
 step "function analysis (analyze_test.py)" $PY dev/tests/analyze_test.py
