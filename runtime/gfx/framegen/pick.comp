@@ -3,7 +3,10 @@
 // A vector for each pixel of the working size at time t, picked from the block vectors around it (and zero) by how
 // well the previous frame at -t*v and the current one at +(1-t)*v agree over the pixel's 3x3 neighbourhood: a still
 // HUD over a moving scene keeps the zero vector on its own pixels, and a moving object's edge takes the vector of
-// whichever side it is on. Ties go to the block's own vector, and before it to zero.
+// whichever side it is on. Ties go to the block's own vector, and before it to zero. Then the forward motion carried here
+// (project.comp): taken when it agrees better, or as well (within TIE) and is further from the scene's mean motion than
+// the pick so far -- a thin object moving over a flat background matches "still" just as well as its own motion (the
+// background is the same either way), and is in front of it; a HUD over a moving scene keeps zero by the same rule.
 //   a.xy  working size      a.zw  field size (blocks)      c.xy  1 / working size      c.z  t
 // Out: xy the vector (working pixels), z the agreement it had.
 #include "common.glsl"
@@ -11,6 +14,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D prv;
 layout(set = 0, binding = 1) uniform sampler2D cur;
 layout(set = 0, binding = 2) uniform sampler2D fld;
+layout(set = 0, binding = 3) uniform sampler2D proj;
+layout(set = 0, binding = 4) uniform sampler2D stat;
+#define TIE 0.004
 layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D pix;
 vec2 P; float T;
 float cost(vec2 v) {
@@ -27,8 +33,8 @@ void main() {
 	P = vec2(p); T = u.c.z;
 	ivec2 b = p / 4, hi = u.a.zw - 1;
 	vec2 best = texelFetch(fld, clamp(b, ivec2(0), hi), 0).xy;
-	float bc = cost(best) - 0.004, c = cost(vec2(0.0)) - 0.006;   /* (ties go to standing still: a pattern that repeats along the motion -- text, grilles -- matches a moving vector as well as zero) */
-	if (c < bc) { bc = c; best = vec2(0.0); }
+	float raw = cost(best), bc = raw - 0.004, rz = cost(vec2(0.0)), c = rz - 0.006;   /* (ties go to standing still: a pattern that repeats along the motion -- text, grilles -- matches a moving vector as well as zero) */
+	if (c < bc) { bc = c; best = vec2(0.0); raw = rz; }   /* (raw: the pick's own difference, its bias aside) */
 	vec2 own = best, seen[8]; int ns = 0;   /* (each distinct vector tried once: in smooth motion the neighbours repeat the block's own) */
 	for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
 		if (i == 0 && j == 0) continue;
@@ -38,7 +44,16 @@ void main() {
 		if (dup) continue;
 		seen[ns++] = v;
 		c = cost(v);
-		if (c < bc) { bc = c; best = v; }
+		if (c < bc) { bc = c; best = v; raw = c; }
+	}
+	/* the forward motion carried here (the tie against the pick's own difference: the biases above are for ties among
+	 * the symmetric ones). Only the block's own: its neighbours' as well filled a thin object's gaps a little more but
+	 * cost the HUD and moving edges more than that (framegen_test) */
+	vec4 pj = texelFetch(proj, clamp(b, ivec2(0), hi), 0);
+	if (pj.z > 0.5 && pj.xy != best) {
+		vec2 mean = texelFetch(stat, ivec2(0), 0).gb;
+		float cp = cost(pj.xy);
+		if (cp < bc || (cp <= raw + TIE && dot(pj.xy - mean, pj.xy - mean) > dot(best - mean, best - mean))) { bc = cp; best = pj.xy; raw = cp; }
 	}
 	imageStore(pix, p, vec4(best, bc, 0.0));
 }

@@ -1,16 +1,18 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// The finest field's mean difference along its vectors, one number (warp.comp's cut test), in one workgroup.
+// The finest field's mean difference along its vectors (warp.comp's cut test) and its mean vector (the scene's motion as
+// a whole: project.comp and pick.comp tell what's in front of it by how far its own motion is from it), in one workgroup.
 //   a.xy  field size
+// Out: r the mean difference, gb the mean vector (working pixels).
 #include "common.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) uniform sampler2D fld;
-layout(set = 1, binding = 0, r32f) uniform writeonly image2D outp;
-shared float part[256];
+layout(set = 1, binding = 0, rgba32f) uniform writeonly image2D outp;
+shared vec3 part[256];
 void main() {
-	uint i = gl_LocalInvocationIndex; int n = u.a.x * u.a.y; float s = 0.0;
-	for (int k = int(i); k < n; k += 256) s += texelFetch(fld, ivec2(k % u.a.x, k / u.a.x), 0).z;
+	uint i = gl_LocalInvocationIndex; int n = u.a.x * u.a.y; vec3 s = vec3(0.0);
+	for (int k = int(i); k < n; k += 256) { vec4 f = texelFetch(fld, ivec2(k % u.a.x, k / u.a.x), 0); s += vec3(f.z, f.xy); }
 	part[i] = s; barrier();
 	for (uint w = 128u; w > 0u; w >>= 1) { if (i < w) part[i] += part[i + w]; barrier(); }
-	if (i == 0u) imageStore(outp, ivec2(0), vec4(part[0] / float(max(n, 1))));
+	if (i == 0u) { vec3 m = part[0] / float(max(n, 1)); imageStore(outp, ivec2(0), vec4(m, 0.0)); }
 }

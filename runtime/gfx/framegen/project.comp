@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The forward motion carried to the made frame's time t: for each block of the finest field (4x4 working pixels), the
+// searched blocks of fsearch.comp (the same grid) whose content lands on it at t -- a block at c moving by f is at c + t*f
+// then -- and of those, the one whose motion differs most from the scene's mean (the background moves with the mean;
+// what lands on top of it is in front of it). That vector is a candidate pick.comp tries beside the symmetric ones.
+//   a.xy  the field's size (blocks)      b.x  radius (blocks)      c.z  t
+// Out: xy the vector (working pixels), z 1 when a searched block lands here.
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D ffld;
+layout(set = 0, binding = 1) uniform sampler2D stat;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D proj;
+void main() {
+	ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+	if (b.x >= u.a.x || b.y >= u.a.y) return;
+	vec2 c = vec2(b * 4) + 2.0, mean = texelFetch(stat, ivec2(0), 0).gb;   /* (this block's centre, in working pixels) */
+	ivec2 hi = u.a.xy - 1;
+	vec2 best = vec2(0.0); float found = 0.0, far = -1.0;
+	for (int j = -u.b.x; j <= u.b.x; j++) for (int i = -u.b.x; i <= u.b.x; i++) {
+		ivec2 s = b + ivec2(i, j);
+		if (s.x < 0 || s.y < 0 || s.x > hi.x || s.y > hi.y) continue;
+		vec4 e = texelFetch(ffld, s, 0); if (e.z < 0.5) continue;   /* (explained by the symmetric field: nothing to carry) */
+		vec2 f = e.xy, at = vec2(s * 4) + 2.0 + u.c.z * f;   /* where the searched block's centre is at t */
+		if (abs(at.x - c.x) > 2.0 || abs(at.y - c.y) > 2.0) continue;   /* (it covers this block's centre) */
+		float d = dot(f - mean, f - mean);
+		if (d > far) { far = d; best = f; found = 1.0; }
+	}
+	imageStore(proj, b, vec4(best, found, 0.0));
+}
