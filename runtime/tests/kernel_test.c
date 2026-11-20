@@ -654,16 +654,18 @@ static void test_callbacks(void) {
 	 * waits the condition variable for the part beyond the slack (the checks are from Luufen's fork, 4918665) */
 	test_slack_us = 20000;
 	{ uint64_t a = guest_time_us(); CHECKEQ(call(h_delay_cb, 1, 200), 0); uint64_t el = guest_time_us() - a; CHECK(el >= 200 && el < 15000); }   /* (not the 20 ms slack) */
-	{ CbJob s = { name, 0, 0 }; s.delay_us = 15000;
+	test_slack_us = 2000000;   /* (the whole delay below inside the slack: short sleeps throughout, long enough for a slow runner to notify during it) */
+	{ CbJob s = { name, 0, 0 }; s.delay_us = 300000;
 	  pthread_t ts = go(cb_delayer, &s); while (!s.ready) nap(1);
 	  Thread *t = 0;   /* (wait for it to be in its sleep: a fixed nap was too short on CI's macOS runner) */
 	  for (int k = 0; k < 1000 && !t; k++) { for (int i = 0; i < nthreads; i++) if (threads[i].started && !threads[i].done && threads[i].wait_type == 2) t = &threads[i]; if (!t) nap(1); }
 	  CHECK(t != 0);
 	  Obj *o = new_obj(CALLBACK, name, 0); o->owner = t ? t->uid : 0; o->func = 0x1018; o->common = 0x7b;
 	  uint64_t a = guest_time_us(); cb_calls = 0; CHECKEQ(call(h_notify_callback, 2, o->uid, 5), 0);
-	  while (!cb_calls && guest_time_us() - a < 50000) nap(1);
+	  while (!cb_calls && guest_time_us() - a < 250000) nap(1);
 	  CHECKEQ((uint32_t)cb_calls, 1); CHECKEQ(cb_common, 0x7b); CHECK(!s.done);   /* delivered within the delay */
-	  pthread_join(ts, 0); CHECKEQ(s.delay_result, 0); CHECK(s.t_end - s.t_start >= 14000 && s.t_end - s.t_start < 300000); }
+	  pthread_join(ts, 0); CHECKEQ(s.delay_result, 0); CHECK(s.t_end - s.t_start >= 299000 && s.t_end - s.t_start < 1500000); }
+	test_slack_us = 20000;
 	{ CbJob l = { name, 0, 0 }; l.delay_us = 60000;
 	  pthread_t tl = go(cb_delayer, &l); pthread_join(tl, 0); CHECKEQ(l.delay_result, 0); CHECK(l.t_end - l.t_start >= 60000 && l.t_end - l.t_start < 500000); }
 	test_slack_us = 0;
