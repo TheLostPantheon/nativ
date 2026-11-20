@@ -1221,6 +1221,7 @@ static int target_bpp_of(const GfxTarget *t) {
 	case 0x30000000u: case 0x40000000u: case 0x50000000u: case 0x60000000u: case 0xF0000000u: case 0x20800000u: case 0x40800000u:
 	case 0xA0800000u: case 0xB0800000u: case 0xC0800000u: return 2;
 	case 0x80800000u: case 0x90800000u: return 1;
+	case 0x10000000u: return 3;   /* U8U8U8 (see target_read_raw_of) */
 	case 0x01000000u: case 0x11000000u: return 8;
 	default: return 4;
 	}
@@ -1288,6 +1289,13 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 		c[0] = v0 < -1.f ? -1.f : v0; c[1] = v1 < -1.f ? -1.f : v1; c[2] = 0; c[3] = 1; return;
 	}
 	case 0x40800000u: c[0] = RD16(a) / 65535.f; c[1] = c[2] = 0; c[3] = 1; return;                    /* U16 */
+	case 0x10000000u: {   /* U8U8U8: three bytes a pixel, BGR (R lowest, as ABGR's) or RGB (B lowest), as a U8U8U8 texture reads
+	                       * them. It used to take the 4-byte default: LittleBigPlanet's 960x544 U8U8U8 target came down a
+	                       * third past its end, over the small textures the game keeps there (its speech bubbles lost their
+	                       * button icons and backgrounds) */
+		const int rgb = ((t->format >> 20) & 3) == 1; const uint8_t b0 = RD8(a), b1 = RD8(a + 1), b2 = RD8(a + 2);
+		c[0] = (rgb ? b2 : b0) / 255.f; c[1] = b1 / 255.f; c[2] = (rgb ? b0 : b2) / 255.f; c[3] = 1; return;
+	}
 	case 0x20800000u: { float v = (int16_t)RD16(a) / 32767.f; c[0] = v < -1.f ? -1.f : v; c[1] = c[2] = 0; c[3] = 1; return; }   /* S16 */
 	case 0x50000000u: {   /* U4U4U4U4: four nibbles in the 8-bit case's channel orders (ABGR: R lowest). Killzone:
 	                       * Mercenary renders a few small masks into one; the 4-byte default below read and
@@ -1342,6 +1350,10 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	case 0xB0800000u: WR8(a, (uint8_t)to8(c[0])); WR8(a + 1, (uint8_t)to8(c[1])); return;    /* U8U8 */
 	case 0xC0800000u: WR8(a, (uint8_t)to8s(c[0])); WR8(a + 1, (uint8_t)to8s(c[1])); return;  /* S8S8 */
 	case 0x40800000u: WR16(a, (uint16_t)to16(c[0])); return;                           /* U16 */
+	case 0x10000000u: {                                                                 /* U8U8U8 (target_read_raw_of's layout) */
+		const int rgb = ((t->format >> 20) & 3) == 1; const uint8_t r = (uint8_t)to8(c[0]), g = (uint8_t)to8(c[1]), b = (uint8_t)to8(c[2]);
+		WR8(a, rgb ? b : r); WR8(a + 1, g); WR8(a + 2, rgb ? r : b); return;
+	}
 	case 0x20800000u: WR16(a, (uint16_t)to16s(c[0])); return;                          /* S16 */
 	case 0x50000000u: {   /* U4U4U4U4 (target_read_of's layout), quantised from the 8-bit value so the GPU path's
 	                       * RGBA8 round trip (gfx_encode_target_rgba8) stores exactly the nibbles this path does */

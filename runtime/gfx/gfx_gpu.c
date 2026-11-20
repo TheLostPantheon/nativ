@@ -3904,6 +3904,11 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	                                                                                               * full precision. LittleBigPlanet samples its 768x768 U16 shadow
 	                                                                                               * atlas as 384x384 tiles, three downloads a frame */
 	case 0x20800000u: *tex_bpp = 2; return xb == 0x0a000000u ? 6 : -1;
+	case 0x10000000u: *tex_bpp = 3; if (xb != 0x98000000u) return -1;                         /* U8U8U8 as U8U8U8: the colour, its two byte orders composed
+	                                                                                               * (BGR: R lowest, RGB: B lowest; a texture's other SWIZZLE3 modes read as
+	                                                                                               * BGR). LittleBigPlanet's 960x544 one came down every time it was read */
+		{ const int flip = (((tgt_fmt >> 20) & 3) == 1) != (sw == 1); swz[0] = flip ? 2u : 0u; swz[1] = 1; swz[2] = flip ? 0u : 2u; swz[3] = 5; }
+		return 0;
 	case 0x10800000u: return xb == 0x12000000u ? 6 : -1;                                        /* F32 as F32 (mode 5's decode at full precision: Uncharted's
 	                                                                                               * shadow mask went through guest memory, its lighting read
 	                                                                                               * it at 1x and every lit silhouette got a 1x-pixel halo) */
