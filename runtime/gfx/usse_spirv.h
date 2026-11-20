@@ -83,7 +83,9 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
  * shader cache key, since the image type is baked into the module */
 /* color_kind: the render target's texture family (0 RGBA8, 1 RGBA16F, 2 RGBA32F), which decides how a
  * fragment program's raw-word colour output (U32/S32) is laid into the four output channels so the
- * target holds those bits exactly; value colours don't depend on it */
+ * target holds those bits exactly; value colours don't depend on it -- except in kind 5, an F16F16F16F16
+ * surface drawn into an R32G32 texture (gfx_gpu.c TK_RAW): raw words go to its two words, a colour is
+ * packed into them as halves */
 void usse_spirv_free(SpirvModule *m);
 /* the sa_tex_unit entries the last usse_spirv_translate read (bit i of out[i / 32]), the low byte of each being all it used:
  * a module depends on these and on nothing else of sa_tex_unit (gfx_gpu.c's shader recipes keep just them) */
