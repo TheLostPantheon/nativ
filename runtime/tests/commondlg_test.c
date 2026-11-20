@@ -213,10 +213,17 @@ static void test_ime(void) {
 	cdlg_utf16_to_utf8(G(out), 64, got, sizeof got); CHECK(!strcmp(got, "Scri"));   /* cut to the game's limit */
 	call(h_ime_term, 0); unsetenv("RECOMP_IME_TEXT");
 }
+/* sceAppUtilAppParamGetInt: the SKU flag (id 0) is a full game's; another id, or no pointer, a parameter error */
+static void test_app_param(void) {
+	const uint32_t v = guest_alloc(4, 4); WR32(v, 0xdeadbeef);
+	CHECKEQ(call(h_app_param_int, 2, 0, v), 0); CHECKEQ(RD32(v), 3);
+	CHECKEQ(call(h_app_param_int, 2, 1, v), 0x80100600); CHECKEQ(call(h_app_param_int, 2, 0, 0), 0x80100600);
+}
+
 int main(void) {
 	recomp_mem = mmap(0, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (recomp_mem == MAP_FAILED) { perror("mmap"); return 2; }
-	test_utf16(); test_msg(); test_ime();
+	test_utf16(); test_msg(); test_ime(); test_app_param();
 	fprintf(stderr, "%d checks, %d failed\n", checks, fails);
 	return fails ? 1 : 0;
 }

@@ -77,7 +77,8 @@ the text dialog's title, limit, initial text and flags, and the errors the conso
 the states a game sees (RUNNING until answered, NOT_FINISHED from `GetResult`, FINISHED after, NONE after `Term`),
 answers to a dialog that has gone, `Close` and `Abort`, and the headless auto-answer (including `RECOMP_IME_TEXT`).
 It also checks the UTF-16 conversion in `commondlg.h`: surrogate pairs, the length limit never splitting one, and
-malformed input. Drawing and key handling need a window and aren't covered. The test includes `apputil.c`, so it
+malformed input, and `sceAppUtilAppParamGetInt`'s SKU flag (a full game's). Drawing and key handling need a window and
+aren't covered. The test includes `apputil.c`, so it
 builds with `-I stub`, a stand-in for SDL's header.
 
     cc -O1 -g -Wall -Wno-unused-function $INC -I stub commondlg_test.c -o /tmp/commondlg_test -lpthread && /tmp/commondlg_test
