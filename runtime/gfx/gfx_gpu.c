@@ -1579,6 +1579,7 @@ typedef struct {
 	uint8_t sx, sy;  /* its texels a guest pixel, across and down: the render scale, or a boosted target's (target_scale) */
 	SDL_GPUTexture *mv; uint64_t mv_frame; uint32_t mv_n;   /* the motion target beside it (RECOMP_MV: mv_target), the frame it was
 	                                                          * last cleared in (mv_qframe + 1) and its motion draws that frame */
+	uint8_t box_said;             /* box_keep has kept guest bytes of it once: logged */
 	uint16_t bx0, by0, bx1, by1;  /* the box (guest pixels, end exclusive) the GPU has changed since guest memory last held all of it:
 	                               * draws add their region (box_add), an upload or download empties it, a whole-texture write fills
 	                               * it. Outside it guest memory is as new as the GPU texture, or newer (box_misses) */
@@ -1595,8 +1596,9 @@ static void box_add(TargetEntry *e, int x0, int y0, int x1, int y1) {
  * texture has, or newer. Linear surfaces only (a tiled one's rows aren't its memory's). LittleBigPlanet keeps a small
  * swizzled texture in the bottom of its 768x1024 downscale atlas, past every region it draws: each frame's read of it waited
  * for the GPU and brought the whole 3 MB target down */
+static int box_on(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_DRAWN_BOX") == 0; return v; }   /* RECOMP_GPU_NO_DRAWN_BOX=1: whole targets down, as before (an A/B check) */
 static int box_misses(const TargetEntry *e, uint32_t lo, uint32_t hi, uint32_t bpp) {
-	if (e->type != 0 || !bpp || !e->width) return 0;
+	if (!box_on() || e->type != 0 || !bpp || !e->width) return 0;
 	if (e->bx1 <= e->bx0 || e->by1 <= e->by0) return 1;
 	const uint32_t pitch = bpp * e->width, end = e->addr + pitch * e->height;
 	if (lo < e->addr) lo = e->addr; if (hi > end) hi = end;
@@ -1607,6 +1609,28 @@ static int box_misses(const TargetEntry *e, uint32_t lo, uint32_t hi, uint32_t b
 		if (c1 >= e->bx0 && c0 < e->bx1) return 0;
 	}
 	return 1;
+}
+/* A download or readback writes the whole surface, but only the box is the GPU's: the rest of guest memory is as new as the
+ * texture, or newer -- what the game put there itself. LittleBigPlanet draws 408 rows of a 960x544 target and keeps small
+ * textures in the rows below; each download wrote the texture's stale rows over them (its speech bubbles' button icons are
+ * multiplied by a 2x2 clip mask there, which came back as a dark pixel: the icons vanished). box_keep saves the surface's
+ * bytes when the box isn't all of it, box_put_back restores those outside the box after the write. Linear surfaces only. */
+static uint8_t *box_keep(uint32_t addr, uint32_t width, uint32_t height, int type, uint32_t bpp, const uint16_t b[4]) {
+	if (!box_on() || type != 0 || (!b[0] && !b[1] && b[2] >= width && b[3] >= height)) return 0;
+	const size_t n = (size_t)bpp * width * height; uint8_t *k = malloc(n);
+	if (k) memcpy(k, G(addr), n);
+	return k;
+}
+static void box_put_back(uint8_t *k, uint32_t addr, uint32_t width, uint32_t height, uint32_t bpp, const uint16_t b[4]) {
+	if (!k) return;
+	const uint32_t pitch = bpp * width; const int empty = b[2] <= b[0] || b[3] <= b[1];
+	for (uint32_t y = 0; y < height; y++) {
+		uint8_t *row = G(addr + y * pitch); const uint8_t *was = k + (size_t)y * pitch;
+		if (empty || y < b[1] || y >= b[3]) { memcpy(row, was, pitch); continue; }
+		if (b[0]) memcpy(row, was, (size_t)b[0] * bpp);
+		if (b[2] < width) memcpy(row + (size_t)b[2] * bpp, was + (size_t)b[2] * bpp, (size_t)(width - b[2]) * bpp);
+	}
+	free(k);
 }
 /* the GPU format a guest colour format renders into, with enough precision that a download encodes
  * the bits gfx_soft.c's target_write would: 8-bit families as RGBA8, the half-float families (F16,
@@ -2050,8 +2074,13 @@ static void target_download_to_guest(TargetEntry *e) {
 	uint32_t npx = e->width * e->height;
 	GfxTarget t = target_entry_as_gfx(e);
 	uint32_t gbytes = (uint32_t)gfx_target_bpp(&t) * npx;
+	const uint16_t box[4] = { e->bx0, e->by0, e->bx1, e->by1 };
 	if (target_raw_ok(e, &t)) {
-		gwatch_write_begin(e->addr, gbytes); target_download_texels(e, 0, G(e->addr)); gwatch_write_end(e->addr, gbytes);
+		gwatch_write_begin(e->addr, gbytes);
+		uint8_t *keep = box_keep(e->addr, e->width, e->height, e->type, (uint32_t)gfx_target_bpp(&t), box);
+		target_download_texels(e, 0, G(e->addr));
+		box_put_back(keep, e->addr, e->width, e->height, (uint32_t)gfx_target_bpp(&t), box);
+		gwatch_write_end(e->addr, gbytes);
 		e->gpu_dirty = 0; box_none(e);
 		textures_invalidate(e->addr, e->addr + gbytes);
 		t_tgt_download += us_now() - tdl0;
@@ -2066,7 +2095,10 @@ static void target_download_to_guest(TargetEntry *e) {
 			fprintf(stderr, "gpu trace addr: download target %#x fmt %#x %ux%u kind %d (frame %llu) %s writes %#x\n", e->addr, t.format, e->width, e->height, e->kind, (unsigned long long)gpu_frame_no, sync_why, ta);
 	}
 	gwatch_write_begin(e->addr, gbytes);   /* one call opens the pages under a watched texture, instead of a write fault per page */
+	uint8_t *keep = box_keep(e->addr, e->width, e->height, e->type, (uint32_t)gfx_target_bpp(&t), box);
+	if (keep && !e->box_said) { e->box_said = 1; fprintf(stderr, "    gpu: target %#x %ux%u comes down as its drawn box %u,%u-%u,%u: guest memory keeps the rest\n", e->addr, e->width, e->height, box[0], box[1], box[2], box[3]); }
 	gfx_encode_target_f32(&t, f);
+	box_put_back(keep, e->addr, e->width, e->height, (uint32_t)gfx_target_bpp(&t), box);
 	gwatch_write_end(e->addr, gbytes);
 	{ static uint32_t ta = 1, last = 0xdeadbeef; if (ta == 1) { const char *v = getenv("RECOMP_GPU_TRACE_ADDR"); ta = v ? (uint32_t)strtoul(v, 0, 16) : 0; }
 	  if (ta && ta >= e->addr && ta < e->addr + gbytes && RD32(ta) != last) { last = RD32(ta); fprintf(stderr, "gpu trace addr: frame %llu: %#x now holds %#x\n", (unsigned long long)gpu_frame_no, ta, last); } }
@@ -3247,7 +3279,7 @@ static int composite_mesh(const GfxDraw *d, const PipeEntry *pipe) {
  * with it left out the symbols showed through the paper and the percentage never moved (2026-10-13). A
  * landed copy never marks the target CPU-written: the GPU's stays the one draws use.
  * RECOMP_GPU_READBACK_MAX=pixels (default 32768, 0 = off): the largest target treated this way. */
-typedef struct { TargetEntry *e; GfxTarget t; int kind; uint64_t gen; SDL_GPUTransferBuffer *xb; SDL_GPUFence *fence; uint64_t frame; int pinned; } Readback;   /* frame: gpu_frame_no when enqueued; pinned: the presenting thread holds the fence for a wait outside the lock (gfx_gpu_readbacks_due) */
+typedef struct { TargetEntry *e; GfxTarget t; int kind; uint64_t gen; SDL_GPUTransferBuffer *xb; SDL_GPUFence *fence; uint64_t frame; int pinned; uint16_t box[4]; } Readback;   /* box: the target's drawn box when queued (box_keep) */   /* frame: gpu_frame_no when enqueued; pinned: the presenting thread holds the fence for a wait outside the lock (gfx_gpu_readbacks_due) */
 #define MAXREADBACK 16
 static Readback readbacks[MAXREADBACK]; static int nreadbacks;
 static SDL_GPUFence *parked[MAXREADBACK]; static int nparked;   /* fences of pinned readbacks another thread completed: the presenting thread releases them at its present, after its wait */
@@ -3263,15 +3295,17 @@ static void readback_complete(Readback *r) {
 	float *f = raw ? 0 : malloc(16u * npx);
 	const uint8_t *map = SDL_MapGPUTransferBuffer(gpu(), r->xb, false);
 	if (map) {
-		if (raw) { gwatch_write_begin(r->t.data, gbytes); memcpy(G(r->t.data), map, gbytes); gwatch_write_end(r->t.data, gbytes); }
+		if (raw) { gwatch_write_begin(r->t.data, gbytes); uint8_t *keep = box_keep(r->t.data, r->t.stride, r->t.height, r->t.type, (uint32_t)gfx_target_bpp(&r->t), r->box);
+		           memcpy(G(r->t.data), map, gbytes); box_put_back(keep, r->t.data, r->t.stride, r->t.height, (uint32_t)gfx_target_bpp(&r->t), r->box); gwatch_write_end(r->t.data, gbytes); }
 		else texels_to_floats(r->kind, map, f, npx);
 		SDL_UnmapGPUTransferBuffer(gpu(), r->xb);
 	}
 	SDL_ReleaseGPUTransferBuffer(gpu(), r->xb);
 	if (map) {
-		if (!raw) { gwatch_write_begin(r->t.data, gbytes); gfx_encode_target_f32(&r->t, f); gwatch_write_end(r->t.data, gbytes); }
+		if (!raw) { gwatch_write_begin(r->t.data, gbytes); uint8_t *keep = box_keep(r->t.data, r->t.stride, r->t.height, r->t.type, (uint32_t)gfx_target_bpp(&r->t), r->box);
+		            gfx_encode_target_f32(&r->t, f); box_put_back(keep, r->t.data, r->t.stride, r->t.height, (uint32_t)gfx_target_bpp(&r->t), r->box); gwatch_write_end(r->t.data, gbytes); }
 		textures_invalidate(r->t.data, r->t.data + gbytes);
-		if (r->e->addr == r->t.data && r->e->gen == r->gen) r->e->gpu_dirty = 0;   /* (still the same target, nothing drawn into it since) */
+		if (r->e->addr == r->t.data && r->e->gen == r->gen) { r->e->gpu_dirty = 0; box_none(r->e); }   /* (still the same target, nothing drawn into it since) */
 		if (trace_sync()) fprintf(stderr, "gpu trace: readback of target %#x %ux%u written to guest memory\n", r->t.data, r->t.stride, r->t.height);
 	}
 	free(f);
@@ -3394,7 +3428,7 @@ static void readback_enqueue(TargetEntry *e) {
 	SDL_DownloadFromGPUTexture(cp, &src, &dst);
 	SDL_EndGPUCopyPass(cp);
 	Readback *r = &readbacks[nreadbacks++]; r->frame = gpu_frame_no; r->pinned = 0;   /* (the slot may hold a compacted-away entry's flag) */
-	r->e = e; r->t = target_entry_as_gfx(e); r->kind = e->kind; r->gen = e->gen; r->xb = xb;
+	r->e = e; r->t = target_entry_as_gfx(e); r->kind = e->kind; r->gen = e->gen; r->xb = xb; r->box[0] = e->bx0; r->box[1] = e->by0; r->box[2] = e->bx1; r->box[3] = e->by1;
 	r->fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
 	if (!r->fence) { SDL_ReleaseGPUTransferBuffer(gpu(), xb); nreadbacks--; return; }
 	n_readbacks++;

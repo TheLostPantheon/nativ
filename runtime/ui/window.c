@@ -95,6 +95,17 @@ static volatile int tp_down[TP_FINGERS], tp_port[TP_FINGERS], tp_x[TP_FINGERS], 
 /* a touchscreen's own fingers (screen_finger): the front panel where each touches the picture, the rear with RB held as it lands */
 enum { ST_FINGERS = 6 };
 static volatile int st_down[ST_FINGERS], st_port[ST_FINGERS], st_x[ST_FINGERS], st_y[ST_FINGERS]; static SDL_FingerID st_id[ST_FINGERS];
+/* A contact the game must see. It reads the panels once a frame, and a trackpad's tap-to-click (or a quick tap of a touchpad)
+ * goes down and up within a few milliseconds: between two reads, it touched nothing (LittleBigPlanet at 25-30 fps took
+ * several taps to start). A release waits until the game has read the contact once and it has lasted TOUCH_MIN_US, a short
+ * real tap's length; window_touch_contacts lifts it then, after reporting it */
+#define TOUCH_MIN_US 60000
+typedef struct { volatile int read, up; volatile uint64_t t0; } TouchHold;
+static TouchHold hold_mouse[2], hold_tp[TP_FINGERS], hold_st[ST_FINGERS];   /* hold_mouse: the left button's front contact, the right's rear */
+static uint64_t now_us(void);
+static void hold_down(TouchHold *h) { h->read = 0; h->up = 0; h->t0 = now_us(); }
+static int hold_release(TouchHold *h) { if (h->read && now_us() - h->t0 >= TOUCH_MIN_US) { h->up = 0; return 1; } h->up = 1; return 0; }   /* 1: lift it now */
+static int hold_due(TouchHold *h) { h->read = 1; if (h->up && now_us() - h->t0 >= TOUCH_MIN_US) { h->up = 0; return 1; } return 0; }   /* a read reported it: 1 when its release is due */
 static volatile int cur_mode;              /* 0 off, 1 front (LB held), 2 rear (RB held) */
 static volatile int cur_down, cur_x[2] = {960, 960}, cur_y[2] = {544, (REAR_Y0 + REAR_Y1) / 2};
 /* Two cursors (two-finger gestures -- Killzone's valves): while a bumper is held, once BOTH sticks have moved the cursor
@@ -441,14 +452,14 @@ int window_last_touch_key(int port) { return last_touch_key[port & 1]; }
 int window_touch_contacts(int port, int *keys, int *xs, int *ys, int max) {
 	int n = 0;
 	#define ADD(k, x, y) do { if (n < max) { keys[n] = (k); xs[n] = (x); ys[n] = (y); n++; } } while (0)
-	if (port == 0 && touch_down) ADD(1, touch_x, touch_y);
-	if (port == 1 && mouse_rear_down) ADD(1, mouse_rear_x, mouse_rear_y);
+	if (port == 0 && touch_down) { ADD(1, touch_x, touch_y); if (hold_due(&hold_mouse[0])) touch_down = 0; }
+	if (port == 1 && mouse_rear_down) { ADD(1, mouse_rear_x, mouse_rear_y); if (hold_due(&hold_mouse[1])) mouse_rear_down = 0; }
 	if (cur_down && cur_mode == port + 1) ADD(2, cur_x[port], cur_y[port]);
 	if (cur_down && cur2_on && cur_mode == port + 1) ADD(3, cur2_x[port], cur2_y[port]);   /* (the second cursor: key 3) */
 	if (port == 0 && flick_down) ADD(4, flick_x, flick_y);   /* (a right-stick flick's swipe: key 4) */
 	if (port == 0 && twist_down) { ADD(5, twist_x[0], twist_y[0]); ADD(6, twist_x[1], twist_y[1]); }   /* (a twist's two fingers: keys 5, 6) */
-	for (int i = 0; i < TP_FINGERS; i++) if (tp_down[i] && tp_port[i] == port) ADD(10 + i, tp_x[i], tp_y[i]);
-	for (int i = 0; i < ST_FINGERS; i++) if (st_down[i] && st_port[i] == port) ADD(20 + i, st_x[i], st_y[i]);   /* (a touchscreen's fingers: keys 20+) */
+	for (int i = 0; i < TP_FINGERS; i++) if (tp_down[i] && tp_port[i] == port) { ADD(10 + i, tp_x[i], tp_y[i]); if (hold_due(&hold_tp[i])) tp_down[i] = 0; }
+	for (int i = 0; i < ST_FINGERS; i++) if (st_down[i] && st_port[i] == port) { ADD(20 + i, st_x[i], st_y[i]); if (hold_due(&hold_st[i])) st_down[i] = 0; }   /* (a touchscreen's fingers: keys 20+) */
 	#undef ADD
 	if (n && port >= 0 && port < 2) last_touch_key[port] = keys[0];
 	return n;
@@ -496,11 +507,11 @@ static void screen_finger(const SDL_Event *e) {
 	const float mx = e->tfinger.x * (float)w, my = e->tfinger.y * (float)h;   /* (SDL's finger positions: 0-1 across the window) */
 	int k = -1, free_k = -1;
 	for (int i = 0; i < ST_FINGERS; i++) { if (st_down[i] && st_id[i] == e->tfinger.fingerID) k = i; else if (!st_down[i] && free_k < 0) free_k = i; }
-	if (e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) { if (k >= 0) st_down[k] = 0; return; }
+	if (e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) { if (k >= 0 && (e->type == SDL_EVENT_FINGER_CANCELED || hold_release(&hold_st[k]))) st_down[k] = 0; return; }
 	int tx, ty;
 	if (k < 0) {   /* a new finger (a motion of one that landed on the bars is ignored) */
 		if (e->type != SDL_EVENT_FINGER_DOWN || free_k < 0 || !mouse_to_touch(mx, my, 0, &tx, &ty)) return;
-		k = free_k; st_id[k] = e->tfinger.fingerID; st_port[k] = rb_held;
+		k = free_k; st_id[k] = e->tfinger.fingerID; st_port[k] = rb_held; hold_down(&hold_st[k]);
 	} else if (!mouse_to_touch(mx, my, 1, &tx, &ty)) return;
 	st_x[k] = tx; st_y[k] = st_port[k] ? clampi(ty, REAR_Y0, REAR_Y1) : ty;
 	st_down[k] = 1;
@@ -1177,9 +1188,9 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN || e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION || e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) {
 				int f = e.gtouchpad.finger;
 				if (e.gtouchpad.touchpad == 0 && f >= 0 && f < TP_FINGERS) {
-					if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) tp_down[f] = 0;
+					if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP) { if (hold_release(&hold_tp[f])) tp_down[f] = 0; }
 					else {
-						if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN || !tp_down[f]) tp_port[f] = rb_held;   /* the panel is chosen as the finger lands */
+						if (e.type == SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN || !tp_down[f]) { tp_port[f] = rb_held; hold_down(&hold_tp[f]); }   /* the panel is chosen as the finger lands */
 						float u = e.gtouchpad.x < 0 ? 0 : e.gtouchpad.x > 1 ? 1 : e.gtouchpad.x, v = e.gtouchpad.y < 0 ? 0 : e.gtouchpad.y > 1 ? 1 : e.gtouchpad.y;
 						tp_x[f] = clampi((int)(u * 1920.f), 0, 1919);
 						tp_y[f] = tp_port[f] ? clampi(REAR_Y0 + (int)(v * (REAR_Y1 - REAR_Y0 + 1)), REAR_Y0, REAR_Y1) : clampi((int)(v * 1088.f), 0, 1087);
@@ -1195,7 +1206,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			if (rel_on && (e.type == SDL_EVENT_MOUSE_MOTION || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP)) {   /* captured: the look, and R / L */
 				if (e.type == SDL_EVENT_MOUSE_MOTION && now_us() - rel_since_us < 60000) continue;
 				if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT && gesture_wanted()) {   /* a swipe: see window_touch_gesture_hint */
-					gesture_drag = 1; touch_x = 960; touch_y = 544; touch_down = 1; gesture_t0 = now_us();
+					gesture_drag = 1; touch_x = 960; touch_y = 544; touch_down = 1; hold_down(&hold_mouse[0]); gesture_t0 = now_us();
 					fprintf(stderr, "    touch swipe: down (mouse, a gesture window)\n"); continue;
 				}
 				if (gesture_drag && e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT) {
@@ -1230,13 +1241,13 @@ void window_run(void *(*fn)(void *), void *arg) {
 				continue;
 			}
 			int tx, ty;
-			if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT && mouse_to_touch(e.button.x, e.button.y, 0, &tx, &ty)) { touch_x = tx; touch_y = ty; touch_down = 1; }   /* (a click on the bars touches nothing) */
-			if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT) touch_down = 0;
+			if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT && mouse_to_touch(e.button.x, e.button.y, 0, &tx, &ty)) { touch_x = tx; touch_y = ty; touch_down = 1; hold_down(&hold_mouse[0]); }   /* (a click on the bars touches nothing) */
+			if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT && hold_release(&hold_mouse[0])) touch_down = 0;
 			if (e.type == SDL_EVENT_MOUSE_MOTION && touch_down && mouse_to_touch(e.motion.x, e.motion.y, 1, &tx, &ty)) { touch_x = tx; touch_y = ty; }
 			/* the right button: the rear panel, at the same place on the picture (the rear panel's
 			 * coordinates face the same way as the front's; it's shorter, so y clamps to its rows) */
-			if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_RIGHT && mouse_to_touch(e.button.x, e.button.y, 0, &tx, &ty)) { mouse_rear_x = tx; mouse_rear_y = clampi(ty, REAR_Y0, REAR_Y1); mouse_rear_down = 1; }
-			if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_RIGHT) mouse_rear_down = 0;
+			if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_RIGHT && mouse_to_touch(e.button.x, e.button.y, 0, &tx, &ty)) { mouse_rear_x = tx; mouse_rear_y = clampi(ty, REAR_Y0, REAR_Y1); mouse_rear_down = 1; hold_down(&hold_mouse[1]); }
+			if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_RIGHT && hold_release(&hold_mouse[1])) mouse_rear_down = 0;
 			if (e.type == SDL_EVENT_MOUSE_MOTION && mouse_rear_down && mouse_to_touch(e.motion.x, e.motion.y, 1, &tx, &ty)) { mouse_rear_x = tx; mouse_rear_y = clampi(ty, REAR_Y0, REAR_Y1); }
 			if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.axis < 4) { pad_raw[e.gaxis.axis] = e.gaxis.value; pad_sticks(e.gaxis.axis / 2); }
 		}
