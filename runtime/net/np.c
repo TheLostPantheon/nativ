@@ -296,6 +296,26 @@ static void h_np_basic_check_callback(Cpu *c) {
 }
 
 static void h_np_one(Cpu *c) { RET(1); }
+/* ---- offline (hle.c: a game not run online): PSN signed out. The service state reads SIGNED_OUT and a registered state
+ * callback hears it once, at the next sceNpCheckCallback, as the online path tells ONLINE; everything else of NP stays
+ * with main.c's catch-all ("not initialised"). Before, sceNpGetServiceState was that catch-all too: an error and its
+ * state word never written, so a game read whatever was in it */
+static void h_np_offline_init(Cpu *c) { RET(0); }
+static void h_np_offline_state(Cpu *c) { if (A0) WR32(A0, 1); RET(0); }   /* SCE_NP_SERVICE_STATE_SIGNED_OUT */
+static void h_np_offline_check_callback(Cpu *c) {
+	pthread_mutex_lock(&np_lock);
+	uint32_t cb = state_pending ? state_cb : 0, arg = state_arg; state_pending = 0;
+	pthread_mutex_unlock(&np_lock);
+	if (cb) { if (np_log()) fprintf(stderr, "    np: service state SIGNED_OUT -> callback %#x\n", cb); guest_call4(c, cb, 1, arg, 0, 0); }
+	RET(0);
+}
+const HleEntry hle_np_offline[] = {
+	{"sceNpInit", h_np_offline_init}, {"sceNpTerm", h_np_offline_init}, {"sceNpGetServiceState", h_np_offline_state},
+	{"sceNpRegisterServiceStateCallback", h_np_register_state}, {"sceNpUnregisterServiceStateCallback", h_np_unregister_state},
+	{"sceNpCheckCallback", h_np_offline_check_callback},
+	{0, 0},
+};
+
 const HleEntry hle_np[] = {
 	{"vshSblAimgrIsCEX", h_np_one},
 	{"SceNpManager_8D7981D4", h_np_ticket_create}, {"SceNpManager_7CE94530", h_np_ticket_get}, {"SceNpManager_80036A44", h_np_zero}, {"SceNpManager_29C9B8A5", h_np_zero},   /* np_common: a retail console (its debug settings then keep their defaults, never the registry) */

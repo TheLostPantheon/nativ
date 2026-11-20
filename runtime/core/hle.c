@@ -11,7 +11,10 @@
 static const HleEntry *const modules[] = {
 	hle_kernel, hle_display, hle_ngs, hle_libc, hle_io, hle_sysmem, hle_apputil, hle_fios, hle_gpu, hle_video, hle_audiodec, hle_gesture, hle_jpeg, hle_camera, hle_audioin,
 };
-static const HleEntry *const online_modules[] = { hle_net, hle_np, hle_http, hle_ssl_local };   /* only for a game run online (net.h) */
+static const HleEntry *const online_modules[] = { hle_net, hle_np, hle_http, hle_ssl_local };   /* a game run online (net.h) */
+/* offline: the network stack as a Vita with its Wi-Fi off has it (net.c: this machine alone), and PSN signed out (np.c);
+ * HTTP, SSL and NP's online services stay with main.c's catch-all ("not initialised") */
+static const HleEntry *const offline_modules[] = { hle_net, hle_np_offline };
 
 static HleFn find_in(const HleEntry *const *mods, size_t n, const char *name) {
 	for (size_t m = 0; m < n; m++)
@@ -21,7 +24,8 @@ static HleFn find_in(const HleEntry *const *mods, size_t n, const char *name) {
 }
 HleFn hle_find(const char *name) {
 	HleFn f = find_in(modules, sizeof modules / sizeof *modules, name);
-	if (!f && net_online()) f = find_in(online_modules, sizeof online_modules / sizeof *online_modules, name);
+	if (!f) f = net_online() ? find_in(online_modules, sizeof online_modules / sizeof *online_modules, name)
+	                         : find_in(offline_modules, sizeof offline_modules / sizeof *offline_modules, name);
 	return f;
 }
 

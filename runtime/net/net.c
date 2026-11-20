@@ -291,9 +291,19 @@ static void net_ov_dgram(uint32_t src_vip, uint16_t src_port, uint16_t dst_port,
 	struct sockaddr_in from; memset(&from, 0, sizeof from); from.sin_family = AF_INET; from.sin_addr.s_addr = src_vip; from.sin_port = htons(src_port);
 	mux_deliver(m, &from, b, (long)n);
 }
+/* Offline (net_online() 0: a game not run online, or a copy online play isn't for): the network a Vita has with its
+ * Wi-Fi off. The stack works and reaches this machine alone: sockets open, bind to this machine (never a port on the
+ * player's network) and talk over loopback; a connection or datagram to anywhere else is ENETUNREACH; the resolver has
+ * no DNS; netctl says DISCONNECTED (sceNetCtlInetGetInfo and GetNatInfo: nothing to describe, the catch-all's error as
+ * before). Games take their offline paths at once. Before, offline was main.c's catch-all for every call -- EPERM from
+ * sceNetSocket, bind and epoll, an error code from sceNetHtonl -- and LittleBigPlanet's game host thread retried that
+ * recursively until its stack ran out. HTTP, SSL and NP's online services stay online-only (hle.c). */
+static int offline(void) { return !net_online(); }
+static int unreachable(const struct sockaddr_in *sa) { return offline() && (ntohl(sa->sin_addr.s_addr) >> 24) != 127; }
+static uint32_t any_addr(void) { return htonl(offline() ? INADDR_LOOPBACK : INADDR_ANY); }   /* (a bind to "any address": this machine's loopback offline) */
 static int udp_bound(uint16_t port, int *fd_out) {   /* a host UDP socket on that port: 0, or -1 with errno */
 	int fd = (int)socket(AF_INET, SOCK_DGRAM, 0); if (fd < 0) { SOCK_ERRNO(); return -1; }
-	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_ANY);
+	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = any_addr();
 	if (bind(fd, (struct sockaddr *)&a, sizeof a)) { SOCK_ERRNO(); const int e = errno; CLOSESOCK(fd); errno = e; return -1; }
 	*fd_out = fd; return 0;
 }
@@ -387,7 +397,7 @@ static void h_net_init(Cpu *c) {
 #ifdef _WIN32
 	static int wsa; if (!wsa) { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); wsa = 1; }
 #endif
-	if (ov_on()) ov_set_dgram_sink(net_ov_dgram);
+	if (!offline() && ov_on()) ov_set_dgram_sink(net_ov_dgram);
 	RET(0);
 }
 static void h_net_term(Cpu *c) { RET(0); }
@@ -470,6 +480,7 @@ static void h_net_bind(Cpu *c) {
 	if (is_p2p(A0)) { p2p_bind(c); return; }
 	if (socks[A0].type == 3) { RET(0); return; }
 	struct sockaddr_in sa; to_host_addr(A1, &sa); char s[48];
+	if (offline() && sa.sin_addr.s_addr == htonl(INADDR_ANY)) sa.sin_addr.s_addr = any_addr();
 	if (socks[A0].type == 2 && sa.sin_port) {   /* (a port P2P sockets have: shared through its mux) */
 		pthread_mutex_lock(&sock_lock);
 		int m; for (m = 0; m < MAXMUX && !(muxes[m].used && !muxes[m].closing && muxes[m].gport == ntohs(sa.sin_port)); m++) {}
@@ -514,6 +525,7 @@ static void portmap(struct sockaddr_in *sa) {
 static void h_net_connect(Cpu *c) {
 	int fd = sock_fd(A0); if (fd < 0 || !A1) { RET(fail(9)); return; }
 	struct sockaddr_in sa; to_host_addr(A1, &sa); char s[48];
+	if (unreachable(&sa)) { if (net_log()) fprintf(stderr, "    net: connect %u %s: offline, unreachable\n", A0, addr_str(&sa, s, sizeof s)); RET(fail(51)); return; }   /* ENETUNREACH */
 	if (on_mux(A0)) { socks[A0].peer = sa; memcpy(&socks[A0].peer_vport, G(A1 + 8), 2); RET(0); return; }   /* (the address send uses) */
 	if (ov_is_vip(sa.sin_addr.s_addr) && (socks[A0].type == 1 || socks[A0].type == 10)) {   /* another copy's: a stream over the overlay */
 		const int nfd = ov_stream_open(sa.sin_addr.s_addr, ntohs(sa.sin_port));
@@ -590,7 +602,7 @@ static int host_flags(uint32_t f) { int h = 0; if (f & 0x2) h |= MSG_PEEK; if (f
 static void h_net_send(Cpu *c) {
 	int fd = sock_fd(A0); if (fd < 0) { RET(fail(9)); return; }
 	if (socks[A0].type == 3) { RET(A2); return; }   /* (ICMP: sent, as far as anyone knows) */
-	if (on_mux(A0)) { if (!socks[A0].peer.sin_port) { RET(fail(39)); return; } long n = mux_send(A0, G(A1), A2, &socks[A0].peer, socks[A0].peer_vport); RET(n < 0 ? fail_host() : (uint32_t)n); return; }
+	if (on_mux(A0)) { if (!socks[A0].peer.sin_port) { RET(fail(39)); return; } if (unreachable(&socks[A0].peer)) { RET(fail(51)); return; } long n = mux_send(A0, G(A1), A2, &socks[A0].peer, socks[A0].peer_vport); RET(n < 0 ? fail_host() : (uint32_t)n); return; }
 	if (socks[A0].hello && !stream_hello(A0)) { RET(fail(35)); return; }   /* (the preamble first: EAGAIN until it's out) */
 	long n = (long)send(fd, (const char *)G(A1), A2, host_flags(A3)); if (n < 0) SOCK_ERRNO();
 	if (net_log() > 2 && n > 0) { fprintf(stderr, "    net: send %u %ld bytes:", A0, n); for (long i = 0; i < n && i < 64; i++) fprintf(stderr, " %02x", ((const uint8_t *)G(A1))[i]); fprintf(stderr, "\n"); }
@@ -603,8 +615,10 @@ static void h_net_sendto(Cpu *c) {   /* (s, buf, len, flags, to, tolen) */
 	if (on_mux(A0)) {
 		uint16_t v = socks[A0].peer_vport; if (to) memcpy(&v, G(to + 8), 2); else sa = socks[A0].peer;
 		if (!sa.sin_port) { RET(fail(39)); return; }
+		if (unreachable(&sa)) { RET(fail(51)); return; }
 		long n = mux_send(A0, G(A1), A2, &sa, v); RET(n < 0 ? fail_host() : (uint32_t)n); return;
 	}
+	if (to && unreachable(&sa)) { if (net_log() > 1) { char s[48]; fprintf(stderr, "    net: sendto %u %s: offline, unreachable\n", A0, addr_str(&sa, s, sizeof s)); } RET(fail(51)); return; }
 	long n = (long)sendto(fd, (const char *)G(A1), A2, host_flags(A3), to ? (struct sockaddr *)&sa : 0, to ? sizeof sa : 0); if (n < 0) SOCK_ERRNO();
 	if (net_log() > 1 || (net_log() && n < 0)) { char s[48]; fprintf(stderr, "    net: sendto %u %u bytes %s -> %ld\n", A0, A2, to ? addr_str(&sa, s, sizeof s) : "-", n < 0 ? -(long)errno : n); }
 	RET(n < 0 ? fail_host() : (uint32_t)n);
@@ -755,6 +769,7 @@ static int resolve4(const char *host, struct in_addr *out) {
 }
 static void h_net_resolver_ntoa(Cpu *c) {   /* (rid, hostname, SceNetInAddr *addr, timeout, retry, flags) */
 	if (!A1 || !A2) { RET(0x804101E6u); return; }
+	if (offline()) { if (net_log()) fprintf(stderr, "    net: resolve %s: offline, no DNS\n", (const char *)G(A1)); RET(0x804101E1u); return; }   /* SCE_NET_ERROR_RESOLVER_ENODNS */
 	const char *host = (const char *)G(A1); char target[256]; int port = 0;
 	const size_t hl = strlen(host);
 	if (hl >= 20 && !strcasecmp(host + hl - 20, "stun.playstation.net") && matching_local()) {   /* (np_matching2's STUN, "usstun.playstation.net": online/stun.c) */
@@ -855,8 +870,9 @@ static void game_ipv4(char *ip, char *mask, size_t n) {
 void net_host_ipv4(char *ip, size_t n) { char mask[32]; game_ipv4(ip, mask, n); }
 static void h_netctl_init(Cpu *c) { RET(0); }
 static void h_netctl_term(Cpu *c) { RET(0); }
-static void h_netctl_state(Cpu *c) { if (A0) WR32(A0, 3); RET(0); }   /* SCE_NETCTL_STATE_CONNECTED */
+static void h_netctl_state(Cpu *c) { if (A0) WR32(A0, offline() ? 0 : 3); RET(0); }   /* SCE_NETCTL_STATE_DISCONNECTED / CONNECTED */
 static void h_netctl_info(Cpu *c) {   /* (code, SceNetCtlInfo *): a 0x100-byte union */
+	if (offline()) { RET(0x80412101u); return; }   /* (no connection to describe: the catch-all's error, as before) */
 	if (!A1) { RET(0x80412102u); return; }
 	uint8_t *o = G(A1); memset(o, 0, 0x100);
 	char ip[32], mask[32]; game_ipv4(ip, mask, sizeof ip);
@@ -879,6 +895,7 @@ static void h_netctl_info(Cpu *c) {   /* (code, SceNetCtlInfo *): a 0x100-byte u
 	RET(0);
 }
 static void h_netctl_nat(Cpu *c) {   /* (SceNetCtlNatInfo *): {size, stun_status, nat_type, mapped_addr} */
+	if (offline()) { RET(0x80412101u); return; }
 	if (!A0) { RET(0x80412102u); return; }
 	char ip[32], mask[32]; game_ipv4(ip, mask, sizeof ip); struct in_addr a; inet_pton(AF_INET, ip, &a);
 	WR32(A0 + 4, 1); WR32(A0 + 8, 1); memcpy(G(A0 + 12), &a, 4);   /* (type 1, open: np_matching2's signaling then offers its
@@ -890,7 +907,7 @@ static void h_netctl_zero(Cpu *c) { RET(0); }
 static void h_netctl_adhoc_state(Cpu *c) { if (A0) WR32(A0, 0); RET(0); }
 /* SceNetCtl_E8E8DF18(int *state): np_matching2's signaling waits for 4 before it starts STUN (with sceNetCtlGetNatInfo's
  * STUN status set) -- connected, as far as it is concerned */
-static void h_netctl_if_state(Cpu *c) { if (A0) WR32(A0, 4); RET(0); }
+static void h_netctl_if_state(Cpu *c) { if (A0) WR32(A0, offline() ? 0 : 4); RET(0); }
 
 /* SceNetInternal_689B9D7D(uint32_t *out): a random 32-bit number (libnet's own generator; np_matching2 seeds its connection
  * and server ids with it) */

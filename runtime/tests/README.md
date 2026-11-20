@@ -158,6 +158,18 @@ instead. Release, a port that isn't open or isn't one, and a null buffer are che
 
 It prints `all passed`.
 
+## The network offline: `net_offline_test.c`
+
+Checks `runtime/net/net.c` with online play off: the network a Vita has with its Wi-Fi off. The byte-order and address
+helpers work; netctl says disconnected and has no address to give; the resolver has no DNS; a socket bound to "any
+address" is bound to this machine's loopback, never a port on the player's network; a datagram to the internet or the
+LAN, and a connection anywhere off this machine, fail with ENETUNREACH; and a datagram between two sockets here is
+delivered. It uses real loopback sockets.
+
+    cc -O1 -g -w $INC net_offline_test.c -o /tmp/net_offline_test -lpthread && /tmp/net_offline_test
+
+It prints `all passed`.
+
 ## The audio decoder: `audiodec_test.c`
 
 Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`
