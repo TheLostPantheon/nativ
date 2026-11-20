@@ -29,6 +29,10 @@ void guest_time_slept(uint32_t us) { (void)us; }
 void display_vblank_callbacks(void) {}   /* display.c's vblank callbacks: none here */
 uint32_t io_guest_fd(int fd) { return (uint32_t)fd + 0x100; }   /* io.c's handle for a host fd (the standard streams) */
 void plat_random(void *buf, size_t n) { for (size_t i = 0; i < n; i++) ((unsigned char *)buf)[i] = (unsigned char)rand(); }
+/* platform_*.c: the timed-wait slack (Windows 20 ms, POSIX 0): a test sets it to run kernel_cb_sleep's short-sleep path */
+static uint64_t test_slack_us;
+uint64_t plat_timedwait_slack_us(void) { return test_slack_us; }
+void plat_sleep_ns(uint64_t ns) { struct timespec ts = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) }; while (nanosleep(&ts, &ts) && errno == EINTR) ; }
 /* waitstats.c (RECOMP_WAIT_STATS): off here */
 int waitstats_on(void) { return 0; }
 uint64_t waitstats_now(void) { return 0; }
@@ -129,6 +133,24 @@ static void test_evf(void) {
 	/* delete wakes the waiter with WAIT_DELETE; the uid is gone */
 	CHECKEQ(call(h_delete_evf, 1, s), 0); pthread_join(td, 0);
 	CHECKEQ(d.result, E_WAIT_DELETE); CHECKEQ(call(h_set_evf, 2, s, 1), E_UNKNOWN_EVF_ID);
+	/* CancelEventFlag(uid, pattern, *num): every waiter released with WAIT_CANCEL, the pattern set, the count written
+	 * (the checks are from Luufen's fork, ceda33e) */
+	{
+		uint32_t k = call(h_create_evf, 4, name, 0x1000, 0, 0), num = word();
+		EvfWait w1 = { k, 2, 1, word(), 0 }, w2 = { k, 4, 1, word(), 0 };
+		pthread_t t1 = go(evf_waiter, &w1); nap(20); pthread_t t2 = go(evf_waiter, &w2); nap(20);
+		CHECK(!w1.done && !w2.done);
+		WR32(num, 0xdead);
+		CHECKEQ(call(h_cancel_evf, 3, k, 2, num), 0); nap(50);
+		CHECK(w1.done && w2.done);
+		CHECKEQ(w1.result, E_WAIT_CANCEL); CHECKEQ(w2.result, E_WAIT_CANCEL);
+		CHECKEQ(RD32(num), 2);
+		CHECKEQ(call(h_poll_evf, 4, k, 2, 1, out), 0); CHECKEQ(RD32(out), 2);   /* the pattern is the one given */
+		CHECKEQ(call(h_cancel_evf, 3, k, 0, 0), 0);                                  /* no waiters, no *num */
+		CHECKEQ(call(h_cancel_evf, 3, 0x40020fff, 0, num), E_UNKNOWN_EVF_ID);
+		if (!w1.done || !w2.done) { call(h_set_evf, 2, k, 6); nap(20); }
+		pthread_join(t1, 0); pthread_join(t2, 0);
+	}
 	/* the info structure */
 	uint32_t info = guest_alloc(0x38, 4); WR32(info, 0x38);
 	CHECKEQ(call(h_evf_info, 2, e, info), 0); CHECKEQ(RD32(info + 0x30), 0); CHECKEQ(RD32(info + 0x34), 0);
@@ -569,7 +591,7 @@ static void test_msgpipe(void) {
 /* ================= callbacks and the CB waits */
 static volatile int cb_calls; static uint32_t cb_id, cb_count, cb_arg, cb_common, cb_tid, cb_ret;
 static void cb_fn(Cpu *c) { cb_calls++; cb_id = c->r[0]; cb_count = c->r[1]; cb_arg = c->r[2]; cb_common = c->r[3]; cb_tid = cur_tid; c->r[0] = cb_ret; }
-typedef struct { uint32_t name, cb, sema, result, delay_result; volatile int done, ready; uint64_t t_start, t_end; } CbJob;
+typedef struct { uint32_t name, cb, sema, result, delay_result; volatile int done, ready; uint64_t t_start, t_end; uint32_t delay_us; } CbJob;
 static void cb_owner(void *p) {   /* creates the callback (so it owns it), then waits with callbacks */
 	CbJob *j = p;
 	j->cb = call(h_create_callback, 4, j->name, 0, 0x1018, 0xbeef);
@@ -577,7 +599,7 @@ static void cb_owner(void *p) {   /* creates the callback (so it owns it), then 
 	j->result = call(h_wait_sema_cb, 3, j->sema, 1, 0);
 	j->done = 1;
 }
-static void cb_delayer(void *p) { CbJob *j = p; j->t_start = guest_time_us(); j->ready = 1; j->delay_result = call(h_delay_cb, 1, 200000); j->t_end = guest_time_us(); j->done = 1; }
+static void cb_delayer(void *p) { CbJob *j = p; j->t_start = guest_time_us(); j->ready = 1; j->delay_result = call(h_delay_cb, 1, j->delay_us ? j->delay_us : 200000); j->t_end = guest_time_us(); j->done = 1; }
 static void cb_end_waiter(void *p) { CbJob *j = p; j->ready = 1; j->result = call(h_wait_thread_end_cb, 3, j->sema /* a thread uid here */, 0, 0); j->done = 1; }
 static void test_callbacks(void) {
 	uint32_t name = guest_alloc(16, 4); strcpy((char *)G(name), "cb");
@@ -627,6 +649,24 @@ static void test_callbacks(void) {
 	CHECKEQ(call(h_notify_callback, 2, dcb, 3), 0); nap(30); CHECKEQ((uint32_t)cb_calls, 1); CHECKEQ(cb_common, 0x79); CHECK(!d.done);
 	pthread_join(td, 0); CHECKEQ(d.delay_result, 0); CHECK(d.t_end - d.t_start >= 199000);   /* (the delay itself, from its start: a slow machine's naps above made t0 late, CI's macOS runner) */
 	(void)t0;
+	/* with a timed-wait slack (Windows: winpthreads' timed wait wakes on the 15.6 ms tick): a delay within the slack sleeps
+	 * in short precise steps, so it ends on time, and a callback notified meanwhile still runs during it; a longer one
+	 * waits the condition variable for the part beyond the slack (the checks are from Luufen's fork, 4918665) */
+	test_slack_us = 20000;
+	{ uint64_t a = guest_time_us(); CHECKEQ(call(h_delay_cb, 1, 200), 0); uint64_t el = guest_time_us() - a; CHECK(el >= 200 && el < 15000); }   /* (not the 20 ms slack) */
+	{ CbJob s = { name, 0, 0 }; s.delay_us = 15000;
+	  pthread_t ts = go(cb_delayer, &s); while (!s.ready) nap(1);
+	  Thread *t = 0;   /* (wait for it to be in its sleep: a fixed nap was too short on CI's macOS runner) */
+	  for (int k = 0; k < 1000 && !t; k++) { for (int i = 0; i < nthreads; i++) if (threads[i].started && !threads[i].done && threads[i].wait_type == 2) t = &threads[i]; if (!t) nap(1); }
+	  CHECK(t != 0);
+	  Obj *o = new_obj(CALLBACK, name, 0); o->owner = t ? t->uid : 0; o->func = 0x1018; o->common = 0x7b;
+	  uint64_t a = guest_time_us(); cb_calls = 0; CHECKEQ(call(h_notify_callback, 2, o->uid, 5), 0);
+	  while (!cb_calls && guest_time_us() - a < 50000) nap(1);
+	  CHECKEQ((uint32_t)cb_calls, 1); CHECKEQ(cb_common, 0x7b); CHECK(!s.done);   /* delivered within the delay */
+	  pthread_join(ts, 0); CHECKEQ(s.delay_result, 0); CHECK(s.t_end - s.t_start >= 14000 && s.t_end - s.t_start < 300000); }
+	{ CbJob l = { name, 0, 0 }; l.delay_us = 60000;
+	  pthread_t tl = go(cb_delayer, &l); pthread_join(tl, 0); CHECKEQ(l.delay_result, 0); CHECK(l.t_end - l.t_start >= 60000 && l.t_end - l.t_start < 500000); }
+	test_slack_us = 0;
 	/* WaitThreadEndCB likewise */
 	uint32_t s2 = the_sema = call(h_create_sema, 5, name, 0, 0, 1, 0);
 	uint32_t t3 = call(h_create_thread, 7, name, 0x1010, 160, 0x1000, 0, 0, 0);
@@ -1120,6 +1160,23 @@ static void test_sched(void) {
 	pthread_mutex_unlock(&sched_m);
 }
 
+/* the object table past 1,048,576 objects (uids are never reused: a game that creates and deletes lightweight mutexes
+ * all the time gets there in about an hour): every object made past it is still found (Luufen's fork, 5012ec8) */
+static void test_obj_table(void) {
+	int saved = nobjs;
+	nobjs = 1024 * 1024 - 4;
+	uint32_t w = guest_alloc(32 * 8, 8); memset(G(w), 0, 32 * 8);
+	for (int i = 0; i < 8; i++) {
+		CHECKEQ(call(h_create_lwmutex, 5, w + 32 * i, 0, 0, 0, 0), 0);
+		Obj *o = obj_at((uint32_t)nobjs - 1);
+		CHECK(o != 0 && o->work == w + 32 * i);
+		CHECK(by_work(w + 32 * i, LWMUTEX) == o);
+		CHECKEQ(call(h_lock_lwmutex, 3, w + 32 * i, 1, 0), 0); CHECKEQ(call(h_unlock_lwmutex, 2, w + 32 * i, 1), 0);
+		CHECKEQ(call(h_delete_lwmutex, 1, w + 32 * i), 0);
+	}
+	(void)saved;
+}
+
 int main(void) {
 	recomp_mem = mmap(0, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (recomp_mem == MAP_FAILED) { perror("mmap"); return 2; }
@@ -1136,6 +1193,7 @@ int main(void) {
 	test_fibers();
 	test_misc();
 	test_timers();
+	{ int b0 = checks, f0 = fails; test_obj_table(); fprintf(stderr, "object table past 1,048,576: %d checks, %d failed\n", checks - b0, fails - f0); }
 	int before = checks, failed_before = fails;
 	test_sched();
 	fprintf(stderr, "scheduler (RECOMP_SCHED=vita): %d checks, %d failed\n", checks - before, fails - failed_before);

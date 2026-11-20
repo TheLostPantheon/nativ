@@ -73,6 +73,7 @@ uint64_t plat_now_us(void) {
 	struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
 #endif
 }
+uint64_t plat_timedwait_slack_us(void) { return 0; }   /* pthread_cond_timedwait wakes at its deadline */
 void plat_sleep_ns(uint64_t ns) {
 	struct timespec ts = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) };
 	while (nanosleep(&ts, &ts) && errno == EINTR) ;

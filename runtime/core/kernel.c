@@ -760,9 +760,16 @@ static pthread_cond_t *wait_cv(void) { if (!my_cv) { my_cv = malloc(sizeof *my_c
  * object stays allocated, so a stale uid or pointer is an error rather than a crash), and the
  * lightweight ones also indexed by their guest work area */
 #define OBJ_PAGE 1024
-static Obj **obj_pages[1024];
+/* the page directory spans the whole uid space (0x40020001 + 2 * index stays below 0x80000000; 4 MB of zero pages the
+ * OS maps only where they're used): uids are never reused, and a game that creates and deletes lightweight mutexes all
+ * the time (Phantasy Star Nova) passed the old 1024 pages (1,048,576 objects) after about an hour: the index past the
+ * directory read the next static as a page pointer and stored through it, a crash at host address 0x1 (found and fixed
+ * in Luufen's fork, 5012ec8). Not addressed: a deleted object stays allocated (~250 bytes), so such a game grows by
+ * that per object; freeing it needs a reclamation scheme a thread paused mid-call can't defeat */
+#define OBJ_DIR (1 << 19)
+static Obj **obj_pages[OBJ_DIR];
 static int nobjs;
-static Obj *obj_at(uint32_t i) { Obj **p = i / OBJ_PAGE < 1024 ? obj_pages[i / OBJ_PAGE] : 0; return p ? p[i % OBJ_PAGE] : 0; }
+static Obj *obj_at(uint32_t i) { Obj **p = i / OBJ_PAGE < OBJ_DIR ? obj_pages[i / OBJ_PAGE] : 0; return p ? p[i % OBJ_PAGE] : 0; }
 typedef struct WorkNode { Obj *o; struct WorkNode *next; } WorkNode;
 static WorkNode *by_work_hash[1 << 16];
 static Obj *new_obj(int kind, uint32_t name, uint32_t attr) {
@@ -771,6 +778,7 @@ static Obj *new_obj(int kind, uint32_t name, uint32_t attr) {
 	o->kind = kind; o->attr = attr;
 	snprintf(o->name, sizeof o->name, "%s", name ? (char *)G(name) : "");
 	pthread_mutex_lock(&klock);
+	if (nobjs >= 0x1ffeffff) { fprintf(stderr, "kernel: object uids used up (%d objects made): stopping\n", nobjs); abort(); }   /* (loudly: ~600 hours of the fastest creator seen) */
 	o->uid = 0x40020001 + 2 * nobjs;
 	if (!obj_pages[nobjs / OBJ_PAGE]) obj_pages[nobjs / OBJ_PAGE] = calloc(OBJ_PAGE, sizeof(Obj *));
 	obj_pages[nobjs / OBJ_PAGE][nobjs % OBJ_PAGE] = o;
@@ -1200,6 +1208,17 @@ static void h_set_evf(Cpu *c) {
 	RET(0);
 }
 static void h_clear_evf(Cpu *c) { Obj *o = by_uid(A0, EVF); if (!o) { RET(E_UNKNOWN_EVF_ID); return; } pthread_mutex_lock(&o->m); o->bits &= A1; pthread_mutex_unlock(&o->m); RET(0); }   /* (uid, bits to keep) */
+/* sceKernelCancelEventFlag(uid, pattern, *numWaitThreads): every waiter is released with WAIT_CANCEL, then the pattern
+ * is the one given and *numWaitThreads how many were released (Vita3K's Event::cancel). It was unimplemented: 0 and no
+ * wake, and Phantasy Star Nova, which kicks its worker threads with it, hung after its first frame (found in Luufen's
+ * fork, ceda33e) */
+static uint32_t cancel_waiters(Obj *o) { uint32_t n = 0; while (o->head) { wake(o, o->head, E_WAIT_CANCEL); n++; } return n; }   /* (o->m held) */
+static void h_cancel_evf(Cpu *c) {
+	Obj *o = by_uid(A0, EVF); if (!o) { RET(E_UNKNOWN_EVF_ID); return; }
+	pthread_mutex_lock(&o->m); uint32_t n = cancel_waiters(o); o->bits = A1; pthread_mutex_unlock(&o->m);
+	if (A2) WR32(A2, n);
+	RET(0);
+}
 static void h_delete_evf(Cpu *c) { h_delete_uid(c, EVF, E_UNKNOWN_EVF_ID); }
 static void h_evf_info(Cpu *c) {   /* (uid, *SceKernelEventFlagInfo 0x38) */
 	Obj *o = by_uid(A0, EVF);
@@ -1344,6 +1363,15 @@ void kernel_cb_sleep(Cpu *c, uint64_t until_us) {
 		if (until_us <= now) return;
 		uint64_t left = until_us - now;
 		if (in_callbacks) { int b = sched_block_begin(); usleep((useconds_t)left); if (b) sched_block_end(); return; }   /* no nesting: a plain sleep */
+		/* a timed wait that may wake up to `slack` late (Windows: the system tick, plat_timedwait_slack_us) waits only the
+		 * time beyond the slack; the rest goes in short precise sleeps, each followed by a look for callbacks */
+		const uint64_t slack = plat_timedwait_slack_us();
+		if (slack && left <= slack) {
+			if (!cb_pending(t)) { int b = sched_block_begin(); plat_sleep_ns((left < 1000 ? left : 1000) * 1000); if (b) sched_block_end(); }
+			else run_callbacks(c);
+			continue;
+		}
+		left -= slack;
 		struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
 		ts.tv_sec += (time_t)(left / 1000000); ts.tv_nsec += (long)((left % 1000000) * 1000);
 		if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
@@ -2008,7 +2036,7 @@ const HleEntry hle_kernel[] = {
 	{"sceKernelSignalSema", h_signal_sema}, {"sceKernelDeleteSema", h_delete_sema}, {"sceKernelGetSemaInfo", h_sema_info},
 	{"sceKernelOpenSema", h_open_sema}, {"sceKernelCloseSema", h_zero_ok}, {"sceKernelOpenMutex", h_open_mutex}, {"sceKernelCloseMutex", h_zero_ok},
 	{"sceKernelCreateEventFlag", h_create_evf}, {"sceKernelWaitEventFlag", h_wait_evf}, {"sceKernelWaitEventFlagCB", h_wait_evf_cb},
-	{"sceKernelPollEventFlag", h_poll_evf}, {"sceKernelSetEventFlag", h_set_evf}, {"sceKernelClearEventFlag", h_clear_evf},
+	{"sceKernelPollEventFlag", h_poll_evf}, {"sceKernelSetEventFlag", h_set_evf}, {"sceKernelClearEventFlag", h_clear_evf}, {"sceKernelCancelEventFlag", h_cancel_evf},
 	{"sceKernelDeleteEventFlag", h_delete_evf}, {"sceKernelGetEventFlagInfo", h_evf_info},
 	{"sceKernelCreateSimpleEvent", h_create_sevent}, {"sceKernelDeleteSimpleEvent", h_delete_sevent}, {"sceKernelWaitEvent", h_wait_sevent}, {"sceKernelWaitEventCB", h_wait_sevent_cb},
 	{"sceKernelPollEvent", h_poll_sevent}, {"sceKernelSetEvent", h_set_sevent}, {"sceKernelClearEvent", h_clear_sevent},

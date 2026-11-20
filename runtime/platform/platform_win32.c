@@ -104,7 +104,28 @@ uint64_t plat_now_us(void) {   /* (QueryPerformanceCounter: what winpthreads' cl
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
+/* A high-resolution waitable timer still wakes ~0.5 ms after it was set, whatever it was asked for: a guest's
+ * DelayThread(1), a yield in a spin-wait, took 470-500 us. Killzone's missions spin-wait for their job threads that way,
+ * ~43 times a frame. So a sleep under 1 ms gives the core up (SwitchToThread) until its deadline on the performance
+ * counter, and never for less than 100 us: exact 1 us sleeps let a guest's lock-poll loop re-take its lightweight mutex
+ * before the thread waiting for it woke (Killzone stopped at its boot). The Vita itself rounds a 1-199 us delay up to
+ * 200 us. Cost: a thread in a short sleep keeps a core busy for that sleep. Found and measured in Luufen's fork
+ * (b729a64): Killzone's mission frames 12.4 -> 10.7 ms there */
+static uint64_t win_now_ns(void) {
+	static LARGE_INTEGER f; LARGE_INTEGER c;
+	if (!f.QuadPart) QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000000ull + (uint64_t)(c.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
+}
+/* winpthreads' pthread_cond_timedwait waits on the ~15.6 ms system tick: a 200 us deadline took 1.9-17.6 ms (Luufen's fork,
+ * 4918665: Phantasy Star Nova's DelayThreadCB(200) took ~10 ms and its frames two vblanks at 60) */
+uint64_t plat_timedwait_slack_us(void) { return 20000; }
 void plat_sleep_ns(uint64_t ns) {
+	if (ns < 1000000) {
+		const uint64_t end = win_now_ns() + (ns < 100000 ? 100000 : ns);
+		do SwitchToThread(); while (win_now_ns() < end);   /* (at least one yield: a delay of 0 still gives the core up) */
+		return;
+	}
 	static __thread HANDLE timer; static __thread int tried;
 	if (!tried) { tried = 1; timer = CreateWaitableTimerExW(0, 0, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS); }   /* Windows 10 1803+: ~0.5 ms, not the 15.6 ms tick */
 	if (timer) {

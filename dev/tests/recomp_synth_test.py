@@ -173,6 +173,14 @@ def thumb_branch(at, target, link_arm):
 
 
 def thumb_bl(at, target): return thumb_branch(at, target, False)
+def thumb_bw(at, target):
+    """a Thumb b.w (T4, a tail call: no link, no change of instruction set) at address at"""
+    bl = thumb_branch(at, target, False)
+    hi, lo = struct.unpack("<HH", bl)
+    return struct.pack("<HH", hi, lo & ~0x4000)   # (bit 14 of the second halfword: BL 1, B.W 0)
+def thumb_bcc(at, target, cond):
+    """a narrow conditional Thumb branch (T1, b<cond>) at address at"""
+    return struct.pack("<H", 0xd000 | cond << 8 | (((target - (at + 4)) >> 1) & 0xff))
 def thumb_blx(at, target): return thumb_branch(at, target, True)
 
 
@@ -198,7 +206,7 @@ def mode_cases(tmp):
     junk_fn = struct.pack("<HHH", 0xed90, 0x3300, 0x4770)   # Thumb: ldc p3, c3, [r0]; bx lr. ARM: an ordinary data-processing word
     F = {n: base + o for n, o in dict(
         ptr=0x00, c_ptr=0x20, noptr=0x40, c_noptr=0x60, odd=0x82, guess_bl=0xa0, c_bl=0xc0, guess=0xe0,
-        noise_arm=0x100, noise_t=0x140).items()}
+        noise_arm=0x100, noise_t=0x140, guess_b=0x160, c_b=0x180, guess_bcc=0x1a0, c_bcc=0x1c0).items()}
     put(0x00, movs1_bx)                              # F.ptr: Thumb, and a word in .rodata holds F.ptr | 1
     put(0x20, thumb_blx(F["c_ptr"], F["ptr"]) + bx_lr)   # calls it with blx #imm (which reads as ARM)
     put(0x40, movs1_bx)                              # F.noptr: the same, no pointer: ARM by its caller's blx
@@ -211,7 +219,12 @@ def mode_cases(tmp):
     put(0x100, struct.pack("<I", 0)); w = thumb_blx(F["noise_arm"], F["noise_t"]); put(0x100, struct.pack("<I", w[0] | w[1] << 8 | w[2] << 16 | w[3] << 24))
     put(0x104, struct.pack("<I", 0xe12fff1e))        # bx lr
     put(0x140, movs1_bx)
-    sizes = {"ptr": 4, "c_ptr": 6, "noptr": 4, "c_noptr": 6, "odd": 6, "guess_bl": 6, "c_bl": 6, "guess": 6, "noise_arm": 8, "noise_t": 4}
+    put(0x160, junk_fn)                              # F.guess_b: the guess says ARM; a Thumb b.w (a tail call) to it says Thumb
+    put(0x180, thumb_bw(F["c_b"], F["guess_b"]) + bx_lr)
+    put(0x1a0, junk_fn)                              # F.guess_bcc: the same through a conditional bhs
+    put(0x1c0, thumb_bcc(F["c_bcc"], F["guess_bcc"], 0x2) + bx_lr)
+    sizes = {"ptr": 4, "c_ptr": 6, "noptr": 4, "c_noptr": 6, "odd": 6, "guess_bl": 6, "c_bl": 6, "guess": 6, "noise_arm": 8, "noise_t": 4,
+             "guess_b": 6, "c_b": 6, "guess_bcc": 6, "c_bcc": 4}
     rodata = struct.pack("<I", F["ptr"] | 1)
     d = {"blocks": [{"start": base, "size": len(text), "init": True, "bytes": bytes(text).hex(), "name": ".text"},
                     {"start": base + 0x1000, "size": len(rodata), "init": True, "bytes": rodata.hex(), "name": ".rodata"}],
@@ -229,8 +242,71 @@ def mode_cases(tmp):
     check("mode: an entry that is not 4-aligned is never ARM", F["odd"] not in arm)
     check("mode: the coprocessor guess yields to a Thumb bl from certain Thumb code", F["guess_bl"] not in arm)
     check("mode: ... and stands without one", F["guess"] in arm)
+    check("mode: the guess yields to a Thumb b.w tail call too (a B never changes the instruction set)", F["guess_b"] not in arm)
+    check("mode: ... and to a conditional Thumb branch", F["guess_bcc"] not in arm)
     check("mode: a blx #imm read from a function the analysis knows as ARM does not make its target ARM", F["noise_t"] not in arm)
     check("mode: the analysis' own ARM list is kept", F["noise_arm"] in arm)
+
+
+def prefix_case(tmp):
+    """an entry inside a 32-bit instruction of its own function's decode: the analysis gives E a chunk overlapping the code
+    before it, E's spans merge from F, and the linear decode reads mov.w across E (Luufen's fork, e5bd60d). Called at
+    E, the CPU runs lsls r0, r0, #8 (the mov.w's second halfword) then the body's adds/bx: r0 = 1 -> 257"""
+    global fails, checks
+    F = rx.BASES[".text"]; E = F + 4
+    code = struct.pack("<5H", 0x2005, 0xF04F, 0x0200, 0x3001, 0x4770)   # movs r0,#5; mov.w r2,#0; adds r0,#1; bx lr
+    image = {F: code}
+    d = {"blocks": [{"start": F, "size": len(code), "init": True, "bytes": code.hex(), "name": ".text"}],
+         "functions": {"f": F | 1, "e": E | 1}, "bodies": [[F, F + 9, F], [F, F + 5, E], [E, F + 9, E]],
+         "relocs": [], "module": "progs", "exports": [], "variables": [], "arm": []}
+    img_file = os.path.join(tmp, "prefix.bin")
+    with open(img_file, "wb") as f:
+        for a, b in image.items(): f.write(struct.pack("<II", a, len(b)) + b)
+    cases = [(E | 1, 1, 0, 0x55, 0), (E | 1, 3, 0, 0x55, 0), (F | 1, 0, 0, 0x55, 0)]
+    want = rx.run_unicorn(image, cases)
+    for variant, extra in (("locals", []), ("plain", ["--no-reg-locals"])):
+        c_file = os.path.join(tmp, f"prefix_{variant}.c"); js = c_file + ".json"; json.dump(d, open(js, "w"))
+        r = subprocess.run([sys.executable, os.path.join(rx.ROOT, "recompiler", "recomp.py"), js, c_file] + extra, capture_output=True, text=True)
+        if r.returncode:
+            check(f"prefix ({variant}): recomp.py", False); print(r.stdout[-800:] + r.stderr[-800:]); continue
+        try:
+            got = rx.run_recompiled(rx.build(c_file, tmp, f"prefix_{variant}"), img_file, cases, tmp)
+        except (subprocess.CalledProcessError, SystemExit) as e:
+            check(f"prefix ({variant}): an entry inside an instruction builds and runs", False); continue
+        check(f"prefix ({variant}): an entry inside an instruction runs its own decode, then the body's", got == want)
+
+
+def gap_cases(tmp):
+    """functions no analysis body covers, reached only through pointers (Luufen's fork, 570a1a7 and cec40dc): G, a Thumb
+    method whose switch case sits after its first unconditional b, and A, an ARM method only a vtable row reaches (an even
+    word next to another code pointer)"""
+    global fails, checks
+    F, R = rx.BASES[".text"], rx.BASES[".rodata"]
+    K, G, A = F, F + 0x10, F + 0x20
+    text = bytearray(0x28)
+    text[0x00:0x04] = struct.pack("<2H", 0x2001, 0x4770)                                # K: movs r0,#1; bx lr (a known function)
+    text[0x10:0x1c] = struct.pack("<6H", 0x2800, 0xd001, 0x2001, 0xe000, 0x2002, 0x4770)  # G: cmp r0,#0; beq +8; movs r0,#1; b +10; movs r0,#2; bx lr
+    text[0x20:0x28] = struct.pack("<2I", 0xe2800003, 0xe12fff1e)                       # A: add r0,r0,#3; bx lr (ARM)
+    rodata = struct.pack("<3I", G | 1, K | 1, A)                                       # a Thumb pointer to G; a vtable row K, A
+    image = {F: bytes(text), R: rodata}
+    d = {"blocks": [{"start": F, "size": len(text), "init": True, "bytes": bytes(text).hex(), "name": ".text"},
+                    {"start": R, "size": len(rodata), "init": True, "bytes": rodata.hex(), "name": ".rodata"}],
+         "functions": {"k": K | 1}, "bodies": [[K, K + 3]], "relocs": [], "module": "progs", "exports": [], "variables": [], "arm": []}
+    img_file = os.path.join(tmp, "gap.bin")
+    with open(img_file, "wb") as f:
+        for a, b in image.items(): f.write(struct.pack("<II", a, len(b)) + b)
+    cases = [(G | 1, 0, 0, 0, 0), (G | 1, 5, 0, 0, 0), (A, 1, 0, 0, 0), (A, 0x40, 0, 0, 0)]
+    want = rx.run_unicorn(image, cases)
+    c_file = os.path.join(tmp, "gap.c"); js = c_file + ".json"; json.dump(d, open(js, "w"))
+    r = subprocess.run([sys.executable, os.path.join(rx.ROOT, "recompiler", "recomp.py"), js, c_file], capture_output=True, text=True)
+    if r.returncode:
+        check("gap: recomp.py", False); print(r.stdout[-800:] + r.stderr[-800:]); return
+    try:
+        got = rx.run_recompiled(rx.build(c_file, tmp, "gap"), img_file, cases, tmp)
+    except (subprocess.CalledProcessError, SystemExit):
+        got = ["(build or run failed)"] * len(cases)
+    check("gap: a pointer-only Thumb method keeps the switch case after its first b", got[:2] == want[:2])
+    check("gap: an ARM method only a vtable row reaches is a function", got[2:] == want[2:])
 
 
 def main():
@@ -239,6 +315,8 @@ def main():
         run_case("jump_entry", JUMP_ENTRY, tmp)
         run_case("jump_entry_module", JUMP_ENTRY, tmp, flags=("--module", "m"), harness=MODULE_HARNESS)
         mode_cases(tmp)
+        prefix_case(tmp)
+        gap_cases(tmp)
     print(f"{checks} checks, {fails} failed")
     return 1 if fails else 0
 

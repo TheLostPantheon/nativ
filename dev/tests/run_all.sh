@@ -32,6 +32,7 @@ step "audio decoder (audiodec_test.c)" unit audiodec_test ${AVC[@]+"${AVC[@]}"} 
 step "controller button bindings (padbind_test.c)" unit padbind_test ../core/settings.c -lpthread
 step "message and text-input dialogs (commondlg_test.c)" unit commondlg_test -I stub -lpthread
 step "NGS voice rules (ngs_rules_test.c)" unit ngs_rules_test
+step "a missed function's instruction set (seedmode_test.c)" unit seedmode_test
 
 echo
 if [ ${#failed[@]} -eq 0 ]; then echo "all passed"; else echo "FAILED: ${failed[*]}"; exit 1; fi

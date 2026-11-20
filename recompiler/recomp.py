@@ -23,7 +23,8 @@ barriers (lock-free code) gets ordered loads (rt.h RD32A...); see SYNC_MN.
 """
 import array, bisect, json, os, re, sys
 from capstone import Cs, CS_ARCH_ARM, CS_MODE_THUMB, CS_MODE_ARM
-from capstone.arm import (ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM, ARM_OP_FP, ARM_SFT_INVALID)
+from capstone.arm import (ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM, ARM_OP_FP, ARM_SFT_INVALID, ARM_CC_AL, ARM_CC_INVALID)
+B_MN = re.compile(r"b(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?(\.w|\.n)?$")   # B and its conditions: no bl, bx, blx
 
 md = Cs(CS_ARCH_ARM, CS_MODE_THUMB)
 md.detail = True
@@ -136,6 +137,7 @@ class Fn:
         self.pc_off = 8 if arm else 4     # a PC read sees the instruction's address + 8 (ARM) or + 4 (Thumb)
         self.tbit = 0 if arm else 1       # what a call's return address carries
         self.addrs = {i.address for i in insns}
+        self.prefix, self.rejoin = [], None   # an entry inside an instruction of its own decode: entry_prefix (main)
         self.lines, self.unimpl = [], []
         self.ordered = ORDERED_LOADS[0] and any(i.mnemonic in SYNC_MN for i in insns)
         self.spin = spin_loads(insns)
@@ -744,7 +746,7 @@ class Fn:
         """the element-array forms above, plus vshll, vqmovn/vqmovun and the saturating narrowing shifts (vq[r]shr[u]n),
         vector or by scalar (dM[x], from the text); None for anything else"""
         dm = re.fullmatch(r"([sui]?)(8|16|32|64)", dt)
-        if not dm or not regs or any(not r or r[0] not in "dq" for r in regs if r):
+        if not dm or not regs or any(not r or not r[0] or r[0] not in "dq" for r in regs if r):   # (a system register, fpscr/mvfr0, is (None, None): Tetris Ultimate crashed recomp.py here)
             return None
         sg, bits = dm.group(1) == "s", int(dm.group(2))
         sm = re.search(r"d(\d+)\[(\d)\]$", i.op_str)
@@ -1583,7 +1585,12 @@ class Fn:
             lines.append(f"\trecomp_hook_{hook}(c);   /* --hooks: before the body, can change c->r / c->vfp */")
         if self.insns and self.insns[0].address != self.entry:
             lines.append(f"\tgoto L_{self.entry:08x};   /* an entry inside another function's code */")
-        for i in self.insns:
+        for i in self.prefix + ([None] if self.prefix else []) + self.insns:
+            if i is None:   # the end of the entry's own decode: it continues where it meets the body's (entry_prefix)
+                last = self.prefix[-1]
+                lines.append(f"\tgoto L_{self.rejoin:08x};   /* the entry's own decode meets the body's here */" if self.rejoin is not None
+                             else f"\tUNIMPL(c, 0x{last.address + last.size:x}u);   /* the entry's own decode never met the body's */")
+                continue
             lines.append(f"L_{i.address:08x}: /* {i.mnemonic} {i.op_str} */")
             lines.append(f"\tTR(0x{i.address:x}u);")
             try:
@@ -1601,7 +1608,7 @@ class Fn:
         # computed jumps (tbb/tbh) land on any instruction of the function
         lines.append("jump:")
         lines.append("\tswitch (c->r[15]) {")
-        for i in self.insns:
+        for i in self.prefix + self.insns:
             lines.append(f"\tcase 0x{i.address:x}u: goto L_{i.address:08x};")
         if any("JUMP(" in x for x in lines):
             # a computed jump to another function's entry (a table case that is a split-off entry) is a tail call: run it
@@ -1764,9 +1771,13 @@ def main():
                     pos += step
         return insns
 
+    CONDS = ("eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al")
+    def base_mn(m):   # the mnemonic without its .w/.n and ARM condition suffix ("mrcne" -> "mrc", "stcvs" -> "stc")
+        m = m.split(".")[0]
+        return m[:-2] if len(m) > 3 and m[-2:] in CONDS and m[:-2] in ("stc", "ldc", "cdp", "mcrr", "mrrc", "mcr", "mrc", "svc", "udf") else m
     def junk(insns):
         for i in insns[:64]:
-            if i.mnemonic.split(".")[0] in ("stc", "ldc", "cdp", "mcrr", "mrrc", "stc2", "ldc2", "cdp2", "udf", "mcr", "mrc"):
+            if base_mn(i.mnemonic) in ("stc", "ldc", "cdp", "mcrr", "mrrc", "stc2", "ldc2", "cdp2", "udf", "mcr", "mrc"):
                 cp = re.match(r"p(\d+)", i.op_str)
                 if cp and int(cp.group(1)) not in (10, 11, 14, 15):
                     return True
@@ -1840,11 +1851,39 @@ def main():
     propagate()
     # a Thumb "bl" keeps the state: an entry that certain Thumb code (not ARM, not a guess itself) calls with "bl" is
     # Thumb, whatever its own decode looks like, so the guess yields to it
+    # A plain branch to another function's entry (b, b<cc>, b.w: a tail call) keeps it too: only BX, BLX and loads to pc
+    # interwork. Phantasy Star Nova (Japan) had a function whose only reference was a Thumb bhs.w and whose decode from a
+    # chunk below its entry read as a coprocessor op: the guess made it ARM and the build failed (Luufen's fork, e1dc753)
     guessed = set(maybe_arm)
-    thumb_bl = {t for f in fns if f.entry not in arm and f.entry not in guessed for t in calls(f, "bl")}
+    def tail_calls(f):
+        for i in f.insns:
+            if B_MN.match(i.mnemonic) and i.operands and i.operands[0].type == ARM_OP_IMM:
+                t = i.operands[0].imm & 0xffffffff
+                if t != f.entry and t in by_entry:
+                    yield t
+    thumb_bl = {t for f in fns if f.entry not in arm and f.entry not in guessed for t in (*calls(f, "bl"), *tail_calls(f))}
     todo.extend(e for e in maybe_arm if e not in thumb_bl)
     propagate()
     fns = [by_entry[f.entry] for f in fns]
+    # An entry inside an instruction of its own function's linear decode: the analysis can give an entry a chunk that
+    # overlaps the code before it, the spans merge, the decode runs from the first chunk and a 32-bit Thumb instruction
+    # covers the entry, so L_<entry> never exists and the build fails (Phantasy Star Nova, fn_81b688cc: an ldr.w at
+    # 0x81b688ca, "use of undeclared label"). Called there, the CPU decodes from the entry: so does the entry's prefix,
+    # until it meets an instruction the body's decode also starts, and then continues in the body (Luufen's fork, e5bd60d)
+    for f in fns:
+        if not f.insns or f.entry in f.addrs:
+            continue
+        span = next(((lo, hi) for lo, hi in fspans.get(f.entry, ()) if lo <= f.entry <= hi), None)
+        if span is None:
+            continue
+        for i in decode([(f.entry, span[1])], f.arm):
+            if i.address in f.addrs:
+                f.rejoin = i.address
+                break
+            if len(f.prefix) >= 64:
+                break
+            f.prefix.append(i)
+        f.addrs |= {i.address for i in f.prefix}
     if arm:
         print(f"{len(arm)} ARM-mode functions")
     # code reached only through a pointer (a callback the module installs for itself) can sit inside
@@ -1886,16 +1925,82 @@ def main():
             a = v & ~1
             if (v & 1) and a not in starts and a not in eset and in_gap(a):
                 gap.add(a)
+    def gap_fn(a, arm):
+        """the function decoded from gap address a, or None. It ends at its first return or unconditional b at or past
+        the furthest forward target of its own direct branches inside the decoded span: a switch's cases can sit after
+        the first b (Phantasy Star Nova's fn_8225fa1c "cmp r1,#0; beq 0x8225fa94; ...; b 0x8225fa6c" lost its cases,
+        each then called as an external: Luufen's fork, 570a1a7). Failing that, at its first return or b, as before (a
+        lone b trampoline stays one). ARM code, and any end past the first, must decode contiguously"""
+        nxt = los[bisect.bisect_right(los, a)] if bisect.bisect_right(los, a) < len(los) else a + 0x40
+        nxt = min([nxt] + [hi for lo, hi in text if lo <= a < hi])   # (not past its block: no bytes there to decode)
+        insns = decode([(a, min(nxt, a + 0x400) - 1)], arm)
+        if not insns or insns[0].address != a:
+            return None
+        def term(i):
+            m = i.mnemonic.split(".")[0]
+            return (m == "bx" and i.op_str == "lr") or (m in ("pop", "ldm", "ldmia") and "pc" in i.op_str) or i.mnemonic in ("b", "b.w")
+        far, last, first, ext = a, insns[-1].address, None, None
+        for k, i in enumerate(insns):
+            if (B_MN.match(i.mnemonic) or i.mnemonic in ("cbz", "cbnz")) and i.operands and i.operands[-1].type == ARM_OP_IMM:
+                t = i.operands[-1].imm & 0xffffffff
+                if a <= t <= last:
+                    far = max(far, t)
+            if term(i):
+                first = k if first is None else first
+                if i.address >= far:
+                    ext = k
+                    break
+        for e in dict.fromkeys((ext, first)):
+            if e is None:
+                continue
+            body = insns[:e + 1]
+            whole = all(body[k].address + body[k].size == body[k + 1].address for k in range(e))
+            if not junk(body) and (whole or (e == first and not arm)) and (not arm or compiled_arm(body)):
+                return body
+        return None
+    def compiled_arm(body):
+        """ARM a compiler emitted, not data that decodes: its first instruction unconditional and most of the rest too
+        (a run of words read as ARM is mostly conditional: the top nibble is anything), no svc, and nothing loads pc but
+        the return. Data next to a vtable row read as "ldrge fp, [r7], #0x150; stmibge r3, {..., pc} ^" in Shovel Knight"""
+        def cond(i):   # (capstone's own condition field: a suffix read off the text misreads movs, lsls, bics)
+            return i.cc not in (ARM_CC_AL, ARM_CC_INVALID)
+        if cond(body[0]) or any(base_mn(i.mnemonic) == "svc" for i in body):
+            return False
+        if any("pc" in i.op_str.split(",")[0] and base_mn(i.mnemonic).startswith("ldr") for i in body[:-1]):
+            return False
+        return sum(not cond(i) for i in body) * 4 >= len(body) * 3
     ngap = 0
     for a in sorted(gap):
-        nxt = los[bisect.bisect_right(los, a)] if bisect.bisect_right(los, a) < len(los) else a + 0x40
-        insns = decode([(a, min(nxt, a + 0x400) - 1)], False)
-        end = next((k for k, i in enumerate(insns) if (i.mnemonic == "bx" and i.op_str == "lr")
-                    or (i.mnemonic in ("pop", "pop.w") and "pc" in i.op_str) or i.mnemonic in ("b", "b.w")), None)
-        if not insns or insns[0].address != a or end is None or junk(insns[:end + 1]):
-            continue
-        eset.add(a); ngap += 1
-        fns.append(Fn(a, insns[:end + 1], eset))
+        body = gap_fn(a, False)
+        if body:
+            eset.add(a); ngap += 1
+            fns.append(Fn(a, body, eset))
+    # ARM methods too: an even, word-aligned pointer into a gap enters ARM code (a blx through it switches by bit 0). An
+    # even word looks like an address far more often than an odd one, so it counts only in a vtable row (next to another
+    # code pointer) and when its ARM decode runs cleanly to its end: Phantasy Star Nova's class methods (0x8203a1ac
+    # "ldr/add/str/bx lr", 0x8204c890) only vtables reach, and each stopped a run on its first call (Luufen's fork, cec40dc)
+    taken = {i.address for f in fns[len(fns) - ngap:] for i in f.insns}
+    def codeptr(w):
+        return (w & ~1) in eset or (((w & 1) or not (w & 3)) and in_gap(w & ~1))
+    garm = set()
+    for s0, bb in blocks.items():
+        for o in range((-s0) % 4, len(bb) - 3, 4):
+            if is_insn(s0 + o):
+                continue
+            v = int.from_bytes(bb[o:o + 4], "little")
+            if v & 3 or v in starts or v in eset or v in taken or not in_gap(v):
+                continue
+            if any(codeptr(int.from_bytes(bb[p:p + 4], "little")) for p in (o - 4, o + 4) if 0 <= p and p + 4 <= len(bb)):
+                garm.add(v)
+    narm = 0
+    for a in sorted(garm):
+        body = gap_fn(a, True)
+        if body:
+            eset.add(a); narm += 1; arm.add(a)
+            fns.append(Fn(a, body, eset, arm=True))
+    if narm:
+        print(f"{narm} ARM functions in gaps (even pointers in vtable rows)")
+    ngap += narm
     if ngap:
         print(f"{ngap} functions in gaps between Ghidra's bodies (reached through pointers)")
     for a in sorted(set(HOOKS) - {f.entry for f in fns}):   # a typo, or an address that moved: say so now, not after a run shows nothing changed
