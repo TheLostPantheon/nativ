@@ -234,11 +234,17 @@ static void synced(const std::string &id) { if (on_synced) on_synced(id); }
 bool enabled(void) { return get("enabled") != "0"; }
 void set_enabled(bool on) { set("enabled", on ? "1" : "0"); }
 bool game_on(const std::string &id) { std::string off = "," + get("off") + ","; return off.find("," + id + ",") == std::string::npos; }
+struct Conn; static bool connect_vita(Conn &c, int ms);
+static void clear_guard(const std::string &id);
 void set_game_on(const std::string &id, bool on) {
 	std::string off = get("off"), out; size_t at = 0;
 	while (at <= off.size()) { size_t c = off.find(',', at); if (c == std::string::npos) c = off.size(); std::string x = off.substr(at, c - at); if (!x.empty() && x != id) out += (out.empty() ? "" : ",") + x; at = c + 1; }
 	if (!on) out += (out.empty() ? "" : ",") + id;
 	set("off", out);
+	if (!on && paired()) {   /* the Vita stops asking about it too */
+		std::lock_guard<std::mutex> l(mu); statuses.erase(id);
+		std::thread([id] { clear_guard(id); }).detach();
+	}
 }
 void set_library(const std::vector<Game> &games) { std::lock_guard<std::mutex> l(mu); library = games; }
 void set_playing(const std::string &id) { std::lock_guard<std::mutex> l(mu); playing = id; }
@@ -415,6 +421,8 @@ static bool connect_vita(Conn &c, int ms) {   /* the last address, else where th
 	}
 	return false;
 }
+
+static void clear_guard(const std::string &id) { std::lock_guard<std::mutex> k(op_mu); Conn c; std::string o; if (connect_vita(c, 3000)) c.req("GUARD " + id, "state\tnone\n", o); }
 
 /* ---- Nativ's side of a save: savedata0's files (but its .slot<N>), and the slots from .slot<N> (0x34C bytes) ---- */
 struct Entry { std::string path, hash, mtime; uint64_t size = 0; };
