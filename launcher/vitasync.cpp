@@ -600,17 +600,30 @@ Check check(const Game &g, int connect_ms) {
 	r = decide(c, g); report(g, r);
 	return r;
 }
+/* a session around a fetch or send (BEGIN .. END): the Vita holds the game's launches for the whole of it, not just
+ * each request; false when the game is running there. (A service without sessions says so: carry on without.) */
+static bool session_begin(Conn &c, const Game &g, std::string &err) {
+	std::string o;
+	if (c.req("BEGIN " + g.id, "", o) || c.err == "unknown request") return true;
+	err = c.err == "busy" ? "the game is running on the Vita" : c.err;
+	return false;
+}
+static void session_end(Conn &c, const Game &g, bool ok) { std::string o; c.req("END " + g.id + (ok ? " 1" : " 0"), "", o); }
 bool pull(const Game &g, std::string &err) {
 	std::lock_guard<std::mutex> l(op_mu); Conn c;
 	if (!connect_vita(c, 4000)) { err = vita_name() + " isn't on the network"; return false; }
+	if (!session_begin(c, g, err)) return false;
 	bool ok = do_pull(c, g, err);
+	session_end(c, g, ok);
 	if (ok) { set_status(g.id, "In sync", 1); std::string o; c.req("GUARD " + g.id, "state\tnone\n", o); { std::lock_guard<std::mutex> k(mu); vita_wins.erase(g.id); } synced(g.id); }
 	return ok;
 }
 bool push(const Game &g, std::string &err) {
 	std::lock_guard<std::mutex> l(op_mu); Conn c;
 	if (!connect_vita(c, 4000)) { err = vita_name() + " isn't on the network"; return false; }
+	if (!session_begin(c, g, err)) return false;
 	bool ok = do_push(c, g, err);
+	session_end(c, g, ok);
 	if (ok) { set_status(g.id, "In sync", 1); std::string o; c.req("GUARD " + g.id, "state\tnone\n", o); synced(g.id); }
 	return ok;
 }
