@@ -4,7 +4,8 @@
  * the list in English and French, and an icon) into a temporary folder, then: the game's and a trophy's details, an
  * unlock and its toast, a second unlock of it, the platinum refused directly and unlocking itself with the last trophy
  * that counts towards it (the add-on's not needed), the unlock state's flags and count, the unlocks kept across contexts
- * (the file), the language's list, an icon by size then bytes, and the errors for a wrong size or trophy. It includes
+ * (the file), the language's list, an icon by size then bytes, a copy without a pack (its context made all the same, unlocks
+ * by id, kept), and the errors for a wrong size or trophy. It includes
  * trophy.c and maps app0: and ux0: to the folder. Build and run: see README.md in this directory.
  */
 #include <stdarg.h>
@@ -133,6 +134,16 @@ int main(void) {
 	WR32(td, 0x400);
 	CHECKEQ(call(h_trophy_info, 5, ctx3, h, 1, td, 0), TR_INVALID_ARGUMENT);
 	CHECKEQ(call(h_unlock_state, 4, 99, h, flags, count), TR_INVALID_CONTEXT);
+	/* a copy without its trophy pack: the context is made all the same, any id unlocks (and is kept) */
+	const uint32_t other = galloc(12); memcpy(G(other), "NPWR11111", 9);
+	const uint32_t cp = galloc(4); CHECKEQ(call(h_create_context, 4, cp, other, 0, 0), 0);
+	const uint32_t ctx4 = RD32(cp);
+	CHECKEQ(call(h_unlock_state, 4, ctx4, h, flags, count), 0); CHECKEQ(RD32(flags), 0); CHECKEQ(RD32(count), 0);
+	CHECKEQ(call(h_unlock, 4, ctx4, h, 5, plat), 0); CHECKEQ(RD32(plat), (uint32_t)-1); CHECK(strstr(last_toast, "Trophy 5") != 0);
+	CHECKEQ(call(h_unlock, 4, ctx4, h, 5, plat), TR_ALREADY_UNLOCKED);
+	CHECKEQ(call(h_destroy_context, 1, ctx4), 0);
+	CHECKEQ(call(h_create_context, 4, cp, other, 0, 0), 0);
+	CHECKEQ(call(h_unlock_state, 4, RD32(cp), h, flags, count), 0); CHECKEQ(RD32(flags), 1u << 5);   /* kept */
 	CHECKEQ(call(h_term, 0), 0); CHECKEQ(call(h_term, 0), TR_NOT_INITIALIZED);
 
 	char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) {}

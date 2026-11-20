@@ -4,7 +4,9 @@
  * (TROP.SFM, or TROP_<language>.SFM in the game's language) and its icons -- and an unlock is kept in
  * ux0:user/00/trophy/data/<NPWRnnnnn_nn>/nativ_trophies.txt (one line a trophy: its id and the SceRtcTick it was unlocked
  * at), so it lasts across sessions with the game's saves. Unlocking shows a toast. The platinum unlocks itself once every
- * trophy that counts towards it (its pid) is unlocked.
+ * trophy that counts towards it (its pid) is unlocked. A copy without its trophy pack (one dumped without sce_sys: a Vita
+ * always has it) still gets its context -- Shovel Knight stops at an assertion when that fails -- and its unlocks by id
+ * ("Trophy <n>", bronze), kept in the same file.
  *
  * Layouts and errors are the firmware's np_trophy (its size checks: game and group details 0x49c, game data 0x1c, group
  * data 0x20, trophy details 0x494, trophy data 0x18; INVALID_ARGUMENT 0x80551604) with the error numbering
@@ -30,7 +32,7 @@ void overlay_toast_titled(const char *title, const char *body, double seconds);
 enum {
 	TR_NOT_INITIALIZED = 0x80551601u, TR_ALREADY_INITIALIZED = 0x80551602u, TR_INVALID_ARGUMENT = 0x80551604u,
 	TR_INVALID_CONTEXT = 0x80551609u, TR_INVALID_TROPHY_ID = 0x8055160eu, TR_ALREADY_UNLOCKED = 0x8055160fu,
-	TR_PLATINUM_CANNOT_UNLOCK = 0x80551610u, TR_CONTEXT_ALREADY_EXISTS = 0x80551616u, TR_TRP_NOT_FOUND = 0x80551619u,
+	TR_PLATINUM_CANNOT_UNLOCK = 0x80551610u, TR_CONTEXT_ALREADY_EXISTS = 0x80551616u,
 };
 enum { MAXTROPHY = 128, MAXGROUP = 32, MAXCTX = 4, NAMEMAX = 128, DETAILMAX = 1024 };
 enum { GRADE_PLATINUM = 1, GRADE_GOLD = 2, GRADE_SILVER = 3, GRADE_BRONZE = 4 };
@@ -38,7 +40,7 @@ enum { GRADE_PLATINUM = 1, GRADE_GOLD = 2, GRADE_SILVER = 3, GRADE_BRONZE = 4 };
 typedef struct { int used, grade, hidden, gid, pid; char name[NAMEMAX], detail[DETAILMAX]; } Trophy;
 typedef struct { int used; char name[NAMEMAX], detail[DETAILMAX]; } Group;
 typedef struct {
-	int used, count;
+	int used, count, nolist;   /* nolist: no trophy pack in this copy: any id is a trophy, known once unlocked */
 	char comm[16], trp[1024], save[1024], title[NAMEMAX], detail[DETAILMAX];
 	Trophy t[MAXTROPHY]; Group g[MAXGROUP];
 	uint32_t flags[MAXTROPHY / 32]; uint64_t when[MAXTROPHY];
@@ -48,6 +50,11 @@ static int inited, next_handle = 1;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int unlocked(const Ctx *x, int id) { return (x->flags[id >> 5] >> (id & 31)) & 1; }
+static int known(Ctx *x, int id) {   /* a trophy of this context (without a pack: any id, made up on first sight) */
+	if (id < 0 || id >= MAXTROPHY) return 0;
+	if (!x->t[id].used && x->nolist) { Trophy *t = &x->t[id]; t->used = 1; t->grade = GRADE_BRONZE; t->gid = t->pid = -1; snprintf(t->name, sizeof t->name, "Trophy %d", id); }
+	return x->t[id].used;
+}
 static Ctx *ctx_of(uint32_t id) { return id >= 1 && id <= MAXCTX && ctxs[id - 1].used ? &ctxs[id - 1] : 0; }
 
 /* ---- the trophy pack: a big-endian table of named entries (header 0x40 bytes: magic 0xdca24d00, the entry count at
@@ -131,7 +138,7 @@ static void mkdirs(char *path) { for (char *q = path + 1; *q; q++) if (*q == '/'
 static void load_unlocks(Ctx *x) {
 	FILE *f = fopen(x->save, "r"); if (!f) return;
 	int id; unsigned long long tick;
-	while (fscanf(f, "%d %llu", &id, &tick) == 2) if (id >= 0 && id < MAXTROPHY && x->t[id].used) { x->flags[id >> 5] |= 1u << (id & 31); x->when[id] = tick; }
+	while (fscanf(f, "%d %llu", &id, &tick) == 2) if (known(x, id)) { x->flags[id >> 5] |= 1u << (id & 31); x->when[id] = tick; }
 	fclose(f);
 }
 static void save_unlocks(Ctx *x) {
@@ -170,8 +177,8 @@ static void h_create_context(Cpu *c) {   /* (SceNpTrophyContext *, const SceNpCo
 	char sfm[32]; snprintf(sfm, sizeof sfm, "TROP_%02u.SFM", game_system_language());
 	uint32_t n; uint8_t *xml = trp_entry(x->trp, sfm, &n);
 	if (!xml) xml = trp_entry(x->trp, "TROP.SFM", &n);
-	if (!xml) { pthread_mutex_unlock(&lock); fprintf(stderr, "    trophy: %s: no trophy list (%s)\n", comm, x->trp); RET(TR_TRP_NOT_FOUND); return; }
-	parse_list(x, (const char *)xml); free(xml);
+	if (xml) { parse_list(x, (const char *)xml); free(xml); }
+	else { x->nolist = 1; snprintf(x->title, sizeof x->title, "%s", comm); fprintf(stderr, "    trophy: %s: this copy has no trophy pack (%s): trophies by id\n", comm, x->trp); }
 	load_unlocks(x);
 	x->used = 1;
 	pthread_mutex_unlock(&lock);
@@ -188,7 +195,7 @@ static void h_unlock(Cpu *c) {   /* (ctx, handle, trophyId, SceNpTrophyId *plati
 	if (!A3) { RET(TR_INVALID_ARGUMENT); return; }
 	pthread_mutex_lock(&lock);
 	Ctx *x = ctx_of(A0);
-	uint32_t r = !x ? TR_INVALID_CONTEXT : id < 0 || id >= MAXTROPHY || !x->t[id].used ? TR_INVALID_TROPHY_ID
+	uint32_t r = !x ? TR_INVALID_CONTEXT : !known(x, id) ? TR_INVALID_TROPHY_ID
 	           : x->t[id].grade == GRADE_PLATINUM ? TR_PLATINUM_CANNOT_UNLOCK : unlocked(x, id) ? TR_ALREADY_UNLOCKED : 0;
 	int plat = -1;
 	if (!r) {
@@ -255,7 +262,7 @@ static void h_trophy_info(Cpu *c) {   /* (ctx, handle, trophyId, SceNpTrophyDeta
 	if ((det && RD32(det) != 0x494) || (dat && RD32(dat) != 0x18)) { RET(TR_INVALID_ARGUMENT); return; }
 	pthread_mutex_lock(&lock);
 	Ctx *x = ctx_of(A0);
-	uint32_t r = !x ? TR_INVALID_CONTEXT : id < 0 || id >= MAXTROPHY || !x->t[id].used ? TR_INVALID_TROPHY_ID : 0;
+	uint32_t r = !x ? TR_INVALID_CONTEXT : !known(x, id) ? TR_INVALID_TROPHY_ID : 0;
 	if (!r) {
 		const Trophy *t = &x->t[id];
 		if (det) { WR32(det + 4, (uint32_t)id); WR32(det + 8, (uint32_t)t->grade); WR32(det + 12, (uint32_t)t->gid); WR32(det + 16, (uint32_t)t->hidden);

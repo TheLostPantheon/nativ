@@ -189,7 +189,8 @@ folder (a platinum, a bronze and a hidden gold counting towards it, an add-on gr
 English and French, an icon) and checks the game's, a group's and a trophy's details at the firmware's structure sizes,
 an unlock with its toast, a second unlock of the same trophy, the platinum refused directly and unlocking itself with
 the last trophy that counts towards it, the unlock state's flags and count, the unlocks read back by a new context, the
-game language's list, an icon by size and then bytes, and the errors for a wrong size, trophy or context.
+game language's list, an icon by size and then bytes, a copy without its pack (the context made all the same, any id
+unlocking and kept), and the errors for a wrong size, trophy or context.
 
     cc -O1 -g -Wall $INC trophy_test.c -o /tmp/trophy_test -lpthread && /tmp/trophy_test
 
