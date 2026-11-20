@@ -201,6 +201,21 @@ The F10 menu's Game page shows whether you're linked to other players.
 Each game's saves live in your library, at `decrypted/<title id>/recomp/fs/savedata0/`. Nativ keeps them when you
 update. Copy that folder somewhere safe to back them up.
 
+## Vita sync
+
+Nativ can keep a game's saves the same on your PS Vita and here, so you can play on either and carry on on the other.
+Your Vita needs the Nativ Sync app (from VitaDB), and both need to be on the same network.
+
+1. On the Vita, open Nativ Sync and choose **Pair with a computer**. It shows a six-digit code.
+2. In Nativ, open **Settings**, **Vita sync**, **Find my Vita**, pick your Vita and type the code.
+
+From then on a game syncs before it starts and after it closes, here and on the Vita. When both sides have new
+progress, Nativ asks which save to keep, showing each one's time and the game's own description of it, and the Vita
+asks the same when you start the game there. The save you don't keep is backed up: Nativ's in
+`backups/vita-sync/<title id>/` in your library, the Vita's on the Vita. A game syncs only when both run the same
+version of it, and only once it has a save on the Vita (play it there once). Settings, Vita sync turns it off for one
+game or all of them.
+
 ## Reporting a bug
 
 1. When something goes wrong, press **F5** straight away. That marks the moment in the log and saves pictures of the

@@ -30,7 +30,7 @@ EOF
   print -r -- "1 ICON \"$W/nativ.ico\"
 1 24 \"$H/nativ.manifest\"" > $W/nativ.rc
   $BIN/x86_64-w64-mingw32-windres $W/nativ.rc -O coff -o $W/nativ_res.o
-  LINK=($W/nativ_res.o -mwindows -static -lpthread)
+  LINK=($W/nativ_res.o -mwindows -static -lpthread -lws2_32 -lbcrypt)   # (Vita sync: sockets, the system's random numbers)
 else
   OUT=${1:-$H/nativ}
   # an install's toolchain (runtime/platform/linux/setup-toolchain.sh; ATIV_LINUX_TOOLCHAIN, else <root>/toolchain when there is one):
@@ -48,14 +48,19 @@ else
   fi
 fi
 mkdir -p $IMGUIOBJ
-CXXFLAGS=(-O2 -std=c++17 -w -I $IMGUI -I $IMGUI/backends -I $ROOT/runtime/ui -I $ROOT/runtime/platform $SDL_CFLAGS)
+CXXFLAGS=(-O2 -std=c++17 -w -I $IMGUI -I $IMGUI/backends -I $ROOT/runtime/ui -I $ROOT/runtime/platform -I $ROOT/third_party/nativ-sync -I $ROOT/third_party/monocypher $SDL_CFLAGS)
 objs=()
 for s in $IMGUI/imgui.cpp $IMGUI/imgui_draw.cpp $IMGUI/imgui_tables.cpp $IMGUI/imgui_widgets.cpp $IMGUI/backends/imgui_impl_sdl3.cpp $IMGUI/backends/imgui_impl_sdlgpu3.cpp; do
   o=$IMGUIOBJ/${s:t:r}.o; objs+=($o)
   if [[ ! -f $o || $s -nt $o ]]; then ($CXX -c $CXXFLAGS $IMFLAGS $s -o $o.$$ && mv -f $o.$$ $o && echo "  c++ ${s:t}") & fi
 done
+# Vita sync's protocol (third_party/nativ-sync, the file the Vita's service runs) and Monocypher, as C
+for s in $ROOT/third_party/nativ-sync/nsync_proto.c $ROOT/third_party/monocypher/monocypher.c; do
+  o=$IMGUIOBJ/${s:t:r}.o; objs+=($o)
+  if [[ ! -f $o || $s -nt $o ]]; then ($CXX -x c -O2 -std=c99 -I $ROOT/third_party/monocypher -c $s -o $o.$$ && mv -f $o.$$ $o && echo "  cc ${s:t}") & fi
+done
 wait
-$CXX $CXXFLAGS -Wall -DREPO_ROOT="\"$ROOTDEF\"" $H/hub.cpp $objs $SDL_LIBS $LINK -o $OUT
+$CXX $CXXFLAGS -Wall -DREPO_ROOT="\"$ROOTDEF\"" $H/hub.cpp $H/vitasync.cpp $objs $SDL_LIBS $LINK -o $OUT
 [[ $TARGET == windows ]] && cp -f $SDLW/bin/SDL3.dll ${OUT:h}/
 [[ -n ${LT:-} ]] && cp -f $LT/SDL3/lib/libSDL3.so.0 ${OUT:h}/libSDL3.so.0.new$$ && mv -f ${OUT:h}/libSDL3.so.0.new$$ ${OUT:h}/libSDL3.so.0
 [[ -n ${MT:-} ]] && cp -f $MT/SDL3/lib/libSDL3.0.dylib ${OUT:h}/libSDL3.0.dylib.new$$ && mv -f ${OUT:h}/libSDL3.0.dylib.new$$ ${OUT:h}/libSDL3.0.dylib   # (whole: a running launcher keeps its file)

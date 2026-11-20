@@ -17,7 +17,8 @@
  * ATIV_PREFS=<dir>: the launcher's own files and the shared settings there instead of the user's app folder (a test).
  * ATIV_DUMP=<dir>: the library (games, firmware, licences, builds, saves) there instead of the usual one, library_dir (a
  * fresh library to try setup on; the stages it runs inherit it). ATIV_SHOT=f.ppm (a verification aid, no visible window): renders the hub once into f.ppm and exits;
- * ATIV_SHOT_UI=library|setup:<0-4>|add|settings:<0-2>|game:<title>|sac|sac:again picks what is on screen, ATIV_SHOT_SIZE=WxH the size (1280x800),
+ * ATIV_SHOT_UI=library|setup:<0-4>|add|settings:<0-4>|game:<title>|sac|sac:again|vplay:<title> picks what is on screen (ATIV_VSYNC_ANSWER=vita|pc|later
+ * answers Vita sync's choice before a game starts, for a test), ATIV_SHOT_SIZE=WxH the size (1280x800),
  * ATIV_SHOT_SCAN=<rows> a folder search's results (vitarecomp scan's output) in the Add dialog.
  * ATIV_TASK=play:<title>|build:<title>|scan:<folder>|licences:<folder>|firmware:<file> (a verification aid, no window): that
  * task run as its button runs it, its log printed, the exit status its outcome; ATIV_TASK_CANCEL=<seconds>: Cancel then.
@@ -28,6 +29,7 @@
 #include "ui_theme.h"   /* the look shared with the in-game overlay */
 #include "languages.h"   /* the language list the runtime answers from */
 #include "padbind.h"     /* the controller buttons' names and keys (the in-game menu rebinds them) */
+#include "vitasync.h"    /* Vita sync: a paired Vita's saves kept the same as Nativ's */
 #include <ctime>
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -506,6 +508,7 @@ static bool title_like(const char *s) {   /* PCSA00029: four letters, five digit
 }
 static void art_paths(Game &g);
 static void count_licences(void);
+static void vsync_library(void);
 static void library_scan(void) {
 	count_licences();
 	for (auto it = g_tex.begin(); it != g_tex.end();) it = it->second.t ? std::next(it) : g_tex.erase(it);   /* (retry art not found before) */
@@ -572,6 +575,7 @@ static void library_scan(void) {
 		closedir(d);
 	}
 	if (g_firmware && g_firmware_version.empty()) g_firmware_version = "from a console dump";
+	vsync_library();
 }
 /* ---- a card's art, from the copy's own sce_sys: pic0.png (960x544, the game's background picture); else its LiveArea's
  * background (template.xml <livearea-background><image>, 840x500); else its LiveArea gate's start image (280x158).
@@ -659,7 +663,10 @@ static void start_play(const Game &g) {
 	if (needs_online_name(g)) { g_name_game = g.id; return; }
 	start_play_now(g);
 }
+static bool vplay_first(const Game &g);   /* (below: Vita sync's turn before a game starts) */
 static void start_play_now(const Game &g) {   /* (ATIV_LAUNCHER: the game's menu offers "Back to the library"; the launcher comes back to the front when it ends) */
+	if (vplay_first(g)) return;   /* a paired Vita first: its newer save fetched, or the choice when both changed (vplay_modal) */
+	vsync::set_playing(g.id);
 	/* ready first: a build older than these tools (Nativ was updated) is brought up to date before the game starts, so an
 	 * update reaches every game; when it's current that's a moment */
 	Step r = step("Checking " + g.name + "'s build is up to date", vitarecomp({"ready", g.id}));
@@ -1271,6 +1278,205 @@ static void controller_buttons_row(const SetTarget &t) {
 	if (ImGui::Button("Reset controller buttons")) for (int a = 0; a < PBA_N; a++) { char k[24]; pb_key(a, k, sizeof k); if (ini_find(*t.x, k)) target_write(t, k, ""); }
 	ImGui::EndDisabled();
 }
+/* ---- Vita sync (vitasync.h): a paired Vita's saves kept the same as Nativ's. Off until a Vita is paired (Settings, Vita
+ * sync). Before a game starts, a moment's check with the Vita: its newer save fetched, or the choice when both changed
+ * (vplay_modal); after it closes, Nativ's save sent. In between, vsync's own thread answers the Vita: a game closing
+ * there, a choice made at a launch there. */
+static vsync::Game vgame(const Game &g) { return {g.id, g.name, g.version, g_dump + "/decrypted/" + g.id + "/recomp/fs/savedata0"}; }
+static void vsync_library(void) {
+	std::vector<vsync::Game> v;
+	for (const Game &g : g_games) if (g.imported) v.push_back(vgame(g));
+	vsync::set_library(v);
+}
+static void vsync_synced(const std::string &id) {   /* the game plays as the Vita's account from now on (nativ-sync's DESIGN.md, Save origin) */
+	std::string acc = vsync::account_id(); if (acc.size() != 16) return;
+	std::string p = game_settings_path(id); Ini x = ini_load(p);
+	if (ini_find(x, "np_account_id")) return;   /* (it has one of its own already) */
+	ini_set(x, "np_account_id", acc); ini_save(x, p, GAME_HEADER);
+}
+static std::string host_name(void) {   /* what the Vita calls this computer */
+	char b[256] = "";
+#ifdef _WIN32
+	DWORD n = sizeof b; if (!GetComputerNameA(b, &n)) b[0] = 0;
+#else
+	if (gethostname(b, sizeof b - 1) != 0) b[0] = 0;
+	if (char *dot = strchr(b, '.')) *dot = 0;   /* ("Desk-PC.local") */
+#endif
+	return b[0] ? b : "Computer";
+}
+static bool vsync_wanted(const Game &g) { return vsync::paired() && vsync::enabled() && vsync::game_on(g.id); }
+
+/* Play's turn with the Vita: CHECK (a background check), then GO (start the game), CHOICE (both changed), COPY (fetching
+ * or sending), FAILED (say why; play anyway or not). gen: a skipped check's late answer is dropped. */
+enum { VP_IDLE, VP_CHECK, VP_CHOICE, VP_COPY, VP_FAILED, VP_GO };
+static struct { std::atomic<int> phase{VP_IDLE}, gen{0}; std::mutex m; std::string id, name, doing, err; vsync::Check check; Uint64 since = 0; } g_vplay;
+static std::string g_vplay_cleared;   /* the game whose turn just ended: its start goes ahead */
+static void vplay_set(int gen, int phase, const std::string &doing = "", const std::string &err = "") {
+	std::lock_guard<std::mutex> l(g_vplay.m);
+	if (gen != g_vplay.gen) return;
+	if (!doing.empty()) g_vplay.doing = doing;
+	if (!err.empty()) g_vplay.err = err;
+	g_vplay.phase = phase;
+}
+static void vplay_copy(int gen, vsync::Game vg, bool from_vita) {
+	std::thread([gen, vg, from_vita] {
+		std::string err; bool ok = from_vita ? vsync::pull(vg, err) : vsync::push(vg, err);
+		vplay_set(gen, ok ? VP_GO : VP_FAILED, "", err);
+	}).detach();
+}
+static bool vplay_first(const Game &g) {
+	if (g_vplay_cleared == g.id) { g_vplay_cleared.clear(); return false; }
+	if (g_vplay.phase != VP_IDLE) return true;   /* (one at a time) */
+	if (!vsync_wanted(g) || getenv("ATIV_SHOT")) return false;
+	int gen;
+	{ std::lock_guard<std::mutex> l(g_vplay.m); gen = ++g_vplay.gen; g_vplay.id = g.id; g_vplay.name = g.name; g_vplay.err.clear(); g_vplay.check = vsync::Check();
+	  g_vplay.doing = "Checking with " + vsync::vita_name() + "\xE2\x80\xA6"; g_vplay.since = SDL_GetTicks(); g_vplay.phase = VP_CHECK; }
+	vsync::Game vg = vgame(g);
+	std::thread([gen, vg] {
+		vsync::Check k = vsync::check(vg, 2500);
+		{ std::lock_guard<std::mutex> l(g_vplay.m); if (gen == g_vplay.gen) g_vplay.check = k; }
+		if (k.kind == vsync::PULL) { vplay_set(gen, VP_COPY, "Getting your save from " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, true); }
+		else vplay_set(gen, k.kind == vsync::CONFLICT ? VP_CHOICE : VP_GO);
+	}).detach();
+	return true;
+}
+static void vplay_modal(void) {
+	const int ph = g_vplay.phase;
+	if (ph == VP_GO) {   /* the game starts */
+		std::string id; { std::lock_guard<std::mutex> l(g_vplay.m); id = g_vplay.id; g_vplay.phase = VP_IDLE; }
+		for (const Game &g : g_games) if (g.id == id) { g_vplay_cleared = id; start_play_now(g); break; }
+		return;
+	}
+	if (ph == VP_IDLE && !ImGui::IsPopupOpen("Vita sync")) return;
+	std::string name, doing, err; vsync::Check k; Uint64 since;
+	{ std::lock_guard<std::mutex> l(g_vplay.m); name = g_vplay.name; doing = g_vplay.doing; err = g_vplay.err; k = g_vplay.check; since = g_vplay.since; }
+	if (ph == VP_CHECK && SDL_GetTicks() - since < 400 && !ImGui::IsPopupOpen("Vita sync")) return;   /* (a quick check shows nothing) */
+	const float em = ImGui::GetFontSize();
+	if (ph != VP_IDLE && !ImGui::IsPopupOpen("Vita sync")) ImGui::OpenPopup("Vita sync");
+	center_next_popup();
+	ImGui::SetNextWindowSize(ImVec2(std::min(ImGui::GetMainViewport()->WorkSize.x * 0.94f, 40 * em), 0));
+	if (!ImGui::BeginPopupModal("Vita sync", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) return;
+	if (ph == VP_IDLE) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+	auto skip = [&] { std::lock_guard<std::mutex> l(g_vplay.m); g_vplay.gen++; g_vplay.phase = VP_GO; };
+	ImGui::PushStyleColor(ImGuiCol_Text, ui::accent); ImGui::TextUnformatted("Vita sync"); ImGui::PopStyleColor();
+	ui::heading(name.c_str(), em * 1.4f);
+	vsync::Game vg; for (const Game &g : g_games) if (g.name == name || g.id == g_vplay.id) vg = vgame(g);
+	if (ph == VP_CHECK || ph == VP_COPY) {
+		ui::spinner(ui::accent); ImGui::TextUnformatted(doing.c_str());
+		ImGui::Dummy(ImVec2(0, em * 0.4f));
+		if (ImGui::Button("Play without syncing")) skip();
+	} else if (ph == VP_CHOICE) {
+		if (const char *ans = getenv("ATIV_VSYNC_ANSWER")) {   /* (a test's answer: vita, pc or later, as the buttons below) */
+			int gen = g_vplay.gen; std::string a = ans;
+			if (a == "vita") { vplay_set(gen, VP_COPY, "Getting your save from " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, true); }
+			else if (a == "pc") { vplay_set(gen, VP_COPY, "Sending this PC's save to " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, false); }
+			else skip();
+		}
+		ui::muted_wrapped(("Your Vita and this PC both have new progress since the last sync. Which save should " + name + " continue from?").c_str());
+		ImGui::Dummy(ImVec2(0, em * 0.3f));
+		const float cw = (ImGui::GetContentRegionAvail().x - em) * 0.5f;
+		const std::string who[2] = {"On " + vsync::vita_name(), "On this PC"};
+		const vsync::Side side[2] = {k.vita, k.pc};
+		for (int i = 0; i < 2; i++) {
+			if (i) ImGui::SameLine(0, em);
+			ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::card); ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, em * 0.5f);
+			ImGui::BeginChild(i ? "pc" : "vita", ImVec2(cw, 0), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+			ImGui::PushStyleColor(ImGuiCol_Text, ui::accent); ImGui::TextUnformatted(who[i].c_str()); ImGui::PopStyleColor();
+			ImGui::TextUnformatted(side[i].when.empty() ? "Changed since the last sync" : side[i].when.c_str());
+			ImGui::PushTextWrapPos(0); ui::muted_wrapped(side[i].detail.c_str()); ImGui::PopTextWrapPos();
+			ImGui::EndChild(); ImGui::PopStyleVar(); ImGui::PopStyleColor();
+		}
+		ImGui::Dummy(ImVec2(0, em * 0.3f));
+		int gen = g_vplay.gen;
+		if (ui::primary_button("Keep the Vita's")) { vplay_set(gen, VP_COPY, "Getting your save from " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, true); }
+		ImGui::SameLine();
+		if (ImGui::Button("Keep this PC's")) { vplay_set(gen, VP_COPY, "Sending this PC's save to " + vsync::vita_name() + "\xE2\x80\xA6"); vplay_copy(gen, vg, false); }
+		ImGui::SameLine();
+		if (ImGui::Button("Decide later")) { vsync::Check kk = k; std::thread([vg, kk] { vsync::mark_conflict(vg, kk); }).detach(); skip(); }
+		ui::muted_wrapped("The save you don't keep is backed up, so you can change your mind later. Decide later plays this PC's save, and your Vita asks again when you start the game there.");
+	} else if (ph == VP_FAILED) {
+		ImGui::PushStyleColor(ImGuiCol_Text, ui::warn); ImGui::TextWrapped("Couldn't sync: %s", err.c_str()); ImGui::PopStyleColor();
+		ImGui::Dummy(ImVec2(0, em * 0.3f));
+		if (ui::primary_button("Play anyway")) skip();
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel")) { std::lock_guard<std::mutex> l(g_vplay.m); g_vplay.gen++; g_vplay.phase = VP_IDLE; }
+	}
+	ImGui::EndPopup();
+}
+/* the after: a game closed in Nativ */
+static void vsync_after_play(const std::string &id, bool wait) {
+	vsync::set_playing("");
+	for (const Game &g : g_games) if (g.id == id && vsync_wanted(g)) {
+		vsync::Game vg = vgame(g);
+		if (wait) vsync::after_play(vg); else std::thread([vg] { vsync::after_play(vg); }).detach();
+	}
+}
+/* a card's line: "· Vita: in sync", or a dot alone where the words don't fit (the full status as its tooltip) */
+static void vsync_card_status(const Game &g, float right) {
+	if (!vsync::paired() || !vsync::game_on(g.id)) return;
+	vsync::Status st = vsync::status(g.id); if (st.text.empty()) return;
+	std::string s = st.text.substr(0, st.text.find(" (")); if (!s.empty()) s[0] = (char)tolower((unsigned char)s[0]);
+	const ImVec4 c = st.tone == 1 ? ui::ready : st.tone == 2 ? ui::warn : ui::muted;
+	std::string label = "\xC2\xB7 Vita: " + s;
+	ImGui::SameLine();
+	if (ImGui::GetCursorPosX() + ImGui::CalcTextSize(label.c_str()).x <= right) ImGui::TextColored(c, "%s", label.c_str());
+	else ui::dot(c);
+	if (ImGui::IsItemHovered()) ImGui::SetTooltip("Vita sync: %s", st.text.c_str());
+}
+
+/* Settings, Vita sync */
+static struct { std::atomic<bool> busy{false}; std::mutex m; std::vector<vsync::Vita> found; bool searched = false; int pick = -1; std::string code, msg; bool confirm_unpair = false; } g_vpair;
+static void vita_sync_page(void) {
+	const float em = ImGui::GetFontSize();
+	if (!vsync::paired()) {
+		ui::row("Vita sync", "Your saves kept the same on your PS Vita and here: a game syncs before it starts and after it closes, on either side, and asks only when both changed. Your Vita needs Nativ Sync (VitaDB) and the same network as this computer.");
+		std::vector<vsync::Vita> found; bool searched; int pick; std::string msg;
+		{ std::lock_guard<std::mutex> l(g_vpair.m); found = g_vpair.found; searched = g_vpair.searched; pick = g_vpair.pick; msg = g_vpair.msg; }
+		ImGui::BeginDisabled(g_vpair.busy);
+		if (ImGui::Button(searched ? "Look again" : "Find my Vita")) {
+			g_vpair.busy = true; { std::lock_guard<std::mutex> l(g_vpair.m); g_vpair.msg.clear(); }
+			std::thread([] { auto v = vsync::find(2500); std::lock_guard<std::mutex> l(g_vpair.m); g_vpair.found = v; g_vpair.searched = true; if (g_vpair.pick >= (int)v.size()) g_vpair.pick = -1; if (v.size() == 1) g_vpair.pick = 0; g_vpair.busy = false; }).detach();
+		}
+		ImGui::EndDisabled();
+		if (g_vpair.busy) { ImGui::SameLine(); ui::spinner(ui::accent); ImGui::TextDisabled("Working\xE2\x80\xA6"); }
+		if (searched && found.empty() && !g_vpair.busy) ui::muted_wrapped("No Vita answered. Is Nativ Sync installed, and is the Vita on the same Wi-Fi?");
+		for (int i = 0; i < (int)found.size(); i++) {
+			std::string l = found[i].name + "  (" + found[i].addr + ")";
+			if (ImGui::RadioButton(l.c_str(), pick == i)) { std::lock_guard<std::mutex> k(g_vpair.m); g_vpair.pick = i; }
+		}
+		if (pick >= 0 && pick < (int)found.size()) {
+			ui::row("Code", "On the Vita, open Nativ Sync and choose Pair with a computer: it shows a six-digit code for five minutes.");
+			input_text("##vcode", g_vpair.code, em * 7, "6 digits");
+			ImGui::SameLine();
+			ImGui::BeginDisabled(g_vpair.busy || g_vpair.code.size() != 6);
+			if (ui::primary_button("Pair")) {
+				g_vpair.busy = true; vsync::Vita v = found[pick]; std::string code = g_vpair.code;
+				std::thread([v, code] { std::string why = vsync::pair(v, code); std::lock_guard<std::mutex> l(g_vpair.m); g_vpair.msg = why; g_vpair.busy = false; if (why.empty()) { g_vpair.code.clear(); g_vpair.found.clear(); g_vpair.searched = false; g_vpair.pick = -1; } }).detach();
+			}
+			ImGui::EndDisabled();
+		}
+		if (!msg.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, ui::warn); ImGui::TextWrapped("%s", msg.c_str()); ImGui::PopStyleColor(); }
+		return;
+	}
+	ui::row(("Paired with " + vsync::vita_name()).c_str(), vsync::online() ? "Connected." : "Not on the network right now: games sync when it's back.");
+	if (!g_vpair.confirm_unpair) { if (ImGui::Button("Unpair")) g_vpair.confirm_unpair = true; }
+	else {
+		ImGui::TextUnformatted("Unpair?"); ImGui::SameLine();
+		if (ImGui::Button("Yes, unpair")) { vsync::unpair(); g_vpair.confirm_unpair = false; }
+		ImGui::SameLine(); if (ImGui::Button("No")) g_vpair.confirm_unpair = false;
+	}
+	ui::row("Sync saves", "Before a game starts and after it closes. Off: nothing is sent or fetched.");
+	{ bool on = vsync::enabled(); if (ui::toggle("vsync_on", &on)) vsync::set_enabled(on); }
+	for (const Game &g : g_games) {
+		if (!g.imported) continue;
+		vsync::Status st = vsync::status(g.id);
+		ImGui::PushID(g.id.c_str());
+		ui::row(g.name.c_str(), st.text.empty() ? (vsync::online() ? "Not checked yet." : "") : st.text.c_str());
+		bool on = vsync::game_on(g.id); if (ui::toggle("vgame", &on)) vsync::set_game_on(g.id, on);
+		ImGui::PopID();
+	}
+}
+
 static void settings_modal(void) {
 	const ImGuiViewport *vp = ImGui::GetMainViewport();
 	const float em = ImGui::GetFontSize();
@@ -1283,9 +1489,9 @@ static void settings_modal(void) {
 	ui::heading("Settings", em * 1.4f);
 	ui::muted_wrapped("For every game. A game reads them when it starts; its own menu (F10) changes them too, for every game. A game's own options, and any value it keeps for itself, are under Game settings on its card.");
 	ImGui::Dummy(ImVec2(0, em * 0.2f));
-	static const char *const tabs[] = {"Display##st", "Controls##st", "Sound & online##st", "Library##st"};
-	ui::segmented(tabs, 4, &g_settings_tab); tab_hint();
-	g_settings_tab = (g_settings_tab + tab_step() + 4) % 4;
+	static const char *const tabs[] = {"Display##st", "Controls##st", "Sound & online##st", "Library##st", "Vita sync##st"};
+	ui::segmented(tabs, 5, &g_settings_tab); tab_hint();
+	g_settings_tab = (g_settings_tab + tab_step() + 5) % 5;
 	ImGui::Dummy(ImVec2(0, em * 0.2f));
 	SetTarget t{&g_shared, shared_path(), SHARED_HEADER};
 	ImGui::BeginChild("settings_rows", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - em * 0.4f), 0);
@@ -1326,6 +1532,8 @@ static void settings_modal(void) {
 			slider_row(t, "Stick deadzone", "How far a controller's stick moves before the game sees it: raise it if the camera or your character drifts on its own.", "stick_deadzone", 0.0, 0.0f, 50.0f, "%.0f%%", 100.0f);
 		} else if (g_settings_tab == 3) {
 			library_page();
+		} else if (g_settings_tab == 4) {
+			vita_sync_page();
 		} else {
 			slider_row(t, "Volume", nullptr, "volume", 1.0, 0.0f, 100.0f, "%.0f%%", 100.0f);
 			toggle_row(t, "Play online", ONLINE_EXPL, "online", true);
@@ -1765,7 +1973,7 @@ static void game_card(const Game &g, float w, float name_h) {
 	ImGui::SetCursorPosY(y0 + name_h + ImGui::GetStyle().ItemSpacing.y);
 	ImGui::SetCursorPosX(pad);
 	if (mine) { ui::spinner(ui::accent); ImGui::TextDisabled("%s", task_status().c_str()); }
-	else if (g.built) { ui::dot(ui::ready); ImGui::TextUnformatted("Ready to play"); }
+	else if (g.built) { ui::dot(ui::ready); ImGui::TextUnformatted("Ready to play"); vsync_card_status(g, w - pad); }
 	else if (g.imported) { ui::dot(ui::warn); ImGui::TextUnformatted("Needs a one-time build"); }
 	else { ui::dot(ui::border); ImGui::TextDisabled("Not added yet"); }
 	ImGui::SetCursorPosX(pad);
@@ -1991,6 +2199,7 @@ static void hub_ui(SDL_Window *win) {
 	} else ImGui::PopStyleVar(2);
 	sac_modal();
 	online_name_modal();
+	vplay_modal();
 	setup_modal(win);
 	settings_modal();
 	game_settings_modal();
@@ -2166,6 +2375,11 @@ static bool mac_preflight(void) {
  * starts the game and sees it end */
 static std::string g_autoplay;
 int main(int argc, char **argv) {
+	if (argc >= 2 && !strcmp(argv[1], "--vita-sync")) {   /* nativ --vita-sync ...: Vita sync from a terminal (vitasync.cpp's cli) */
+		g_root = find_root(); g_dump = library_dir();
+		vsync::init(pref_dir(), g_dump + "/backups/vita-sync", host_name());
+		return vsync::cli(argc - 2, argv + 2);
+	}
 	for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "--play")) g_autoplay = argv[i + 1];
 	g_root = find_root();
 	if (!exists(g_root + "/pipeline/vitarecomp.py")) {   /* (the launcher apart from its folder: run from inside the zip, or copied out alone) */
@@ -2225,6 +2439,8 @@ int main(int argc, char **argv) {
 	if (g_settings_writable) settings_migrate();   /* (a screenshot run touches no one's settings but a test folder's) */
 	set_env("RECOMP_SETTINGS_SHARED", shared_path());   /* the games it starts read the same shared file (runtime/core/main.c) */
 	library_scan();
+	if (!shot_path) { vsync::init(pref_dir(), g_dump + "/backups/vita-sync", host_name()); vsync::set_on_synced(vsync_synced); vsync_library(); vsync::start(); }
+	else if (getenv("ATIV_PREFS")) vsync::init(pref_dir(), g_dump + "/backups/vita-sync", "");   /* (a screenshot: a test folder's pairing shown, nothing sent) */
 	g_setup_open = g_prefs["setup_done"] != "1" || !g_firmware;   /* first run, or the firmware still missing */
 	if (!g_autoplay.empty() && !shot_path) {
 		const Game *g = nullptr; for (const Game &x : g_games) if (x.id == g_autoplay) g = &x;
@@ -2246,6 +2462,12 @@ int main(int argc, char **argv) {
 		g_settings_open = ui_sel.rfind("settings", 0) == 0; if (g_settings_open && ui_sel.size() > 9) g_settings_tab = atoi(ui_sel.c_str() + 9);
 		if (ui_sel.rfind("game:", 0) == 0) g_game_settings = ui_sel.substr(5);
 		if (ui_sel.rfind("name:", 0) == 0) g_name_game = ui_sel.substr(5);
+		if (ui_sel.rfind("vplay:", 0) == 0) {   /* the choice before a game starts, with sample saves */
+			for (const Game &g : g_games) if (g.id == ui_sel.substr(6)) { g_vplay.id = g.id; g_vplay.name = g.name; }
+			g_vplay.check.kind = vsync::CONFLICT;
+			g_vplay.check.vita = {"16 Nov, 21:12", "Sample: the Vita's newest save"}; g_vplay.check.pc = {"Today, 00:38", "Sample: this PC's newest save"};
+			g_vplay.phase = VP_CHOICE;
+		}
 		if (getenv("ATIV_SHOT_NOFW") && *getenv("ATIV_SHOT_NOFW")) { g_firmware = false; g_firmware_version.clear(); }
 		if (const char *u = getenv("ATIV_SHOT_UPDATE")) { g_update.tag = u; g_update.page = "https://example.invalid/"; }   /* (the notice, without asking anyone) */
 		files_check();   /* (an install's own check, as at start: what a damaged copy shows) */
@@ -2274,6 +2496,7 @@ int main(int argc, char **argv) {
 		static Uint64 last_scan;
 		if (g_task.running && SDL_GetTicks() - last_scan > 1500) { library_scan(); last_scan = SDL_GetTicks(); }   /* (a long add: its card follows) */
 		if (g_refresh.exchange(false)) {
+			if (g_task.kind == "play") vsync_after_play(g_task.game, !g_autoplay.empty() && g_task.ok);   /* (Nativ's save to a paired Vita; before quitting, when --play quits) */
 			if (g_task.kind == "play" && !g_autoplay.empty() && g_task.ok) quit = true;   /* (--play: the game ended, and with it the launcher Steam started) */
 			else if (g_task.kind == "play") { SDL_RestoreWindow(win); SDL_RaiseWindow(win); }   /* (the game closed: back to the library) */
 			library_scan();
@@ -2309,6 +2532,7 @@ int main(int argc, char **argv) {
 	}
 	task_cancel();
 	if (g_task.reader.joinable()) g_task.reader.join();
+	vsync::stop();
 	SDL_WaitForGPUIdle(g_gpu);
 	for (auto &kv : g_tex) if (kv.second.t) SDL_ReleaseGPUTexture(g_gpu, kv.second.t);
 	ImGui_ImplSDL3_Shutdown(); ImGui_ImplSDLGPU3_Shutdown(); ImGui::DestroyContext();
