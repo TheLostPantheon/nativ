@@ -720,6 +720,11 @@ int cli(int argc, char **argv) {
 		std::string why = pair(v, argv[2]); printf("%s\n", why.empty() ? ("paired with " + vita_name()).c_str() : why.c_str()); return why.empty() ? 0 : 1;
 	}
 	if (cmd == "unpair") { unpair(); return 0; }
+	if (cmd == "guard" && argc >= 4) {   /* a test: the Vita asks before the game starts, with both sides as they are */
+		Game g{argv[1], argv[1], argv[2], argv[3]};
+		Check k = check(g, 3000); mark_conflict(g, k); printf("%s: the Vita asks at its next start\n", g.id.c_str()); return 0;
+	}
+	if (cmd == "unguard" && argc >= 2) { clear_guard(argv[1]); printf("%s: the Vita's question withdrawn\n", argv[1]); return 0; }
 	if (cmd == "choices" && argc >= 4) {   /* the background side's first step: choices kept at the Vita, carried out (for one game) */
 		set_library({Game{argv[1], argv[1], argv[2], argv[3]}});
 		Conn c; J ch; if (!connect_vita(c, 3000) || !c.req_json("CHOICES", ch)) { printf("failed: %s\n", c.err.c_str()); return 1; }
@@ -739,7 +744,7 @@ int cli(int argc, char **argv) {
 		std::string err; bool ok = cmd == "pull" ? pull(g, err) : push(g, err);
 		printf("%s%s\n", ok ? "done" : "failed: ", err.c_str()); return ok ? 0 : 1;
 	}
-	printf("nativ --vita-sync find | pair <address> <code> | unpair | status | on|off <TITLE> | check|pull|push|choices <TITLE> <version> <savedata0 folder>\n");
+	printf("nativ --vita-sync find | pair <address> <code> | unpair | status | on|off|unguard <TITLE> | check|pull|push|choices|guard <TITLE> <version> <savedata0 folder>\n");
 	return 2;
 }
 }
