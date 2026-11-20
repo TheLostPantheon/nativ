@@ -9,7 +9,7 @@
 #include "net.h"
 
 static const HleEntry *const modules[] = {
-	hle_kernel, hle_display, hle_ngs, hle_libc, hle_io, hle_sysmem, hle_apputil, hle_fios, hle_gpu, hle_video, hle_audiodec, hle_gesture, hle_jpeg, hle_camera, hle_audioin,
+	hle_kernel, hle_display, hle_ngs, hle_libc, hle_io, hle_sysmem, hle_apputil, hle_fios, hle_gpu, hle_video, hle_audiodec, hle_gesture, hle_jpeg, hle_camera, hle_audioin, hle_trophy,
 };
 static const HleEntry *const online_modules[] = { hle_net, hle_np, hle_http, hle_ssl_local };   /* a game run online (net.h) */
 /* offline: the network stack as a Vita with its Wi-Fi off has it (net.c: this machine alone; http.c: a request is never
