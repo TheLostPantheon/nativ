@@ -1666,6 +1666,57 @@ static void setup_modal(SDL_Window *win) {
 }
 
 static bool g_add_open;   /* the Add a game dialog */
+/* the Experimental section's slot, dashed in the section's colour. With no experimental game yet it's a banner across the
+ * row saying what one is (any game Nativ has no pack for, built from the player's copy); after some, a card-sized
+ * "Add another game" tile at the end of the grid */
+static void dashed_box(ImDrawList *dl, ImVec2 p, ImVec2 q, float r, ImU32 c, float em) {
+	const float dash = em * 0.55f, gap = em * 0.4f, t = 1.3f, pi = 3.14159265f;
+	auto edge = [&](ImVec2 a, ImVec2 b) { float len = std::hypot(b.x - a.x, b.y - a.y); if (len <= 0) return; ImVec2 d((b.x - a.x) / len, (b.y - a.y) / len);
+		for (float s0 = 0; s0 < len; s0 += dash + gap) { float s1 = std::min(len, s0 + dash); dl->AddLine(ImVec2(a.x + d.x * s0, a.y + d.y * s0), ImVec2(a.x + d.x * s1, a.y + d.y * s1), c, t); } };
+	edge(ImVec2(p.x + r, p.y), ImVec2(q.x - r, p.y)); edge(ImVec2(q.x, p.y + r), ImVec2(q.x, q.y - r));
+	edge(ImVec2(q.x - r, q.y), ImVec2(p.x + r, q.y)); edge(ImVec2(p.x, q.y - r), ImVec2(p.x, p.y + r));
+	const ImVec2 cs[4] = { ImVec2(p.x + r, p.y + r), ImVec2(q.x - r, p.y + r), ImVec2(q.x - r, q.y - r), ImVec2(p.x + r, q.y - r) };
+	for (int k = 0; k < 4; k++) { dl->PathArcTo(cs[k], r, pi * (1 + 0.5f * k), pi * (1.5f + 0.5f * k)); dl->PathStroke(c, 0, t); }
+}
+static void add_slot(float w, bool first, bool busy) {
+	const float em = ImGui::GetFontSize(), r = ImGui::GetStyle().ChildRounding, pad = em * 1.2f;
+	ImGui::PushID("add_slot");
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	const char *title = first ? "Any other Vita game" : "Add another game";
+	const char *body = "Add your copy and Nativ builds it as an experimental game. It gets no game-specific work, so it may not start or may crash, and it comes with no support.";
+	const float bw = ImGui::CalcTextSize("+ Add a game").x + ImGui::GetStyle().FramePadding.x * 4, bh = ImGui::GetFrameHeight(), mr = em * (first ? 0.75f : 0.55f);
+	ImGui::PushFont(nullptr, em * 1.15f); const ImVec2 ts = ImGui::CalcTextSize(title); ImGui::PopFont();
+	ImVec2 p = ImGui::GetCursorScreenPos();
+	if (first) {   /* the banner: mark, title and what it means on the left, the button on the right */
+		const float textx = pad + mr * 2 + em * 0.9f, wrap = w - textx - bw - pad * 2;
+		const ImVec2 bs = ImGui::CalcTextSize(body, nullptr, false, wrap);
+		const float h = std::max(ts.y + em * 0.3f + bs.y, bh) + pad * 2;
+		const ImVec2 q(p.x + w, p.y + h);
+		dl->AddRectFilled(p, q, ui::u32(ui::experimental, 0.035f), r);
+		dashed_box(dl, p, q, r, ui::u32(ui::experimental, 0.45f), em);
+		ui::tier_mark(dl, ImVec2(p.x + pad + mr, p.y + h * 0.5f), mr, 1, ui::u32(ui::experimental, 0.9f));
+		const float ty = p.y + (h - (ts.y + em * 0.3f + bs.y)) * 0.5f;
+		ImGui::PushFont(nullptr, em * 1.15f); dl->AddText(ImVec2(p.x + textx, ty), ui::u32(ui::text), title); ImGui::PopFont();
+		ImGui::SetCursorScreenPos(ImVec2(p.x + textx, ty + ts.y + em * 0.3f));
+		ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap); ImGui::PushStyleColor(ImGuiCol_Text, ui::muted); ImGui::TextWrapped("%s", body); ImGui::PopStyleColor(); ImGui::PopTextWrapPos();
+		ImGui::SetCursorScreenPos(ImVec2(q.x - pad - bw, p.y + (h - bh) * 0.5f));
+		ImGui::BeginDisabled(busy); if (ImGui::Button("+ Add a game", ImVec2(bw, 0))) g_add_open = true; ImGui::EndDisabled();
+		ImGui::SetCursorScreenPos(p); ImGui::Dummy(ImVec2(w, h));
+	} else {       /* the tile: a card's cover in size, the mark, "Add another game" and the button, centred */
+		const float h = w * 544.0f / 960.0f; const ImVec2 q(p.x + w, p.y + h);
+		const bool hov = ImGui::IsMouseHoveringRect(p, q) && !busy;
+		dl->AddRectFilled(p, q, ui::u32(ui::experimental, hov ? 0.07f : 0.035f), r);
+		dashed_box(dl, p, q, r, ui::u32(ui::experimental, hov ? 0.7f : 0.45f), em);
+		float y = p.y + (h - (mr * 2 + em * 0.6f + ts.y + em * 0.9f + bh)) * 0.5f;
+		ui::tier_mark(dl, ImVec2(p.x + w * 0.5f, y + mr), mr, 1, ui::u32(ui::experimental, 0.9f)); y += mr * 2 + em * 0.6f;
+		ImGui::PushFont(nullptr, em * 1.15f); dl->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, y), ui::u32(ui::text), title); ImGui::PopFont(); y += ts.y + em * 0.9f;
+		ImGui::SetCursorScreenPos(ImVec2(p.x + (w - bw) * 0.5f, y));
+		ImGui::BeginDisabled(busy); if (ImGui::Button("+ Add a game", ImVec2(bw, 0))) g_add_open = true; ImGui::EndDisabled();
+		if (hov) ImGui::SetTooltip("%s", body);
+		ImGui::SetCursorScreenPos(p); ImGui::Dummy(ImVec2(w, h));
+	}
+	ImGui::PopID();
+}
 /* ---- a game's card: its cover (pic0), icon, name, state, one primary action */
 static std::string self_exe(void);   /* (below, with find_root) */
 static void game_card(const Game &g, float w, float name_h) {
@@ -1873,7 +1924,7 @@ static void hub_ui(SDL_Window *win) {
 	for (int sec = 0; sec < 2; sec++) {
 		std::vector<const Game *> gs;
 		for (const Game &g : g_games) if ((g.tier == "experimental") == (sec == 1)) gs.push_back(&g);
-		if (gs.empty()) continue;
+		if (gs.empty() && sec == 0) continue;   /* (the Experimental section always shows: it says where every other game goes) */
 		ImGui::Dummy(ImVec2(0, em * (sec ? 0.6f : 0.2f)));
 		{	/* the section's tier mark, then its heading and what it means */
 			const float r = em * 0.36f; ImVec2 c = ImGui::GetCursorScreenPos();
@@ -1886,6 +1937,10 @@ static void hub_ui(SDL_Window *win) {
 		for (size_t i = 0; i < gs.size(); i++) {
 			if (i % cols) ImGui::SameLine();
 			ImGui::BeginGroup(); game_card(*gs[i], cw, name_h); ImGui::EndGroup();
+		}
+		if (sec == 1) {   /* where any other game goes: a banner while there's none, then a tile after them */
+			if (gs.empty()) add_slot(cw * cols + gap * (cols - 1), true, busy);
+			else { if (gs.size() % cols) ImGui::SameLine(); add_slot(cw, false, busy); }
 		}
 		ImGui::PopStyleVar();
 	}
