@@ -171,6 +171,31 @@ network without asking any server. It uses real loopback sockets.
 
 It prints `all passed`.
 
+## PSN comparisons and offline state: `np_test.c`
+
+Checks the parts of `runtime/net/np.c` every game gets. SceNpCommon's comparisons, as the firmware's `np_common` has
+them: the same player, one id without a platform (still the same player), another online id, platform or option bytes
+(not), an id the system didn't make, a null argument, and the ordered comparison's -1, 0 and 1 (an id without a platform
+counts as "psp2"). And offline PSN: the service state reads signed out, and a registered state callback hears it once.
+
+    cc -O1 -g -w $INC np_test.c -o /tmp/np_test -lpthread && /tmp/np_test
+
+It prints `all passed`.
+
+## Trophies: `trophy_test.c`
+
+Checks `runtime/core/trophy.c`, the game's trophies kept on this machine. It writes a small trophy pack into a temporary
+folder (a platinum, a bronze and a hidden gold counting towards it, an add-on group's trophy that doesn't, the list in
+English and French, an icon) and checks the game's, a group's and a trophy's details at the firmware's structure sizes,
+an unlock with its toast, a second unlock of the same trophy, the platinum refused directly and unlocking itself with
+the last trophy that counts towards it, the unlock state's flags and count, the unlocks read back by a new context, the
+game language's list, an icon by size and then bytes, a copy without its pack (the context made all the same, any id
+unlocking and kept), and the errors for a wrong size, trophy or context.
+
+    cc -O1 -g -Wall $INC trophy_test.c -o /tmp/trophy_test -lpthread && /tmp/trophy_test
+
+It prints `all passed`.
+
 ## The audio decoder: `audiodec_test.c`
 
 Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`

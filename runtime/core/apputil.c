@@ -639,7 +639,6 @@ int cdlg_active(void) {
 }
 
 /* ---- trophies: a context and a handle that accept everything */
-static void h_trophy_create(Cpu *c) { if (A0) WR32(A0, 1); RET(0); }
 
 /* system events (suspend/resume and the like): none ever arrives; the real call returns an error
  * when the queue is empty, which ends a game's drain loop */
@@ -655,6 +654,7 @@ static uint32_t system_language(void) {
 	for (int i = 0; i < game_language_count; i++) if (!strcmp(b, game_languages[i].key)) return (uint32_t)i;
 	return 1;
 }
+uint32_t game_system_language(void) { return system_language(); }   /* (trophy.c: which TROP_<language>.SFM) */
 /* system settings (id, *value): 1 language (system_language: English US unless chosen), 2 enter button (1 cross), 4 date format
  * (0 YYYY/MM/DD), 5 time format (0 12-hour), 6 time zone (0 minutes: UTC, which is what the host's
  * RTC reports as local time too), 7 summer time (0 off); 3 is the user name, a string. Anything else
@@ -786,7 +786,5 @@ const HleEntry hle_apputil[] = {
 	{"sceAppUtilSaveDataSlotGetParam", h_save_slot_param}, {"sceAppUtilSaveDataSlotCreate", h_save_slot_create}, {"sceAppUtilSaveDataSlotDelete", h_save_slot_delete}, {"sceAppUtilSaveDataSlotSetParam", h_save_slot_set_param},
 	{"sceAppUtilSaveDataDataSave", h_save_data_save},
 	{"sceAppUtilSaveDataDataRemove", h_save_data_remove},
-	{"sceNpTrophyCreateContext", h_trophy_create},
-	{"sceNpTrophyCreateHandle", h_trophy_create},
 	{0, 0},
 };
