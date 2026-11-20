@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#include "seedmode.h"
 #include "rt.h"
 #include "platform.h"
 #include "hle.h"
@@ -374,10 +375,14 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 		 * cut short, branched to from the part it kept): recorded for analyze.py --seeds, which takes it as a
 		 * function on the next run. Thumb: an odd address, one ARM code can't start at (not 4-aligned), or one
 		 * Thumb code called or branched to (a branch target carries no Thumb bit; np_matching2's 0x8cee was
-		 * recorded as ARM); ARM: the rest */
+		 * recorded as ARM); ARM: the rest, except after a register BLX, whose target's bit 0 says (seedmode.h) */
 		const char *sp = getenv("RECOMP_SEEDS");
 		FILE *sf = addr >= 0x81000000u && addr < 0xa0000000u ? fopen(sp ? sp : "missed_functions.txt", "a") : 0;   /* (a call through a null or poisoned pointer is not a missed function) */
-		if (sf) { fprintf(sf, "%#x %s\n", addr & ~1u, (addr & 3) || (c->r[14] & 1) ? "thumb" : "arm"); fclose(sf); }
+		if (sf) {   /* the instruction set: seedmode.h (after a register BLX, the target's bit 0) */
+			const uint32_t lr = c->r[14], in = lr >= 0x81000004u && lr < 0xa0000000u;
+			const uint32_t before = !in ? 0 : (lr & 1) ? RD16((lr & ~1u) - 2) : RD32(lr - 4);
+			fprintf(sf, "%#x %s\n", addr & ~1u, seed_thumb(addr, lr, before, c->r) ? "thumb" : "arm"); fclose(sf);
+		}
 		snprintf(gaps_stop, sizeof gaps_stop, "a call to %#x, code the analysis missed (called from %#x; taken as a function on the next build)", addr, c->r[14]);
 		summary("stopped"); exit(2);
 	}

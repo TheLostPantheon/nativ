@@ -38,5 +38,7 @@ uint64_t plat_now_us(void);                              /* a monotonic microsec
                                                           * compare with another module's clock: macOS counts uptime, without sleep) */
 void plat_random(void *buf, size_t n);                   /* n unpredictable bytes (an install's own ids: apputil.c's console id) */
 void plat_sleep_ns(uint64_t ns);                         /* as precise as the platform allows (Windows: a high-resolution waitable timer, not Sleep's 1-16 ms) */
+uint64_t plat_timedwait_slack_us(void);                  /* how late a timed condition-variable wait may wake past its deadline (Windows
+                                                          * winpthreads: on the ~15.6 ms system tick; POSIX: 0) -- kernel.c kernel_cb_sleep */
 
 #endif
