@@ -126,6 +126,8 @@ static pthread_mutex_t klock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t kcond = PTHREAD_COND_INITIALIZER;   /* thread ends */
 static __thread uint32_t cur_tid = 0x40010003;              /* the main thread's */
 static __thread Thread *cur_thread;                         /* 0 on the main thread */
+/* the calling guest thread's name and uid, for a report (main.c's bad call): "main" on the main thread */
+const char *kernel_thread_name(uint32_t *uid) { if (uid) *uid = cur_thread ? cur_thread->uid : 0; return cur_thread ? cur_thread->name : "main"; }
 int waitstats_on(void); uint64_t waitstats_now(void); void waitstats_begin(uint64_t t0); void waitstats_wait(uint64_t t0, uint64_t woken_at); void waitstats_sleep(uint64_t t0); void waitstats_name(const char *n);   /* (debug/waitstats.c) */
 #define SELF() (cur_thread ? cur_thread : &main_thread)
 uint32_t recomp_cur_tid(void) { return cur_tid; }           /* the calling host thread's guest uid (verify.c's RECOMP_WATCH_*) */

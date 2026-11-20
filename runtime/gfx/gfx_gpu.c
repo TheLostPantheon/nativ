@@ -3410,6 +3410,64 @@ void gfx_gpu_guest_written(uint32_t addr, uint32_t len) {
 	}
 }
 /* every GPU target -> guest memory (gfxreplay's RECOMP_REPLAY_DRAWS dump: the state mid-frame) */
+/* gfxreplay's RECOMP_REPLAY_STENCIL=path (Metal only, a debugging aid): the stencil of the depth/stencil surface at ds as the GPU
+ * has it, one byte a texel, as a P5 PGM the depth texture's size -- eight full-screen passes over a scratch R8G8B8A8 target,
+ * each adding 1 << bit / 255 where a stencil test of that bit alone passes. 0 when there is no such surface or no Metal. */
+int gfx_gpu_debug_stencil(uint32_t ds, const char *path) {
+	if (!gpu() || !(SDL_GetGPUShaderFormats(gpu()) & SDL_GPU_SHADERFORMAT_MSL)) return 0;
+	batch_flush("stencil dump");
+	DepthEntry *de = 0; for (int i = 0; i < MAXDEPTHG; i++) if (depthsg[i].key == ds && depthsg[i].tex && (!de || depthsg[i].used > de->used)) de = &depthsg[i];
+	if (!de) return 0;
+	uint32_t W = TSX(de, de->w), H = TSY(de, de->h);
+	static const char *msl = "#include <metal_stdlib>\nusing namespace metal;\nstruct VOut { float4 position [[position]]; };\n"
+		"vertex VOut main0(uint vid [[vertex_id]]) { float2 p[3] = { float2(-1,1), float2(3,1), float2(-1,-3) }; VOut o; o.position = float4(p[vid], 0, 1); return o; }\n"
+		"fragment float4 main0_bit(VOut in [[stage_in]], constant float &v [[buffer(0)]]) { return float4(v, 0, 0, 1); }\n";
+	SDL_GPUShaderCreateInfo vi = { .code = (const Uint8 *)msl, .code_size = strlen(msl) + 1, .entrypoint = "main0", .format = SDL_GPU_SHADERFORMAT_MSL, .stage = SDL_GPU_SHADERSTAGE_VERTEX };
+	SDL_GPUShaderCreateInfo fi = vi; fi.entrypoint = "main0_bit"; fi.stage = SDL_GPU_SHADERSTAGE_FRAGMENT; fi.num_uniform_buffers = 1;
+	SDL_GPUShader *vs = SDL_CreateGPUShader(gpu(), &vi), *fs = SDL_CreateGPUShader(gpu(), &fi);
+	SDL_GPUTextureCreateInfo ti = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET, .width = W, .height = H, .layer_count_or_depth = 1, .num_levels = 1 };
+	SDL_GPUTexture *out = SDL_CreateGPUTexture(gpu(), &ti);
+	if (!vs || !fs || !out) return 0;
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu());
+	SDL_GPUColorTargetInfo cti = { .texture = out, .load_op = SDL_GPU_LOADOP_CLEAR, .clear_color = (SDL_FColor){0, 0, 0, 0}, .store_op = SDL_GPU_STOREOP_STORE };
+	SDL_GPUDepthStencilTargetInfo dti = { .texture = de->tex, .load_op = SDL_GPU_LOADOP_LOAD, .stencil_load_op = SDL_GPU_LOADOP_LOAD, .store_op = SDL_GPU_STOREOP_STORE, .stencil_store_op = SDL_GPU_STOREOP_STORE };
+	SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &cti, 1, &dti);
+	SDL_GPUViewport vp = { 0, 0, (float)W, (float)H, 0, 1 }; SDL_SetGPUViewport(rp, &vp);
+	for (int bit = 0; bit < 8; bit++) {
+		SDL_GPUColorTargetDescription ctd = { .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM };
+		ctd.blend_state.enable_blend = true; ctd.blend_state.color_blend_op = ctd.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+		ctd.blend_state.src_color_blendfactor = ctd.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+		ctd.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO; ctd.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+		SDL_GPUGraphicsPipelineCreateInfo ci = {0};
+		ci.vertex_shader = vs; ci.fragment_shader = fs; ci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+		ci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL; ci.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+		ci.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+		SDL_GPUStencilOpState sos = { SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, SDL_GPU_STENCILOP_KEEP, SDL_GPU_COMPAREOP_EQUAL };
+		ci.depth_stencil_state.enable_stencil_test = true; ci.depth_stencil_state.front_stencil_state = ci.depth_stencil_state.back_stencil_state = sos;
+		ci.depth_stencil_state.compare_mask = (Uint8)(1u << bit); ci.depth_stencil_state.write_mask = 0;
+		ci.target_info.num_color_targets = 1; ci.target_info.color_target_descriptions = &ctd;
+		ci.target_info.has_depth_stencil_target = true; ci.target_info.depth_stencil_format = depth_format();
+		SDL_GPUGraphicsPipeline *pp = SDL_CreateGPUGraphicsPipeline(gpu(), &ci);
+		if (!pp) continue;
+		SDL_BindGPUGraphicsPipeline(rp, pp); SDL_SetGPUStencilReference(rp, (Uint8)(1u << bit));
+		float v = (float)(1u << bit) / 255.0f; SDL_PushGPUFragmentUniformData(cmd, 0, &v, sizeof v);
+		SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+		SDL_ReleaseGPUGraphicsPipeline(gpu(), pp);
+	}
+	SDL_EndGPURenderPass(rp);
+	SDL_GPUTransferBufferCreateInfo bi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, .size = 4 * W * H };
+	SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(gpu(), &bi);
+	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureRegion src = { .texture = out, .w = W, .h = H, .d = 1 }; SDL_GPUTextureTransferInfo dst = { .transfer_buffer = tb, .pixels_per_row = W, .rows_per_layer = H };
+	SDL_DownloadFromGPUTexture(cp, &src, &dst); SDL_EndGPUCopyPass(cp);
+	SDL_GPUFence *f = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); SDL_WaitForGPUFences(gpu(), true, &f, 1); SDL_ReleaseGPUFence(gpu(), f);
+	const uint8_t *px = SDL_MapGPUTransferBuffer(gpu(), tb, false);
+	FILE *o = fopen(path, "wb");
+	if (o) { fprintf(o, "P5\n%u %u\n255\n", W, H); for (uint32_t i = 0; i < W * H; i++) fputc(px[4 * i], o); fclose(o); }
+	SDL_UnmapGPUTransferBuffer(gpu(), tb); SDL_ReleaseGPUTransferBuffer(gpu(), tb);
+	SDL_ReleaseGPUTexture(gpu(), out); SDL_ReleaseGPUShader(gpu(), vs); SDL_ReleaseGPUShader(gpu(), fs);
+	return o != 0;
+}
 void gfx_gpu_sync_all(void) { if (!gpu()) return; batch_flush("sync to guest"); readbacks_complete(0, ~0u); for (int i = 0; i < ntargets; i++) if (targets[i].gpu_dirty) target_download_to_guest(&targets[i]); }
 /* a scene's visibility results are in guest memory before it ends (RECOMP_VIS_SYNC=0: a frame or so later, as they come
  * back). The game reads them once the scene's notification says it is done, and the host writes notifications at the

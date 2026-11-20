@@ -364,7 +364,8 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 	if (!name) {   /* another module's function (its table isn't the caller's) */
 		GuestFn f = guest_lookup(addr & ~1u);
 		if (f) { f(c); return; }
-		fprintf(stderr, "call to %#x: neither recompiled code nor an import (lr %#x)\n", addr, c->r[14]);
+		{ extern const char *kernel_thread_name(uint32_t *uid); uint32_t uid; const char *tn = kernel_thread_name(&uid);
+		  fprintf(stderr, "call to %#x: neither recompiled code nor an import (lr %#x, thread '%s' uid %#x)\n", addr, c->r[14], tn, uid); }
 		/* the guest call chain: recompiled functions are C functions, so the native stack IS the
 		 * guest's (fn_<address> frames, innermost first); the registers say what was called through */
 		fprintf(stderr, "  r0 %#x r1 %#x r2 %#x r3 %#x r4 %#x r5 %#x r6 %#x r7 %#x sp %#x\n",

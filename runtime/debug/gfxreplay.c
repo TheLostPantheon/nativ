@@ -189,12 +189,14 @@ int main(int argc, char **argv) {
 				       d.clip_mode, d.clip_xmin, d.clip_xmax, d.clip_ymin, d.clip_ymax, d.fp_disabled, d.polygon_mode, d.point_line_width);
 				continue;
 			}
-			if (getenv("RECOMP_REPLAY_INFO") && atol(getenv("RECOMP_REPLAY_INFO")) == draws + 1) {   /* what draw k's programs declare */
+			if (getenv("RECOMP_REPLAY_INFO") && (atol(getenv("RECOMP_REPLAY_INFO")) == draws + 1 || !strcmp(getenv("RECOMP_REPLAY_INFO"), "all"))) {   /* (all: every draw) */   /* what draw k's programs declare */
 				const UsseProgram *fp = usse_get(d.fprog);
 				const UsseFragLayout *fl = fp ? usse_fragment_layout(fp) : 0;
 				fprintf(stderr, "draw %d: target %#x fmt %#x  vprog %#x fprog %#x", draws + 1, cur.data, cur.format, d.vprog, d.fprog);
 				if (fl) fprintf(stderr, "  colour: type %d comps %d %s at %d", fl->color_type, fl->color_comps, fl->native_color ? "O" : "PA", fl->color_pa_start);
-				fprintf(stderr, "  blend %d\n", d.blend.present);
+				fprintf(stderr, "  blend %d mask %#x  depth func %u%s  stencil func %u ref %u masks %#x/%#x ops %u/%u/%u  prim %u count %u cull %d\n", d.blend.present, d.blend.mask,
+				        d.depth_func, d.depth_write ? " write" : "", d.stencil_func, d.stencil_ref, d.stencil_cmask, d.stencil_wmask, d.stencil_fail, d.depth_fail, d.depth_pass, d.prim, d.count, d.cull);
+				for (int k = 0; k < 16; k++) if (d.tex[k].data) fprintf(stderr, "    tex %d: %#x fmt %#x %ux%u filter %u/%u modes %#x/%#x\n", k, d.tex[k].data, d.tex[k].format, d.tex[k].width, d.tex[k].height, d.tex[k].min_filter, d.tex[k].mag_filter, d.tex[k].u_mode, d.tex[k].v_mode);
 			}
 			{	/* RECOMP_REPLAY_SAVE_PROG=hexaddr:path -- a program's GXP bytes out of the capture's memory, for usse_dis / usse_run (see README) */
 				static const char *sp = 0; static int sp_init = 0, sp_done = 0;
@@ -267,6 +269,13 @@ int main(int argc, char **argv) {
 					const char *m = getenv("RECOMP_REPLAY_MEM"), *c1 = strchr(m, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : 0;
 					uint32_t ma = (uint32_t)strtoul(m, 0, 16), ml = c1 ? (uint32_t)strtoul(c1 + 1, 0, 0) : 0;
 					FILE *mf = c2 ? fopen(c2 + 1, "wb") : 0; if (mf) { fwrite(G(ma), 1, ml, mf); fclose(mf); }
+				}
+				if (getenv("RECOMP_REPLAY_STENCIL") && cur.ds_data) {   /* the depth/stencil surface's stencil after the draw (P5 PGM): the GPU's own (Metal), else guest memory's (the software path writes it there) */
+					extern int gfx_gpu_debug_stencil(uint32_t ds, const char *path);
+					if (!(g && !strcmp(g, "gpu") && gfx_gpu_debug_stencil(cur.ds_data, getenv("RECOMP_REPLAY_STENCIL")))) {
+						FILE *sf = fopen(getenv("RECOMP_REPLAY_STENCIL"), "wb");
+						if (sf) { fprintf(sf, "P5\n%u %u\n255\n", cur.stride, cur.height); for (uint32_t i = 0; i < cur.stride * cur.height; i++) fputc(G(cur.ds_data)[4 * i + 3], sf); fclose(sf); }
+					}
 				}
 				if (getenv("RECOMP_REPLAY_RAW")) {   /* the target's bytes as the game sees them, for comparing HDR targets the 8-bit image clamps */
 					FILE *rf = fopen(getenv("RECOMP_REPLAY_RAW"), "wb");

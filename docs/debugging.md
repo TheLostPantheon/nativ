@@ -87,6 +87,9 @@ Captures let you take a frame apart in seconds, without running the game.
 | `RECOMP_REPLAY_DUMP=1` | Print the scenes and draws as text, without rendering. |
 | `RECOMP_REPLAY_DRAWS=k` | Stop after draw k and write the target as it stands. |
 | `RECOMP_REPLAY_KEEP_TARGETS=1` | Never restore a surface the replay has already drawn. Later passes then read this replay's own output: the way to see a fix's effect downstream, and to read a GPU capture's G-buffer, whose memory copy is stale. |
+| `RECOMP_REPLAY_INFO=k` (or `=all`) | Draw k's (or every draw's) programs, colour output, blend and colour mask, depth and stencil state, primitive, count, cull, and bound textures (address, format, size, filters, modes). |
+| `RECOMP_REPLAY_STENCIL=<file>` | With `RECOMP_REPLAY_DRAWS=k`: the depth/stencil surface's stencil after draw k, one byte a texel (PGM): the GPU's own on Metal, else guest memory's. |
+| `RECOMP_GPU_RAW_TARGETS=<hexaddr>[,...]` | Targets known to hold raw words from the start (`TK_RAW`). Live play learns it at a target's first raw-word draw, so a one-frame replay draws that scene the old, lossy way: Resistance's G-buffer (`1ffa8000`) needs this for a replay that matches play. |
 | `RECOMP_REPLAY_WIDEN=k` | Replay as if the screen were k times wider, to test the wide-aspect paths. |
 | `RECOMP_GFX_STATS=1` | Each draw's outcome: culled, clipped, failed stencil or depth, or written. |
 | `RECOMP_DEBUG_DRAW=k` | One draw's uniforms and its shader inputs and outputs over a grid of pixels. `=all` with `RECOMP_DEBUG_PIXEL=x,y` lists every draw that touches that pixel: its history through the frame. |
