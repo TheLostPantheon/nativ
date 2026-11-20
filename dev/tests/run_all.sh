@@ -34,6 +34,7 @@ step "controller button bindings (padbind_test.c)" unit padbind_test ../core/set
 step "message and text-input dialogs (commondlg_test.c)" unit commondlg_test -I stub -lpthread
 step "NGS voice rules (ngs_rules_test.c)" unit ngs_rules_test
 step "the microphone (audioin_test.c)" unit audioin_test
+step "the network offline (net_offline_test.c)" unit net_offline_test -lpthread
 step "a missed function's instruction set (seedmode_test.c)" unit seedmode_test
 
 echo

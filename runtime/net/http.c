@@ -20,6 +20,11 @@
  * Without libcurl (RECOMP_CURL undefined: Windows and the self-contained Linux install have none) the servers answered in
  * this process still answer -- Killzone's login stand-in, so online play works everywhere -- and any other request fails
  * as an unreachable network would.
+ *
+ * Offline (net_online() 0: hle.c registers this for every game, net.c's "Wi-Fi off"): templates, connections and
+ * requests are made as usual, and sending one fails as an unreachable network (NETWORK) -- no server is asked, this
+ * process's own included. Before, offline was main.c's catch-all: Create* "succeeded" with id 0 and a send failed as
+ * not initialised.
  */
 #include <ctype.h>
 #include <pthread.h>
@@ -238,6 +243,10 @@ static void h_http_send(Cpu *c) {   /* (reqId, postData, size) */
 	char host[256], target[256]; int port = 0, tport = 0;
 	const int parsed = !url_host(reqs[id].url, host, sizeof host, &port);
 	int redirected = parsed && net_redirect_lookup(host, target, sizeof target, &tport);
+	if (!net_online()) {   /* offline: the network is down (see the top) */
+		if (http_log()) fprintf(stderr, "    http: %s %s -> offline, not sent\n", method, reqs[id].url);
+		RET(0x80431063u); return;   /* NETWORK */
+	}
 	if (parsed && matching_list((int)id, host)) { RET(0); return; }
 	if (parsed && !redirected && local_answer((int)id, host, method, A1 ? G(A1) : 0, A1 ? A2 : 0)) { RET(0); return; }   /* (the player's own server wins) */
 	if (parsed && !redirected && net_blocked(host)) { RET(0x80436007u); return; }   /* (Sony's: as a name that doesn't resolve, RESOLVER_ENOHOST) */
