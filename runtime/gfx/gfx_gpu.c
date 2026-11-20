@@ -1579,7 +1579,35 @@ typedef struct {
 	uint8_t sx, sy;  /* its texels a guest pixel, across and down: the render scale, or a boosted target's (target_scale) */
 	SDL_GPUTexture *mv; uint64_t mv_frame; uint32_t mv_n;   /* the motion target beside it (RECOMP_MV: mv_target), the frame it was
 	                                                          * last cleared in (mv_qframe + 1) and its motion draws that frame */
+	uint16_t bx0, by0, bx1, by1;  /* the box (guest pixels, end exclusive) the GPU has changed since guest memory last held all of it:
+	                               * draws add their region (box_add), an upload or download empties it, a whole-texture write fills
+	                               * it. Outside it guest memory is as new as the GPU texture, or newer (box_misses) */
 } TargetEntry;
+static void box_none(TargetEntry *e) { e->bx0 = e->by0 = e->bx1 = e->by1 = 0; }
+static void box_all(TargetEntry *e) { e->bx0 = e->by0 = 0; e->bx1 = (uint16_t)e->width; e->by1 = (uint16_t)e->height; }
+static void box_add(TargetEntry *e, int x0, int y0, int x1, int y1) {
+	if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > (int)e->width) x1 = (int)e->width; if (y1 > (int)e->height) y1 = (int)e->height;
+	if (x1 <= x0 || y1 <= y0) return;
+	if (e->bx1 <= e->bx0 || e->by1 <= e->by0) { e->bx0 = (uint16_t)x0; e->by0 = (uint16_t)y0; e->bx1 = (uint16_t)x1; e->by1 = (uint16_t)y1; return; }
+	if (x0 < e->bx0) e->bx0 = (uint16_t)x0; if (y0 < e->by0) e->by0 = (uint16_t)y0; if (x1 > e->bx1) e->bx1 = (uint16_t)x1; if (y1 > e->by1) e->by1 = (uint16_t)y1;
+}
+/* the guest bytes [lo, hi) hold no pixel of e's box (bpp: the surface's bytes a pixel): guest memory there is what the GPU
+ * texture has, or newer. Linear surfaces only (a tiled one's rows aren't its memory's). LittleBigPlanet keeps a small
+ * swizzled texture in the bottom of its 768x1024 downscale atlas, past every region it draws: each frame's read of it waited
+ * for the GPU and brought the whole 3 MB target down */
+static int box_misses(const TargetEntry *e, uint32_t lo, uint32_t hi, uint32_t bpp) {
+	if (e->type != 0 || !bpp || !e->width) return 0;
+	if (e->bx1 <= e->bx0 || e->by1 <= e->by0) return 1;
+	const uint32_t pitch = bpp * e->width, end = e->addr + pitch * e->height;
+	if (lo < e->addr) lo = e->addr; if (hi > end) hi = end;
+	if (hi <= lo) return 1;
+	const uint32_t o0 = lo - e->addr, o1 = hi - 1 - e->addr, r0 = o0 / pitch, r1 = o1 / pitch;
+	for (uint32_t r = r0 > e->by0 ? r0 : e->by0; r <= r1 && r < e->by1; r++) {   /* the rows both cover: a whole row between the first and last meets the box at once */
+		const uint32_t c0 = r == r0 ? o0 % pitch / bpp : 0, c1 = r == r1 ? o1 % pitch / bpp : e->width - 1;
+		if (c1 >= e->bx0 && c0 < e->bx1) return 0;
+	}
+	return 1;
+}
 /* the GPU format a guest colour format renders into, with enough precision that a download encodes
  * the bits gfx_soft.c's target_write would: 8-bit families as RGBA8, the half-float families (F16,
  * U2F10F10F10, F11F11F10, SE5M9M9M9) as RGBA16F, F32/F32F32 as RGBA32F */
@@ -1636,6 +1664,9 @@ static int target_kind(uint32_t fmt) {
 	case 0x41000000u: return hdr_rg11b10() ? TK_HDR10 : TK_F16;
 	case 0x01000000u: case 0x00800000u: case 0xF0000000u: case 0x21000000u: case 0x31000000u: return TK_F16;
 	case 0x10800000u: case 0x11000000u: return TK_F32;
+	/* U16, S16: one 16-bit normalised channel, which F32 holds exactly. RGBA8 kept 8 of the 16 bits (and no sign):
+	 * LittleBigPlanet draws its shadow depth into a U16 target, and every receiver compared against the top byte */
+	case 0x40800000u: case 0x20800000u: return TK_F32;
 	default: return GFX_TGT_GAMMA(fmt) && (fmt & 0xF1800000u) == 0 ? TK_U8S : TK_U8;
 	}
 }
@@ -1968,7 +1999,7 @@ static void target_upload_from_guest(TargetEntry *e) {
 	}
 	SDL_SubmitGPUCommandBuffer(cmd);
 	SDL_ReleaseGPUTransferBuffer(gpu(), xb);
-	e->cpu_dirty = 0; e->gen = ++write_clock;
+	e->cpu_dirty = 0; e->gen = ++write_clock; box_none(e);
 }
 /* the GPU colour texture -> RGBA floats in a caller-owned buffer (not guest memory: RECOMP_GFX_CHECK
  * compares it against the software path without the two stepping on each other) */
@@ -2021,7 +2052,7 @@ static void target_download_to_guest(TargetEntry *e) {
 	uint32_t gbytes = (uint32_t)gfx_target_bpp(&t) * npx;
 	if (target_raw_ok(e, &t)) {
 		gwatch_write_begin(e->addr, gbytes); target_download_texels(e, 0, G(e->addr)); gwatch_write_end(e->addr, gbytes);
-		e->gpu_dirty = 0;
+		e->gpu_dirty = 0; box_none(e);
 		textures_invalidate(e->addr, e->addr + gbytes);
 		t_tgt_download += us_now() - tdl0;
 		if (hitch_log() && us_now() - tdl0 > 1000) fprintf(stderr, "    gpu hitch: target %#x %ux%u downloaded to guest memory %s in %.2f ms\n", e->addr, e->width, e->height, sync_why, (us_now() - tdl0) / 1e3);
@@ -2041,7 +2072,7 @@ static void target_download_to_guest(TargetEntry *e) {
 	  if (ta && ta >= e->addr && ta < e->addr + gbytes && RD32(ta) != last) { last = RD32(ta); fprintf(stderr, "gpu trace addr: frame %llu: %#x now holds %#x\n", (unsigned long long)gpu_frame_no, ta, last); } }
 	if (trace_sync() && npx > 10 * e->width + 10) fprintf(stderr, "gpu trace:   download (10,10) = %g %g %g -> guest word %#x\n", f[4 * (10 * e->width + 10)], f[4 * (10 * e->width + 10) + 1], f[4 * (10 * e->width + 10) + 2], RD32(e->addr + 4 * (10 * e->width + 10)));
 	free(f);
-	e->gpu_dirty = 0;
+	e->gpu_dirty = 0; box_none(e);
 	textures_invalidate(e->addr, e->addr + gbytes);
 	t_tgt_download += us_now() - tdl0;
 	if (hitch_log() && us_now() - tdl0 > 1000) fprintf(stderr, "    gpu hitch: target %#x %ux%u downloaded to guest memory %s in %.2f ms\n", e->addr, e->width, e->height, sync_why, (us_now() - tdl0) / 1e3);
@@ -2542,7 +2573,7 @@ static void target_alias_sync(TargetEntry *e) {
 			SDL_GPUTextureLocation src = { .texture = o->color }, dst = { .texture = e->color };
 			SDL_CopyGPUTextureToTexture(cp, &src, &dst, TSX(e, e->width), TSY(e, e->height), 1, false);
 			SDL_EndGPUCopyPass(cp); SDL_SubmitGPUCommandBuffer(cmd);
-			e->cpu_dirty = 0; e->gpu_dirty = 1; e->gen = ++write_clock; via_guest = 0;
+			e->cpu_dirty = 0; e->gpu_dirty = 1; e->gen = ++write_clock; via_guest = 0; box_all(e);
 		} else { sync_why = "(another target over the same memory begins a scene)"; target_download_to_guest(o); via_guest = 1; }
 	}
 	if (via_guest) e->cpu_dirty = 1;   /* the last hand-over went through guest memory: reload from there before the first draw */
@@ -2590,7 +2621,7 @@ static int target_snapshot(TargetEntry *e) {
 }
 static void snap_to_guest(TargetEntry *e) {   /* the guest-memory path needs the starting pixels there: the snapshot, downloaded (once a scene) */
 	SDL_GPUTexture *c = e->color; e->color = e->snap; sync_why = "(scene start, for a read the GPU snapshot can't serve)"; target_download_to_guest(e); e->color = c;
-	e->gpu_dirty = 1;   /* (the target itself has drawn on since) */
+	e->gpu_dirty = 1; box_all(e);   /* (the target itself has drawn on since) */
 	scene_snap = 1;
 }
 static int same_region_read(const GfxTexture *tex) {
@@ -3085,7 +3116,7 @@ static void fsr_run(TargetEntry *e) {
 		fprintf(stderr, "    fsr: frame %llu: %ux%u -> %ux%u %s, depth %s, jitter %.3f %.3f\n", (unsigned long long)mv_qframe, f.rw, f.rh, f.dw, f.dh, f.hdr ? "HDR" : "LDR", f.inverted ? "inverted" : "forward", jx, jy);
 	} else if (timing) { SDL_GPUFence *fe = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); if (fe) { SDL_WaitForGPUFences(gpu(), true, &fe, 1); SDL_ReleaseGPUFence(gpu(), fe); } t_fsr_ms += (double)(SDL_GetTicksNS() - t0) / 1e6; }
 	else SDL_SubmitGPUCommandBuffer(cmd);
-	if (ok) { dest->gen = ++write_clock; dest->gpu_dirty = 1; dest->cpu_dirty = 0; dest->used = ++target_clock; n_fsr++; }   /* (the newest over the address: what samples it next gets FSR's frame) */
+	if (ok) { dest->gen = ++write_clock; dest->gpu_dirty = 1; dest->cpu_dirty = 0; box_all(dest); dest->used = ++target_clock; n_fsr++; }   /* (the newest over the address: what samples it next gets FSR's frame) */
 }
 /* the game queued its frame for display (gxm_sony.c's observer through gfx_frame_queued, on the thread that drew it): the
  * motion vectors' frame boundary. Not present: the game draws the next frame's first scenes before the display queue's
@@ -3499,7 +3530,7 @@ void gfx_gpu_end_scene(void) {
 	if (gpu()) {
 		batch_flush("end of scene");
 		const SsaoCamera *cam = ao_scene && ao_draws >= 30 && scene_entry && scene_depth_entry && scene_depth_entry->tex ? ao_camera() : 0;
-		if (cam && ssao_apply(gpu(), scene_entry->color, kind_format(scene_entry->kind), scene_depth_entry->tex, TSX(scene_entry, scene_entry->width), TSY(scene_entry, scene_entry->height), cam)) n_ao++;   /* before anything reads the scene */
+		if (cam && ssao_apply(gpu(), scene_entry->color, kind_format(scene_entry->kind), scene_depth_entry->tex, TSX(scene_entry, scene_entry->width), TSY(scene_entry, scene_entry->height), cam)) { n_ao++; box_all(scene_entry); }   /* before anything reads the scene */
 		ao_scene = 0;
 		if (scene_entry) readback_enqueue(scene_entry);
 		if (vis_pending() && (vis_sync() == 1 || (vis_sync() == 2 && vis_pending_set()))) vis_complete(1);
@@ -3827,7 +3858,7 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	 * formats (U8) place the one value; the HDR packed formats take none */
 	static const uint8_t sw4[8][4] = { {0,1,2,3}, {2,1,0,3}, {3,2,1,0}, {1,2,3,0}, {0,1,2,5}, {2,1,0,5}, {3,2,1,5}, {1,2,3,5} };
 	static const uint8_t sw1[8][4] = { {0,4,4,5}, {0,4,4,4}, {0,5,5,5}, {0,0,0,0}, {0,0,0,4}, {0,0,0,5}, {4,4,4,0}, {5,5,5,0} };
-	int ncomp = xb == 0x0c000000u || xb == 0x0d000000u || xb == 0x1b000000u ? 4 : xb == 0x00000000u || xb == 0x12000000u ? 1 : 0;
+	int ncomp = xb == 0x0c000000u || xb == 0x0d000000u || xb == 0x1b000000u ? 4 : xb == 0x00000000u || xb == 0x12000000u || xb == 0x09000000u || xb == 0x0a000000u ? 1 : 0;
 	for (int k = 0; k < 4; k++) swz[k] = ncomp == 4 ? sw4[sw][k] : ncomp == 1 ? sw1[sw][k] : (uint32_t)k;
 	switch (tb) {
 	case 0x80800000u: *tex_bpp = 1; return xb == 0x00000000u ? 5 : -1;                          /* U8 as U8 */
@@ -3835,6 +3866,10 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	                                                                                               * low byte and decodes it from there); Killzone's 384x384 depth-pair
 	                                                                                               * target, sampled by ~40 draws a frame, came down every frame */
 		swz[0] = 0; swz[1] = 1; swz[2] = 4; swz[3] = 5; return 0;
+	case 0x40800000u: *tex_bpp = 2; return xb == 0x09000000u ? 6 : -1;                          /* U16 as U16, S16 as S16 (an F32 target: target_kind): one channel at
+	                                                                                               * full precision. LittleBigPlanet samples its 768x768 U16 shadow
+	                                                                                               * atlas as 384x384 tiles, three downloads a frame */
+	case 0x20800000u: *tex_bpp = 2; return xb == 0x0a000000u ? 6 : -1;
 	case 0x10800000u: return xb == 0x12000000u ? 6 : -1;                                        /* F32 as F32 (mode 5's decode at full precision: Uncharted's
 	                                                                                               * shadow mask went through guest memory, its lighting read
 	                                                                                               * it at 1x and every lit silhouette got a 1x-pixel halo) */
@@ -4082,6 +4117,10 @@ guest:;
 		GfxTarget tg = target_entry_as_gfx(te2);
 		uint32_t thi = te2->addr + (uint32_t)gfx_target_bpp(&tg) * te2->width * te2->height;
 		if (tex->data >= thi || xhi <= te2->addr) continue;
+		if (box_misses(te2, tex->data, xhi, (uint32_t)gfx_target_bpp(&tg))) {   /* nothing the GPU drew is under it: guest memory is current */
+			if (trace_sync()) fprintf(stderr, "gpu trace: texture %#x fmt %#x %ux%u is outside what target %#x drew (%u,%u-%u,%u): no download\n", tex->data, tex->format, tex->width, tex->height, te2->addr, te2->bx0, te2->by0, te2->bx1, te2->by1);
+			continue;
+		}
 		list[n++] = te2;
 	}
 	for (int a = 1; a < n; a++) for (int b = a; b > 0 && list[b - 1]->gen > list[b]->gen; b--) { TargetEntry *x = list[b]; list[b] = list[b - 1]; list[b - 1] = x; }
@@ -4349,7 +4388,7 @@ int gfx_gpu_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t 
 	SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
 	SDL_EndGPURenderPass(rp);
 	SDL_SubmitGPUCommandBuffer(cmd);
-	d->cpu_dirty = 0; d->gpu_dirty = 1; d->gen = ++write_clock; d->prev_drawn_frame = d->drawn_frame; d->drawn_frame = gpu_frame_no; d->used = ++target_clock;
+	d->cpu_dirty = 0; d->gpu_dirty = 1; d->gen = ++write_clock; box_all(d); d->prev_drawn_frame = d->drawn_frame; d->drawn_frame = gpu_frame_no; d->used = ++target_clock;
 	readback_enqueue(d);
 	return 1;
 #undef DECLINE
@@ -6194,6 +6233,15 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * depth while each light's stencil volume writes stencil with depth writes off, rebuild that view,
 	 * and so flush the batch, before every draw */
 	scene_entry->gpu_dirty = 1; scene_entry->gen = ++write_clock; scene_first_draw = 0;
+	{	/* the pixels it can change: its region clip and, for triangles, its viewport (clip space ends there), a pixel's margin */
+		int x0 = cur_wx0, y0 = cur_wy0, x1 = cur_wx1, y1 = cur_wy1;
+		if (d->viewport_set && !d->viewport_disabled && !g_points_draw && !g_lines_draw) {
+			const float ax = fabsf(d->vp_xscale), ay = fabsf(d->vp_yscale);
+			const int vx0 = (int)floorf(d->vp_xoff - ax) - 1, vx1 = (int)ceilf(d->vp_xoff + ax) + 1, vy0 = (int)floorf(d->vp_yoff - ay) - 1, vy1 = (int)ceilf(d->vp_yoff + ay) + 1;
+			if (vx0 > x0) x0 = vx0; if (vy0 > y0) y0 = vy0; if (vx1 < x1) x1 = vx1; if (vy1 < y1) y1 = vy1;
+		}
+		box_add(scene_entry, x0, y0, x1, y1);
+	}
 	if (scene_depth_entry && scene_target.depth) {
 		int st_on = ds_stencil_ok && (d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass);   /* get_pipeline's enable_stencil_test */
 		int zwrites = ds_clear || (ds_depth_ok && d->depth_write);
