@@ -663,6 +663,13 @@ static void h_system_param_int(Cpu *c) {
 	if (A0 < 1 || A0 > 7 || A0 == 3 || !A1) { RET(0x80100600u); return; }
 	WR32(A1, A0 == 1 ? system_language() : A0 == 2 ? SYSPARAM_ENTER_BUTTON : 0); RET(0);
 }
+/* (id, int *value): the one application parameter, the SKU flag (id 0): a full game (3; a trial is 1, none 0). Before
+ * this the not-implemented stub returned success and wrote nothing, so the game read whatever its stack held: 16 games of
+ * the user's library ask (the 2026-11-19 census), Resistance at boot. Any other id is a parameter error */
+static void h_app_param_int(Cpu *c) {
+	if (A0 != 0 || !A1) { RET(0x80100600u); return; }   /* SCE_APPUTIL_ERROR_PARAMETER */
+	WR32(A1, 3); RET(0);   /* SCE_APPUTIL_APPPARAM_SKU_FLAG_FULL */
+}
 /* (id, buffer, size): only the user name (3) is a string -- "Player" (RECOMP_USERNAME overrides),
  * truncated to the buffer like strncpy plus a terminator; Killzone asks for it at boot (17 bytes:
  * the SDK's 16-character limit) */
@@ -734,7 +741,7 @@ const HleEntry hle_apputil[] = {
 	{"sceAppMgrAppParamGetString", h_app_param_string},
 	{"sceAppMgrReceiveSystemEvent", h_receive_system_event},
 	{"sceAppUtilSystemParamGetInt", h_system_param_int}, {"_sceAppMgrGetAppState", h_app_state}, {"sceSysmoduleIsLoaded", h_zero_ok},
-	{"sceAppUtilSystemParamGetString", h_system_param_string},
+	{"sceAppUtilSystemParamGetString", h_system_param_string}, {"sceAppUtilAppParamGetInt", h_app_param_int},
 	{"sceAppUtilInit", h_zero}, {"sceAppUtilShutdown", h_zero}, {"sceAppUtilDrmOpen", h_drm_open}, {"sceAppUtilDrmClose", h_zero},   /* (SceAppUtilDrmAddcontId *, mount point): the additional content's licence -- the host has no DRM, every add-on is licensed */   /* (SceAppUtilInitParam *, SceAppUtilBootParam *): nothing to set up */
 	{"sceAppUtilReceiveAppEvent", h_receive_app_event},
 	{"sceAppUtilAppEventParseLiveArea", h_app_event_parse}, {"sceAppUtilAppEventParseNearGift", h_app_event_parse},

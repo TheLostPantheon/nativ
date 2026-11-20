@@ -102,8 +102,18 @@ static void vblanks_add(uint64_t n) {
  * Ordinary per-frame reads now leave the clock on the vblank grid; a loop that spins on the time
  * still advances it and terminates. */
 static __thread uint32_t reads_in_row;
+/* The real clock counts from the game's start, from where the fixed clock starts (2^32 us). It was the host's monotonic
+ * clock, which is the machine's uptime: on a Mac up six days a game read about 5.4e5 s of process time, where a Vita
+ * reports the time since the process started. What a large time breaks is its fraction once the game keeps it as a
+ * float of seconds: at 5.4e5 s a float steps by 62.5 ms, so frames see no time pass and then a jump. WipEout 2048's menu
+ * came up with a black background and its Single Player tile missing in nearly every real-clock run, the half of the
+ * 32-bit cycle where the low word reads positive as well (so not a wrap); counted from the start, it was right every
+ * time, as it always was on the fixed clock, whose 2^32 us start steps by 0.5 ms (2026-11-20). */
+static uint64_t real_origin;
+__attribute__((constructor)) static void real_origin_init(void) { real_origin = raw_us(); }
+static uint64_t real_guest_us(void) { return (1ull << 32) + now_us() - real_origin; }
 uint64_t guest_time_us(void) {
-	if (!clock_fixed()) return now_us();
+	if (!clock_fixed()) return real_guest_us();
 	if (++reads_in_row > 16) __atomic_add_fetch(&vreads, 1, __ATOMIC_RELAXED);
 	vclock_idle();
 	return (1ull << 32) + vclock_edges() * 16667ull + __atomic_load_n(&vreads, __ATOMIC_RELAXED);
@@ -112,7 +122,7 @@ int guest_clock_fixed(void) { return clock_fixed(); }
 /* the same time as guest_time_us without its side effects (the fixed clock advances a microsecond
  * per read past 16 in a row): for an observer that must not perturb what the game sees -- metrics.c */
 uint64_t guest_time_us_peek(void) {
-	if (!clock_fixed()) return now_us();
+	if (!clock_fixed()) return real_guest_us();
 	return (1ull << 32) + vclock_edges() * 16667ull + __atomic_load_n(&vreads, __ATOMIC_RELAXED);
 }
 /* a thread's own sleep (sceKernelDelayThread) also moves the fixed clock by what it asked for:

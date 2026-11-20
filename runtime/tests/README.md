@@ -77,7 +77,8 @@ the text dialog's title, limit, initial text and flags, and the errors the conso
 the states a game sees (RUNNING until answered, NOT_FINISHED from `GetResult`, FINISHED after, NONE after `Term`),
 answers to a dialog that has gone, `Close` and `Abort`, and the headless auto-answer (including `RECOMP_IME_TEXT`).
 It also checks the UTF-16 conversion in `commondlg.h`: surrogate pairs, the length limit never splitting one, and
-malformed input. Drawing and key handling need a window and aren't covered. The test includes `apputil.c`, so it
+malformed input, and `sceAppUtilAppParamGetInt`'s SKU flag (a full game's). Drawing and key handling need a window and
+aren't covered. The test includes `apputil.c`, so it
 builds with `-I stub`, a stand-in for SDL's header.
 
     cc -O1 -g -Wall -Wno-unused-function $INC -I stub commondlg_test.c -o /tmp/commondlg_test -lpthread && /tmp/commondlg_test
@@ -120,11 +121,13 @@ It prints `all passed`.
 
 ## NGS voice rules: `ngs_rules_test.c`
 
-Checks `runtime/audio/ngs_rules.h`, two small rules of the NGS voices: the start buffer of a player is the signed byte at
-+81 of its parameters (Vita3K's layout; +80 is reserved), and `sceNgsVoicePlay` starts a voice that is at rest but leaves
-a playing one alone and answers `SCE_NGS_ERROR`, so a game that calls Play on its music voice every update does not restart
-it each time. The voices the runtime runs from their creation (master, reverb, buses) count as at rest until the game's own
-first Play.
+Checks `runtime/audio/ngs_rules.h`, three small rules of the NGS voices: the start buffer of a player is the signed byte at
++81 of its parameters (Vita3K's layout; +80 is reserved); a player buffer with no whole frame in it is passed over to its
+next (FMOD's hardware streams start on an empty buffer 0, with the stream's ring in buffer 1), while a slot with no data
+address, a missing next or a cycle of empty buffers ends the voice; and `sceNgsVoicePlay` starts a voice that is at rest
+but leaves a playing one alone and answers `SCE_NGS_ERROR`, so a game that calls Play on its music voice every update does
+not restart it each time. The voices the runtime runs from their creation (master, reverb, buses) count as at rest until
+the game's own first Play.
 
     cc -O1 -g -Wall $INC ngs_rules_test.c -o /tmp/ngs_rules_test && /tmp/ngs_rules_test
 
