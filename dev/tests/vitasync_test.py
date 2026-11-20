@@ -45,7 +45,7 @@ class FakeVita:
     """the Vita's service, in memory"""
     def __init__(self, L, code):
         self.L, self.code, self.saves, self.pairs, self.bases, self.guards, self.running = L, code, {}, {}, {}, {}, set()
-        self.stage, self.commits = {}, 0
+        self.stage, self.commits, self.pending = {}, 0, []
         self.sock = socket.socket(); self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0)); self.sock.listen(4); self.port = self.sock.getsockname()[1]
         threading.Thread(target=self.serve, daemon=True).start()
@@ -107,6 +107,9 @@ class FakeVita:
             ids = [a[1]] if len(a) > 1 and a[1] else sorted(self.saves)
             return ok({"games": [{"id": i, "name": self.saves[i].name if i in self.saves else "", "version": self.saves[i].version if i in self.saves else "",
                                   "save": i in self.saves, "base": self.bases.get((pc, i)), "guard": self.guards.get(i, "none")} for i in ids]})
+        if cmd == "CHOICES":
+            mine = [c for c in self.pending if c[0] == pc]; self.pending = [c for c in self.pending if c[0] != pc]
+            return ok({"choices": [{"id": c[1], "choice": c[2]} for c in mine]})
         tid = a[1]; s = self.saves.get(tid)
         if cmd in ("MANIFEST", "GET", "COMMIT") and tid in self.running: return b"ERR busy"
         if cmd == "MANIFEST":
@@ -190,6 +193,18 @@ def main():
     check(run("check", "PCSE00640", "1.08", save_dir).startswith("skip: Playing on the Vita"), "a game running on the Vita: its save left alone")
     vita.running.discard("PCSE00640")
     check(run("check", "PCSA00999", "1.00", save_dir).startswith("skip: Not on the Vita"), "a game the Vita doesn't have")
+    print("== choices made at the Vita while this computer was away")
+    pc_id = [l.split("=", 1)[1] for l in open(os.path.join(prefs, "vita-sync.ini")).read().splitlines() if l.startswith("pc_id=")][0]
+    g.files["saveData.bin"] += b"the Vita again\n"
+    with open(os.path.join(save_dir, "saveData.bin"), "ab") as f: f.write(b"this side again\n")
+    vita.pending.append((pc_id, "PCSE00640", "vita"))
+    out = run("choices", "PCSE00640", "1.08", save_dir)
+    check(local("saveData.bin") == g.files["saveData.bin"] and "In sync" in out, "keep the Vita's (chosen there): its save fetched at once")
+    with open(os.path.join(save_dir, "saveData.bin"), "ab") as f: f.write(b"and here once more\n")
+    vita.pending.append((pc_id, "PCSE00640", "pc")); vita.pending.append(("someone-else-00", "PCSE00640", "vita"))
+    out = run("choices", "PCSE00640", "1.08", save_dir)
+    check(vita.saves["PCSE00640"].files["saveData.bin"] == local("saveData.bin") and "In sync" in out, "use the PC's (chosen there): this save sent")
+    check(vita.pending == [("someone-else-00", "PCSE00640", "vita")], "another computer's choice left for it")
     check("off" in run("off", "PCSE00640") and run("check", "PCSE00640", "1.08", save_dir).startswith("skip: Off"), "a game turned off is left alone")
 
     print("%s" % ("all passed" if not fails else "%d failed" % len(fails)))
