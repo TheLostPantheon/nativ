@@ -675,6 +675,16 @@ static void rs_read(const Voice *v, double step, float *l, float *r) {
 	*l = sl; *r = sr;
 }
 
+/* a PCM or ADPCM player's current buffer holds no whole frame: on to its next, as from a finished buffer
+ * (ngs_rules.h: FMOD's hardware streams start on an empty buffer 0); 0 where the chain ends */
+static int pass_empty(Voice *v, uint32_t pp, uint32_t data, int hops) {
+	int next = ngs_player_pass_empty(data, (int16_t)RD16(pp + P_BUF(v->buffer) + 10), hops);
+	if (next < 0) return 0;
+	uint32_t prev = v->buffer;
+	v->byte_pos = 0; v->loops_done = 0; v->buffer = (uint32_t)next;
+	player_event(v, EV_SWAPPED, prev, RD32(pp + P_BUF(next)));
+	return 1;
+}
 /* the Scream/simple player's ADPCM type (SCE_NGS_PLAYER_TYPE_ADPCM, 1): HE-VAG frames of 16 bytes
  * per channel (stereo: a left frame then a right frame), 28 samples each, through the same buffer
  * chain and resampling as PCM. Unit 13's weapon and world effects are all ADPCM -- 563 of its 565
@@ -683,10 +693,11 @@ static void rs_read(const Voice *v, double step, float *l, float *r) {
 /* the next source sample of an ADPCM player into *l, *r: 1, or 0 when its data ends */
 static int fetch_adpcm(Voice *v, uint32_t pp, int ch, float rate, float *l, float *r) {
 	uint32_t frame_bytes = 16u * (uint32_t)ch;
-	for (;;) {
+	for (int hops = 0;;) {
 		if (v->buffer > 3) return 0;
 		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
-		if (!data || bytes < frame_bytes) return 0;
+		if (bytes < frame_bytes) { if (!pass_empty(v, pp, data, hops++)) return 0; v->ad_idx = 0; v->ad_valid = 0; continue; }
+		if (!data) return 0;
 		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next (as the PCM path) */
 			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
 			v->byte_pos = 0; v->ad_idx = 0; v->ad_valid = 0;
@@ -724,10 +735,11 @@ static int fetch_adpcm(Voice *v, uint32_t pp, int ch, float rate, float *l, floa
 /* the next source sample of a PCM player: 1, or 0 when its data ends */
 static int fetch_pcm(Voice *v, uint32_t pp, int ch, float rate, float *l, float *r) {
 	uint32_t frame_bytes = 2u * (uint32_t)ch;
-	for (;;) {
+	for (int hops = 0;;) {
 		if (v->buffer > 3) return 0;
 		uint32_t data = RD32(pp + P_BUF(v->buffer)), bytes = RD32(pp + P_BUF(v->buffer) + 4);
-		if (!data || bytes < frame_bytes) return 0;
+		if (bytes < frame_bytes) { if (!pass_empty(v, pp, data, hops++)) return 0; continue; }
+		if (!data) return 0;
 		if (v->byte_pos + frame_bytes > bytes) {   /* this buffer is done: repeat it, or move to the next */
 			int16_t loops = (int16_t)RD16(pp + P_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + P_BUF(v->buffer) + 10);
 			v->byte_pos = 0;
