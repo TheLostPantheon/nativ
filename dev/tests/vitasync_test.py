@@ -45,7 +45,7 @@ class FakeVita:
     """the Vita's service, in memory"""
     def __init__(self, L, code):
         self.L, self.code, self.saves, self.pairs, self.bases, self.guards, self.running = L, code, {}, {}, {}, {}, set()
-        self.stage, self.commits, self.pending = {}, 0, []
+        self.stage, self.commits, self.pending, self.sessions = {}, 0, [], []
         self.sock = socket.socket(); self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0)); self.sock.listen(4); self.port = self.sock.getsockname()[1]
         threading.Thread(target=self.serve, daemon=True).start()
@@ -146,6 +146,10 @@ class FakeVita:
             kv = dict(l.split("\t", 1) for l in body.decode().splitlines() if "\t" in l)
             self.guards[tid] = kv.get("state", "none"); return ok()
         if cmd == "RELEASE": return ok()
+        if cmd == "BEGIN":
+            if tid in self.running: return b"ERR busy"
+            self.sessions.append(("begin", tid)); return ok()
+        if cmd == "END": self.sessions.append(("end", tid)); return ok()
         return b"ERR unknown request"
 
 def slot(title):
@@ -191,7 +195,10 @@ def main():
     check(len(backed) >= 1 and os.path.isfile(os.path.join(backups, "PCSE00640", sorted(backed)[-1], "saveData.bin")), "and this one was backed up first")
     vita.running.add("PCSE00640")
     check(run("check", "PCSE00640", "1.08", save_dir).startswith("skip: Playing on the Vita"), "a game running on the Vita: its save left alone")
+    check("running on the Vita" in run("pull", "PCSE00640", "1.08", save_dir), "a fetch while the game runs there is refused")
     vita.running.discard("PCSE00640")
+    vita.sessions.clear(); run("pull", "PCSE00640", "1.08", save_dir)
+    check(vita.sessions == [("begin", "PCSE00640"), ("end", "PCSE00640")], "a fetch is one session: the Vita holds launches for all of it")
     check(run("check", "PCSA00999", "1.00", save_dir).startswith("skip: Not on the Vita"), "a game the Vita doesn't have")
     print("== choices made at the Vita while this computer was away")
     pc_id = [l.split("=", 1)[1] for l in open(os.path.join(prefs, "vita-sync.ini")).read().splitlines() if l.startswith("pc_id=")][0]
