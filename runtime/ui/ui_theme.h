@@ -9,6 +9,7 @@
 #ifndef ATIV_UI_THEME_H
 #define ATIV_UI_THEME_H
 #include "imgui.h"
+#include <cfloat>
 #include <cstdio>
 #include <initializer_list>
 #include <sys/stat.h>
@@ -17,7 +18,8 @@ namespace ui {
 inline const ImVec4 bg(0.071f, 0.078f, 0.098f, 1), surface(0.102f, 0.114f, 0.141f, 1), card(0.125f, 0.141f, 0.173f, 1),
 	card_hi(0.149f, 0.168f, 0.204f, 1), border(0.173f, 0.192f, 0.231f, 1), text(0.914f, 0.902f, 0.875f, 1), muted(0.565f, 0.592f, 0.639f, 1),
 	accent(0.941f, 0.706f, 0.298f, 1), accent_hi(0.961f, 0.773f, 0.424f, 1), accent_ink(0.10f, 0.08f, 0.04f, 1),
-	ready(0.345f, 0.761f, 0.545f, 1), warn(0.910f, 0.639f, 0.239f, 1), error(0.898f, 0.376f, 0.353f, 1);
+	ready(0.345f, 0.761f, 0.545f, 1), warn(0.910f, 0.639f, 0.239f, 1), error(0.898f, 0.376f, 0.353f, 1),
+	experimental(0.616f, 0.663f, 0.949f, 1);   /* the experimental tier's tint: cool beside the amber of the enhanced games */
 inline ImVec4 with_alpha(const ImVec4 &c, float a) { return ImVec4(c.x, c.y, c.z, c.w * a); }
 inline ImU32 u32(const ImVec4 &c, float a = 1) { return ImGui::GetColorU32(with_alpha(c, a)); }
 
@@ -111,6 +113,34 @@ inline void spinner(const ImVec4 &c) {
 	ImDrawList *dl = ImGui::GetWindowDrawList();
 	dl->PathArcTo(ImVec2(p.x + r, p.y + h * 0.5f), r, t, t + 4.4f, 20); dl->PathStroke(u32(c), 0, r * 0.32f);
 	ImGui::Dummy(ImVec2(r * 2, h)); ImGui::SameLine(0, h * 0.4f);
+}
+/* a game's tier, as one mark everywhere it shows (the library's cards and section headings): ENHANCED, a filled amber pill
+ * with a four-point spark; EXPERIMENTAL, a dark pill with a cool outline and a flask. Drawn shapes, not glyphs: the
+ * font may have neither symbol. kind 0 enhanced, 1 experimental */
+inline void tier_mark(ImDrawList *dl, ImVec2 c, float r, int kind, ImU32 col) {
+	if (kind == 0) {   /* a spark: two thin diamonds crossed */
+		const float t = r * 0.28f;
+		dl->AddQuadFilled(ImVec2(c.x, c.y - r), ImVec2(c.x + t, c.y), ImVec2(c.x, c.y + r), ImVec2(c.x - t, c.y), col);
+		dl->AddQuadFilled(ImVec2(c.x - r, c.y), ImVec2(c.x, c.y - t), ImVec2(c.x + r, c.y), ImVec2(c.x, c.y + t), col);
+	} else {           /* a flask: a neck, then a body widening to a flat base */
+		const float n = r * 0.28f, top = c.y - r, neck = c.y - r * 0.15f, base = c.y + r;
+		dl->AddRectFilled(ImVec2(c.x - n, top), ImVec2(c.x + n, neck), col);
+		dl->AddQuadFilled(ImVec2(c.x - n, neck), ImVec2(c.x + n, neck), ImVec2(c.x + r * 0.9f, base), ImVec2(c.x - r * 0.9f, base), col);
+		dl->AddLine(ImVec2(c.x - n * 1.7f, top), ImVec2(c.x + n * 1.7f, top), col, r * 0.18f);   /* (the lip) */
+	}
+}
+/* the badge at p (top-left), its size returned: on a cover it sits over any art, so each kind has its own ground */
+inline ImVec2 tier_badge(ImDrawList *dl, ImVec2 p, int kind, float scale = 1.0f) {
+	const char *label = kind == 0 ? "ENHANCED" : "EXPERIMENTAL";
+	const float fs = ImGui::GetFontSize() * 0.72f * scale, r = fs * 0.42f, px = fs * 0.62f, py = fs * 0.32f, gapx = fs * 0.42f;
+	const ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, label);
+	const ImVec2 sz(px + r * 2 + gapx + ts.x + px, ts.y + py * 2), q(p.x + sz.x, p.y + sz.y);
+	const ImVec4 fg = kind == 0 ? accent_ink : experimental;
+	if (kind == 0) dl->AddRectFilled(p, q, u32(accent), sz.y * 0.5f);
+	else { dl->AddRectFilled(p, q, u32(bg, 0.9f), sz.y * 0.5f); dl->AddRect(p, q, u32(experimental, 0.85f), sz.y * 0.5f, 0, 1.2f); }
+	tier_mark(dl, ImVec2(p.x + px + r, p.y + sz.y * 0.5f), r, kind, u32(fg));
+	dl->AddText(nullptr, fs, ImVec2(p.x + px + r * 2 + gapx, p.y + py), u32(fg), label);
+	return sz;
 }
 inline void chip(const char *s, const ImVec4 &c) {   /* a small rounded label, tinted */
 	ImVec2 p = ImGui::GetCursorScreenPos(), ts = ImGui::CalcTextSize(s); float px = ImGui::GetFontSize() * 0.55f, py = ImGui::GetFontSize() * 0.18f;

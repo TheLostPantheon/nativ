@@ -1673,7 +1673,8 @@ static void game_card(const Game &g, float w, float name_h) {
 	const float img_h = w * 544.0f / 960.0f;
 	const bool busy = g_task.running, mine = busy && std::find(g_task.games.begin(), g_task.games.end(), g.id) != g_task.games.end();
 	ImGui::PushID(g.id.c_str());
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::card); ImGui::PushStyleColor(ImGuiCol_Border, ui::border);
+	const int kind = g.tier == "enhanced" ? 0 : g.tier == "experimental" ? 1 : -1;   /* its tier mark (ui::tier_badge); none for compatible */
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::card); ImGui::PushStyleColor(ImGuiCol_Border, kind == 0 ? ui::with_alpha(ui::accent, 0.45f) : ui::border);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 	ImGui::BeginChild("card", ImVec2(w, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
 	ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -1692,6 +1693,12 @@ static void game_card(const Game &g, float w, float name_h) {
 		ImVec2 ts = ImGui::CalcTextSize(g.name.c_str(), nullptr, false, wrap);
 		dl->AddText(nullptr, 0, ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (img_h - ts.y) * 0.5f), ui::u32(ui::muted, 0.75f), g.name.c_str(), nullptr, wrap);
 		ImGui::PopFont();
+	}
+	if (kind >= 0) {   /* the tier, over the cover's top-left corner; what it means on hover */
+		const ImVec2 b(p.x + pad * 0.75f, p.y + pad * 0.75f), sz = ui::tier_badge(dl, b, kind);
+		if (ImGui::IsMouseHoveringRect(b, ImVec2(b.x + sz.x, b.y + sz.y)) && ImGui::IsWindowHovered())
+			ImGui::SetTooltip("%s", kind == 0 ? "Enhanced with Nativ: tested with each release, with extras made for this game."
+			                                  : "Experimental: built from your copy with no game-specific work.\nIt may not start or may crash, and it comes with no support.");
 	}
 	if (icon.t) {   /* the icon over the cover's bottom-left corner */
 		float s = em * 3.0f; ImVec2 a(p.x + pad, p.y + img_h - s * 0.6f);
@@ -1713,8 +1720,8 @@ static void game_card(const Game &g, float w, float name_h) {
 	ImGui::SetCursorPosX(pad);
 	{	/* the title id and the version: this copy's, else what the pack plays; a chip when the pack recommends another */
 		std::string line = g.id, rec = recommended_version(g), vs = played_versions(g);
-		if (!g.pack) line += "  ·  experimental";
-		else if (g.version == "unknown") line += "  ·  this version: experimental";
+		if (!g.pack) {}   /* (the badge says experimental) */
+		else if (g.version == "unknown") line += "  ·  a version its pack doesn't play";
 		else if (g.unsupported) line += "  ·  a version Nativ doesn't play yet";
 		else if (g.imported && !g.version.empty() && g.version != "-") line += "  ·  " + (g.region.empty() ? "" : g.region + " ") + g.version;
 		else if (!g.imported && !vs.empty()) line += "  ·  plays " + (g.region.empty() ? "" : g.region + " ") + vs;
@@ -1868,8 +1875,13 @@ static void hub_ui(SDL_Window *win) {
 		for (const Game &g : g_games) if ((g.tier == "experimental") == (sec == 1)) gs.push_back(&g);
 		if (gs.empty()) continue;
 		ImGui::Dummy(ImVec2(0, em * (sec ? 0.6f : 0.2f)));
-		ImGui::TextUnformatted(sec ? "Other games" : "Enhanced with Nativ"); ImGui::SameLine();
-		ImGui::TextDisabled(sec ? "experimental: built from your copy with no game-specific work, and no support" : "tested with each release, with extras made for each game");
+		{	/* the section's tier mark, then its heading and what it means */
+			const float r = em * 0.36f; ImVec2 c = ImGui::GetCursorScreenPos();
+			ui::tier_mark(ImGui::GetWindowDrawList(), ImVec2(c.x + r, c.y + ImGui::GetTextLineHeight() * 0.5f), r, sec, ui::u32(sec ? ui::experimental : ui::accent));
+			ImGui::Dummy(ImVec2(r * 2 + em * 0.3f, ImGui::GetTextLineHeight())); ImGui::SameLine();
+		}
+		ImGui::TextColored(sec ? ui::experimental : ui::accent, "%s", sec ? "Experimental" : "Enhanced with Nativ"); ImGui::SameLine();
+		ImGui::TextDisabled(sec ? "built from your copy with no game-specific work, and no support" : "tested with each release, with extras made for each game");
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));
 		for (size_t i = 0; i < gs.size(); i++) {
 			if (i % cols) ImGui::SameLine();
