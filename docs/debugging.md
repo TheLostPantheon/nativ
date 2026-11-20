@@ -138,6 +138,8 @@ Most of these turn one optimisation back to the slower path, for an A/B comparis
 | `RECOMP_GPU_RING_WAIT_ALL=1` | At a vertex or index ring wrap, wait for all GPU work, not just the work over the region being reused. |
 | `RECOMP_GPU_DECODE_CHECK=1` | Check the fast texture decoders byte for byte against the generic one. `RECOMP_SOFT_PVRTC_SLOW=1` decodes PVRTC per texel. |
 | `RECOMP_GPU_F32F32_RGBA=1` | Store two-channel float targets as four channels, the bandwidth A/B. |
+| `RECOMP_GPU_NO_RAW=1` | Keep a half-float target that a shader writes as raw words (a packed G-buffer) in a half-float texture. By default it moves to an exact 32-bit texture after its first such scene, because converting through floats loses every byte pair that reads as a NaN. `RECOMP_GPU_RAW_TARGETS=<hex address>[,...]` marks targets up front, so a one-frame capture's replay shows the exact version. |
+| `RECOMP_GPU_NO_LINES=1` | Drop line primitives instead of drawing them as quads. |
 | `RECOMP_GPU_NULL_FS=0` | Run a disabled fragment program behind a zero colour mask instead of an empty shader. |
 | `RECOMP_GPU_HDR_RG11B10=1` | Store HDR lighting targets in a 4-byte format. Not usable: games read the alpha this format drops. |
 | `RECOMP_GPU_NO_PRESENT=1` | Present through guest memory instead of from the GPU texture. |

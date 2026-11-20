@@ -174,6 +174,8 @@ void usse_pack_iter(UsseInst *inst, const UsseIter *it, const float comps[4]);
 /* fragment colour output: read color_comps components of color_type starting at color_pa_start
  * (PA, or O if native_color) into out[4] (RGBA, 0..1 range already). */
 void usse_read_color(const UsseInst *inst, const UsseFragLayout *fl, float out[4]);
+/* the program writes its colour as raw words (a TY_U32/TY_S32 output: a packed G-buffer), not as values the target's format converts */
+int usse_frag_raw_color(const UsseFragLayout *fl);
 
 /* disassemble one decoded program to a FILE* (usse_dis.c); returns the number of instructions
  * whose instruction word matched no known encoding at all (should be 0: everything in §3 decodes

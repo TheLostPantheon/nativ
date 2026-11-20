@@ -990,7 +990,7 @@ static ShaderEntry *get_shader(uint32_t addr, const UsseProgram *prog, const Uss
                                const UsseVfLayout *vf, uint32_t layout_hash) {   /* vf/layout_hash: a vertex program's GPU-side fetch plan (vf_plan), null/0 for the CPU packer's records (and fragment programs) */
 	uint32_t hash = usse_program_hash(prog), hash2 = vprog && !canon_vary_on() ? usse_program_hash(vprog) : 0;
 	usse_spirv_key(prog, fl, sa_tex_unit, &kind, &cube_mask, &snap_mask);   /* (only what changes the module: one shader for the variants that don't) */
-	int pcf_unit = kind >= 0 ? shadow_unit(addr, hash) : -1, pcf = pcf_unit >= 0 && shadow_filter_want() ? 16 : 0;   /* (fragment programs: kind is the target's) */
+	int pcf_unit = kind >= 0 && kind != 5 /* TK_RAW: words, not a colour to average */ ? shadow_unit(addr, hash) : -1, pcf = pcf_unit >= 0 && shadow_filter_want() ? 16 : 0;   /* (fragment programs: kind is the target's) */
 	const int pts = g_points_draw ? 1 : g_lines_draw && !usse_is_fragment(prog) ? 2 : 0;   /* (a line's fragment program is the plain one) */
 	ShaderEntry *x = shader_find(hash, hash2, kind, cube_mask, snap_mask, layout_hash, pcf, pts, g_fzero_draw);
 	if (x) {
@@ -1594,7 +1594,16 @@ typedef struct {
  * the lighting passes' bandwidth, off by default until that difference is measured as harmless. (The
  * translator sees it as its own colour kind: a raw-word colour program would lay its words out as
  * bytes there, as it would for RGBA8 -- no program writes raw words into an HDR target.) */
-enum { TK_U8, TK_F16, TK_F32, TK_U8S, TK_HDR10 };
+/* TK_RAW: a half-float target (F16F16F16F16, 8 bytes a pixel, linear) that a program writes as raw words (a TY_U32/S32
+ * colour: Resistance's G-buffer packs colour bytes into its two words). As RGBA16F each half went through a float on its
+ * way in, and every half with a NaN's bit pattern (a byte pair whose high byte is 0x7C-0x7F or 0xFC-0xFF: alpha 255 in
+ * every pixel, any colour byte from 124 up) came out as the one canonical NaN, its low byte zeroed: the hard-edged dark
+ * blotches on Resistance's walls. As R32G32_FLOAT the words pass through untouched, as an F32F32 target's do (Unit 13's
+ * G-buffer); the translator packs a float colour into halves itself (usse_spirv.c, colour kind TK_RAW), and the guest
+ * memory round trip copies bytes. Learned at the first such draw (raw_target_note): that scene is drawn as before, the
+ * target's next scene is TK_RAW. RECOMP_GPU_NO_RAW=1: RGBA16F as before (an A/B). */
+enum { TK_U8, TK_F16, TK_F32, TK_U8S, TK_HDR10, TK_RAW };
+_Static_assert(TK_RAW == 5, "usse_spirv.c's colour kind 5");
 /* The F32 family (F32: one word a pixel, F32F32: two; the Vita has no wider float colour format)
  * renders as R32G32_FLOAT, 8 bytes a texel, not RGBA32F's 16: gfx_soft.c's target_write stores
  * exactly words 0 and 1 of the colour and its decode reads back (r, g, 0, 1), which is what an R32G32
@@ -1630,11 +1639,27 @@ static int target_kind(uint32_t fmt) {
 	default: return GFX_TGT_GAMMA(fmt) && (fmt & 0xF1800000u) == 0 ? TK_U8S : TK_U8;
 	}
 }
+#define MAXRAWT 16
+static struct { uint32_t addr, format; } raw_targets[MAXRAWT]; static int nraw_targets;
+static int raw_targets_off(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_RAW") != 0; return v; }
+static int raw_target_is(uint32_t addr, uint32_t fmt) {
+	static int seeded;   /* RECOMP_GPU_RAW_TARGETS=<hexaddr>[,...]: known from the start (a one-frame capture's replay draws a target's first scene only) */
+	if (!seeded) { seeded = 1; const char *v = getenv("RECOMP_GPU_RAW_TARGETS");
+		for (char *q = (char *)v; q && *q && nraw_targets < MAXRAWT; ) { uint32_t a = (uint32_t)strtoul(q, &q, 16); if (a) { raw_targets[nraw_targets].addr = a; raw_targets[nraw_targets++].format = 0; } while (*q == ',' || *q == ' ') q++; if (*q && !isxdigit((unsigned char)*q)) break; } }
+	for (int i = 0; i < nraw_targets; i++) if (raw_targets[i].addr == addr && (raw_targets[i].format == fmt || (!raw_targets[i].format && (fmt & 0xF1800000u) == 0x01000000u))) return 1;
+	return 0;
+}
+static int target_kind_of(const GfxTarget *t) { int k = target_kind(t->format); return k == TK_F16 && t->type == 0 && raw_target_is(t->data, t->format) ? TK_RAW : k; }
+static void raw_target_note(const TargetEntry *e) {   /* a raw-word colour drawn into an RGBA16F target: TK_RAW from its next scene (linear F16F16F16F16 only) */
+	if (raw_targets_off() || e->type != 0 || (e->format & 0xF1800000u) != 0x01000000u || nraw_targets == MAXRAWT || raw_target_is(e->addr, e->format)) return;
+	raw_targets[nraw_targets].addr = e->addr; raw_targets[nraw_targets++].format = e->format;
+	fprintf(stderr, "    gpu: target %#x %ux%u fmt %#x is written as raw words: an exact R32G32 texture from its next scene\n", e->addr, e->width, e->height, e->format);
+}
 static SDL_GPUTextureFormat kind_format(int k) {
-	return k == TK_F32 ? (f32_rg() ? SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT : SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT) : k == TK_F16 ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT
+	return k == TK_F32 || k == TK_RAW ? (f32_rg() ? SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT : SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT) : k == TK_F16 ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT
 	     : k == TK_HDR10 ? SDL_GPU_TEXTUREFORMAT_R11G11B10_UFLOAT : k == TK_U8S ? SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 }
-static uint32_t kind_bytes(int k) { return k == TK_F32 ? (f32_rg() ? 8u : 16u) : k == TK_F16 ? 8 : 4; }   /* (TK_HDR10: 4) */
+static uint32_t kind_bytes(int k) { return k == TK_F32 || k == TK_RAW ? (f32_rg() ? 8u : 16u) : k == TK_F16 ? 8 : 4; }   /* (TK_HDR10: 4) */
 /* ---- internal resolution. RECOMP_RENDER_SCALE=n (1-RSCALE_MAX; F2 in the window cycles them): every GPU
  * render target, depth/stencil surface, view and FRAGCOLOR copy is n times its guest surface's size,
  * and every draw's viewport and scissor n times its own -- the game's geometry is rasterised at n
@@ -1756,6 +1781,8 @@ static float h2f(uint16_t h) {
 static TargetEntry targets[MAXTARGET]; static int ntargets;
 static uint64_t target_clock;
 static void target_download_to_guest(TargetEntry *e);
+static const char *sync_why; static void readbacks_complete(uint32_t lo, uint32_t hi);   /* (below) */
+static int target_raw_ok(const TargetEntry *e, const GfxTarget *t);
 static uint32_t n_fallback, n_gpu_draws; static uint64_t n_gpu_indices;   /* n_gpu_indices: this frame's GPU draws' index counts summed (RECOMP_GPU_STATS: how much geometry -- a level of detail setting's effect) */
 /* metrics.c: how many draws this run has sent to the GPU vs. the software fallback path, so far --
  * cumulative, read-only; metrics.c takes its own deltas (RECOMP_GPU_STATS's report, above, is the
@@ -1802,7 +1829,7 @@ static TargetEntry *get_target(const GfxTarget *t) {
 	return get_target_at(t, sx, sy);
 }
 static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy) {
-	for (int i = 0; i < ntargets; i++) if (targets[i].addr == t->data && targets[i].width == t->stride && targets[i].height == t->height && targets[i].kind == target_kind(t->format) && targets[i].type == t->type && targets[i].sx == sx && targets[i].sy == sy) {
+	for (int i = 0; i < ntargets; i++) if (targets[i].addr == t->data && targets[i].width == t->stride && targets[i].height == t->height && targets[i].kind == target_kind_of(t) && targets[i].type == t->type && targets[i].sx == sx && targets[i].sy == sy) {
 		TargetEntry *e = &targets[i];
 		e->used = ++target_clock;
 		/* the same colour address can be used by one scene with a depth buffer and another
@@ -1816,6 +1843,13 @@ static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy) {
 		}
 		return e;
 	}
+	const int kind = target_kind_of(t);
+	if (kind == TK_RAW) for (int i = 0; i < ntargets; i++) {   /* the RGBA16F entry it was until now (any scale): its pixels to guest memory, which the new one starts from */
+		TargetEntry *o = &targets[i]; if (!o->color || o->addr != t->data || o->format != t->format || o->kind != TK_F16) continue;
+		readbacks_complete(o->addr, o->addr + 1);
+		if (o->gpu_dirty) { sync_why = "(now a raw-word target)"; target_download_to_guest(o); }
+		batch_retire(o->color, "target now raw-word"); target_release(o); o->addr = 0; o->used = 0;
+	}
 	TargetEntry *e;
 	if (ntargets < MAXTARGET) e = &targets[ntargets++];
 	else {
@@ -1825,7 +1859,7 @@ static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy) {
 		target_release(e);
 	}
 	memset(e, 0, sizeof *e); e->addr = t->data; e->width = t->stride; e->height = t->height; e->format = t->format; e->type = t->type; e->used = ++target_clock; e->sx = sx; e->sy = sy;
-	e->kind = target_kind(t->format);
+	e->kind = kind;
 	e->cpu_dirty = 1; e->gen = ++write_clock;   /* starts as whatever guest memory holds (an earlier frame's render, a CPU write) */
 	SDL_GPUTextureCreateInfo tci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = kind_format(e->kind),
 		.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
@@ -1876,6 +1910,7 @@ static void floats_to_texels(int kind, const float *in, uint8_t *out, uint32_t n
 	for (uint32_t i = 0; i < n; i++) {
 		const float *c = in + 4 * i;
 		if (kind == TK_F32) memcpy(out + tb * i, c, tb);   /* R32G32: the first two words; RGBA32F: all four */
+		else if (kind == TK_RAW) { uint16_t h[4] = { f2h(c[0]), f2h(c[1]), f2h(c[2]), f2h(c[3]) }; memset(out + tb * i, 0, tb); memcpy(out + tb * i, h, 8); }   /* the halves in words 0 and 1 */
 		else if (kind == TK_F16) { uint16_t h[4] = { f2h(c[0]), f2h(c[1]), f2h(c[2]), f2h(c[3]) }; memcpy(out + 8 * i, h, 8); }
 		else if (kind == TK_HDR10) { uint32_t p = to_ufloat(c[0], 6) | to_ufloat(c[1], 6) << 11 | to_ufloat(c[2], 5) << 22; memcpy(out + 4 * i, &p, 4); }
 		else for (int k = 0; k < 4; k++) { float v = c[k]; out[4 * i + k] = (uint8_t)(v <= 0 ? 0 : v >= 1 ? 255 : (uint32_t)(v * 255 + .5f)); }
@@ -1886,6 +1921,7 @@ static void texels_to_floats(int kind, const uint8_t *in, float *out, uint32_t n
 	for (uint32_t i = 0; i < n; i++) {
 		float *c = out + 4 * i;
 		if (kind == TK_F32) { memcpy(c, in + tb * i, tb); if (tb == 8) { c[2] = 0; c[3] = 1; } }   /* R32G32 samples as (r, g, 0, 1): gfx_soft.c's F32F32 decode */
+		else if (kind == TK_RAW) { uint16_t h[4]; memcpy(h, in + tb * i, 8); for (int k = 0; k < 4; k++) c[k] = h2f(h[k]); }
 		else if (kind == TK_F16) { uint16_t h[4]; memcpy(h, in + 8 * i, 8); for (int k = 0; k < 4; k++) c[k] = h2f(h[k]); }
 		else if (kind == TK_HDR10) { uint32_t p; memcpy(&p, in + 4 * i, 4); c[0] = from_ufloat(p & 0x7ff, 6); c[1] = from_ufloat((p >> 11) & 0x7ff, 6); c[2] = from_ufloat(p >> 22, 5); c[3] = 1; }
 		else for (int k = 0; k < 4; k++) c[k] = in[4 * i + k] / 255.f;
@@ -1911,9 +1947,11 @@ static void target_upload_from_guest(TargetEntry *e) {
 	uint32_t npx = e->width * e->height, n = kind_bytes(e->kind) * npx;
 	float *f = malloc(16u * npx); uint8_t *raw = malloc(n);
 	GfxTarget t = target_entry_as_gfx(e);
-	gfx_decode_target_f32(&t, f);   /* the game's own declared colour format (565, F16, F32F32, ...), decoded as gfx_soft.c reads it */
+	const int bytes = e->kind == TK_RAW && target_raw_ok(e, &t);   /* a raw-word target: the guest's bytes are its texels */
+	if (bytes) { memcpy(raw, G(e->addr), n); memset(f, 0, 16u * npx); }
+	else gfx_decode_target_f32(&t, f);   /* the game's own declared colour format (565, F16, F32F32, ...), decoded as gfx_soft.c reads it */
 	if (trace_sync() && npx > 10 * e->width + 10) fprintf(stderr, "gpu trace:   upload (10,10) = %g %g %g, guest word %#x\n", f[4 * (10 * e->width + 10)], f[4 * (10 * e->width + 10) + 1], f[4 * (10 * e->width + 10) + 2], RD32(e->addr + 4 * (10 * e->width + 10)));
-	floats_to_texels(e->kind, f, raw, npx);
+	if (!bytes) floats_to_texels(e->kind, f, raw, npx);
 	SDL_GPUTransferBufferCreateInfo xci = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = n };
 	SDL_GPUTransferBuffer *xb = SDL_CreateGPUTransferBuffer(gpu(), &xci);
 	void *map = SDL_MapGPUTransferBuffer(gpu(), xb, true); memcpy(map, raw, n); SDL_UnmapGPUTransferBuffer(gpu(), xb);
@@ -1961,7 +1999,10 @@ static void target_download_texels(TargetEntry *e, float *out, uint8_t *raw) {  
 }
 /* an 8-bit target whose guest format is the GPU texture's own byte layout (gfx_target_plain_rgba8): guest memory takes the
  * downloaded bytes as they are -- the float round trip (decode, then encode texel by texel) cost ~3 ms a 960x544 present */
-static int target_raw_ok(const TargetEntry *e, const GfxTarget *t) { return (e->kind == TK_U8 || e->kind == TK_U8S) && t->stride == e->width && gfx_target_plain_rgba8(t); }
+static int target_raw_ok(const TargetEntry *e, const GfxTarget *t) {
+	return ((e->kind == TK_U8 || e->kind == TK_U8S) && t->stride == e->width && gfx_target_plain_rgba8(t))
+	    || (e->kind == TK_RAW && kind_bytes(TK_RAW) == 8 && t->type == 0 && t->stride == e->width);   /* a raw-word target: its texels are the guest's 8 bytes a pixel */
+}
 static void target_download_to_buffer(TargetEntry *e, uint8_t *out) {   /* as RGBA8, for RECOMP_GFX_CHECK's comparison */
 	uint32_t npx = e->width * e->height;
 	float *f = malloc(16u * npx); target_download_floats(e, f);
@@ -2963,7 +3004,7 @@ static void mv_capture(TargetEntry *e, uint64_t f) {
 		for (uint32_t i = 0; i < w * h; i++) {
 			const uint8_t *q = px + (size_t)bpp * i; float v[3] = { 0, 0, 0 }; uint8_t c[3];
 			if (e->kind == TK_U8 || e->kind == TK_U8S) { memcpy(c, q, 3); fwrite(c, 1, 3, fc); continue; }
-			if (e->kind == TK_F16) for (int k = 0; k < 3; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); v[k] = half_to_float(hv); }
+			if (e->kind == TK_F16 || e->kind == TK_RAW) for (int k = 0; k < 3; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); v[k] = half_to_float(hv); }
 			else if (e->kind == TK_HDR10) {   /* R11G11B10_UFLOAT: 6- and 5-bit mantissas over 5-bit exponents */
 				uint32_t x; memcpy(&x, q, 4); const uint32_t f[3] = { x & 0x7ff, (x >> 11) & 0x7ff, x >> 22 }; const int mb[3] = { 6, 6, 5 };
 				for (int k = 0; k < 3; k++) { uint32_t m = f[k] & ((1u << mb[k]) - 1), ex = f[k] >> mb[k]; v[k] = ex ? ldexpf(1.0f + (float)m / (float)(1u << mb[k]), (int)ex - 15) : ldexpf((float)m / (float)(1u << mb[k]), -14); }
@@ -3182,7 +3223,8 @@ static void readback_complete(Readback *r) {
 	if (r->pinned) { if (nparked < MAXREADBACK) parked[nparked++] = r->fence; }   /* (never freed under a lock-free waiter; at most MAXREADBACK can be pinned between presents) */
 	else SDL_ReleaseGPUFence(gpu(), r->fence);
 	uint32_t npx = r->t.stride * r->t.height;
-	const int raw = (r->kind == TK_U8 || r->kind == TK_U8S) && r->t.stride == r->t.width && gfx_target_plain_rgba8(&r->t);   /* (target_raw_ok: the bytes as they are) */
+	const int raw = ((r->kind == TK_U8 || r->kind == TK_U8S) && r->t.stride == r->t.width && gfx_target_plain_rgba8(&r->t))
+	             || (r->kind == TK_RAW && kind_bytes(TK_RAW) == 8 && r->t.type == 0 && r->t.stride == r->t.width);   /* (target_raw_ok: the bytes as they are) */
 	const uint32_t gbytes = (uint32_t)gfx_target_bpp(&r->t) * npx;
 	float *f = raw ? 0 : malloc(16u * npx);
 	const uint8_t *map = SDL_MapGPUTransferBuffer(gpu(), r->xb, false);
@@ -3904,7 +3946,7 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 	}
 	const int snap2 = snap && scene_snap == 2 && best == scene_entry && best->snap && !dbest;   /* the starting pixels in the GPU snapshot */
 	if (snap && !snap2) { if (scene_snap == 2) snap_to_guest(scene_entry); goto guest; }
-	if (best && !dbest && gfx_texture_levels(tex) > 1 && !no_views()) { TexEntry *mv = mip_view(tex, best, snap2 ? best->snap : 0, snap2 ? best->snap_gen : 0); if (mv) return mv; }   /* every level a GPU target (the transfer chain's) */
+	if (best && !dbest && best->kind != TK_RAW && gfx_texture_levels(tex) > 1 && !no_views()) { TexEntry *mv = mip_view(tex, best, snap2 ? best->snap : 0, snap2 ? best->snap_gen : 0); if (mv) return mv; }   /* every level a GPU target (the transfer chain's) */
 	if (ex && !snap2 && (!dbest || best->gen > dbest->gen) && !getenv("RECOMP_GPU_DEBUG_NO_RTT")) {
 		if (best == scene_entry) batch_flush("scene target sampled");   /* sampled while it is the attachment (undefined either way): at least after the draws before it */
 		*exact = best; return 0;
@@ -3927,7 +3969,9 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 			}
 			if (trace_sync()) fprintf(stderr, "gpu trace: no view of depth %#x %ux%u (gpu newer %d, gen %llu) for texture %#x fmt %#x %ux%u u%#x: decoded from guest memory\n", dbest->key, dbest->w, dbest->h, dbest->gpu_newer, (unsigned long long)dbest->gen, tex->data, tex->format, tex->width, tex->height, tex->u_mode);
 		} else if (best) {
-			uint32_t tex_bpp; int mode = view_mode(best->format, tex, &tex_bpp, u.swz);
+			/* a raw-word target holds its two words as an F32F32 target does (R32G32): read as bytes by the same view
+			 * (Resistance's lighting reads its G-buffer as U8U8U8U8 at twice the width), as halves by none (guest memory) */
+			uint32_t tex_bpp; int mode = view_mode(best->kind == TK_RAW ? 0x11000000u : best->format, tex, &tex_bpp, u.swz);
 			GfxTarget tg = target_entry_as_gfx(best);
 			/* an sRGB target: the view pass reads decoded values. Mode 0 (U8U8U8U8 as U8U8U8U8, a sub-rectangle) passes them on
 			 * -- into an sRGB view texture (re-encoded to the same bytes) or RGBA32F (kept decoded) -- and the draw's shader treats
@@ -5620,6 +5664,9 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * themselves.) */
 	static int gpu_fetch = -1; if (gpu_fetch < 0) gpu_fetch = getenv("RECOMP_GPU_NO_FETCH") == 0;
 	if (fl && fl->frag_color_used && !gpu_fetch) { soft_fallback(d, "framebuffer colour (FRAGCOLOR)"); return; }
+	if (scene_entry->kind == TK_F16 && usse_frag_raw_color(fl)) raw_target_note(scene_entry);
+	/* a raw-word target holds words, not colours: nothing to blend with or read back as one */
+	if (scene_entry->kind == TK_RAW && ((fl && fl->frag_color_used) || (d->blend.present && (d->blend.color_func || d->blend.alpha_func)))) { soft_fallback(d, "a blend into a raw-word target"); return; }
 	__atomic_add_fetch(&n_gpu_draws, 1, __ATOMIC_RELAXED); n_gpu_indices += d->count;
 	t_setup += us_now() - td0;
 	uint64_t tsh0 = us_now();

@@ -1811,6 +1811,7 @@ void usse_pack_iter_raw(UsseInst *inst, const UsseIter *it, const uint32_t raw[4
 	Ctx cx; memset(&cx, 0, sizeof cx); cx.t = inst;
 	for (int c = 0; c < n && c < 4; c++) write_raw_lane(&cx, &o, 0, c, raw[c]);
 }
+int usse_frag_raw_color(const UsseFragLayout *fl) { return fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32); }
 void usse_read_color(const UsseInst *inst, const UsseFragLayout *fl, float out[4]) {
 	UOperand o; memset(&o, 0, sizeof o);
 	o.bank = (uint8_t)(fl->native_color ? BK_O : BK_PA); o.num = (uint16_t)fl->color_pa_start; o.type = (uint8_t)fl->color_type;

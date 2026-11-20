@@ -1130,7 +1130,7 @@ void usse_spirv_key(const UsseProgram *prog, const UsseFragLayout *fl, const uin
 	if (fl) for (int i = 0; i < fl->niters; i++) if (fl->iters[i].is_tex && fl->iters[i].tex_unit >= 0 && fl->iters[i].tex_unit < 16) used |= 1u << fl->iters[i].tex_unit;
 	if (cube_mask) *cube_mask &= used;
 	if (snap_mask) *snap_mask &= used;
-	if (color_kind && *color_kind >= 0) *color_kind = fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes) */
+	if (color_kind && *color_kind >= 0) *color_kind = *color_kind == 5 ? 5 : fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes; kind 5 packs every colour) */
 }
 uint32_t usse_spirv_predict_cube(const UsseProgram *prog, const UsseFragLayout *fl, const uint32_t sa_tex_unit[256]) {
 	uint32_t m = 0; int n = 0; const UOp *code = usse_program_code(prog, 0, &n);
@@ -1791,7 +1791,7 @@ static void emit_frag_epilogue(Gen *g, int *ok) {
 		uint32_t w[4];
 		for (int k = 0; k < 4; k++) w[k] = k < n ? read_raw_comp(g, &o, 0, k, ok) : c_uint(s, 0);
 		for (int c = 0; c < 4; c++) {
-			if (g->color_kind == 2) comp[c] = result1(s, &s->func, SpvOpBitcast, t_float(s), w[c]);                 /* RGBA32F: a word a channel */
+			if (g->color_kind == 2 || g->color_kind == 5) comp[c] = result1(s, &s->func, SpvOpBitcast, t_float(s), w[c]);   /* RGBA32F / R32G32, and a raw-word F16F16F16F16 target's R32G32: a word a channel */
 			else if (g->color_kind == 1) comp[c] = half_to_float_spv(s, extract_lane_spv(s, w[c / 2], TY_F16, c & 1));   /* RGBA16F: halves */
 			else comp[c] = fop2(s, SpvOpFDiv, result1(s, &s->func, SpvOpConvertUToF, t_float(s), extract_lane_spv(s, w[0], TY_U8, c)), c_float(s, 255.0f));   /* RGBA8: bytes */
 		}
@@ -1807,6 +1807,12 @@ static void emit_frag_epilogue(Gen *g, int *ok) {
 		comp[c] = norm ? lane_to_float_norm_spv(s, raw, o.type) : lane_to_float_spv(s, raw, o.type);
 	}
 	if (!*ok) return;
+	if (g->color_kind == 5) {   /* a raw-word target (gfx_gpu.c TK_RAW): the colour as its F16F16F16F16 surface holds it, two halves a word */
+		uint32_t tf = t_float(s), tu = t_uint(s), v2 = t_vec(s, tf, 2);
+		uint32_t h01 = result3(s, &s->func, SpvOpExtInst, tu, s->glsl_ext, 58 /*PackHalf2x16*/, result2(s, &s->func, SpvOpCompositeConstruct, v2, comp[0], comp[1]));
+		uint32_t h23 = result3(s, &s->func, SpvOpExtInst, tu, s->glsl_ext, 58 /*PackHalf2x16*/, result2(s, &s->func, SpvOpCompositeConstruct, v2, comp[2], comp[3]));
+		comp[0] = result1(s, &s->func, SpvOpBitcast, tf, h01); comp[1] = result1(s, &s->func, SpvOpBitcast, tf, h23); comp[2] = comp[3] = c_float(s, 0);
+	}
 	uint32_t id = nid(s); INS(&s->func, SpvOpCompositeConstruct, t_vec(s, t_float(s), 4), id, comp[0], comp[1], comp[2], comp[3]);
 	store(s, g->var_frag_color, id);
 }
