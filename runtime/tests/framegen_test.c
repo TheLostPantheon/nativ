@@ -3,8 +3,11 @@
  *
  *   framegen_test                          a synthetic pair: a textured scene panned by (dx, dy) under a still HUD
  *                                          block; checks the frame made halfway against the scene panned by half,
- *                                          and the HUD against itself, and prints both errors beside a plain blend's
+ *                                          and the HUD against itself, and prints both errors beside a plain blend's;
+ *                                          then --objects' checks
  *   framegen_test prev.png cur.png out.png [t]   the frame at t (default 0.5) between two real frames
+ *   framegen_test --objects                a dark object over a bright background at 2880x1632, each moving its own way:
+ *                                          the error around the object's edges and how much of it is a light outline
  *   framegen_test --time w h [w h ...]     GPU time per game frame and per made frame at those frame sizes
  *
  * Build: runtime/tests/framegen_test.sh. Exit 0 when the synthetic checks pass.
@@ -125,11 +128,71 @@ static void bench(uint32_t w, uint32_t h) {
 	SDL_ReleaseGPUTexture(dev, ta); SDL_ReleaseGPUTexture(dev, tb); free(a); free(b);
 }
 
+/* objects in front of a background at a frame size whose working size is a quarter of it (2880x1632, render scale 3):
+ * a bright, softly textured background (a sky, a lit wall) and a dark object on it, each moving its own way over the
+ * pair. Checked at t = 1/4 and 1/2 against the scene drawn at t: the error in a band around the object's edges (where a
+ * wrong vector shows the background's colour around it, or a ghost of it) and how much of that band came out much
+ * brighter than it should (a light outline). A thin object (narrower than its motion over the pair) is lost from the made
+ * frames, the background shown in its place: the search sees the background in its blocks, and where two motions both fit
+ * a pixel the still one is taken (what keeps a HUD sharp). Those two are printed, not checked. */
+typedef struct { const char *name; float bx, by, ox, oy; int thin; } ObjCase;   /* background's motion, object's, a thin one */
+enum { OW = 2880, OH = 1632 };
+static float sky(float x, float y) { return 0.78f + 0.3f * (scene(x / 3, y / 3) - 0.5f); }
+static int object(float x, float y, int thin) {
+	float u = x - 1440, v = y - 816;
+	if (thin) return fabsf(u) < 7 && v > -500 && v < 500;   /* a post 14 pixels wide */
+	if (u * u + v * v < 260 * 260) return 1;   /* a disc and a slanted bar from it, like a gun */
+	float a = u * 0.94f + v * 0.34f, b = -u * 0.34f + v * 0.94f;
+	return a > 0 && a < 900 && fabsf(b) < 45;
+}
+static void paint_obj(uint8_t *px, uint8_t *mask, const ObjCase *c, float t) {
+	for (uint32_t y = 0; y < OH; y++) for (uint32_t x = 0; x < OW; x++) {
+		float X = (float)x - c->ox * t, Y = (float)y - c->oy * t; int in = object(X, Y, c->thin);
+		float v = in ? 0.10f + 0.12f * scene(X / 2 + 300, Y / 2) : sky((float)x - c->bx * t, (float)y - c->by * t);
+		uint8_t *p = px + 4 * (y * OW + x); p[0] = (uint8_t)(v * 255); p[1] = (uint8_t)(v * 235); p[2] = (uint8_t)(v * 215); p[3] = 255;
+		if (mask) mask[y * OW + x] = (uint8_t)in;
+	}
+}
+static int objects(void) {
+	int fails = 0;
+	static const ObjCase cs[] = {
+		{ "still object, background panning", 36, 8, 0, 0, 0 },
+		{ "still object, fast pan", 120, -30, 0, 0, 0 },
+		{ "object moving, background still", 0, 0, 60, 12, 0 },
+		{ "object and background opposite", 40, 0, -50, 0, 0 },
+		{ "thin post, fast", 0, 0, 72, 0, 1 },
+		{ "thin post, parallax", 24, 0, 72, 0, 1 },
+	};
+	uint8_t *a = malloc(4 * OW * OH), *b = malloc(4 * OW * OH), *want = malloc(4 * OW * OH), *mask = malloc(OW * OH);
+	for (size_t i = 0; i < sizeof cs / sizeof *cs; i++) for (int k = 1; k <= 2; k++) {
+		float t = 0.25f * (float)k;
+		paint_obj(a, 0, &cs[i], 0); paint_obj(b, 0, &cs[i], 1); paint_obj(want, mask, &cs[i], t);
+		double ms; uint8_t *g = generate(a, b, OW, OH, t, &ms);
+		double band = 0, rest = 0; long nb = 0, nr = 0, light = 0;
+		for (uint32_t y = 24; y + 24 < OH; y++) for (uint32_t x = 24; x + 24 < OW; x++) {
+			uint8_t m = mask[y * OW + x]; int edge = 0;
+			for (int dy = -16; dy <= 16 && !edge; dy += 8) for (int dx = -16; dx <= 16 && !edge; dx += 8) edge = mask[(y + dy) * OW + x + dx] != m;
+			const uint8_t *p = g + 4 * (y * OW + x), *q = want + 4 * (y * OW + x);
+			double e = (abs(p[0] - q[0]) + abs(p[1] - q[1]) + abs(p[2] - q[2])) / 3.0;
+			if (edge || (cs[i].thin && m)) { band += e; nb++; if (p[0] + p[1] + p[2] > q[0] + q[1] + q[2] + 3 * 64) light++; } else { rest += e; nr++; }
+		}
+		double eb = band / (double)nb, lp = 100.0 * (double)light / (double)nb; int ok = cs[i].thin || (eb < 6.0 && lp < 1.0 && rest / (double)nr < 2.0);
+		printf("%-34s t %.2f: edge band error %5.2f, %5.2f%% of it light, elsewhere %.2f, %.2f ms  %s\n", cs[i].name, t, eb, lp, rest / (double)nr, ms, cs[i].thin ? "(not checked)" : ok ? "ok" : "FAIL");
+		if (!ok) fails++;
+		if (getenv("FG_TEST_OUT")) { char p[512]; snprintf(p, sizeof p, "%s/obj%zu_%d_made.png", getenv("FG_TEST_OUT"), i, k); save(p, g, OW, OH);
+			snprintf(p, sizeof p, "%s/obj%zu_%d_want.png", getenv("FG_TEST_OUT"), i, k); save(p, want, OW, OH); }
+		free(g);
+	}
+	free(a); free(b); free(want); free(mask);
+	return fails;
+}
+
 int main(int argc, char **argv) {
 	if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 2; }
 	dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL, false, NULL);
 	if (!dev) { fprintf(stderr, "no GPU device: %s\n", SDL_GetError()); return 2; }
 	fprintf(stderr, "device: %s\n", SDL_GetGPUDeviceDriver(dev));
+	if (argc >= 2 && !strcmp(argv[1], "--objects")) { int f = objects(); printf(f ? "%d failed\n" : "all passed\n", f); return f ? 1 : 0; }
 	if (argc >= 2 && !strcmp(argv[1], "--time")) { for (int i = 2; i + 1 < argc; i += 2) bench((uint32_t)atoi(argv[i]), (uint32_t)atoi(argv[i + 1])); return 0; }
 	if (argc >= 4) {
 		uint32_t w, h, w2, h2; uint8_t *a = load(argv[1], &w, &h), *b = load(argv[2], &w2, &h2);
@@ -155,6 +218,7 @@ int main(int argc, char **argv) {
 			snprintf(p, sizeof p, "%s/pan%zu_want.png", getenv("FG_TEST_OUT"), i); save(p, mid, w, h); }
 		free(g);
 	}
+	fails += objects();
 	printf(fails ? "%d failed\n" : "all passed\n", fails);
 	return fails ? 1 : 0;
 }

@@ -163,7 +163,8 @@ has a menu with that game's own options. Some worth knowing:
   screen, or 60 fps on 120 Hz), it shows a frame made between each two of the game's, for smoother motion. The frames
   are made from the finished pictures alone, so it works in any game, and a still HUD stays sharp. The game's own frames
   show a little later (17 ms on a 60 Hz screen), so leave it off where reactions matter most. Fast motion, or something
-  appearing suddenly, can leave a faint smear in a made frame.
+  appearing suddenly, can leave a faint smear in a made frame, and a thin thing moving fast (a pole in a quick turn) can
+  flicker. The frame rate counters show the game's own frames, with the frames shown beside them ("frame gen 120").
 - **Language** (a game's settings, and the menu's Game page): the language the game is told the system speaks, from the
   ones that game has been checked in (Uncharted: English and Spanish). It applies the next time the game starts.
   Automatic is English.

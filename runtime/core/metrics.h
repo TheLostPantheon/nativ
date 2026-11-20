@@ -51,5 +51,9 @@ int metrics_osd_lines(char (*out)[40], int max);   /* the same overlay as text l
 /* the last ~1.5s of game frames' fps (game_frame_stats' own number): for the overlay menu's
  * Performance page ("show fps"), which wants the figure as a plain double, not drawn into a bitmap */
 double metrics_fps(void);
+/* frame generation (window.c): frames shown in the last second, the game's own and the made ones, while it makes any (0 when it doesn't);
+ * the fps above stays the game's own */
+void metrics_set_frame_gen(unsigned shown_per_s);
+unsigned metrics_frame_gen_shown(void);
 
 #endif

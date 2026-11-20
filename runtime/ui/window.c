@@ -656,9 +656,9 @@ void audio_output(int dev, const void *buf, uint32_t bytes) {
 static int fg_late;   /* refreshes a new game frame waits behind the made ones (the A/V sync's picture term counts them) */
 static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t w, uint32_t h, uint32_t levels, int fresh) {
 	static int on, since, gaps[8], ngap, phase, n = 1;
-	static int log = -1; static unsigned made, frames; static uint64_t t_log;   /* RECOMP_FRAME_GEN_LOG=1: the cadence once a second */
+	static int log = -1; static unsigned made, frames; static uint64_t t_log;   /* counted each second (RECOMP_FRAME_GEN_LOG=1 logs them) */
 	if (log < 0) log = getenv("RECOMP_FRAME_GEN_LOG") != 0;
-	if (!fg_wanted()) { if (on) { fg_forget(); on = 0; } fg_late = 0; return src; }
+	if (!fg_wanted()) { if (on) { fg_forget(); on = 0; metrics_set_frame_gen(0); } fg_late = 0; return src; }
 	if (!on) { fg_forget(); on = 1; ngap = 0; since = 0; phase = 0; n = 1; }
 	since++;
 	if (fresh) {
@@ -671,7 +671,11 @@ static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src,
 		phase = 0; frames++;
 	}
 	fg_late = n >= 2 ? n - 1 : 0;
-	if (log && now_us() - t_log > 1000000) { fprintf(stderr, "    framegen: every game frame shown for %d refreshes, %u game frames and %u made in the last second\n", n, frames, made); made = frames = 0; t_log = now_us(); }
+	if (now_us() - t_log > 1000000) {   /* each second: the frames shown, for the fps counters (metrics.c), and RECOMP_FRAME_GEN_LOG=1's cadence */
+		metrics_set_frame_gen(made ? frames + made : 0);
+		if (log) fprintf(stderr, "    framegen: every game frame shown for %d refreshes, %u game frames and %u made in the last second\n", n, frames, made);
+		made = frames = 0; t_log = now_us();
+	}
 	if (n < 2 || phase >= n - 1) return src;
 	SDL_GPUTexture *g = fg_make(gpu, cmd, (float)(phase + 1) / (float)n);
 	phase++;

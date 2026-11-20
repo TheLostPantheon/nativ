@@ -11,7 +11,12 @@
  *   3. stat     the finest level's mean match: a cut (frames that don't match as a whole) isn't blended
  *   4. pick     per pixel of the working size at time t, the block vector around it (or zero) the two frames agree
  *               on best there: a still HUD keeps its own pixels still over a moving scene
- *   5. warp     the frame: each pixel the previous frame at -t*v blended with the current one at +(1-t)*v
+ *   5. warp     the frame: each pixel the previous frame at -t*v blended with the current one at +(1-t)*v, v the one of
+ *               the picked vectors around it the two agree on best at that pixel (an object's edge inside a working
+ *               pixel); where none agrees, the side nearer to the pixel as the nearer frame has it, not a ghost of both
+ *
+ * Known: a thin object moving further than its own width over the pair is lost from the made frames (the search sees
+ * the background in its blocks, and a still match wins a tie, which is what keeps a HUD sharp); framegen_test --objects.
  *
  * 1 runs once per game frame, 2-3 once per pair (on its first generated frame), 4-5 per generated frame. The passes
  * are GLSL compute shaders (*.comp here, compiled by build.sh into ../framegen_shaders.h), run as SPIR-V on Vulkan

@@ -178,6 +178,9 @@ void metrics_set_audio(uint32_t queued_ms, uint32_t ports, uint32_t underruns) {
 
 /* the overlay menu's Performance page ("show fps"): the same number the title bar and the F1
  * overlay already show, as a plain double instead of a drawn line */
+static unsigned fg_shown;
+void metrics_set_frame_gen(unsigned shown_per_s) { __atomic_store_n(&fg_shown, shown_per_s, __ATOMIC_RELAXED); }
+unsigned metrics_frame_gen_shown(void) { return __atomic_load_n(&fg_shown, __ATOMIC_RELAXED); }
 double metrics_fps(void) {
 	double fps, avg_ms, max_ms, low1_ms;
 	pthread_mutex_lock(&mx); game_frame_stats(now_us(), &fps, &avg_ms, &max_ms, &low1_ms); pthread_mutex_unlock(&mx);
@@ -264,7 +267,7 @@ static void draw_glyph(uint8_t *buf, int stride_px, char ch, int x, int y) {
  * rules that out, this is belt and suspenders for a buffer that's cheap to keep */
 static uint8_t *osd_buf[2]; static int osd_live, osd_w, osd_h;
 static int osd_level_v = -1;   /* -1: RECOMP_OSD not read yet */
-static char line_full[6][40]; static int n_full;
+static char line_full[7][40]; static int n_full;   /* (7: the frame generation layout's extra line) */
 
 int metrics_osd_level(void) {   /* F1 (the window's event thread) writes it, every present reads it: atomic */
 	int v = __atomic_load_n(&osd_level_v, __ATOMIC_RELAXED);
@@ -396,18 +399,22 @@ static void maybe_tick(uint64_t now) {
 	double render_ms = lf_render_us / 1000.0, present_ms = last_present_us / 1000.0;
 	uint32_t am = audio_ms, ap = audio_ports, au = audio_underruns;
 
+	unsigned shown = metrics_frame_gen_shown();   /* frame generation: the frames shown beside the game's own */
+	char shown_s[24] = ""; if (shown) snprintf(shown_s, sizeof shown_s, " (frame gen %u)", shown);
 	snprintf(line_title, sizeof line_title,
-	        "vitarecomp - %.1f fps  frame %.1f/%.1f/%.1f ms  speed %.2fx  %s %u scn %u dr%s  cpu %.0f%%  win %.1f fps",
-	        fps, avg_ms, max_ms, low1_ms, speed, backend, scenes, draws, (gpu && fd) ? " (sw fallback)" : "", cpu, wfps);
+	        "vitarecomp - %.1f fps%s  frame %.1f/%.1f/%.1f ms  speed %.2fx  %s %u scn %u dr%s  cpu %.0f%%  win %.1f fps",
+	        fps, shown_s, avg_ms, max_ms, low1_ms, speed, backend, scenes, draws, (gpu && fd) ? " (sw fallback)" : "", cpu, wfps);
 
 	/* the overlay's own lines, in its font's upper-case + digits + ". : / - %" charset only */
-	snprintf(line_full[0], sizeof line_full[0], "FPS %.1f FRAME %.1f/%.1f/%.1f MS", fps, avg_ms, max_ms, low1_ms);
-	snprintf(line_full[1], sizeof line_full[1], "SPEED %.2fX WINDOW %.1f FPS", speed, wfps);
-	snprintf(line_full[2], sizeof line_full[2], "%s%s %uSCN %uDR %uSW", gpu ? "GPU" : "SOFT", gpu && rs == 2 ? " 2X" : gpu && rs == 3 ? " 3X" : gpu && rs == 4 ? " 4X" : "", scenes, draws, fd);
-	snprintf(line_full[3], sizeof line_full[3], "RENDER %.1fMS PRESENT %.1fMS", render_ms, present_ms);
-	snprintf(line_full[4], sizeof line_full[4], "CPU %.0f%% THREADS %d", cpu, threads);
-	snprintf(line_full[5], sizeof line_full[5], "AUDIO %uMS Q %u UNDERRUN", am, au);
-	n_full = 6;
+	int l = 0;   /* (frame generation on: the first line, the one the FPS level shows, is the game's fps and the frames shown, the timings a line of their own) */
+	if (shown) { snprintf(line_full[l++], sizeof line_full[0], "FPS %.1f FRAME GEN %u", fps, shown); snprintf(line_full[l++], sizeof line_full[0], "FRAME %.1f/%.1f/%.1f MS", avg_ms, max_ms, low1_ms); }
+	else snprintf(line_full[l++], sizeof line_full[0], "FPS %.1f FRAME %.1f/%.1f/%.1f MS", fps, avg_ms, max_ms, low1_ms);
+	snprintf(line_full[l++], sizeof line_full[0], "SPEED %.2fX WINDOW %.1f FPS", speed, wfps);
+	snprintf(line_full[l++], sizeof line_full[0], "%s%s %uSCN %uDR %uSW", gpu ? "GPU" : "SOFT", gpu && rs == 2 ? " 2X" : gpu && rs == 3 ? " 3X" : gpu && rs == 4 ? " 4X" : "", scenes, draws, fd);
+	snprintf(line_full[l++], sizeof line_full[0], "RENDER %.1fMS PRESENT %.1fMS", render_ms, present_ms);
+	snprintf(line_full[l++], sizeof line_full[0], "CPU %.0f%% THREADS %d", cpu, threads);
+	snprintf(line_full[l++], sizeof line_full[0], "AUDIO %uMS Q %u UNDERRUN", am, au);
+	n_full = l;
 
 	rebuild_osd(metrics_osd_level());
 	maybe_dump_osd();
