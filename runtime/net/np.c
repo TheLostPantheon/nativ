@@ -296,6 +296,44 @@ static void h_np_basic_check_callback(Cpu *c) {
 }
 
 static void h_np_one(Cpu *c) { RET(1); }
+/* ---- SceNpCommon's comparisons, as the firmware's np_common has them (its sceNpCmpNpId, sceNpCmpOnlineId and
+ * sceNpCmpNpIdInOrder, read from the recompiled module): a game that loads np_common (the online packs) runs Sony's own,
+ * every other game these. A SceNpId: the online id's 16 characters (+0, then a terminator), opt[8] (+0x14: four bytes,
+ * then the platform's four at +0x18) and reserved[8] (+0x1c), whose first byte is 1 in an id the system made. A null
+ * argument is INVALID_ARGUMENT, an id not made by the system (reserved[0] != 1) 0x80550605, a mismatch NOT_MATCH. */
+#define NP_UTIL_INVALID_ARGUMENT 0x80550601u
+#define NP_UTIL_INVALID_NP_ID    0x80550605u
+#define NP_UTIL_NOT_MATCH        0x80550609u
+static int np_ids_ok(uint32_t a, uint32_t b) { return RD8(a + 0x1c) == 1 && RD8(b + 0x1c) == 1; }
+static void h_np_cmp_np_id(Cpu *c) {   /* (const SceNpId *, const SceNpId *) -> 0 the same player */
+	const uint32_t a = A0, b = A1;
+	if (!a || !b) { RET(NP_UTIL_INVALID_ARGUMENT); return; }
+	if (!np_ids_ok(a, b)) { RET(NP_UTIL_INVALID_NP_ID); return; }
+	if (strncmp((const char *)G(a), (const char *)G(b), 16) || memcmp(G(a + 0x14), G(b + 0x14), 4)) { RET(NP_UTIL_NOT_MATCH); return; }
+	/* the platform: the same, or either id without one */
+	RET(!memcmp(G(a + 0x18), G(b + 0x18), 4) || !RD8(a + 0x18) || !RD8(b + 0x18) ? 0 : NP_UTIL_NOT_MATCH);
+}
+static void h_np_cmp_online_id(Cpu *c) {   /* (const SceNpId *, const SceNpId *): the online ids alone */
+	const uint32_t a = A0, b = A1;
+	if (!a || !b) { RET(NP_UTIL_INVALID_ARGUMENT); return; }
+	if (!np_ids_ok(a, b)) { RET(NP_UTIL_INVALID_NP_ID); return; }
+	RET(strncmp((const char *)G(a), (const char *)G(b), 16) ? NP_UTIL_NOT_MATCH : 0);
+}
+static int np_sign(int r) { return r < 0 ? -1 : r > 0; }
+static void h_np_cmp_np_id_in_order(Cpu *c) {   /* (const SceNpId *, const SceNpId *, int *order): -1, 0 or 1 */
+	const uint32_t a = A0, b = A1, out = A2;
+	if (!a || !b || !out) { RET(NP_UTIL_INVALID_ARGUMENT); return; }
+	if (!np_ids_ok(a, b)) { RET(NP_UTIL_INVALID_NP_ID); return; }
+	int r = np_sign(strncmp((const char *)G(a), (const char *)G(b), 16));
+	if (!r) r = np_sign(memcmp(G(a + 0x14), G(b + 0x14), 4));
+	if (!r && (RD8(a + 0x18) || RD8(b + 0x18))) {   /* the platform; an id without one is "psp2" (np_common's default) */
+		const void *pa = RD8(a + 0x18) ? (const void *)G(a + 0x18) : "psp2", *pb = RD8(b + 0x18) ? (const void *)G(b + 0x18) : "psp2";
+		r = np_sign(memcmp(pa, pb, 4));
+	}
+	WR32(out, (uint32_t)r);
+	RET(0);
+}
+
 /* ---- offline (hle.c: a game not run online): PSN signed out. The service state reads SIGNED_OUT and a registered state
  * callback hears it once, at the next sceNpCheckCallback, as the online path tells ONLINE; everything else of NP stays
  * with main.c's catch-all ("not initialised"). Before, sceNpGetServiceState was that catch-all too: an error and its
@@ -313,6 +351,7 @@ const HleEntry hle_np_offline[] = {
 	{"sceNpInit", h_np_offline_init}, {"sceNpTerm", h_np_offline_init}, {"sceNpGetServiceState", h_np_offline_state},
 	{"sceNpRegisterServiceStateCallback", h_np_register_state}, {"sceNpUnregisterServiceStateCallback", h_np_unregister_state},
 	{"sceNpCheckCallback", h_np_offline_check_callback},
+	{"sceNpCmpNpId", h_np_cmp_np_id}, {"sceNpCmpOnlineId", h_np_cmp_online_id}, {"sceNpCmpNpIdInOrder", h_np_cmp_np_id_in_order},
 	{0, 0},
 };
 
@@ -336,5 +375,6 @@ const HleEntry hle_np[] = {
 	{"sceNpLookupInit", h_np_zero}, {"sceNpLookupTerm", h_np_zero}, {"sceNpLookupCreateTitleCtx", h_np_lookup_create}, {"sceNpLookupDeleteTitleCtx", h_np_zero},
 	{"sceNpLookupCreateRequest", h_np_lookup_create}, {"sceNpLookupDeleteRequest", h_np_zero}, {"sceNpLookupAbortRequest", h_np_zero},
 	{"sceNpLookupUserProfileAsync", h_np_lookup_profile}, {"sceNpLookupPollAsync", h_np_lookup_poll},
+	{"sceNpCmpNpId", h_np_cmp_np_id}, {"sceNpCmpOnlineId", h_np_cmp_online_id}, {"sceNpCmpNpIdInOrder", h_np_cmp_np_id_in_order},   /* (np_common's own, when it's loaded) */
 	{0, 0},
 };

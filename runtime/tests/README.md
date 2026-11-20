@@ -171,6 +171,17 @@ network without asking any server. It uses real loopback sockets.
 
 It prints `all passed`.
 
+## PSN comparisons and offline state: `np_test.c`
+
+Checks the parts of `runtime/net/np.c` every game gets. SceNpCommon's comparisons, as the firmware's `np_common` has
+them: the same player, one id without a platform (still the same player), another online id, platform or option bytes
+(not), an id the system didn't make, a null argument, and the ordered comparison's -1, 0 and 1 (an id without a platform
+counts as "psp2"). And offline PSN: the service state reads signed out, and a registered state callback hears it once.
+
+    cc -O1 -g -w $INC np_test.c -o /tmp/np_test -lpthread && /tmp/np_test
+
+It prints `all passed`.
+
 ## The audio decoder: `audiodec_test.c`
 
 Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`
