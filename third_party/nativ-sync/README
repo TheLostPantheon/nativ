@@ -1,0 +1,3 @@
+nsync_proto.c / nsync_proto.h: the Nativ Sync protocol's pairing, frames and manifest hashes, from
+https://github.com/TheLostPantheon/nativ-sync (common/), MIT licensed (the SPDX line in each file). The Vita's service
+compiles the same file. Over Monocypher (third_party/monocypher). Keep it identical to the nativ-sync repository's copy.
