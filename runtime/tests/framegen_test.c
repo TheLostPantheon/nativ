@@ -132,9 +132,9 @@ static void bench(uint32_t w, uint32_t h) {
  * a bright, softly textured background (a sky, a lit wall) and a dark object on it, each moving its own way over the
  * pair. Checked at t = 1/4 and 1/2 against the scene drawn at t: the error in a band around the object's edges (where a
  * wrong vector shows the background's colour around it, or a ghost of it) and how much of that band came out much
- * brighter than it should (a light outline). A thin object (narrower than its motion over the pair) is lost from the made
- * frames, the background shown in its place: the search sees the background in its blocks, and where two motions both fit
- * a pixel the still one is taken (what keeps a HUD sharp). Those two are printed, not checked. */
+ * brighter than it should (a light outline). A thin object (narrower than its motion over the pair) used to vanish from
+ * the made frames, the background shown in its place (band error 41-45, 28% of it light); the forward search and its
+ * projection keep most of it now, in pieces: checked loosely, against a return of that. */
 typedef struct { const char *name; float bx, by, ox, oy; int thin; } ObjCase;   /* background's motion, object's, a thin one */
 enum { OW = 2880, OH = 1632 };
 static float sky(float x, float y) { return 0.78f + 0.3f * (scene(x / 3, y / 3) - 0.5f); }
@@ -176,8 +176,9 @@ static int objects(void) {
 			double e = (abs(p[0] - q[0]) + abs(p[1] - q[1]) + abs(p[2] - q[2])) / 3.0;
 			if (edge || (cs[i].thin && m)) { band += e; nb++; if (p[0] + p[1] + p[2] > q[0] + q[1] + q[2] + 3 * 64) light++; } else { rest += e; nr++; }
 		}
-		double eb = band / (double)nb, lp = 100.0 * (double)light / (double)nb; int ok = cs[i].thin || (eb < 6.0 && lp < 1.0 && rest / (double)nr < 2.0);
-		printf("%-34s t %.2f: edge band error %5.2f, %5.2f%% of it light, elsewhere %.2f, %.2f ms  %s\n", cs[i].name, t, eb, lp, rest / (double)nr, ms, cs[i].thin ? "(not checked)" : ok ? "ok" : "FAIL");
+		double eb = band / (double)nb, lp = 100.0 * (double)light / (double)nb;
+		int ok = cs[i].thin ? eb < 38.0 && lp < 24.0 : eb < 6.0 && lp < 1.0 && rest / (double)nr < 2.0;
+		printf("%-34s t %.2f: edge band error %5.2f, %5.2f%% of it light, elsewhere %.2f, %.2f ms  %s\n", cs[i].name, t, eb, lp, rest / (double)nr, ms, ok ? "ok" : "FAIL");
 		if (!ok) fails++;
 		if (getenv("FG_TEST_OUT")) { char p[512]; snprintf(p, sizeof p, "%s/obj%zu_%d_made.png", getenv("FG_TEST_OUT"), i, k); save(p, g, OW, OH);
 			snprintf(p, sizeof p, "%s/obj%zu_%d_want.png", getenv("FG_TEST_OUT"), i, k); save(p, want, OW, OH); }

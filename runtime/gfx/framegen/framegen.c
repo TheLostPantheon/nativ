@@ -8,17 +8,25 @@
  *   2. search   a vector per 4x4 block at each level, coarsest first: the previous frame at -v/2 matched against the
  *               current one at +v/2 (where the generated frame needs its vectors), each level starting from the
  *               coarser one's, the finest to half a pixel
- *   3. stat     the finest level's mean match: a cut (frames that don't match as a whole) isn't blended
- *   4. pick     per pixel of the working size at time t, the block vector around it (or zero) the two frames agree
- *               on best there: a still HUD keeps its own pixels still over a moving scene
+ *   3. stat     the finest level's mean match (a cut: frames that don't match as a whole aren't blended) and mean
+ *               vector (the scene's motion as a whole)
+ *   3b. fsearch per block of the finest field, its symmetric vector checked forward (the previous frame's window
+ *               against the current one's along it); where that doesn't explain it -- something left or came in: a
+ *               thin object, an edge being covered -- every vector within a radius at half the working size, forward
+ *   3c. project that forward motion carried to time t, per block: what lands there, furthest from the mean motion
+ *               (in front)
+ *   4. pick     per pixel of the working size at time t, the block vector around it (or zero, or the projected one)
+ *               the two frames agree on best there; a projected one also wins a tie when it is further from the mean
+ *               motion: a still HUD keeps its own pixels still over a moving scene, a thin object keeps its motion
+ *               over a still one
  *   5. warp     the frame: each pixel the previous frame at -t*v blended with the current one at +(1-t)*v, v the one of
  *               the picked vectors around it the two agree on best at that pixel (an object's edge inside a working
  *               pixel); where none agrees, the side nearer to the pixel as the nearer frame has it, not a ghost of both
  *
- * Known: a thin object moving further than its own width over the pair is lost from the made frames (the search sees
- * the background in its blocks, and a still match wins a tie, which is what keeps a HUD sharp); framegen_test --objects.
+ * A thin object (narrower than its motion over the pair) is what 3b-3c are for: the symmetric search sees the background
+ * in its blocks and "still" matches it as well as its own motion; framegen_test --objects checks it.
  *
- * 1 runs once per game frame, 2-3 once per pair (on its first generated frame), 4-5 per generated frame. The passes
+ * 1 runs once per game frame, 2-3b once per pair (on its first generated frame), 3c-5 per generated frame. The passes
  * are GLSL compute shaders (*.comp here, compiled by build.sh into ../framegen_shaders.h), run as SPIR-V on Vulkan
  * and through SPIRV-Cross on Metal. Written for Nativ, not taken from an existing interpolator.
  */
@@ -39,22 +47,27 @@ int settings_int(const char *key, int def);
 #define LAMBDA 0.002f   /* a vector's cost per pixel of difference from its parent's (mean luma difference units) */
 #define ZERO_BIAS 0.003f
 #define CUT 0.10f       /* the finest level's mean difference above which the pair is a cut */
+#define FRADIUS 10      /* the forward search's radius at half the working size: +-20 working pixels */
+#define FEXPLAINED 0.03f   /* a forward window difference below which the symmetric vector explains a block */
+#define PRADIUS 4       /* the projection's, in blocks: a motion of up to 4 * 4 / t working pixels lands within it */
 
-enum { P_REDUCE, P_SEARCH, P_PICK, P_WARP, P_STAT, NP };
+enum { P_REDUCE, P_SEARCH, P_PICK, P_WARP, P_STAT, P_FSEARCH, P_PROJECT, NP };
 typedef struct { const char *name; const uint32_t *code; size_t size; int nsamp, gx, gy; } Pass;
 static const Pass passes[NP] = {   /* each writes one image and takes the one constant block */
 	{ "reduce", fg_reduce, sizeof fg_reduce, 1, 8, 8 },
 	{ "search", fg_search, sizeof fg_search, 3, 8, 8 },
-	{ "pick", fg_pick, sizeof fg_pick, 3, 8, 8 },
+	{ "pick", fg_pick, sizeof fg_pick, 5, 8, 8 },
 	{ "warp", fg_warp, sizeof fg_warp, 4, 8, 8 },
 	{ "stat", fg_stat, sizeof fg_stat, 1, 16, 16 },
+	{ "fsearch", fg_fsearch, sizeof fg_fsearch, 3, 8, 8 },
+	{ "project", fg_project, sizeof fg_project, 2, 8, 8 },
 };
 typedef struct { int32_t a[4], b[4]; float c[4], d[4]; } U;   /* common.glsl's block (std140) */
 
 static struct {
 	uint32_t w, h, levels;                      /* the frames these were made for */
-	int scale, nl; uint32_t lw[NL], lh[NL], fw[NL], fh[NL];
-	SDL_GPUTexture *col[2], *lum[2][NL], *fld[NL], *pix, *stat, *gen;
+	int scale, nl, flev; uint32_t lw[NL], lh[NL], fw[NL], fh[NL];   /* flev: the forward search's level (its field is the finest's grid) */
+	SDL_GPUTexture *col[2], *lum[2][NL], *fld[NL], *pix, *stat, *gen, *ffld, *proj;
 	SDL_GPUSampler *lin;
 	SDL_GPUComputePipeline *pipe[NP]; int tried[NP];
 	int cur, have, flow, failed, said;
@@ -116,7 +129,7 @@ static SDL_GPUTexture *tex(SDL_GPUDevice *dev, SDL_GPUTextureFormat fmt, uint32_
 	return t;
 }
 static void release_all(SDL_GPUDevice *dev) {
-	SDL_GPUTexture **t[4 + 3 * NL + 1] = { &G.col[0], &G.col[1], &G.pix, &G.stat, &G.gen }; int n = 5;
+	SDL_GPUTexture **t[7 + 3 * NL] = { &G.col[0], &G.col[1], &G.pix, &G.stat, &G.gen, &G.ffld, &G.proj }; int n = 7;
 	for (int k = 0; k < NL; k++) { t[n++] = &G.lum[0][k]; t[n++] = &G.lum[1][k]; t[n++] = &G.fld[k]; }
 	for (int i = 0; i < n; i++) if (*t[i]) { SDL_ReleaseGPUTexture(dev, *t[i]); *t[i] = 0; }
 }
@@ -134,7 +147,10 @@ static int make_all(SDL_GPUDevice *dev, uint32_t w, uint32_t h, uint32_t levels)
 		G.fld[k] = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[k], G.fh[k], 1, S | W);
 	}
 	G.pix = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.lw[0], G.lh[0], 1, S | W);
-	G.stat = tex(dev, SDL_GPU_TEXTUREFORMAT_R32_FLOAT, 1, 1, 1, S | W);
+	G.stat = tex(dev, SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT, 1, 1, 1, S | W);
+	G.flev = G.nl > 1 ? 1 : 0;
+	G.ffld = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[0], G.fh[0], 1, S | W);
+	G.proj = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[0], G.fh[0], 1, S | W);
 	G.gen = tex(dev, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, w, h, levels, S | W | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET);   /* (a colour target: its mips) */
 	if (!G.lin) {
 		SDL_GPUSamplerCreateInfo sci = { .min_filter = SDL_GPU_FILTER_LINEAR, .mag_filter = SDL_GPU_FILTER_LINEAR, .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
@@ -149,7 +165,7 @@ static int make_all(SDL_GPUDevice *dev, uint32_t w, uint32_t h, uint32_t levels)
 
 static void run(SDL_GPUCommandBuffer *cmd, int p, SDL_GPUTexture *const *in, SDL_GPUTexture *out, const U *u, uint32_t w, uint32_t h) {
 	SDL_GPUStorageTextureReadWriteBinding tb = { .texture = out };
-	SDL_GPUTextureSamplerBinding sb[4];
+	SDL_GPUTextureSamplerBinding sb[5];
 	for (int i = 0; i < passes[p].nsamp; i++) sb[i] = (SDL_GPUTextureSamplerBinding){ .texture = in[i], .sampler = G.lin };
 	SDL_PushGPUComputeUniformData(cmd, 0, u, sizeof *u);
 	SDL_GPUComputePass *cp = SDL_BeginGPUComputePass(cmd, &tb, 1, 0, 0);
@@ -195,10 +211,17 @@ SDL_GPUTexture *fg_make(SDL_GPUDevice *dev, SDL_GPUCommandBuffer *cmd, float t) 
 		}
 		U s = { { (int)G.fw[0], (int)G.fh[0] } };
 		run(cmd, P_STAT, &G.fld[0], G.stat, &s, 16, 16);
+		const int k = G.flev;
+		U f = { { (int)G.lw[k], (int)G.lh[k], (int)G.fw[0], (int)G.fh[0] }, { 0, 1 << k, FRADIUS, 0 }, { 1.0f / (float)G.lw[k], 1.0f / (float)G.lh[k], FEXPLAINED, ZERO_BIAS } };
+		SDL_GPUTexture *fin[3] = { G.lum[p][k], G.lum[c][k], G.fld[0] };
+		run(cmd, P_FSEARCH, fin, G.ffld, &f, G.fw[0], G.fh[0]);
 		G.flow = 1;
 	}
+	U pj = { { (int)G.fw[0], (int)G.fh[0] }, { PRADIUS }, { 0, 0, t } };
+	SDL_GPUTexture *pin[2] = { G.ffld, G.stat };
+	run(cmd, P_PROJECT, pin, G.proj, &pj, G.fw[0], G.fh[0]);
 	U u = { { (int)G.lw[0], (int)G.lh[0], (int)G.fw[0], (int)G.fh[0] }, { 0 }, { 1.0f / (float)G.lw[0], 1.0f / (float)G.lh[0], t } };
-	SDL_GPUTexture *in[3] = { G.lum[p][0], G.lum[c][0], G.fld[0] };
+	SDL_GPUTexture *in[5] = { G.lum[p][0], G.lum[c][0], G.fld[0], G.proj, G.stat };
 	run(cmd, P_PICK, in, G.pix, &u, G.lw[0], G.lh[0]);
 	U w = { { (int)G.w, (int)G.h, (int)G.lw[0], (int)G.lh[0] }, { G.scale }, { 1.0f / (float)G.w, 1.0f / (float)G.h, t, CUT } };
 	SDL_GPUTexture *win[4] = { G.col[p], G.col[c], G.pix, G.stat };

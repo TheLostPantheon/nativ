@@ -1,0 +1,42 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The forward motion of what the symmetric search can't explain, per block of the finest field (4x4 working pixels),
+// searched at half the working size. First the block's own symmetric vector, forward: the previous frame's 4x4 window
+// centred on the block against the current frame's along it. If that explains it (the window still matches), nothing
+// more: most of a pan, a still scene, a HUD. If not -- something left the block or came into it: a thin object moving
+// further than its own width (the symmetric search sees the background around it, and "still" matches that as well),
+// an edge being covered -- every vector within a radius, the zero vector favoured by a bias, and the best kept as the
+// block's forward motion if it explains the block (a thin object's does, its background flat or still around it; a
+// window half of a still HUD and half of the scene moving under it has no one motion, and its best guess would be a
+// candidate that only matches by chance). project.comp carries those to the made frame's time.
+//   a.xy  level size      a.zw  field size (blocks)      b.y  working pixels per level pixel (2, or 1 with no half level)
+//   b.z  radius (level pixels)      c.xy  1 / level size      c.z  the window difference that counts as explained
+//   c.w  the zero vector's bias
+// Out: xy the vector (working pixels, previous -> current), z 1 when it's a motion the symmetric field doesn't have.
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D prv;
+layout(set = 0, binding = 1) uniform sampler2D cur;
+layout(set = 0, binding = 2) uniform sampler2D fld;   /* (the finest symmetric field: working pixels) */
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D outp;
+float pv[16]; vec2 O;
+float diff_along(vec2 v) {
+	float s = 0.0;
+	for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) s += abs(pv[j * 4 + i] - textureLod(cur, (O + vec2(i, j) + v) * u.c.xy, 0.0).r);
+	return s * (1.0 / 16.0);
+}
+void main() {
+	ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+	if (b.x >= u.a.z || b.y >= u.a.w) return;
+	float k = float(u.b.y);
+	O = (vec2(b * 4) + 2.0) / k - 2.0 + 0.5;   /* (the window's first texel centre: 4x4 level pixels centred on the block) */
+	for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) pv[j * 4 + i] = textureLod(prv, (O + vec2(i, j)) * u.c.xy, 0.0).r;
+	vec2 own = texelFetch(fld, b, 0).xy;
+	if (diff_along(own / k) < u.c.z) { imageStore(outp, b, vec4(own, 0.0, 0.0)); return; }
+	vec2 best = vec2(0.0); float bc = 1e9, raw = 1e9;
+	for (int y = -u.b.z; y <= u.b.z; y++) for (int x = -u.b.z; x <= u.b.z; x++) {
+		vec2 v = vec2(x, y); float d = diff_along(v), c = d - ((x == 0 && y == 0) ? u.c.w : 0.0);
+		if (c < bc) { bc = c; best = v; raw = d; }
+	}
+	imageStore(outp, b, vec4(best * k, raw < u.c.z ? 1.0 : 0.0, 0.0));
+}
