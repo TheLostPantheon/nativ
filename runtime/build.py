@@ -207,12 +207,27 @@ def main(argv):
         if not os.path.isfile(o) or newer(s, o) or newer(os.path.join(RT, "ui", "overlay.h"), o) or (s.endswith("overlay.cpp") and newer(PROMPTS_H, o)):
             work.append(([CXX, "-c"] + CXXFLAGS + [s, "-o", f"{o}.{os.getpid()}"], s, o, CXX, True))
 
+    # A generated file the compiler fails on is compiled once more with its vectorizers off: the code is ours, but the
+    # optimiser has bugs of its own. Apple clang 21's loop vectorizer made an add between a 4- and a 16-lane vector out of
+    # a loop of LittleBigPlanet's summing bytes four at a time, and the back end died on it ("Do not know how to split this
+    # operator's operand!"). The first attempt's messages are shown only when the second fails too. The object stays
+    # newer than its source, so later builds keep it.
+    gcc = "Free Software Foundation" in " ".join(out_of([CC, "--version"]))
+    NOVEC = ["-fno-tree-vectorize"] if gcc else ["-fno-vectorize", "-fno-slp-vectorize"]
     def compile_one(w):
         argv, s, o, cc, tmp = w
-        r = subprocess.run(argv)
+        generated = not tmp and not s.startswith(os.path.join(ROOT, "third_party"))
+        r = subprocess.run(argv, capture_output=generated, text=generated)
+        if r.returncode and generated:
+            r2 = subprocess.run(argv[:-3] + NOVEC + argv[-3:])   # (after -O2: clang takes an -O level as turning them back on, the last word wins)
+            if not r2.returncode:
+                say(f"  {cc} {os.path.basename(s)} (again with the vectorizers off: the compiler failed on it)")
+                return None
+            sys.stderr.write(r.stderr)
         if r.returncode:
             if tmp: _rm(argv[-1])
             return s
+        if generated and r.stderr: sys.stderr.write(r.stderr)
         if tmp: os.replace(argv[-1], o)
         say(f"  {cc} {os.path.basename(s)}")
         return None
