@@ -3144,7 +3144,10 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	if (scene_entry->drawn_frame != gpu_frame_no + 1) { scene_entry->prev_drawn_frame = scene_entry->drawn_frame; scene_entry->drawn_frame = gpu_frame_no + 1; }   /* (+1: 0 = never) */
 	scene_snap = 0;
 	if (scene_entry != &scratch_entry && scene_entry->self_read) {   /* (same_region_read) */
-		if (gpu_snap_on() && scene_entry->gpu_dirty && target_snapshot(scene_entry)) scene_snap = 2;
+		/* the GPU snapshot also when guest memory holds the same pixels (a readback after the scene before): the guest-memory
+		 * path then decodes the target as a texture on the CPU for the scene's reads. Resistance reads its 1024x256 F16 bloom
+		 * atlas on the CPU after every scene, so its blur passes re-decoded the atlas every other frame, 20 ms each time */
+		if (gpu_snap_on() && target_snapshot(scene_entry)) scene_snap = 2;
 		else { if (scene_entry->gpu_dirty) { sync_why = "(scene start: read in its own scene)"; target_download_to_guest(scene_entry); } scene_snap = 1; }
 	}
 	scene_entry->depth = scene_entry->own_depth;   /* (never a texture a previous scene borrowed from the depth table: it may be gone) */
