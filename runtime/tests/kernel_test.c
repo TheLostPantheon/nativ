@@ -404,8 +404,9 @@ static void test_threads(void) {
 	CHECK(t >= 0x40010100 && !(t & 1));
 	CHECKEQ(call(h_thread_info, 2, t, info), 0); CHECKEQ(RD32(info + 0x2c), 16); CHECKEQ(RD32(info + 0x3c), 165); CHECKEQ(RD32(info + 0x28), 0x80000000u);
 	uint32_t arg = word(); WR32(arg, 0xabcd);
-	CHECKEQ(call(h_start_thread, 3, t, 4, arg), 0);
-	CHECKEQ(call(h_start_thread, 3, t, 4, arg), E_NOT_DORMANT);
+	CHECKEQ(call(h_start_thread, 3, t, 4, arg), 0);   /* (no second start here: this entry returns at once, so the thread may already
+	                                                   * be DORMANT again and a restart rightly succeeds; a thread blocked on a
+	                                                   * semaphore checks E_NOT_DORMANT below. A slow CI runner hit it, 2026-11-20) */
 	uint32_t st = word(); WR32(st, 0xffffffff);
 	CHECKEQ(call(h_wait_thread_end, 3, t, st, 0), 0); CHECKEQ(RD32(st), 1);
 	CHECKEQ(call(h_thread_exit_status, 2, t, st), 0); CHECKEQ(RD32(st), 1);
