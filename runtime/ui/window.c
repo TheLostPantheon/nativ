@@ -42,6 +42,7 @@
 #include "settings.h"
 #include "overlay.h"
 #include "padbind.h"
+#include "framegen/framegen.h"
 
 enum { SELECT = 0x1, START = 0x8, UP = 0x10, RIGHT = 0x20, DOWN = 0x40, LEFT = 0x80, LTRIG = 0x100, RTRIG = 0x200,
        TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000, SQUARE = 0x8000,
@@ -78,6 +79,7 @@ static void pad_sticks(int only) {   /* (only: the stick whose axis moved, 0 lef
 }
 static int active;
 static int self_paced; static uint64_t last_paced_us;   /* a present mode that doesn't wait for vsync: the present loop paces itself */
+static SDL_GPUPresentMode base_pm = SDL_GPU_PRESENTMODE_VSYNC;   /* the present mode chosen at start (frame generation asks for vsync while it is on) */
 static volatile int touch_down, touch_x, touch_y;   /* the mouse as the front touch panel (1920x1088) */
 /* Gamepad touch -- the agreed scheme (memory: input-touch-mapping-design): the triggers are L and R;
  * the bumpers are touch modifiers. A DS4/DualSense touchpad's fingers touch the front panel finger
@@ -646,6 +648,41 @@ void audio_output(int dev, const void *buf, uint32_t bytes) {
 	}
 }
 
+/* frame generation (runtime/gfx/framegen): a game drawing fewer frames than the display refreshes has each frame shown
+ * for n refreshes; all but the last of them show frames made between it and the one before (t = 1/n, 2/n, ...), so the
+ * motion steps every refresh. n: the median of the last 8 gaps between new frames, in refreshes (2 for a 30 fps game on
+ * 60 Hz, 4 on 120 Hz; 1, nothing to make, at the display's own rate). The made frames come first, so the picture is
+ * (n-1)/n of a game frame later than without: the price of the smoothness. A late game frame: the newest stays up. */
+static int fg_late;   /* refreshes a new game frame waits behind the made ones (the A/V sync's picture term counts them) */
+static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t w, uint32_t h, uint32_t levels, int fresh) {
+	static int on, since, gaps[8], ngap, phase, n = 1;
+	static int log = -1; static unsigned made, frames; static uint64_t t_log;   /* counted each second (RECOMP_FRAME_GEN_LOG=1 logs them) */
+	if (log < 0) log = getenv("RECOMP_FRAME_GEN_LOG") != 0;
+	if (!fg_wanted()) { if (on) { fg_forget(); on = 0; metrics_set_frame_gen(0); } fg_late = 0; return src; }
+	if (!on) { fg_forget(); on = 1; ngap = 0; since = 0; phase = 0; n = 1; }
+	since++;
+	if (fresh) {
+		gaps[ngap++ % 8] = since; since = 0;
+		int k = ngap < 8 ? ngap : 8, s[8];
+		memcpy(s, gaps, sizeof s);
+		for (int i = 1; i < k; i++) for (int j = i; j > 0 && s[j - 1] > s[j]; j--) { int x = s[j]; s[j] = s[j - 1]; s[j - 1] = x; }
+		n = s[k / 2]; if (n < 1) n = 1; if (n > 4) n = 4;
+		fg_frame(gpu, cmd, src, w, h, levels);
+		phase = 0; frames++;
+	}
+	fg_late = n >= 2 ? n - 1 : 0;
+	if (now_us() - t_log > 1000000) {   /* each second: the frames shown, for the fps counters (metrics.c), and RECOMP_FRAME_GEN_LOG=1's cadence */
+		metrics_set_frame_gen(made ? frames + made : 0);
+		if (log) fprintf(stderr, "    framegen: every game frame shown for %d refreshes, %u game frames and %u made in the last second\n", n, frames, made);
+		made = frames = 0; t_log = now_us();
+	}
+	if (n < 2 || phase >= n - 1) return src;
+	SDL_GPUTexture *g = fg_make(gpu, cmd, (float)(phase + 1) / (float)n);
+	phase++;
+	if (g) made++;
+	return g ? g : src;
+}
+
 /* the GPU backend's frame: blitted (on the game thread) into one of three RGBA8 textures here, the
  * present loop shows the latest; three so the one being written is never the one being shown */
 static SDL_GPUTexture *gtex[3]; static uint32_t gtw[3], gth[3]; static int gidx = -1, gshow = -1, gnew;
@@ -1009,7 +1046,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 		 * gfx_gpu.c fetch_blit) */
 		SDL_GPUPresentMode pm = pe ? (!strcmp(pe, "immediate") ? SDL_GPU_PRESENTMODE_IMMEDIATE : !strcmp(pe, "mailbox") ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC)
 		                           : dv && !strcmp(dv, "vulkan") ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC;
-		if (pm != SDL_GPU_PRESENTMODE_VSYNC && SDL_WindowSupportsGPUPresentMode(gpu, win, pm) && SDL_SetGPUSwapchainParameters(gpu, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pm)) self_paced = 1;
+		if (pm != SDL_GPU_PRESENTMODE_VSYNC && SDL_WindowSupportsGPUPresentMode(gpu, win, pm) && SDL_SetGPUSwapchainParameters(gpu, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pm)) { self_paced = 1; base_pm = pm; }
 		fprintf(stderr, "    window: present mode %s\n", !self_paced ? "vsync" : pm == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "immediate");
 	}
 	/* frames the swapchain may have queued for presentation (SDL's default 2): each one is a refresh
@@ -1439,6 +1476,19 @@ void window_run(void *(*fn)(void *), void *arg) {
 			while (!__atomic_load_n(&gnew, __ATOMIC_ACQUIRE) && !__atomic_load_n(&new_frame, __ATOMIC_ACQUIRE) && now_us() - last_paced_us < period) SDL_DelayPrecise(250000);
 			last_paced_us = now_us();
 		}
+		{	/* frame generation shows a made frame on a refresh of its own: with mailbox (Vulkan's default, self-paced above) this
+			 * loop's timer drifts against the display's refresh and the made frames would land two in one refresh or none.
+			 * Vsync while it is on (unless RECOMP_PRESENT_MODE asked for a mode); the start's mode again when it is off */
+			static int fg_vsync = 0; int want = base_pm != SDL_GPU_PRESENTMODE_VSYNC && fg_wanted();
+			if (want != fg_vsync) {
+				extern void gfx_lock_enter(void), gfx_lock_leave(void);
+				gfx_lock_enter();
+				if (SDL_SetGPUSwapchainParameters(gpu, win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, want ? SDL_GPU_PRESENTMODE_VSYNC : base_pm)) { self_paced = !want; fg_vsync = want; }
+				else fg_vsync = want;   /* (refused: leave it, don't retry every refresh) */
+				gfx_lock_leave();
+				fprintf(stderr, "    window: present mode %s (frame generation %s)\n", self_paced ? "mailbox" : "vsync", want ? "on" : "off");
+			}
+		}
 		uint64_t t_blit0 = now_us();
 		SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
 		if (!cmd) continue;
@@ -1476,7 +1526,8 @@ void window_run(void *(*fn)(void *), void *arg) {
 		int have_frame = new_frame;
 		uint32_t pw = fw, ph = fh;
 		SDL_GPUTransferBuffer *up_xfer = 0;
-		if (gnew) { gshow = gidx; gnew = 0; }
+		int fresh = 0;   /* a new game frame this refresh (frame generation's cadence) */
+		if (gnew) { gshow = gidx; gnew = 0; fresh = 1; }
 		SDL_GPUTexture *gsrc = gshow >= 0 ? gtex[gshow] : 0; uint32_t gw = gshow >= 0 ? gtw[gshow] : 0, gh = gshow >= 0 ? gth[gshow] : 0, gl = gshow >= 0 ? gtl[gshow] : 1;
 		if (have_frame && gpu && ensure_src_texture(pw, ph)) {
 			void *dst = SDL_MapGPUTransferBuffer(gpu, xfer, true);
@@ -1495,6 +1546,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			SDL_UploadToGPUTexture(cp, &src, &dst, true);
 			SDL_EndGPUCopyPass(cp);
 		}
+		if (got_swap && swap && gsrc) gsrc = frame_gen(cmd, gsrc, gw, gh, gl, fresh);
 		if (got_swap && swap && (gsrc || src_tex)) {
 			/* the 960x544-aspect frame inside the (resizable) window, in whichever aspect mode the
 			 * overlay's Display page picked (present_rect, above: fit/stretch/fill) */
@@ -1562,7 +1614,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			}
 			if (gsrc && gshow >= 0 && gshow != last_shown && gready_us[gshow]) {
 				uint64_t d = t_blit3 - gready_us[gshow];
-				if (d < 200000) av_video_ms += ((float)d / 1e3f + 1.5f * refresh_ms - av_video_ms) * 0.05f;
+				if (d < 200000) av_video_ms += ((float)d / 1e3f + (1.5f + (float)fg_late) * refresh_ms - av_video_ms) * 0.05f;   /* (+ the refreshes frame generation shows made frames first) */
 				sum += d; n++; if (d > mx) mx = d;
 				if (on && t_blit3 - t_rep > 1000000) {
 					extern float display_frame_period_ms(void);

@@ -897,6 +897,7 @@ def cmd_test(g):
         ("RECOMP_GFX_COVERAGE", "" if ENV.get("TEST_COVERAGE") == "0" else "gfxcov.json"), ("RECOMP_TITLE", g.TITLE_ID), ("RECOMP_GAME_NAME", g.NAME), ("RECOMP_INPUT", g.TEST_INPUT),
         ("RECOMP_TOUCH", g.TEST_TOUCH), ("RECOMP_HEADLESS", "1"), ("RECOMP_FS", "fs"), ("RECOMP_LOG", "0"), ("RECOMP_SHOT", every or frames),
         ("RECOMP_SHOT_LAST", frames)])   # (a series too ends at the test frame: it ran on to the timeout, 15 minutes for shots it had long since taken)
+    if ENV.get("TEST_WINDOW") == "1": e.pop("RECOMP_HEADLESS", None)   # TEST_WINDOW=1: in a window, for what only the window does (present pacing, frame generation, the overlay)
     with open(os.path.join(td, "test.log"), "wb") as log:
         timed(g.exe_argv(os.path.join(OUT, g.EXE)) + [os.path.join("..", g.BASE + ".img"), g.entry(), "100000000000"], e, td, subprocess.DEVNULL, log,
               test_timeout(g))
@@ -994,7 +995,7 @@ def cmd_recipes(g):
 SHIPS = ("vitarecomp", "README.md", "LICENSE", "THIRD_PARTY.md", "requirements.txt", "launcher/", "pipeline/", "recompiler/",
          "decrypt/", "runtime/", "packs/", "third_party/", "assets/brand/png/", "assets/brand/nativ.ico", "assets/brand/nativ.icns",
          "dev/framediff.py")   # (check's comparison: an install can gate itself)
-NOT_SHIPPED = ("decrypt/vitadecrypt/tests/", "runtime/tests/", "runtime/gfx/shaders/", "runtime/gfx/fsr/passes/", "runtime/gfx/fsr/build.sh", "runtime/gfx/fsr/passes.py", "runtime/gfx/fsr/clears.glsl", "runtime/gfx/fsr/ffx_fsr3upscaler_callbacks_nativ.h", "runtime/debug/gfxreplay.c",
+NOT_SHIPPED = ("decrypt/vitadecrypt/tests/", "runtime/tests/", "runtime/gfx/shaders/", "runtime/gfx/fsr/passes/", "runtime/gfx/fsr/build.sh", "runtime/gfx/framegen/build.sh", "runtime/gfx/framegen/common.glsl", "runtime/gfx/framegen/reduce.comp", "runtime/gfx/framegen/search.comp", "runtime/gfx/framegen/pick.comp", "runtime/gfx/framegen/warp.comp", "runtime/gfx/framegen/stat.comp", "runtime/gfx/fsr/passes.py", "runtime/gfx/fsr/clears.glsl", "runtime/gfx/fsr/ffx_fsr3upscaler_callbacks_nativ.h", "runtime/debug/gfxreplay.c",
                "runtime/debug/build_replay.sh", "third_party/kenney-prompts/make.py")
 BUILT = ("launcher/nativ", "launcher/nativ.exe", "launcher/SDL3.dll", "launcher/libSDL3.so.0")   # (the launcher as built here: untracked, shipped when present)
 DIST_LIST = ".nativ-dist"   # (the files a dist wrote: the next one over it removes those it no longer ships, and only those)

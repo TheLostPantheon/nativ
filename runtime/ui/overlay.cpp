@@ -93,6 +93,7 @@ float window_aspect_widen(void);
 /* metrics.c: the F1 overlay's level, direct (not just cycling) and F1's cycle, and the live fps for the Performance page */
 int metrics_osd_level(void); void metrics_osd_set(int level); void metrics_osd_cycle(void);
 double metrics_fps(void);
+unsigned metrics_frame_gen_shown(void);
 int metrics_osd_lines(char (*out)[40], int max);   /* the F1 overlay's text, drawn here as the HUD (overlay_marks) */
 /* settings.c */
 int settings_has(const char *key);
@@ -367,6 +368,8 @@ static void page_display(void) {
 		ImGui::SetNextItemWidth(-FLT_MIN);
 		if (ImGui::SliderFloat("##sharp", &sh, 0.0f, 100.0f, sh <= 0.0f ? "Off" : "%.0f%%")) { settings_set_float("sharpen", sh / 100.0f); settings_save(); }
 	}
+	ui::row("Frame generation", "Makes a frame between each two of the game's, for smoother motion where the display refreshes faster than the game draws (a 30 fps game on a 60 Hz display). Adds a little delay to the picture.");
+	{ bool fg = settings_int("frame_gen", 0) != 0; if (ui::toggle("fgen", &fg)) { settings_set_int("frame_gen", fg ? 1 : 0); settings_save(); } }
 	ui::row("Texture filtering", "Keeps textures crisp when seen at an angle.");
 	{	static const int an[5] = {1, 2, 4, 8, 16}; static const char *const names[5] = {"Off##af", "2×##af", "4×##af", "8×##af", "16×##af"};
 		int cur = settings_int("anisotropy", 16), v = 4; for (int i = 0; i < 5; i++) if (an[i] == cur) v = i;
@@ -383,7 +386,9 @@ static void page_performance(void) {
 	ui::row("On-screen stats", "Frame rate and timings drawn over the game. F1 cycles them.");
 	{ static const char *const names[3] = {"Off##osd", "FPS##osd", "Full##osd"}; int lvl = metrics_osd_level(); if (ui::segmented(names, 3, &lvl)) set_osd(lvl); }
 	ui::row("Frame rate now");
-	{ char b[32]; std::snprintf(b, sizeof b, "%.0f fps", metrics_fps()); ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.6f); ImGui::TextUnformatted(b); ImGui::PopFont(); }
+	{ char b[48]; unsigned shown = metrics_frame_gen_shown();   /* (frame generation: the frames shown too) */
+	  if (shown) std::snprintf(b, sizeof b, "%.0f fps, frame gen %u", metrics_fps(), shown); else std::snprintf(b, sizeof b, "%.0f fps", metrics_fps());
+	  ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.6f); ImGui::TextUnformatted(b); ImGui::PopFont(); }
 	ui::rows_end();
 }
 static void page_game(void) {
@@ -931,7 +936,7 @@ static void build_pause_banner(float w, float hgt) {
  * (metrics.c's F1 lines) -- no window, no input, the foreground draw list only */
 static const OverlayMark *g_marks; static int g_nmarks;
 static float g_rear[4];   /* the rear panel's rows on the picture, in window points (x, y, w, h); w 0: none */
-static char g_osd[6][40]; static int g_nosd;   /* the overlay's lines this frame (metrics_osd_lines) */
+static char g_osd[7][40]; static int g_nosd;   /* the overlay's lines this frame (metrics_osd_lines) */
 int overlay_draws_hud(void) { return g_ctx && g_has_window; }
 static void build_marks(void) {
 	ImDrawList *dl = g_intro ? ImGui::GetForegroundDrawList() : ImGui::GetBackgroundDrawList();   /* over the game's frame (LOAD), under the bar and its menus; over the touch card */
@@ -1639,7 +1644,7 @@ void overlay_frame(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w
 }
 void overlay_marks(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, uint32_t w, uint32_t h, double dt_s, const OverlayMark *marks, int n, const float rear_rect[4]) {
 	if (overlay_is_open()) return;   /* the menu has its own fps line (page_performance) */
-	g_nosd = metrics_osd_lines(g_osd, 6);
+	g_nosd = metrics_osd_lines(g_osd, 7);
 	/* headless (the dump's HUD check): only with something to show. Windowed: every present -- the bar's
 	 * hover and timers, the cursor and the capture flag live in this frame (a frame that draws nothing is
 	 * a few microseconds of CPU and no render pass: render_frame) */
@@ -1696,7 +1701,7 @@ void overlay_render_forced(SDL_GPUDevice *device, SDL_GPUTexture *target, uint32
 	}
 	if (!strcmp(ui, "toast")) g_force_toast = true;
 	else { g_force_bar = true; if (strcmp(ui, "bar")) g_force_menu = ui; }
-	g_nosd = metrics_osd_lines(g_osd, 6);   /* the HUD too (RECOMP_OSD), in the same frame as the bar so it layers as it does live: under it */
+	g_nosd = metrics_osd_lines(g_osd, 7);   /* the HUD too (RECOMP_OSD), in the same frame as the bar so it layers as it does live: under it */
 	/* three frames: the bar's first, its menu popup's auto-fit on the second, and only the settled third
 	 * drawn (the texture is LOADed into, so drawing all three would stack the bar's translucency) */
 	for (int i = 0; i < 3; i++) forced_frame(device, target, w, h, i == 2, build_closed);

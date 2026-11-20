@@ -133,6 +133,20 @@ the game's own first Play.
 
 It prints `all N passed`.
 
+## Frame generation: `framegen_test.c`
+
+Runs `runtime/gfx/framegen` on the GPU without a window (Metal through SPIRV-Cross, or Vulkan). A textured scene panned
+by five amounts under a still, text-like HUD: the frame made halfway against the scene panned by half (beside a plain
+blend's error) and the HUD against itself. Then a dark object over a bright background at 2880x1632 (a quarter working
+size, as at render scale 3), the object still, moving, or moving against the background: the error in a band around its
+edges and how much of that band came out much brighter (a light outline). A thin object moving further than its own
+width is printed but not checked: it is lost from the made frames (`framegen.c`, Known). `framegen_test prev.png
+cur.png out.png [t]` makes the frame at t between two real frames, and `--time w h` measures the GPU time per frame.
+
+    ./framegen_test.sh
+
+It prints `all passed`.
+
 ## The audio decoder: `audiodec_test.c`
 
 Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`

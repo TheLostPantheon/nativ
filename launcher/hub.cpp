@@ -1047,7 +1047,7 @@ static bool game_key(const std::string &k) {   /* (settings.c's game_key: kept i
 /* the shared keys' defaults where a game reads no value (runtime/core/settings.h; the consumers' own) */
 static const char *setting_default(const std::string &k) {
 	static const std::pair<const char *, const char *> d[] = {{"render_scale", "1"}, {"fullscreen", "0"}, {"aspect_ratio", "native"}, {"hud_layout", "edges"},
-		{"aspect", "fit"}, {"frame_rate", "30"}, {"post_aa", "1"}, {"sharpen", "0.35"}, {"anisotropy", "16"}, {"shadow_filter", "1"}, {"full_res_world", "1"},
+		{"aspect", "fit"}, {"frame_rate", "30"}, {"post_aa", "1"}, {"sharpen", "0.35"}, {"frame_gen", "0"}, {"anisotropy", "16"}, {"shadow_filter", "1"}, {"full_res_world", "1"},
 		{"ssao", "1"}, {"ssao_strength", "1"}, {"osd", "0"}, {"input_mode", "auto"}, {"mouse_look", "1"}, {"raw_look", "1"}, {"mouse_sens", "1"},
 		{"mouse_invert", "0"}, {"shoulder_buttons", "triggers"}, {"touch_cursor_speed", "1"}, {"gyro", "1"}, {"gyro_pose", "upright"}, {"gyro_sens", "1"}, {"volume", "1"}, {"online_id", ""}, {"online", "1"},
 		{"camera", "light"}, {"save_dialog", "ask"}, {"audio_sync_trim_ms", "0"}, {"audio_buffers", "1"}};
@@ -1510,6 +1510,7 @@ static void settings_modal(void) {
 			seg_row(t, "Frame rate", "60 in the games that support it (Unit 13, Killzone, Uncharted), and experimental: parts of a game timed in fixed 1/30 s steps can run fast.", "frame_rate", "30", {{"30", "30"}, {"60", "60"}});
 			toggle_row(t, "Anti-aliasing", "Smooths jagged edges (FXAA).", "post_aa", true);
 			slider_row(t, "Sharpening", "Brings back detail lost to scaling and anti-aliasing.", "sharpen", 0.35, 0.0f, 100.0f, "%.0f%%", 100.0f);
+			toggle_row(t, "Frame generation", "Makes a frame between each two of the game's, for smoother motion where the display refreshes faster than the game draws (a 30 fps game on a 60 Hz display). Adds a little delay to the picture.", "frame_gen", false);
 			seg_row(t, "Texture filtering", "Keeps textures crisp when seen at an angle.", "anisotropy", "16", {{"1", "Off"}, {"2", "2×"}, {"4", "4×"}, {"8", "8×"}, {"16", "16×"}});
 			seg_row(t, "Shadow edges", "How soft the edges of shadows are.", "shadow_filter", "1", {{"0", "Original"}, {"1", "Soft"}, {"2", "Softer"}});
 			toggle_row(t, "Full-resolution world", "Games that draw their 3D world below the screen's resolution draw it at the full one. Sharper, at a GPU cost.", "full_res_world", true);
@@ -1571,7 +1572,7 @@ static bool game_option(const Game &g, const char *name) {
 }
 static const char *setting_name(const std::string &k) {
 	static const std::pair<const char *, const char *> names[] = {{"render_scale", "Resolution"}, {"fullscreen", "Fullscreen"}, {"aspect_ratio", "Widescreen"},
-		{"hud_layout", "HUD"}, {"aspect", "Picture fit"}, {"frame_rate", "Frame rate"}, {"post_aa", "Anti-aliasing"}, {"sharpen", "Sharpening"},
+		{"hud_layout", "HUD"}, {"aspect", "Picture fit"}, {"frame_rate", "Frame rate"}, {"post_aa", "Anti-aliasing"}, {"sharpen", "Sharpening"}, {"frame_gen", "Frame generation"},
 		{"anisotropy", "Texture filtering"}, {"shadow_filter", "Shadow edges"}, {"full_res_world", "Full-resolution world"}, {"ssao", "Ambient occlusion"},
 		{"ssao_strength", "Occlusion strength"}, {"osd", "On-screen stats"}, {"input_mode", "Play with"}, {"mouse_look", "Mouse look"}, {"raw_look", "Mouse aim"},
 		{"mouse_sens", "Mouse sensitivity"}, {"mouse_invert", "Invert vertical look"}, {"shoulder_buttons", "L and R buttons"}, {"volume", "Volume"}, {"online_id", "Online name"}, {"online", "Play online"}, {"gyro", "Gyro"},

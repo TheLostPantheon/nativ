@@ -1,0 +1,65 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The motion between two frames at one level of their luma pyramids, a vector per 4x4 block, matched symmetrically:
+// for a vector v, the 8x8 window around the block in the previous frame at -v/2 against the current frame's at +v/2
+// (the picture halfway between them is where the generated frame needs its vectors, so nothing is left unmatched
+// there). The coarsest level tries every vector within a radius; each finer one the coarser level's vectors around
+// its parent block (doubled), then a pixel around the best, then (the finest) half a pixel.
+//   a.xy  level size      a.zw  field size (blocks)
+//   b.xy  coarser field size (0: this is the coarsest)      b.z  search radius      b.w  1: half-pixel refinement
+//   c.xy  1 / level size      c.z  cost per pixel of difference from the parent's vector      c.w  the zero vector's bias
+// Out: xy the vector (pixels of this level, previous -> current), z the window's mean difference along it.
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D prv;
+layout(set = 0, binding = 1) uniform sampler2D cur;
+layout(set = 0, binding = 2) uniform sampler2D coarse;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D fld;
+vec2 O;
+float cost(vec2 v) {
+	vec2 h = 0.5 * v; float s = 0.0;
+	for (int j = 0; j < 8; j++) for (int i = 0; i < 8; i++) {
+		vec2 x = O + vec2(i, j) + 0.5;
+		s += abs(textureLod(prv, (x - h) * u.c.xy, 0.0).r - textureLod(cur, (x + h) * u.c.xy, 0.0).r);
+	}
+	return s * (1.0 / 64.0);
+}
+void main() {
+	ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+	if (b.x >= u.a.z || b.y >= u.a.w) return;
+	O = vec2(b * 4 - 2);
+	vec2 best = vec2(0.0), pred = vec2(0.0);
+	float raw = cost(vec2(0.0)), bc;
+	if (u.b.x == 0) {
+		bc = raw - u.c.w;
+		for (int y = -u.b.z; y <= u.b.z; y++) for (int x = -u.b.z; x <= u.b.z; x++) {
+			if (x == 0 && y == 0) continue;
+			vec2 v = vec2(x, y); float r = cost(v), c = r + 0.25 * u.c.z * (abs(v.x) + abs(v.y));
+			if (c < bc) { bc = c; best = v; raw = r; }
+		}
+	} else {
+		ivec2 pb = b / 2, hi = u.b.xy - 1;
+		pred = 2.0 * texelFetch(coarse, clamp(pb, ivec2(0), hi), 0).xy;
+		bc = raw - u.c.w + u.c.z * (abs(pred.x) + abs(pred.y));
+		vec2 seen[9]; int ns = 0;   /* (in smooth motion the parent's neighbours all hold one vector: each tried once) */
+		for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+			vec2 v = 2.0 * texelFetch(coarse, clamp(pb + ivec2(i, j), ivec2(0), hi), 0).xy;
+			bool dup = v == vec2(0.0);
+			for (int k = 0; k < ns && !dup; k++) dup = seen[k] == v;
+			if (dup) continue;
+			seen[ns++] = v;
+			float r = cost(v), c = r + u.c.z * (abs(v.x - pred.x) + abs(v.y - pred.y));
+			if (c < bc) { bc = c; best = v; raw = r; }
+		}
+		for (int k = 0; k <= u.b.w; k++) {
+			float d = k == 0 ? 1.0 : 0.5; vec2 c0 = best;
+			for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+				if (i == 0 && j == 0) continue;
+				vec2 v = c0 + d * vec2(i, j);
+				float r = cost(v), c = r + u.c.z * (abs(v.x - pred.x) + abs(v.y - pred.y));
+				if (c < bc) { bc = c; best = v; raw = r; }
+			}
+		}
+	}
+	imageStore(fld, b, vec4(best, raw, 0.0));
+}
