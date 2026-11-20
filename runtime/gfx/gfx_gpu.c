@@ -3792,7 +3792,7 @@ static int view_mode(uint32_t tgt_fmt, const GfxTexture *tex, uint32_t *tex_bpp,
 	return -1;
 }
 /* the texture's addressing of the target's memory as a source-pixel mapping (ViewU), or 0 when the layouts don't line up */
-static int view_mapping(uint32_t tgt_addr, uint32_t tgt_stride, uint32_t tgt_w, uint32_t tgt_h, int tgt_type, uint32_t tgt_bpp, const GfxTexture *tex, uint32_t tex_bpp, int sx, int sy, ViewU *u) {   /* sx, sy: the source's scale */
+static int view_mapping(uint32_t tgt_addr, uint32_t tgt_stride, uint32_t tgt_w, uint32_t tgt_h, int tgt_type, uint32_t tgt_bpp, const GfxTexture *tex, uint32_t tex_bpp, int sx, int sy, ViewU *u, int past_end) {   /* sx, sy: the source's scale; past_end: the texture may run on past the target (the shader repeats its last row) */
 	int layout = (tex->u_mode >> 4) & 3;
 	if (gfx_texture_levels(tex) != 1) return 0;   /* a mip chain past the view's own level isn't the target's */
 	uint32_t swz[4]; memcpy(swz, u->swz, sizeof swz);   /* set by view_mode before this */
@@ -3800,7 +3800,7 @@ static int view_mapping(uint32_t tgt_addr, uint32_t tgt_stride, uint32_t tgt_w, 
 	if (layout == 0 && tgt_type == 0) {   /* linear rows over linear rows, at any offset and stride */
 		u->tex_stride = (tex->format & 0xfff) ? (tex->format & 0xfff) : ((tex->width + 7u) & ~7u);
 		uint64_t end = (uint64_t)u->off_bytes + ((uint64_t)(tex->height - 1) * u->tex_stride + tex->width) * tex_bpp;
-		return end <= (uint64_t)tgt_stride * tgt_h * tgt_bpp + tgt_bpp;   /* +1 pixel: a byte view at +4 of an F32F32 target ends one word past it (the shader clamps that read) */
+		return past_end || end <= (uint64_t)tgt_stride * tgt_h * tgt_bpp + tgt_bpp;   /* +1 pixel: a byte view at +4 of an F32F32 target ends one word past it (the shader clamps that read) */
 	}
 	if (u->off_bytes || tex->height > tgt_h || tex_bpp != tgt_bpp) return 0;
 	if (layout == 2 && tgt_type == 1 && ((tex->width + 31u) & ~31u) == tgt_stride) { u->tex_stride = tgt_stride; return 1; }   /* the same 32x32 tiling (the target's width here is its stride, a whole number of tiles): identity */
@@ -3959,7 +3959,7 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 		if (dbest && (!best || dbest->gen > best->gen)) {   /* the depth surface's content is the newest over this memory */
 			for (int k = 0; k < 4; k++) u.swz[k] = (uint32_t)k;
 			const uint32_t msx = dbest->msx ? dbest->msx : 1u, msy = dbest->msy ? dbest->msy : 1u;
-			if (dbest->gpu_newer && view_mapping(dbest->key, dbest->ds_stride, dbest->w * msx, dbest->h * msy, dbest->type, d16 ? 2 : 4, tex, d16 ? 2 : 4, dbest->sx, dbest->sy, &u)) {   /* (the surface's memory: its samples) */
+			if (dbest->gpu_newer && view_mapping(dbest->key, dbest->ds_stride, dbest->w * msx, dbest->h * msy, dbest->type, d16 ? 2 : 4, tex, d16 ? 2 : 4, dbest->sx, dbest->sy, &u, 0)) {   /* (the surface's memory: its samples) */
 				u.mode = d16 ? 1u : 0u;   /* the depth view's quantisation: 16 bits, else 24 */
 				if (msx > 1 || msy > 1) { u.tgt_w = dbest->w; u.tgt_h = dbest->h; u.ms_x = msx; u.ms_y = msy; }   /* a sample -> the texture's pixel holding it (drawn single-sampled) */
 				SDL_GPUTextureFormat vfmt = view_format(1, (int)u.mode, 0, tex->min_filter || tex->mag_filter); u.vfmt = (uint32_t)vfmt;
@@ -3981,10 +3981,23 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 			 * the view as it treats the target bound directly (bind_unit's sRGB masks). The other reinterpretations read raw bytes:
 			 * guest memory. Killzone's streak strip (the bottom 384x64 of an sRGB 384x192 target) went down twice a frame. */
 			if (best->kind == TK_U8S && mode != 0) mode = -1;
-			if (mode >= 0 && view_mapping(best->addr, best->width, best->width, best->height, best->type, (uint32_t)gfx_target_bpp(&tg), tex, tex_bpp, best->sx, best->sy, &u)) {   /* a TargetEntry's width is the surface stride */
+			/* a texture that starts at a U8U8U8U8 target, rows as wide, and runs on past its last row: Persona 4 Golden draws
+			 * its 3D into 1024x476 targets and samples each as a 1024x1024 texture (the top 476 rows). With nothing else drawn
+			 * past the target, the rows below repeat its last (the game reads only the rows it drew); it went down to guest
+			 * memory every frame, the scene at 1x whatever the render scale. Its view is RGBA8: the target's own bytes,
+			 * filtered as the target bound directly would be, and at 6x a quarter of RGBA32F's 600 MB */
+			int tall = 0;
+			if (mode == 0 && best->kind == TK_U8 && best->type == 0 && tex->data == best->addr && ((tex->u_mode >> 4) & 3) == 0 && tex->height > best->height
+			    && ((tex->format & 0xfff) ? (tex->format & 0xfff) : ((tex->width + 7u) & ~7u)) == best->width) {
+				tall = 1;
+				for (int ti = 0; ti < ntargets && tall; ti++) { TargetEntry *t2 = &targets[ti]; if (t2 == best || !t2->color) continue;
+					GfxTarget tg2 = target_entry_as_gfx(t2); uint32_t thi = t2->addr + (uint32_t)gfx_target_bpp(&tg2) * t2->width * t2->height;
+					if (tex->data < thi && xhi > t2->addr) tall = 0; }
+			}
+			if (mode >= 0 && view_mapping(best->addr, best->width, best->width, best->height, best->type, (uint32_t)gfx_target_bpp(&tg), tex, tex_bpp, best->sx, best->sy, &u, tall)) {   /* a TargetEntry's width is the surface stride */
 				u.mode = (uint32_t)mode;
 				int vfilt = tex->min_filter || tex->mag_filter;
-				SDL_GPUTextureFormat vfmt = view_format(0, mode, best->kind, vfilt); u.vfmt = (uint32_t)vfmt;
+				SDL_GPUTextureFormat vfmt = tall ? kind_format(TK_U8) : view_format(0, mode, best->kind, vfilt); u.vfmt = (uint32_t)vfmt;
 				if (!snap2) target_sync_for_gpu(best);   /* guest memory may hold the newest bytes (a software draw, a replay's restore) */
 				v = view_entry(tex, vfmt, best->sx, best->sy); v->vfilt = vfilt; v->vlinear = best->kind == TK_U8S;
 				const uint64_t want = snap2 ? best->snap_gen : best->gen;   /* (a view of the snapshot: its own generation) */
