@@ -120,11 +120,13 @@ It prints `all passed`.
 
 ## NGS voice rules: `ngs_rules_test.c`
 
-Checks `runtime/audio/ngs_rules.h`, two small rules of the NGS voices: the start buffer of a player is the signed byte at
-+81 of its parameters (Vita3K's layout; +80 is reserved), and `sceNgsVoicePlay` starts a voice that is at rest but leaves
-a playing one alone and answers `SCE_NGS_ERROR`, so a game that calls Play on its music voice every update does not restart
-it each time. The voices the runtime runs from their creation (master, reverb, buses) count as at rest until the game's own
-first Play.
+Checks `runtime/audio/ngs_rules.h`, three small rules of the NGS voices: the start buffer of a player is the signed byte at
++81 of its parameters (Vita3K's layout; +80 is reserved); a player buffer with no whole frame in it is passed over to its
+next (FMOD's hardware streams start on an empty buffer 0, with the stream's ring in buffer 1), while a slot with no data
+address, a missing next or a cycle of empty buffers ends the voice; and `sceNgsVoicePlay` starts a voice that is at rest
+but leaves a playing one alone and answers `SCE_NGS_ERROR`, so a game that calls Play on its music voice every update does
+not restart it each time. The voices the runtime runs from their creation (master, reverb, buses) count as at rest until
+the game's own first Play.
 
     cc -O1 -g -Wall $INC ngs_rules_test.c -o /tmp/ngs_rules_test && /tmp/ngs_rules_test
 

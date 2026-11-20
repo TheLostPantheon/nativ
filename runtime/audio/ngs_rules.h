@@ -12,6 +12,17 @@
 /* the buffer a player starts on: 0..3 as given, else 0 */
 static inline uint32_t ngs_player_start(int8_t start) { return start >= 0 && start < 4 ? (uint32_t)start : 0; }
 
+/* A player buffer that holds no whole frame is passed over to its next, never looped. FMOD's hardware streams start
+ * a PCM voice on buffer 0 = {the stream's ring, 0 bytes, next 1}; the ring is buffer 1, looped until the stream ends,
+ * then buffer 2 is a frame of tail. The runtime ended the voice at the empty buffer, and FMOD took the channel for
+ * finished at the next update: in Resistance: Burning Skies no line of dialogue played (each stream was opened,
+ * buffered and freed within 40 ms) and the menu music jumped to another segment several times a second. The buffer to
+ * move to, or -1 where the chain ends: a buffer with no data address (a slot the game never filled), one with no
+ * next, or the fifth empty buffer in a row (empty buffers in a cycle). */
+static inline int ngs_player_pass_empty(uint32_t data, int16_t next, int hops) {
+	return data && next >= 0 && next < 4 && hops < 4 ? next : -1;
+}
+
 #define NGS_ERROR 0x804a0001u
 /* sceNgsVoicePlay starts a voice that is at rest and does nothing to one that is not (paused, or in its key-off release
  * too): it returns SCE_NGS_ERROR, as Vita3K's VoiceScheduler::play does for a voice that is not AVAILABLE. A game that
