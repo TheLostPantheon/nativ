@@ -147,6 +147,17 @@ cur.png out.png [t]` makes the frame at t between two real frames, and `--time w
 
 It prints `all passed`.
 
+## The microphone: `audioin_test.c`
+
+Checks `runtime/audio/audioin.c`, the silent microphone: a port of each type opens, a second one of a type and an
+unknown type or size are refused with the console's errors, an input hands back exactly its grain of silence, ten
+inputs take ten buffers' time on the host clock, and under the fixed clock the wait goes to the guest clock's pacing
+instead. Release, a port that isn't open or isn't one, and a null buffer are checked too.
+
+    cc -O1 -g -Wall $INC audioin_test.c -o /tmp/audioin_test && /tmp/audioin_test
+
+It prints `all passed`.
+
 ## The audio decoder: `audiodec_test.c`
 
 Checks `runtime/audio/audiodec.c` (SceAudiodec), driven through guest-memory `SceAudiodecCtrl` and `SceAudiodecInfo`

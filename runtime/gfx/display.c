@@ -503,12 +503,12 @@ static void h_audio_set_volume(Cpu *c) {
  * goes on rather than deadlock, and says so. */
 static uint64_t port_vnext[8];
 static uint64_t guest_vblank_us(void) { return (1ull << 32) + vclock_edges() * 16667ull; }
-static void audio_wait_guest(uint32_t i, uint64_t len) {
+void audio_wait_guest_at(uint64_t *vnext, uint32_t i, uint64_t len) {   /* (vnext: the port's own "next buffer" time; audioin.c's microphone too) */
 	vclock_idle();
 	uint64_t now = guest_vblank_us();
-	if (port_vnext[i] < now) port_vnext[i] = now;
-	uint64_t start = port_vnext[i];   /* this buffer starts playing when the previous one ends */
-	port_vnext[i] += len;
+	if (*vnext < now) *vnext = now;
+	uint64_t start = *vnext;   /* this buffer starts playing when the previous one ends */
+	*vnext += len;
 	if (start <= now) return;
 	int b = sched_block_begin();
 	pthread_mutex_lock(&vclock_m);
@@ -524,6 +524,7 @@ static void audio_wait_guest(uint32_t i, uint64_t len) {
 	pthread_mutex_unlock(&vclock_m);
 	if (b) sched_block_end();
 }
+static void audio_wait_guest(uint32_t i, uint64_t len) { audio_wait_guest_at(&port_vnext[i], i, len); }
 static void h_audio_output(Cpu *c) {   /* (port, buffer) */
 	uint32_t i = A0 - 1;
 	if (i >= 8 || !port_len[i]) { RET(0x80260003u); return; }
