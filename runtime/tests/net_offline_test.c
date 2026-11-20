@@ -2,14 +2,16 @@
  * Unit harness for runtime/net/net.c offline (net_online() 0): the network a Vita has with its Wi-Fi off. The byte-order
  * and address helpers work; netctl says DISCONNECTED and has no connection to describe; the resolver has no DNS; a
  * socket bound to "any address" is bound to this machine's loopback, never a port on the player's network; a datagram or
- * a connection to anywhere else is ENETUNREACH; and two sockets on this machine still talk. It includes net.c with
- * RECOMP_ONLINE=0 and supplies what it takes from the rest of the runtime (the overlay, settings, STUN: off). Uses real
- * loopback sockets. Build and run: see README.md in this directory.
+ * a connection to anywhere else is ENETUNREACH; and two sockets on this machine still talk. runtime/net/http.c too:
+ * a template, connection and request are made, and sending it fails as an unreachable network. It includes net.c and
+ * http.c with RECOMP_ONLINE=0 and supplies what they take from the rest of the runtime (the overlay, settings, STUN, the
+ * matching service: off). Uses real loopback sockets. Build and run: see README.md in this directory.
  */
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include "../net/net.c"
+#include "../net/http.c"
 
 /* ---- the runtime net.c expects */
 uint8_t *recomp_mem;
@@ -28,6 +30,9 @@ int ov_stream_open(uint32_t vip, uint16_t port) { (void)vip; (void)port; return 
 int ov_send_dgram(uint32_t vip, uint16_t dport, uint16_t sport, const uint8_t *d, size_t n) { (void)vip; (void)sport; (void)dport; (void)d; (void)n; return -1; }
 void ov_set_dgram_sink(OvDgramSink f) { (void)f; }
 void ov_allow_port(uint16_t port) { (void)port; }
+int m2_service_port(void) { return 0; }
+void hmac_sha1(const void *key, size_t kn, const void *data, size_t n, uint8_t out[20]) { (void)key; (void)kn; (void)data; (void)n; memset(out, 0, 20); }
+uint32_t module_export_addr(const char *name) { (void)name; return 0; }
 
 static int checks, fails;
 #define CHECK(cond) do { checks++; if (!(cond)) { fails++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
@@ -87,12 +92,24 @@ static void test_sockets(void) {
 	call(h_net_close, 1, a); call(h_net_close, 1, b); call(h_net_close, 1, t);
 }
 
+static void test_http(void) {
+	CHECKEQ(call(h_http_init, 1, 0x10000), 0);
+	const uint32_t t = call(h_http_create_template, 3, gstr("Nativ"), 1, 0);
+	CHECK(t >= 1 && t < 0x80000000u);
+	const uint32_t cn = call(h_http_create_connection, 3, t, gstr("http://example.com/"), 1);
+	CHECK(cn >= 1 && cn < 0x80000000u);
+	const uint32_t rq = call(h_http_create_request, 6, cn, 0, gstr("http://example.com/x"), 0, 0, 0);
+	CHECK(rq >= 1 && rq < 0x80000000u);
+	CHECKEQ(call(h_http_send, 3, rq, 0, 0), 0x80431063u);   /* NETWORK: never sent */
+	CHECKEQ(call(h_http_status, 2, rq, gzero(4)), 0x80431065u);   /* (no response to read) */
+}
+
 int main(void) {
 	setenv("RECOMP_ONLINE", "0", 1);
 	recomp_mem = mmap(0, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 	if (recomp_mem == MAP_FAILED) { perror("mmap"); return 2; }
 	CHECK(!net_online());
-	test_helpers(); test_netctl(); test_sockets();
+	test_helpers(); test_netctl(); test_sockets(); test_http();
 	fprintf(stderr, "%d checks, %d failed\n", checks, fails);
 	if (!fails) fprintf(stderr, "all passed\n");
 	return fails ? 1 : 0;

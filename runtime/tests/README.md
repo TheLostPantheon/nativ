@@ -164,7 +164,8 @@ Checks `runtime/net/net.c` with online play off: the network a Vita has with its
 helpers work; netctl says disconnected and has no address to give; the resolver has no DNS; a socket bound to "any
 address" is bound to this machine's loopback, never a port on the player's network; a datagram to the internet or the
 LAN, and a connection anywhere off this machine, fail with ENETUNREACH; and a datagram between two sockets here is
-delivered. It uses real loopback sockets.
+delivered. `runtime/net/http.c` too: a template, connection and request are made, and sending it fails as an unreachable
+network without asking any server. It uses real loopback sockets.
 
     cc -O1 -g -w $INC net_offline_test.c -o /tmp/net_offline_test -lpthread && /tmp/net_offline_test
 
