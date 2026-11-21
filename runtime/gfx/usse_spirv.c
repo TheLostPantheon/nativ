@@ -2089,6 +2089,38 @@ static void emit_vertex_fetch(Gen *g, const UsseVfLayout *vf, int npa, int *ok) 
 	if (vf->instance_reg >= 0 && vf->instance_reg < npa) store(s, access1(s, g->ptr_priv_u, g->var_pa, c_uint(s, (uint32_t)vf->instance_reg)), zero_w);
 }
 
+
+/* SMLSI/SMBO's register-increment state (Gen.inc): ports usse.c's run_program handling */
+static void sm_state_apply(int8_t inc[4][17], const UOp *op) {
+	if (op->op == OP_SMBO) { for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) inc[sl][r] = (int8_t)(r + op->args[sl]); return; }
+	for (int sl = 0; sl < 4; sl++) {
+		int v = op->args[sl], k = (int8_t)(v & 0xFF), mode2 = (v >> 8) & 1;
+		if (!mode2) for (int r = 0; r <= 16; r++) inc[sl][r] = (int8_t)(r * k);
+		else for (int r = 0; r < 4; r++) inc[sl][r] = (int8_t)((k >> (2 * r)) & 3);
+	}
+}
+/* the loop-around-a-switch form with SMLSI/SMBO past the first block: their state is fixed at translate time, in program
+ * order, which is what every path sees when each taken branch arrives with the state its target has in program order
+ * (fall-throughs always do). Assassin's Creed III: Liberation's water shader sets an increment for one instruction inside
+ * an else-block and puts the default back: either way past it, the same state -- but every SMLSI past the first block used
+ * to send such a program to the CPU, and its two draws there slowed a whole level to a crawl. Not for subroutines (a
+ * return's target isn't known at translate time) */
+static int sm_state_consistent(const UOp *code, int n, int entry) {
+	if (entry >= 0) return 0;
+	int8_t (*st)[4][17] = malloc((size_t)(n + 1) * sizeof *st), cur[4][17];
+	if (!st) return 0;
+	for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) cur[sl][r] = (int8_t)r;
+	for (int i = 0; i < n; i++) { memcpy(st[i], cur, sizeof cur); if (code[i].op == OP_SMLSI || code[i].op == OP_SMBO) sm_state_apply(cur, &code[i]); }
+	memcpy(st[n], cur, sizeof cur);
+	int ok = 1;
+	for (int i = 0; i < n && ok; i++) if (code[i].op == OP_BR) {
+		const int t = i + (int)code[i].imm;
+		if (t >= 0 && t <= n && memcmp(st[i + 1], st[t], sizeof cur)) ok = 0;
+	}
+	free(st);
+	return ok;
+}
+
 SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout *vl, const UsseFragLayout *fl,
                                   const uint32_t sa_tex_unit[256], int max_smp, int *smp_units_out, int *nsmp_out, int color_kind, uint32_t cube_mask, uint32_t snap_mask,
                                   const UsseVfLayout *vf) {
@@ -2401,7 +2433,8 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 			if (target >= 0 && target < n) sm_lead[target] = 1;
 		}
 		int first = 1; while (first < n && !sm_lead[first]) first++;
-		for (int i = first; i < n && sm; i++) if (code[i].op == OP_SMLSI || code[i].op == OP_SMBO) sm = 0;
+		int late = 0; for (int i = first; i < n; i++) late |= code[i].op == OP_SMLSI || code[i].op == OP_SMBO;
+		if (late && sm && !sm_state_consistent(code, n, entry)) sm = 0;
 		if (sm && !g.var_pc) {
 			g.var_pc = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0)); g.var_steps = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0));
 			g.var_link = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, ~0u));
@@ -2489,14 +2522,7 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 			} else if (op->pred_kind != 0 && op->op != OP_NOP) { snprintf(m.err, sizeof m.err, "predicated %s at instruction %d", op->op == OP_KILL ? "KILL" : "branch", i); ok = 0; break; }
 			switch (op->op) {
 			case OP_NOP: break;
-			case OP_SMLSI:   /* ports usse.c's run_program SMLSI handling, at translate time (see slot_off) */
-				for (int sl = 0; sl < 4; sl++) {
-					int v = op->args[sl], inc = (int8_t)(v & 0xFF), mode2 = (v >> 8) & 1;
-					if (!mode2) for (int r = 0; r <= 16; r++) g.inc[sl][r] = (int8_t)(r * inc);
-					else for (int r = 0; r < 4; r++) g.inc[sl][r] = (int8_t)((inc >> (2 * r)) & 3);
-				}
-				break;
-			case OP_SMBO: for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) g.inc[sl][r] = (int8_t)(r + op->args[sl]); break;
+			case OP_SMLSI: case OP_SMBO: sm_state_apply(g.inc, op); break;   /* (usse.c's run_program, at translate time: see slot_off) */
 			case OP_VMAD2: emit_vmad2(&g, op, &ok); break;
 			case OP_VNMAD: emit_vnmad(&g, op, &ok); break;
 			case OP_VMAD: emit_vmad(&g, op, &ok); break;
