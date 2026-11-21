@@ -1002,6 +1002,27 @@ static void h_motion_state(Cpu *c) {
 	memcpy(G(p), b, sizeof b);
 	RET(0);
 }
+/* sceMotionGetSensorState(SceMotionSensorState *, records): the raw accelerometer and gyroscope, records of 0x40 bytes --
+ * accelerometer +0, gyroscope +12, u32 timestamp +36, u32 counter +40, u64 host timestamp +48, u8 data info +56 -- each the
+ * state now (with a live pad's, or a console lying still: gravity along -z, no rotation). Unimplemented, it returned success
+ * and wrote nothing: Assassin's Creed III: Liberation read uninitialised floats there each frame, its camera matrix came
+ * out NaN, and every world draw was culled (the screen stayed white behind the HUD) */
+static void h_motion_sensor(Cpu *c) {
+	if (!motion_on) { RET(0x80360206u); return; }   /* SCE_MOTION_ERROR_NOT_SAMPLING */
+	if (!A0) { RET(0x80360200u); return; }           /* SCE_MOTION_ERROR_DATA_INVALID */
+	const uint32_t n = (int32_t)A1 < 1 ? 1 : A1 > 64 ? 64 : A1;
+	float a[3] = {0, 0, -1.0f}, g[3] = {0, 0, 0}, q[4];
+	motion_now(a, g, q);
+	static uint32_t counter;
+	const uint64_t t = guest_time_us();
+	for (uint32_t k = 0; k < n; k++) {
+		uint8_t b[0x40]; memset(b, 0, sizeof b);
+		for (int i = 0; i < 3; i++) { ms_put_f(b, 4 * i, a[i]); ms_put_f(b, 12 + 4 * i, g[i]); }
+		const uint32_t t32 = (uint32_t)t, cn = counter++; memcpy(b + 36, &t32, 4); memcpy(b + 40, &cn, 4); memcpy(b + 48, &t, 8);
+		memcpy(G(A0 + 0x40 * k), b, sizeof b);
+	}
+	RET(0);
+}
 static void h_motion_basic(Cpu *c) {   /* (SceFVector3 *) */
 	if (!motion_on) { RET(0x80360206u); return; }
 	float a[3], g[3], q[4];
@@ -1034,7 +1055,7 @@ const HleEntry hle_display[] = {
 	{"sceAudioOutGetAdopt", h_audio_adopt},   /* (port type): 1, the type can be opened -- only voice chat or the system's music takes one */
 	{"sceDisplayGetRefreshRate", h_refresh_rate}, {"sceDisplayGetVcount", h_get_vcount}, {"sceKernelSetGPO", h_set_gpo},
 	{"sceCtrlSetSamplingMode", h_ctrl_mode}, {"sceCtrlSetSamplingModeExt", h_ctrl_mode}, {"sceTouchSetSamplingState", h_touch_sampling},
-	{"sceMotionStartSampling", h_motion_start}, {"sceMotionStopSampling", h_motion_stop}, {"sceMotionGetState", h_motion_state},
+	{"sceMotionStartSampling", h_motion_start}, {"sceMotionStopSampling", h_motion_stop}, {"sceMotionGetState", h_motion_state}, {"sceMotionGetSensorState", h_motion_sensor},
 	{"sceMotionGetBasicOrientation", h_motion_basic}, {"sceMotionReset", h_motion_reset}, {"sceMotionSetDeadband", h_input_ok}, {"sceMotionSetTiltCorrection", h_input_ok},
 	{0, 0},
 };
