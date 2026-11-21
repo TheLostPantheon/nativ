@@ -1610,12 +1610,11 @@ class Fn:
         lines.append("\tswitch (c->r[15]) {")
         for i in self.prefix + self.insns:
             lines.append(f"\tcase 0x{i.address:x}u: goto L_{i.address:08x};")
-        if any("JUMP(" in x for x in lines):
-            # a computed jump to another function's entry (a table case that is a split-off entry) is a tail call: run it
-            # and return, as a branch there would; anything else is code the analysis never saw
-            lines.append("\tdefault: { GuestFn f = recomp_lookup_here(c->r[15]); if (f) { f(c); return; } } recomp_unimplemented(c, c->r[15]); return;")
-        else:
-            lines.append("\tdefault: recomp_unimplemented(c, c->r[15]); return;")
+        # a computed jump to another function's entry (a table case that is a split-off entry, or a block the analysis found
+        # only as a seed) is a tail call: run it and return, as a branch there would. Anything else is code the analysis
+        # never saw: recorded as a function for the next build (recomp_missed_jump), as a call to missed code is.
+        # Assassin's Creed III: Liberation jumped past an unconditional branch to a block nothing else reached, and stopped
+        lines.append(f"\tdefault: {{ GuestFn f = recomp_lookup_here(c->r[15]); if (f) {{ f(c); return; }} }} recomp_missed_jump(c, c->r[15], {0 if self.arm else 1}); return;")
         lines.append("\t}")
         lines.append("}")
         return reg_locals(lines, 3 if hook else 2) if REG_LOCALS[0] else lines
@@ -2025,6 +2024,15 @@ def main():
         out = [f'#include "{os.path.basename(base)}.h"']
     else:
         out += decls
+    # N is a minimum: a game larger than N parts of PART_INSNS instructions gets more, so a part stays a size a compiler
+    # builds in a few GB. Assassin's Creed III: Liberation's ~12 M instructions came out as 16 parts of 113 MB of C each, and
+    # the build's twelve compilers at once outran a 24 GB Mac. RECOMP_PART_INSNS sets the size (default 150000, ~23 MB of C)
+    if nsplit:
+        cap = int(os.environ.get("RECOMP_PART_INSNS") or 150000)
+        nsplit = max(nsplit, -(-sum(len(f.insns) for f in fns) // cap))
+        parts = [[] for _ in range(nsplit)]
+        n = nsplit   # (part files past the last, from a larger split before: the build compiles every one it finds)
+        while os.path.exists(f"{base}_part{n}.c"): os.remove(f"{base}_part{n}.c"); n += 1
     per = (sum(len(f.insns) for f in fns) // max(nsplit, 1)) + 1
     k = acc = 0
     for f in fns:

@@ -47,6 +47,7 @@ extern uint8_t *recomp_mem;
 /* provided by the host: a call to a guest address that isn't recompiled code (an import) */
 extern void recomp_call_external(Cpu *c, uint32_t addr);
 extern void recomp_unimplemented(Cpu *c, uint32_t addr);
+extern void recomp_missed_jump(Cpu *c, uint32_t addr, int thumb);   /* a computed jump to code the analysis never saw: recorded for the next build */
 extern GuestFn recomp_lookup(uint32_t addr);
 extern const char *recomp_import_name(uint32_t addr);   /* the import a stub address stands for */
 /* A module's functions (or import stubs) by guest address: recomp.py's list, hashed once before main() runs

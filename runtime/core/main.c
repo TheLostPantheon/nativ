@@ -509,6 +509,21 @@ void recomp_unimplemented(Cpu *c, uint32_t addr) {
 	summary("stopped"); exit(2);
 }
 
+/* a computed jump inside a recompiled function to an address that is none of its instructions and no function's entry: code
+ * the analysis never saw (a block reached only through a table or arithmetic it didn't follow). Recorded as a function in the
+ * jumping function's instruction set, as a call to missed code is (missed_functions.txt -> analyze.py --seeds); the next build
+ * has it, and the jump's fallback runs it as a tail call */
+void recomp_missed_jump(Cpu *c, uint32_t addr, int thumb) {
+	pthread_mutex_lock(&host_lock);
+	fprintf(stderr, "jump to %#x: code the analysis missed (lr %#x)\n", addr, c->r[14]);
+	const char *sp = getenv("RECOMP_SEEDS");
+	FILE *sf = addr >= 0x81000000u && addr < 0xa0000000u ? fopen(sp ? sp : "missed_functions.txt", "a") : 0;
+	if (sf) { fprintf(sf, "%#x %s\n", addr & ~1u, thumb ? "thumb" : "arm"); fclose(sf); }
+	snprintf(gaps_stop, sizeof gaps_stop, "a jump to %#x, code the analysis missed (taken as a function on the next build)", addr);
+	if (*hle_last_format) fprintf(stderr, "last formatted string: %s\n", hle_last_format);
+	summary("stopped"); exit(2);
+}
+
 static uint32_t module_starts[16];
 static int nmodule_starts;
 static void load_image(const char *path) {

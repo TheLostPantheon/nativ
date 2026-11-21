@@ -182,6 +182,14 @@ def main(argv):
     for s in srcs:
         o = os.path.join(OBJ, os.path.splitext(os.path.basename(s))[0] + ".o")
         if not os.path.isfile(o) or newer(s, o) or newer(rt, o): work.append(([CC, "-c"] + FLAGS + [s, "-o", o], s, o, CC, False))
+    # (the rule above is for parts of ~10-12 MB of C; a compiler's memory grows with its file, so larger parts take
+    # proportionally fewer at once: recomp.py caps a part near 23 MB, and a game split before that cap could have 113 MB ones)
+    if work and not ENV.get("JOBS"):
+        big = max(os.path.getsize(w[1]) for w in work) / 1e6
+        scale = max(1, -(-int(big) // 12))
+        if scale > 1:
+            jobs = max(1, min(memory_gb() // (per * scale), os.cpu_count() or 1))
+            print(f"  largest part {big:.0f} MB: {jobs} compiles at once")
     # the in-game overlay (runtime/ui/overlay.cpp, this project's one C++ file) and Dear ImGui itself
     # (third_party/imgui/, MIT: see its own README for the pinned release): built once into their own
     # cached objects -- nothing here depends on which game is being linked -- and reused by that game's later builds
