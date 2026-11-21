@@ -1288,9 +1288,27 @@ static void emit_depthf(Gen *g, const UOp *op, int *ok) {
  * VDP into pa10.y (pa11) -- taken as the pointer's writer, every skinned caster fell to the CPU */
 static int writes_word(const UOp *w, int bank, int word) {
 	if (w->dst.bank != bank) return 0;
+	if (w->op == OP_VBW) {   /* one 32-bit word a repeat, whatever its mask says (usse.c exec_vbw): Assassin's Creed III: Liberation's
+	                          * skinning builds the bone index with VBWs into pa0-pa2 between the I32MAD that forms the pointer in pa5
+	                          * and its LDST -- taken as writing pa2-pa5, every skinned mesh fell to the CPU and a level ran at a few fps.
+	                          * (SMLSI mode without the program at hand: a wider guess; ldst_pointer_sa has it: vbw_writes_word) */
+		const int n = w->reps > 0 ? w->reps : 1;
+		return word >= w->dst.num && word < w->dst.num + (w->repmode == RM_SLMSI ? 4 * n : n);
+	}
 	if (!w->mask || w->op == OP_LDST || w->op == OP_I32MAD || w->op == OP_I32MAD2 || w->op == OP_I16MAD || w->op == OP_I8MAD) return w->dst.num == word;
 	int lpw = lpw_of(w->dst.type);
 	for (int c = 0; c < 4; c++) if ((w->mask >> c) & 1 && w->dst.num + c / lpw == word) return 1;
+	return 0;
+}
+static void sm_state_apply(int8_t inc[4][17], const UOp *op);   /* (below) */
+/* the words code[j] (a VBW) writes: one a repeat, at dst + the repeat's destination offset -- in SMLSI mode the increments in
+ * force there, which are the program-order state (as the translation fixes them) */
+static int vbw_writes_word(const UOp *code, int j, int word) {
+	const UOp *w = &code[j]; const int n = w->reps > 0 ? w->reps : 1;
+	if (w->repmode != RM_SLMSI) return word >= w->dst.num && word < w->dst.num + n;
+	int8_t inc[4][17]; for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) inc[sl][r] = (int8_t)r;
+	for (int k = 0; k < j; k++) if (code[k].op == OP_SMLSI || code[k].op == OP_SMBO) sm_state_apply(inc, &code[k]);
+	for (int r = 0; r < n && r <= 16; r++) if (w->dst.num + inc[3][r] == word) return 1;
 	return 0;
 }
 static int ldst_pointer_sa(const UOp *code, int i) {
@@ -1300,7 +1318,7 @@ static int ldst_pointer_sa(const UOp *code, int i) {
 	for (int j = i - 1; j >= 0; j--) {   /* the latest writer of the base register */
 		const UOp *w = &code[j];
 		if (w->op == OP_NOP || w->op == OP_SMLSI || w->op == OP_SMBO || w->op == OP_BR || w->op == OP_KILL) continue;
-		if (!writes_word(w, op->s0.bank, op->s0.num)) continue;
+		if (w->op == OP_VBW ? w->dst.bank != op->s0.bank || !vbw_writes_word(code, j, op->s0.num) : !writes_word(w, op->s0.bank, op->s0.num)) continue;
 		if (w->op == OP_I32MAD && w->sub2 == 2 && w->s2.bank == BK_SA) return w->s2.num;   /* a full-width addend from SA: the pointer */
 		if (w->op == OP_I32MAD2 && !w->sub2 && w->s2.bank == BK_SA && !(w->s2.negabs & 1)) return w->s2.num;   /* I32MAD2's addend is always whole (Killzone's quarter-res pass: (960y + x) * 32 + SA11) */
 		return -1;
