@@ -57,8 +57,10 @@ static uint32_t tex_bpp(uint32_t format) {
 	default: return 0;
 	}
 }
-/* RECOMP_SRGB=1: carry the textures' and colour surfaces' sRGB (gamma) modes to the renderers (gfx.h
- * GFX_TEX_GAMMA / GFX_TGT_GAMMA). Off by default (2026-10-07): the bits are where Sony's own setters
+/* The textures' and colour surfaces' sRGB (gamma) modes, carried to the renderers (gfx.h GFX_TEX_GAMMA / GFX_TGT_GAMMA), as
+ * the hardware applies them. On by default since 2026-11-20 (RECOMP_SRGB=0 drops them): every game that turned them on itself
+ * (Unit 13, Uncharted, Killzone) needed them, and LittleBigPlanet, a generated pack without them, showed its frames unencoded
+ * on its sRGB display surfaces -- harsh contrast and blown, oversaturated lights. The history: off by default (2026-10-07): the bits are where Sony's own setters
  * put them (texture word 0 bits 27-28, colour surface word 0 bits 12-13), but decoding the textures
  * and encoding Uncharted's one sRGB surface as the GPU's sRGB formats would made its title menu
  * either far too dark (decode only) or hazy (both), while without them it is closest to the real
@@ -67,7 +69,7 @@ static uint32_t tex_bpp(uint32_t format) {
  * Unit 13 turns them on (packs/PCSA00014/pack.toml): its deferred lighting is gamma-correct (sRGB albedo
  * textures, an sRGB tonemap surface the final pass reads raw), and without the modes every sunlit
  * surface lit ~3x too bright and its filmic tonemap clipped the floors to white (2026-10-08). */
-static int srgb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_SRGB"); v = e && *e == '1'; } return v; }
+static int srgb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_SRGB"); v = !(e && *e == '0'); } return v; }
 /* ---- SceGxmTexture (4 control words) -> the renderer's GfxTexture */
 static GfxTexture texture_words(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3);
 static GfxTexture texture(uint32_t t) { return texture_words(RD32(t), RD32(t + 4), RD32(t + 8), RD32(t + 12)); }
