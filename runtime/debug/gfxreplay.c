@@ -196,6 +196,8 @@ int main(int argc, char **argv) {
 				if (fl) fprintf(stderr, "  colour: type %d comps %d %s at %d", fl->color_type, fl->color_comps, fl->native_color ? "O" : "PA", fl->color_pa_start);
 				fprintf(stderr, "  blend %d mask %#x  depth func %u%s  stencil func %u ref %u masks %#x/%#x ops %u/%u/%u  prim %u count %u cull %d\n", d.blend.present, d.blend.mask,
 				        d.depth_func, d.depth_write ? " write" : "", d.stencil_func, d.stencil_ref, d.stencil_cmask, d.stencil_wmask, d.stencil_fail, d.depth_fail, d.depth_pass, d.prim, d.count, d.cull);
+				fprintf(stderr, "    viewport %s%s offset %g,%g scale %g,%g  region clip mode %#x %u,%u-%u,%u\n", d.viewport_set ? "set" : "unset", d.viewport_disabled ? " (disabled)" : "",
+				        d.vp_xoff, d.vp_yoff, d.vp_xscale, d.vp_yscale, d.clip_mode, d.clip_xmin, d.clip_ymin, d.clip_xmax, d.clip_ymax);
 				for (int k = 0; k < 16; k++) if (d.tex[k].data) fprintf(stderr, "    tex %d: %#x fmt %#x %ux%u filter %u/%u modes %#x/%#x\n", k, d.tex[k].data, d.tex[k].format, d.tex[k].width, d.tex[k].height, d.tex[k].min_filter, d.tex[k].mag_filter, d.tex[k].u_mode, d.tex[k].v_mode);
 			}
 			{	/* RECOMP_REPLAY_SAVE_PROG=hexaddr:path -- a program's GXP bytes out of the capture's memory, for usse_dis / usse_run (see README) */

@@ -23,6 +23,7 @@
 #import <objc/runtime.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <signal.h>
 #include <pthread.h>
@@ -164,6 +165,19 @@ static id new_pipe(id self, SEL sel, MTLRenderPipelineDescriptor *pd, NSError **
 	return ps;
 }
 
+/* tmp renamed to path, never over an existing path (another game process sharing the folder may have taken that number).
+ * renamex_np's RENAME_EXCL where the volume has it; where it doesn't (ENOTSUP: ext4 through FSKit, the external drive a
+ * library often lives on), the name is reserved by an exclusive create and then replaced by the rename -- before this the
+ * archive kept no segment at all there, and every session compiled its pipelines again (2026-11-22) */
+static int place_exclusive(const char *tmp, const char *path) {
+	if (!renamex_np(tmp, path, RENAME_EXCL)) return 1;
+	if (errno != ENOTSUP && errno != EINVAL) return 0;   /* (EEXIST: the number is taken) */
+	const int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+	if (fd < 0) return 0;
+	close(fd);
+	if (!rename(tmp, path)) return 1;
+	unlink(path); return 0;
+}
 static int warmed;   /* this session's warm-up made every pipeline the recipes name */
 void mtl_archive_flush(int how) {
 	if (!on) return;
@@ -179,7 +193,7 @@ void mtl_archive_flush(int how) {
 				for (int k = 0; k < 64 && !placed; k++) {   /* (the next number no other game process sharing the folder took: never replacing one) */
 					pthread_mutex_lock(&cur_m); const int s = seg_next++; pthread_mutex_unlock(&cur_m);
 					snprintf(path, sizeof path, "%s/seg_%06d.bin", dir, s);
-					placed = !renamex_np(tmp, path, RENAME_EXCL);
+					placed = place_exclusive(tmp, path);
 				}
 			if (placed && !stat(path, &st)) {
 				pthread_mutex_lock(&seg_m); NSArray *o = segs; segs = [[o arrayByAddingObject:a] retain]; [o release]; pthread_mutex_unlock(&seg_m);

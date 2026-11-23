@@ -199,6 +199,7 @@ int gfx_kick_defer(const uint32_t *addr, const uint32_t *val, int n) {
 }
 void gfx_vis_settle(void) { if (gfx_gpu_vis_deferred()) LOCKED(gfx_gpu_vis_flush(1)); }
 int gfx_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t sstride, uint32_t dst, uint32_t dstride) { int r = 0; LOCKED(if (gpu_backend()) r = gfx_gpu_transfer_downscale(src, sw, sh, sstride, dst, dstride)); return r; }   /* a CPU read of guest memory a GPU target may hold newer: the download only */
+int gfx_transfer_fill(uint32_t base, uint32_t w, uint32_t h, uint32_t stride, uint32_t color, uint32_t bytes) { int r = 0; LOCKED(if (gpu_backend()) r = gfx_gpu_transfer_fill(base, w, h, stride, color, bytes)); return r; }   /* a clear of a GPU target, done there */
 void gfx_end_scene(void) {
 	int m = metrics_on(); uint64_t t0 = m ? now_us() : 0;
 	LOCKED(rc_on_end_scene(); gfxcap_end_scene(); if (gpu_backend()) gfx_gpu_end_scene(); else gfx_soft_end_scene());

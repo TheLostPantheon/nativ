@@ -57,8 +57,10 @@ static uint32_t tex_bpp(uint32_t format) {
 	default: return 0;
 	}
 }
-/* RECOMP_SRGB=1: carry the textures' and colour surfaces' sRGB (gamma) modes to the renderers (gfx.h
- * GFX_TEX_GAMMA / GFX_TGT_GAMMA). Off by default (2026-10-07): the bits are where Sony's own setters
+/* The textures' and colour surfaces' sRGB (gamma) modes, carried to the renderers (gfx.h GFX_TEX_GAMMA / GFX_TGT_GAMMA), as
+ * the hardware applies them. On by default since 2026-11-20 (RECOMP_SRGB=0 drops them): every game that turned them on itself
+ * (Unit 13, Uncharted, Killzone) needed them, and LittleBigPlanet, a generated pack without them, showed its frames unencoded
+ * on its sRGB display surfaces -- harsh contrast and blown, oversaturated lights. The history: off by default (2026-10-07): the bits are where Sony's own setters
  * put them (texture word 0 bits 27-28, colour surface word 0 bits 12-13), but decoding the textures
  * and encoding Uncharted's one sRGB surface as the GPU's sRGB formats would made its title menu
  * either far too dark (decode only) or hazy (both), while without them it is closest to the real
@@ -67,7 +69,7 @@ static uint32_t tex_bpp(uint32_t format) {
  * Unit 13 turns them on (packs/PCSA00014/pack.toml): its deferred lighting is gamma-correct (sRGB albedo
  * textures, an sRGB tonemap surface the final pass reads raw), and without the modes every sunlit
  * surface lit ~3x too bright and its filmic tonemap clipped the floors to white (2026-10-08). */
-static int srgb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_SRGB"); v = e && *e == '1'; } return v; }
+static int srgb_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMP_SRGB"); v = !(e && *e == '0'); } return v; }
 /* ---- SceGxmTexture (4 control words) -> the renderer's GfxTexture */
 static GfxTexture texture_words(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3);
 static GfxTexture texture(uint32_t t) { return texture_words(RD32(t), RD32(t + 4), RD32(t + 8), RD32(t + 12)); }
@@ -730,6 +732,12 @@ static uint16_t downscale_u565(uint32_t s00, uint32_t s10, uint32_t s01, uint32_
 	return (uint16_t)((hi << 11) | (mid << 5) | lo);
 }
 
+/* the bytes a w x h rectangle of a linear surface covers from its first byte: its rows at the stride, the last one ending at
+ * the rectangle's width. stride x h reached past the end: Assassin's Creed III: Liberation clears the right part of its
+ * G-buffer's rows with a fill whose last row ends exactly where its lit image begins, and the 4 KB past it made every frame
+ * bring that image down from the GPU too (2026-11-22) */
+static uint32_t transfer_extent(uint32_t w, uint32_t h, uint32_t stride, int bytes) { return h ? (h - 1) * stride + w * (uint32_t)bytes : 0; }
+
 /* sceGxmTransferDownscale(srcFormat, srcAddress, srcX, srcY, srcWidth, srcHeight, srcStride,
  * destFormat, destAddress, destX, destY, destStride, syncObject, syncFlags, notification): a 2x2 box
  * filter, destination (srcWidth/2) x (srcHeight/2) -- both surfaces linear (the SDK signature carries
@@ -753,7 +761,7 @@ static void o_transfer_downscale(Cpu *c) {
 	if (dst_stride <= 0) dst_stride = (int32_t)(dst_w * (uint32_t)bytes);
 	uint32_t sbase = src_addr + src_y * (uint32_t)src_stride + src_x * (uint32_t)bytes;
 	uint32_t dbase = dst_addr + dst_y * (uint32_t)dst_stride + dst_x * (uint32_t)bytes;
-	uint32_t slen = (uint32_t)src_stride * src_h, dlen = (uint32_t)dst_stride * dst_h;
+	uint32_t slen = transfer_extent(src_w, src_h, (uint32_t)src_stride, bytes), dlen = transfer_extent(dst_w, dst_h, (uint32_t)dst_stride, bytes);
 	uint64_t t0 = transfer_begin();
 	if (bytes == 4 && gfx_transfer_downscale(sbase, src_w, src_h, (uint32_t)src_stride, dbase, (uint32_t)dst_stride)) {   /* a GPU-drawn source: done there, no download (gfx_gpu.c) */
 		static int check = -1; if (check < 0) check = getenv("RECOMP_GPU_TRANSFER_CHECK") != 0;
@@ -808,10 +816,25 @@ static void o_transfer_copy(Cpu *c) {
 	if (key_mode && bytes != 4) { transfer_log_once("copy colorkey", src_fmt, 0, width, height, 0); key_mode = 0; }
 	if (src_stride <= 0) src_stride = (int32_t)(width * (uint32_t)bytes);
 	if (dst_stride <= 0) dst_stride = (int32_t)(width * (uint32_t)bytes);
-	/* a conservative bound (exact for linear; tiled/swizzled cover the same total bytes, reordered) */
-	uint32_t slen = width * height * (uint32_t)bytes, dlen = slen;
+	/* the bytes each side covers: a linear rectangle's exactly (its rows at the stride, the last one ending at the width);
+	 * a tiled or swizzled one's the same total from the surface's start, reordered (a conservative bound) */
+	uint32_t slo = src_addr, dlo = dst_addr, slen = width * height * (uint32_t)bytes, dlen = slen;
+	if (!src_type) { slo = src_addr + src_y * (uint32_t)src_stride + src_x * (uint32_t)bytes; slen = transfer_extent(width, height, (uint32_t)src_stride, bytes); }
+	if (!dst_type) { dlo = dst_addr + dst_y * (uint32_t)dst_stride + dst_x * (uint32_t)bytes; dlen = transfer_extent(width, height, (uint32_t)dst_stride, bytes); }
 	uint64_t t0 = transfer_begin();
-	gfx_guest_reading(src_addr, slen); gfx_guest_writing(dst_addr, dlen);
+	gfx_guest_reading(slo, slen); gfx_guest_writing(dlo, dlen);
+	if (!key_mode && src_type == dst_type && src_stride == dst_stride && src_x == dst_x && src_y == dst_y) {
+		/* the same layout at the same place on both sides: every pixel keeps its offset, so the copy is runs of whole bytes --
+		 * a row each for linear, the whole range for a full tiled (whole 32x32 tiles, rows the stride wide) or swizzled (power
+		 * of two) surface, whose pixels then cover [0, w x h) exactly. Assassin's Creed III: Liberation restores its 704x576
+		 * tiled depth surface this way every frame: 2 ms pixel by pixel, a memmove instead (2026-11-22) */
+		const uint32_t row = width * (uint32_t)bytes;
+		int whole = 0;
+		if (!src_type) { for (uint32_t y = 0; y < height; y++) memmove(G(dlo + y * (uint32_t)dst_stride), G(slo + y * (uint32_t)src_stride), row); whole = 1; }
+		else if (!src_x && !src_y && ((src_type == 0x00400000u && row == (uint32_t)src_stride && width % 32 == 0 && height % 32 == 0)
+		                             || (src_type == 0x00800000u && !(width & (width - 1)) && !(height & (height - 1))))) { memmove(G(dst_addr), G(src_addr), (size_t)row * height); whole = 1; }
+		if (whole) { gfx_guest_written(dlo, dlen); transfer_end("copy (runs)", t0, width, height, src_addr, dst_addr, src_fmt); return; }
+	}
 	for (uint32_t y = 0; y < height; y++) {
 		for (uint32_t x = 0; x < width; x++) {
 			uint32_t si = transfer_index(src_x + x, src_y + y, src_stride, bytes, src_type, width, height) * (uint32_t)bytes;
@@ -824,7 +847,7 @@ static void o_transfer_copy(Cpu *c) {
 			memmove(G(dst_addr + di), G(src_addr + si), (size_t)bytes);
 		}
 	}
-	gfx_guest_written(dst_addr, dlen);
+	gfx_guest_written(dlo, dlen);
 	transfer_end("copy", t0, width, height, src_addr, dst_addr, src_fmt);
 }
 
@@ -840,8 +863,9 @@ static void o_transfer_fill(Cpu *c) {
 	if (!bytes) return;
 	if (dst_stride <= 0) dst_stride = (int32_t)(width * (uint32_t)bytes);
 	uint32_t base = dst_addr + dst_y * (uint32_t)dst_stride + dst_x * (uint32_t)bytes;
-	uint32_t len = (uint32_t)dst_stride * height;
+	uint32_t len = transfer_extent(width, height, (uint32_t)dst_stride, bytes);
 	uint64_t t0 = transfer_begin();
+	if (gfx_transfer_fill(base, width, height, (uint32_t)dst_stride, color, (uint32_t)bytes)) { transfer_end("fill (GPU)", t0, width, height, 0, base, dst_fmt); return; }   /* a clear of a GPU target, done there (gfx_gpu.c) */
 	gfx_guest_writing(base, len);
 	for (uint32_t y = 0; y < height; y++)
 		for (uint32_t x = 0; x < width; x++)

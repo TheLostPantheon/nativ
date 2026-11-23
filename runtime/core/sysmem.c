@@ -29,14 +29,31 @@ static pthread_mutex_t block_lock = PTHREAD_MUTEX_INITIALIZER;   /* blocks[] and
 #define MAX_HOLES 1024
 static uint32_t holes[MAX_HOLES][2];
 static int nholes;
-static uint32_t hole_take(uint32_t size) {
+static void hole_put(uint32_t base, uint32_t size);
+static uint32_t hole_take(uint32_t size, uint32_t align) {   /* align: a power of two; the hole's bytes before the aligned base stay a hole */
 	int best = -1;
-	for (int i = 0; i < nholes; i++) if (holes[i][1] >= size && (best < 0 || holes[i][1] < holes[best][1])) best = i;
+	for (int i = 0; i < nholes; i++) {
+		const uint32_t at = (holes[i][0] + align - 1) & ~(align - 1);
+		if (at - holes[i][0] < holes[i][1] && holes[i][1] - (at - holes[i][0]) >= size && (best < 0 || holes[i][1] < holes[best][1])) best = i;
+	}
 	if (best < 0) return 0;
-	const uint32_t base = holes[best][0];
-	if (holes[best][1] == size) holes[best][0] = holes[--nholes][0], holes[best][1] = holes[nholes][1];
-	else holes[best][0] += size, holes[best][1] -= size;
+	const uint32_t h = holes[best][0], len = holes[best][1], base = (h + align - 1) & ~(align - 1), before = base - h, after = len - before - size;
+	holes[best][0] = holes[--nholes][0]; holes[best][1] = holes[nholes][1];   /* (taken out whole, its pieces put back) */
+	if (before) hole_put(h, before);
+	if (after) hole_put(base + size, after);
 	return base;
+}
+/* where the console's kernel puts a block of this type: its base on the type's own granularity (the size is a multiple of it
+ * already, or the console refuses it). 4 KiB pages for the ordinary user types, 256 KiB for CDRAM, 1 MiB for the physically
+ * contiguous main-memory ones (the codec engine's). Need for Speed: Most Wanted sizes its 2 MiB video block as 512 KiB at
+ * 256 KiB alignment plus 1 MiB at 1 MiB alignment, which fits only from a 1 MiB boundary: at 4 KiB the second allocation failed
+ * and its intro movie waited forever on a white screen */
+static uint32_t block_align(uint32_t type) {
+	switch (type) {
+	case 0x09408060u: return 256u << 10;                   /* USER_CDRAM_RW */
+	case 0x0c80d060u: case 0x0d808060u: return 1u << 20;   /* USER_MAIN_PHYCONT_RW, USER_MAIN_PHYCONT_NC_RW */
+	default: return 4096u;
+	}
 }
 static void hole_put(uint32_t base, uint32_t size) {
 	for (int i = 0; i < nholes; i++) {   /* merged with a neighbour on either side (then the merged hole is put back) */
@@ -56,9 +73,10 @@ static void h_alloc_block(Cpu *c) {   /* (name, type, size, opt) */
 	int slot = -1;
 	for (int i = 0; i < nblocks; i++) if (!blocks[i][1]) { slot = i; break; }   /* a freed slot first */
 	if (slot < 0) { if (nblocks >= MAX_BLOCKS) { pthread_mutex_unlock(&block_lock); RET(0x80020001u); return; } slot = nblocks++; }
-	uint32_t size = A2, base = hole_take(page_up(size));
+	const uint32_t align = block_align(A1);
+	uint32_t size = A2, base = hole_take(page_up(size), align);
 	const int reused = base != 0;
-	if (!base) base = guest_alloc(size, 4096);
+	if (!base) base = guest_alloc(size, align);
 	blocks[slot][0] = base; blocks[slot][1] = size; block_type[slot] = A1;
 	pthread_mutex_unlock(&block_lock);
 	memset(G(base), 0, size);

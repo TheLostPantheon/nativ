@@ -397,27 +397,53 @@ class Analyser:
         return None
 
     def note_bound(self, i, prev, t):
-        """a "cmp rN, #b" then "ble/bls/blt/blo t": t is entered with rN <= b (or < b), for guard_entries"""
+        """the upper bound a register has where a branch i enters block t, for guard_entries: the tightest of what this edge
+        knows -- the branch's own "cmp rN, b; ble/bls t" (blt/blo: < b), an earlier "cmp rN, b; bgt/bhi away" in the run that
+        fell through to here (bge/bhs: < b), or the run's own entry bound -- with rN not written since. Across the edges
+        into t the loosest holds (a bound must hold however t is entered; different registers: none). Compilers lay a
+        sparse switch out as a binary tree of such compares ending in branches to tbb/tbh blocks: Assassin's Creed III:
+        Liberation's tree reached three of its five tables through fall-throughs and taken "bgt"s, the bounds were missed,
+        each table read garbage entries, the walk met junk and the function was cut back to its first run"""
+        facts = []
         m = i.mnemonic.split(".")[0]
-        if m not in ("ble", "bls", "blt", "blo", "bcc") or not prev:
-            return
-        p = prev[-1]; ops = p.operands
-        if p.mnemonic.split(".")[0] != "cmp" or len(ops) != 2 or ops[0].type != ARM_OP_REG:
-            return
-        if ops[1].type == ARM_OP_IMM: b = ops[1].imm
-        elif ops[1].type == ARM_OP_REG:
-            b = None
-            for q in reversed(prev[:-1]):
-                qo = q.operands
-                if qo and qo[0].type == ARM_OP_REG and qo[0].reg == ops[1].reg:
-                    if q.mnemonic.split(".")[0] in ("movw", "mov", "movs") and len(qo) == 2 and qo[1].type == ARM_OP_IMM: b = qo[1].imm
-                    break
-            if b is None: return
-        else: return
-        if m in ("blt", "blo", "bcc"): b -= 1
+        if m in ("ble", "bls", "blt", "blo", "bcc") and prev and prev[-1].mnemonic.split(".")[0] == "cmp":
+            c = prev[-1]; ops = c.operands
+            if len(ops) == 2 and ops[0].type == ARM_OP_REG:
+                b = ops[1].imm if ops[1].type == ARM_OP_IMM else self.const_of(prev[:-1], ops[1].reg) if ops[1].type == ARM_OP_REG else None
+                if b is not None: facts.append((ops[0].reg, b - (m in ("blt", "blo", "bcc"))))
+        written = set()
+        for k in range(len(prev) - 1, -1, -1):   # earlier compares the run fell through ("cmp; bgt away": <= b at the fall-through)
+            p = prev[k]; pm = p.mnemonic.split(".")[0]
+            above = 0 if pm in ("bgt", "bhi") else 1 if pm in ("bge", "bhs", "bcs") else None
+            if above is not None and k and prev[k - 1].mnemonic.split(".")[0] == "cmp":
+                c = prev[k - 1]; ops = c.operands
+                if len(ops) == 2 and ops[0].type == ARM_OP_REG and ops[0].reg not in written:
+                    b = ops[1].imm if ops[1].type == ARM_OP_IMM else self.const_of(prev[:k - 1], ops[1].reg) if ops[1].type == ARM_OP_REG else None
+                    if b is not None: facts.append((ops[0].reg, b - above))
+                continue
+            po = p.operands
+            if po and po[0].type == ARM_OP_REG and not pm.startswith(("cmp", "cmn", "tst", "teq", "b", "it", "str", "push", "vst")):
+                written.add(po[0].reg)
+        eb = self.entry_bounds.get(self.run_start)
+        if eb and eb[0] is not None and eb[0] not in written:
+            facts.append(eb)
+        if not facts:
+            self.entry_bounds[t] = (None, 0); return   # an edge with nothing known: no bound for t
+        reg = facts[0][0]
+        b = min(f[1] for f in facts if f[0] == reg)
         old = self.entry_bounds.get(t)
-        if old is None or (old[0] == ops[0].reg and b < old[1]): self.entry_bounds[t] = (ops[0].reg, b)
-        elif old[0] != ops[0].reg: self.entry_bounds[t] = (None, 0)   # entered from differently-guarded places: no bound
+        if old is None: self.entry_bounds[t] = (reg, b)
+        elif old[0] == reg: self.entry_bounds[t] = (reg, max(old[1], b))
+        else: self.entry_bounds[t] = (None, 0)
+
+    def const_of(self, prev, reg):
+        """the constant a movw/mov loaded into reg last in prev (None: written otherwise, or not at all)"""
+        for q in reversed(prev):
+            qo = q.operands
+            if qo and qo[0].type == ARM_OP_REG and qo[0].reg == reg:
+                if q.mnemonic.split(".")[0] in ("movw", "mov", "movs") and len(qo) == 2 and qo[1].type == ARM_OP_IMM: return qo[1].imm
+                return None
+        return None
 
     def table_targets(self, i, prev, arm):
         """a jump table's targets: Thumb tbb/tbh [pc, rN] (entries up to where the code it jumps to
@@ -569,7 +595,34 @@ class Analyser:
 
     def is_prologue(self, a):
         hw, hw2 = self.half(a), self.half(a + 2)
-        return hw is not None and hw2 is not None and ((hw & 0xff00) == 0xb500 or (hw == 0xe92d and hw2 & 0x4000 and not hw2 & 0x8000))
+        if hw is None or hw2 is None:
+            return False
+        if (hw & 0xff00) == 0xb500 or (hw == 0xe92d and hw2 & 0x4000 and not hw2 & 0x8000):   # push {..., lr} / push.w {..., lr}
+            return True
+        # mov ip, sp before the pushes: the caller's sp kept in ip (varargs functions push r0-r3 first, then {..., ip, lr}).
+        # Need for Speed Most Wanted's 0x8161c460, called only through a pointer built at run time (2026-11-22)
+        return hw == 0x46ec and ((hw2 & 0xfe00) == 0xb400 or hw2 == 0xe92d)
+
+    def leaf_after_end(self, a, covered_at):
+        """a few instructions ending in bx lr right where the function before ends (bx lr, pop {pc}, b), none of them
+        anything else that leaves: a leaf function no push marks -- an empty virtual method (a lone bx lr), a
+        `return 0`. covered_at(x): x belongs to a body already"""
+        if not self.ends_function(a):
+            return False
+        x = a
+        for _ in range(6):
+            if covered_at(x):
+                return False
+            i = self.insn(x, False)
+            if i is None or self.conditional(i, False):
+                return False
+            if i.id == A.ARM_INS_BX:
+                return i.op_str == "lr"
+            if i.id in (A.ARM_INS_B, A.ARM_INS_BL, A.ARM_INS_BLX, A.ARM_INS_CBZ, A.ARM_INS_CBNZ, A.ARM_INS_TBB, A.ARM_INS_TBH, A.ARM_INS_POP) \
+               or i.id in LDM or "pc" in i.op_str or i.mnemonic in ("nop", "udf", "bkpt", "svc"):
+                return False
+            x += i.size
+        return False
 
     def ends_function(self, a):
         """the instruction before a ends a function (bx lr, pop {pc}, b) and a isn't padding"""
@@ -605,6 +658,8 @@ def analyse(elf, out, compare=None, base=None, link=(), var_base=VAR_BASE):
     m = Module(elf)
     if base is not None:
         m.relocate(base)
+    import guestfix   # known bugs in Sony's libraries as games ship them, fixed in the code before it is read
+    guestfix.apply(m.mem[(m.loads[0][2] + m.delta) & 0xffffffff], log=lambda s: print(s, file=sys.stderr))
     names = known_names()
     linked = {}
     for path, lbase in link:
@@ -711,7 +766,8 @@ def analyse(elf, out, compare=None, base=None, link=(), var_base=VAR_BASE):
 
 
 def prologues(an, bodies):
-    """push {..., lr} at addresses no body covers, as (address, ARM): Thumb push / push.w, and ARM's
+    """push {..., lr} at addresses no body covers, as (address, ARM): Thumb push / push.w (or mov ip, sp before one), a
+    Thumb leaf right after a function's end (Analyser.leaf_after_end), and ARM's
     stmdb sp!, {..., lr} (0xe92d4xxx as a word -- a pattern Thumb's push.w, whose halfwords sit the
     other way round, never makes), which system modules' callbacks start with"""
     covered = bytearray(len(an.code) // 2 + 1)
@@ -719,13 +775,23 @@ def prologues(an, bodies):
         if an.in_text(lo):
             for x in range((lo - an.lo) // 2, min((hi - an.lo) // 2 + 1, len(covered))):
                 covered[x] = 1
-    out = []
+    out, own_to = [], 0
     for h in range(0, len(an.code) // 2 - 1):
         if covered[h]:
             continue
         a = an.lo + 2 * h
-        if an.is_prologue(a):   # push {..., lr} / push.w {..., lr}
+        if a < own_to:   # the pushes of the mov ip, sp prologue just found: its own, not functions of their own
+            continue
+        if an.is_prologue(a):   # push {..., lr} / push.w {..., lr}, or mov ip, sp before them
             out.append((a, False))
+            if an.half(a) == 0x46ec:
+                own_to = a + 2
+                for _ in range(2):   # (up to two pushes: r0-r3, then {..., ip, lr})
+                    if an.half(own_to) == 0xe92d: own_to += 4
+                    elif (an.half(own_to) or 0) & 0xfe00 == 0xb400: own_to += 2
+                    else: break
+        elif an.leaf_after_end(a, lambda x: covered[(x - an.lo) // 2] if 0 <= (x - an.lo) // 2 < len(covered) else True):
+            out.append((a, False))   # a leaf: bx lr within a few instructions of the function before's end
         elif not a & 3 and not covered[h + 1]:
             w = an.half(a) | (an.half(a + 2) or 0) << 16
             if w >> 16 == 0xe92d and w & 0x4000:   # ARM stmdb sp!, {..., lr}

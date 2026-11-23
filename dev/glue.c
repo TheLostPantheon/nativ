@@ -14,6 +14,8 @@ void recomp_set_mem(uint8_t *m) { recomp_mem = m; }
 void recomp_set_external(void (*cb)(Cpu *, uint32_t)) { external_cb = cb; }
 void recomp_call_external(Cpu *c, uint32_t addr) { if (external_cb) external_cb(c, addr); else c->r[0] = 0; }
 void recomp_unimplemented(Cpu *c, uint32_t addr) { recomp_unimpl_at = addr; c->stop = 1; }
+/* a computed jump to code the analysis never saw (main.c records it for the next build): here the run stops there */
+void recomp_missed_jump(Cpu *c, uint32_t addr, int thumb) { (void)thumb; recomp_unimpl_at = addr; c->stop = 1; }
 /* flush-to-zero and default-NaN, like the console's RunFast FPSCR (AArch64 FPCR.FZ | DN) */
 void recomp_runfast(void) {
 #if defined(__aarch64__)

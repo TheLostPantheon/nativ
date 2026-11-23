@@ -47,6 +47,7 @@ extern uint8_t *recomp_mem;
 /* provided by the host: a call to a guest address that isn't recompiled code (an import) */
 extern void recomp_call_external(Cpu *c, uint32_t addr);
 extern void recomp_unimplemented(Cpu *c, uint32_t addr);
+extern void recomp_missed_jump(Cpu *c, uint32_t addr, int thumb);   /* a computed jump to code the analysis never saw: recorded for the next build */
 extern GuestFn recomp_lookup(uint32_t addr);
 extern const char *recomp_import_name(uint32_t addr);   /* the import a stub address stands for */
 /* A module's functions (or import stubs) by guest address: recomp.py's list, hashed once before main() runs
@@ -70,9 +71,42 @@ static inline const void *recomp_addr_map_find(const RecompAddrMap *m, uint32_t 
 	uint32_t i = ((a >> 1) * 0x9E3779B1u) >> m->shift;
 	for (;;) { const uint32_t k = m->keys[i]; if (k == a) return m->vals[i]; if (!k) return 0; i = (i + 1) & m->mask; }
 }
+/* an indirect call's target (blx/bx through a register: C++'s virtual calls, function pointers), through a one-entry cache at
+ * the call site: the guest address in the high word, the host function as an offset from recomp_lookup in the low word, so
+ * one 64-bit load reads a consistent pair whichever thread filled it. Filled once, by the first target found, and never
+ * replaced: a site calling one target (most of them) skips the table's hash and its two dependent loads into a table of
+ * megabytes; one calling several finds its others in the table as before, without threads rewriting a shared line. In a
+ * module the miss looks that module's table up first (RECOMP_IC_MISS). Assassin's Creed III: Liberation's job threads spent ~9%
+ * of their time in recomp_lookup (2026-11-22) */
+static inline GuestFn recomp_ic_fill(uint64_t *ic, uint32_t t, GuestFn f, uint64_t e) {
+	if (f && !e) {
+		const intptr_t d = (intptr_t)(void *)f - (intptr_t)(void *)recomp_lookup;
+		if (d == (intptr_t)(int32_t)d) __atomic_store_n(ic, (uint64_t)t << 32 | (uint32_t)(int32_t)d, __ATOMIC_RELAXED);
+	}
+	return f;
+}
+#define RECOMP_LOOKUP_IC(t) __extension__ ({ static uint64_t recomp_ic_; const uint32_t recomp_t_ = (t); \
+	const uint64_t recomp_e_ = __atomic_load_n(&recomp_ic_, __ATOMIC_RELAXED); \
+	recomp_e_ && (uint32_t)(recomp_e_ >> 32) == recomp_t_ ? (GuestFn)(void *)((intptr_t)(void *)recomp_lookup + (int32_t)(uint32_t)recomp_e_) \
+	                                                    : recomp_ic_fill(&recomp_ic_, recomp_t_, RECOMP_IC_MISS(recomp_t_), recomp_e_); })
+#ifndef RECOMP_IC_MISS
+#define RECOMP_IC_MISS recomp_lookup   /* (a module's generated header points it at recomp_lookup_here) */
+#endif
 
 #define G(a) (recomp_mem + (uint32_t)(a))
-static inline uint32_t RD32(uint32_t a) { uint32_t v; memcpy(&v, G(a), 4); return v; }
+/* a NANTRAP build (below, at NANCHK) also reports the first store of the default NaN to each place, and the first load of
+ * one: most NaNs a game makes are thrown away (a zero vector's length, masked off by its own compare), and an engine that
+ * keeps NaN as its "not set" value stores it everywhere; the one that matters is read back as a number */
+#if defined(RECOMP_NANTRAP)
+extern void recomp_nan_stored(uint32_t a);
+extern void recomp_nan_loaded(uint32_t a);
+#define NANSTORE32(a, v) do { if (__builtin_expect((v) == 0x7fc00000u, 0)) recomp_nan_stored(a); } while (0)
+#define NANLOAD32(a, v) do { if (__builtin_expect((v) == 0x7fc00000u, 0)) recomp_nan_loaded(a); } while (0)
+#else
+#define NANSTORE32(a, v) ((void)0)
+#define NANLOAD32(a, v) ((void)0)
+#endif
+static inline uint32_t RD32(uint32_t a) { uint32_t v; memcpy(&v, G(a), 4); NANLOAD32(a, v); return v; }
 static inline uint16_t RD16(uint32_t a) { uint16_t v; memcpy(&v, G(a), 2); return v; }
 static inline uint8_t RD8(uint32_t a) { return *G(a); }
 /* ordered loads (recomp.py SYNC_MN: in lock-free code): no later load is satisfied before this one -- an acquire load
@@ -85,11 +119,11 @@ static inline uint16_t RD16V(uint32_t a) { if (a & 1) { volatile uint8_t *p = G(
 static inline uint8_t RD8V(uint32_t a) { return __atomic_load_n(G(a), __ATOMIC_RELAXED); }
 static inline uint16_t RD16A(uint32_t a) { if (a & 1) { uint16_t v = RD16(a); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; } return __atomic_load_n((uint16_t *)G(a), __ATOMIC_ACQUIRE); }
 static inline uint8_t RD8A(uint32_t a) { return __atomic_load_n(G(a), __ATOMIC_ACQUIRE); }
-static inline void WR32(uint32_t a, uint32_t v) { memcpy(G(a), &v, 4); }
+static inline void WR32(uint32_t a, uint32_t v) { NANSTORE32(a, v); memcpy(G(a), &v, 4); }
 static inline void WR16(uint32_t a, uint16_t v) { memcpy(G(a), &v, 2); }
 static inline void WR8(uint32_t a, uint8_t v) { *G(a) = v; }
-static inline uint64_t RD64(uint32_t a) { uint64_t v; memcpy(&v, G(a), 8); return v; }
-static inline void WR64(uint32_t a, uint64_t v) { memcpy(G(a), &v, 8); }
+static inline uint64_t RD64(uint32_t a) { uint64_t v; memcpy(&v, G(a), 8); NANLOAD32(a, (uint32_t)v); NANLOAD32(a + 4, (uint32_t)(v >> 32)); return v; }
+static inline void WR64(uint32_t a, uint64_t v) { NANSTORE32(a, (uint32_t)v); NANSTORE32(a + 4, (uint32_t)(v >> 32)); memcpy(G(a), &v, 8); }
 
 /* condition codes (capstone's ARM_CC_*: EQ=1 .. LE=14, AL=15) */
 static inline int COND(Cpu *c, int cc) {
@@ -199,11 +233,53 @@ static inline uint32_t STREX##N(uint32_t a, uint32_t v) { \
 }
 RECOMP_EXCL_NARROW(B, uint8_t, 3)
 RECOMP_EXCL_NARROW(H, uint16_t, 4)
+/* -DRECOMP_NANTRAP (a debug build: RECOMP_CFLAGS=-DRECOMP_NANTRAP): where a NaN is born. The host's Invalid Operation
+ * flag (FPSR.IOC) is set by an operation that makes a NaN out of numbers (0/0, inf-inf, 0*inf, sqrt of a negative) and
+ * not by one that only carries a NaN along, so a float result that is NaN with the flag up names the instruction that
+ * made it: recomp_nan_born reports the function around it (main.c), once per place, with the frame. A NaN that spreads
+ * through a game's state (a camera that follows a skeleton that looks at the camera) shows only copies of itself
+ * afterwards; this finds the first one. */
+#if defined(RECOMP_NANTRAP) && defined(__aarch64__)
+/* RECOMP_NANTAG=1 (with the NANTRAP build): NaNs carry where they were born. FPCR.DN is left off (recomp_runfast) and the
+ * helpers below keep a NaN's payload instead of making it the default NaN, so a NaN made at a place leaves it as
+ * 0x7fe00000 | that place's number (recomp_nan_born: the log names the number) and keeps it through arithmetic, memory,
+ * threads and frames: the NaN in a camera matrix says which instruction made it. A NaN that reaches a register some other
+ * way keeps its own bits: 0x7fc00000, the game's own constant (its "not set"); 0x7fdf0xxx, a half-float NaN from data;
+ * anything else, data that isn't a float at all. (A game comparing NaN bit patterns could act differently in this build.) */
+extern int recomp_nan_tag;
+extern uint32_t recomp_nan_born(void);   /* reports the place; the NaN to leave there (0 while tagging is off) */
+static inline uint32_t NAN_PASS(uint32_t b) { return recomp_nan_tag ? (b | 0x00400000u) : 0x7fc00000u; }   /* a NaN carried along */
+static inline uint32_t NAN_NEW(void) { uint32_t t = recomp_nan_born(); return t ? t : 0x7fc00000u; }   /* one made here with no flag raised */
+static inline uint32_t NAN_HALF(uint32_t m) { return recomp_nan_tag ? (0x7fdf0000u | m) : 0x7fc00000u; }   /* a half-float NaN widened */
+static inline float NANCHK(float x) {
+	uint64_t s; __asm__ volatile("mrs %0, fpsr" : "=r"(s) : "w"(x));
+	if (__builtin_expect(s & 1, 0)) {
+		__asm__ volatile("msr fpsr, %0" : : "r"(s & ~1ull));
+		if (x != x) { uint32_t t = recomp_nan_born(); if (t) memcpy(&x, &t, 4); }
+	}
+	return x;
+}
+static inline double NANCHKD(double x) {
+	uint64_t s; __asm__ volatile("mrs %0, fpsr" : "=r"(s) : "w"(x));
+	if (__builtin_expect(s & 1, 0)) {
+		__asm__ volatile("msr fpsr, %0" : : "r"(s & ~1ull));
+		if (x != x) { uint32_t t = recomp_nan_born(); if (t) { uint64_t d = 0x7ff8000000000000ull | (uint64_t)(t & 0x3fffffu) << 29; memcpy(&x, &d, 8); } }   /* (the float payload's bits, where a narrowing keeps them) */
+	}
+	return x;
+}
+#else
+#define NANCHK(x) (x)
+#define NANCHKD(x) (x)
+#define NAN_PASS(b) 0x7fc00000u
+#define NAN_NEW() 0x7fc00000u
+#define NAN_HALF(m) 0x7fc00000u
+#endif
 /* NEON floating point always runs in the "standard FPSCR" mode: denormals flushed to zero */
 static inline float FZF(float x) {   /* and NaNs become the default NaN (NEON's DN) */
+	x = NANCHK(x);
 	uint32_t b; memcpy(&b, &x, 4);
 	if (!(b & 0x7f800000u)) b &= 0x80000000u;
-	else if ((b & 0x7f800000u) == 0x7f800000u && (b & 0x7fffff)) b = 0x7fc00000u;
+	else if ((b & 0x7f800000u) == 0x7f800000u && (b & 0x7fffff)) b = NAN_PASS(b);
 	memcpy(&x, &b, 4); return x;
 }
 static inline float B2F(uint32_t b) { float x; memcpy(&x, &b, 4); return x; }
@@ -211,9 +287,9 @@ static inline uint32_t F2B(float x) { uint32_t b; memcpy(&b, &x, 4); return b; }
 /* VRSQRTE.F32: the ARMv7 ARM's FPRSqrtEstimate (bit-exact) */
 static inline uint32_t RSQRTE_F32(uint32_t b) {
 	uint32_t sign = b & 0x80000000u, exp = (b >> 23) & 0xff, frac = b & 0x7fffff;
-	if (exp == 0xff && frac) return 0x7fc00000u;               /* NaN */
+	if (exp == 0xff && frac) return NAN_PASS(b);               /* NaN */
 	if (exp == 0) return sign | 0x7f800000u;                    /* zero, flushed denormal: inf */
-	if (sign) return 0x7fc00000u;                               /* negative: default NaN */
+	if (sign) return NAN_NEW();                                 /* negative: default NaN */
 	if (exp == 0xff) return 0;                                  /* +inf: +0 */
 	double a;   /* the operand's significand scaled into [0.25, 1) by the exponent's parity */
 	uint64_t frac64 = (uint64_t)frac << 29;
@@ -239,7 +315,7 @@ extern __thread uint32_t recomp_tpidruro;
  * and NEON always does: insnsweep.py found the payload carried through) */
 static inline uint32_t H2F(uint16_t h) {
 	uint32_t sign = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 31, m = h & 0x3ff;
-	if (e == 31) return m ? 0x7fc00000u : sign | 0x7f800000u;
+	if (e == 31) return m ? NAN_HALF(m) : sign | 0x7f800000u;
 	if (e == 0) {
 		if (!m) return sign;
 		while (!(m & 0x400)) { m <<= 1; e--; }   /* subnormal half: normalise */
@@ -267,7 +343,7 @@ static inline uint16_t F2H(uint32_t f) {
 /* VRECPE.F32: the ARMv7 ARM's FPRecipEstimate (a 9-bit table-free estimate, bit-exact) */
 static inline uint32_t RECPE_F32(uint32_t b) {
 	uint32_t sign = b & 0x80000000u, exp = (b >> 23) & 0xff, frac = b & 0x7fffff;
-	if (exp == 0xff && frac) return 0x7fc00000u;               /* NaN -> default NaN */
+	if (exp == 0xff && frac) return NAN_PASS(b);               /* NaN -> default NaN */
 	if (exp == 0) return sign | 0x7f800000u;                    /* zero, flushed denormal -> inf */
 	if (exp == 0xff) return sign;                               /* inf -> zero */
 	if (exp >= 253) return sign;                                /* |x| >= 2^126 -> zero (flushed) */
@@ -296,8 +372,8 @@ static inline uint64_t SATU(int64_t v, int bits) { int64_t mx = ((int64_t)1 << b
  * in hardware (recomp_runfast sets FPCR.DN); x86 has no such mode and makes its own (0xffc00000 for 0/0), so there
  * the result is replaced (isacover found vdiv.f32 s3, s3, s3 differing on x86) */
 #if defined(__aarch64__)
-#define DNS(x) (x)
-#define DND(x) (x)
+#define DNS(x) NANCHK(x)
+#define DND(x) NANCHKD(x)
 #else
 static inline float DNS(float x) { return x != x ? B2F(0x7fc00000u) : x; }
 static inline double DND(double x) { if (x != x) { uint64_t b = 0x7ff8000000000000ull; memcpy(&x, &b, 8); } return x; }
@@ -354,13 +430,13 @@ static inline int64_t RSHR64_S(int64_t v, int n) { return n >= 64 ? 0 : (v >> n)
  * values (the two zeros) take the sign that wins (+0 for max, -0 for min); denormals flushed */
 static inline uint32_t FMAX_F32(uint32_t a, uint32_t b) {
 	float x = FZF(B2F(a)), y = FZF(B2F(b));
-	if (x != x || y != y) return 0x7fc00000u;
+	if (x != x || y != y) return NAN_PASS(x != x ? F2B(x) : F2B(y));
 	if (x == y) return F2B(x) & F2B(y);
 	return F2B(x > y ? x : y);
 }
 static inline uint32_t FMIN_F32(uint32_t a, uint32_t b) {
 	float x = FZF(B2F(a)), y = FZF(B2F(b));
-	if (x != x || y != y) return 0x7fc00000u;
+	if (x != x || y != y) return NAN_PASS(x != x ? F2B(x) : F2B(y));
 	if (x == y) return F2B(x) | F2B(y);
 	return F2B(x < y ? x : y);
 }

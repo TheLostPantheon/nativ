@@ -1065,6 +1065,23 @@ void gfx_decode_texture_rgba8(const GfxTexture *t, uint8_t *out) {
  * ambient pass read garbage reflection directions from them */
 void gfx_decode_texture_f32(const GfxTexture *t, float *out) {
 	int w = t->width ? t->width : 1, h = t->height ? t->height : 1;
+	if ((t->format & 0xff000000u) == 0x1b000000u) {
+		/* F16F16F16F16 straight from its halves: texel_raw's read and apply_swizzle's placement, without the per-texel
+		 * format dispatch and coordinates. Assassin's Creed III: Liberation rewrites six of them every frame (2026-11-22) */
+		for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+			const uint32_t a = t->data + 8 * texel_index(t, (uint32_t)x, (uint32_t)y); float *o = out + 4 * (y * w + x);
+			for (int k = 0; k < 4; k++) o[k] = half_to_float_soft(RD16(a + 2 * (uint32_t)k));
+			apply_swizzle(t->format, 4, o);
+		}
+		static int check = -1; if (check < 0) check = getenv("RECOMP_GPU_DECODE_CHECK") != 0;   /* (as gfx_decode_texture_rgba8's) */
+		if (check) {
+			float ref[4]; int bad = -1;
+			for (int y = 0; y < h && bad < 0; y++) for (int x = 0; x < w && bad < 0; x++) { texel(t, (x + 0.5f) / w, (y + 0.5f) / h, ref); if (memcmp(ref, out + 4 * (y * w + x), sizeof ref)) bad = y * w + x; }
+			static int said; if (bad >= 0 && said++ < 20) fprintf(stderr, "    gfx: decode check: F16 texture %#x fmt %#x %dx%d: texel %d differs\n", t->data, t->format, w, h, bad);
+			static unsigned ok; if (bad < 0 && ++ok % 200 == 1) fprintf(stderr, "    gfx: decode check: %u F16 textures identical so far (last %#x fmt %#x %dx%d)\n", ok, t->data, t->format, w, h);
+		}
+		return;
+	}
 	for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) texel(t, (x + 0.5f) / w, (y + 0.5f) / h, out + 4 * (y * w + x));
 }
 /* YUV textures (linear; Uncharted's photo minigame shows its photos as YUV420P3, undecoded they came out
@@ -1221,6 +1238,7 @@ static int target_bpp_of(const GfxTarget *t) {
 	case 0x30000000u: case 0x40000000u: case 0x50000000u: case 0x60000000u: case 0xF0000000u: case 0x20800000u: case 0x40800000u:
 	case 0xA0800000u: case 0xB0800000u: case 0xC0800000u: return 2;
 	case 0x80800000u: case 0x90800000u: return 1;
+	case 0x10000000u: return 3;   /* U8U8U8 (see target_read_raw_of) */
 	case 0x01000000u: case 0x11000000u: return 8;
 	default: return 4;
 	}
@@ -1288,6 +1306,13 @@ static void target_read_raw_of(const GfxTarget *t, int x, int y, float c[4]) {
 		c[0] = v0 < -1.f ? -1.f : v0; c[1] = v1 < -1.f ? -1.f : v1; c[2] = 0; c[3] = 1; return;
 	}
 	case 0x40800000u: c[0] = RD16(a) / 65535.f; c[1] = c[2] = 0; c[3] = 1; return;                    /* U16 */
+	case 0x10000000u: {   /* U8U8U8: three bytes a pixel, BGR (R lowest, as ABGR's) or RGB (B lowest), as a U8U8U8 texture reads
+	                       * them. It used to take the 4-byte default: LittleBigPlanet's 960x544 U8U8U8 target came down a
+	                       * third past its end, over the small textures the game keeps there (its speech bubbles lost their
+	                       * button icons and backgrounds) */
+		const int rgb = ((t->format >> 20) & 3) == 1; const uint8_t b0 = RD8(a), b1 = RD8(a + 1), b2 = RD8(a + 2);
+		c[0] = (rgb ? b2 : b0) / 255.f; c[1] = b1 / 255.f; c[2] = (rgb ? b0 : b2) / 255.f; c[3] = 1; return;
+	}
 	case 0x20800000u: { float v = (int16_t)RD16(a) / 32767.f; c[0] = v < -1.f ? -1.f : v; c[1] = c[2] = 0; c[3] = 1; return; }   /* S16 */
 	case 0x50000000u: {   /* U4U4U4U4: four nibbles in the 8-bit case's channel orders (ABGR: R lowest). Killzone:
 	                       * Mercenary renders a few small masks into one; the 4-byte default below read and
@@ -1342,6 +1367,10 @@ static void target_write_raw_of(const GfxTarget *t, int x, int y, const float c[
 	case 0xB0800000u: WR8(a, (uint8_t)to8(c[0])); WR8(a + 1, (uint8_t)to8(c[1])); return;    /* U8U8 */
 	case 0xC0800000u: WR8(a, (uint8_t)to8s(c[0])); WR8(a + 1, (uint8_t)to8s(c[1])); return;  /* S8S8 */
 	case 0x40800000u: WR16(a, (uint16_t)to16(c[0])); return;                           /* U16 */
+	case 0x10000000u: {                                                                 /* U8U8U8 (target_read_raw_of's layout) */
+		const int rgb = ((t->format >> 20) & 3) == 1; const uint8_t r = (uint8_t)to8(c[0]), g = (uint8_t)to8(c[1]), b = (uint8_t)to8(c[2]);
+		WR8(a, rgb ? b : r); WR8(a + 1, g); WR8(a + 2, rgb ? r : b); return;
+	}
 	case 0x20800000u: WR16(a, (uint16_t)to16s(c[0])); return;                          /* S16 */
 	case 0x50000000u: {   /* U4U4U4U4 (target_read_of's layout), quantised from the 8-bit value so the GPU path's
 	                       * RGBA8 round trip (gfx_encode_target_rgba8) stores exactly the nibbles this path does */
@@ -1859,7 +1888,15 @@ static void shade_interp(const Tri *t, const DrawRec *r, int x, int y, float b0,
 	/* FRAGCOLOR_USED: the program reads the pixel's current colour (programmable blending -- Unit 13's
 	 * occlusion pass multiplies the lit HDR buffer by its half-res AO; without the preload it
 	 * multiplied by zero and the whole frame went black under the later passes) */
-	if (fl->frag_color_used) { float cur[4]; target_read(x, y, cur); usse_preload_color(&finst, fl, cur); }
+	if (fl->frag_color_used) {
+		float cur[4]; target_read(x, y, cur);
+		if (fl->color_type == 5 /* TY_F16 */ && fl->color_comps > 2 && (target.format & 0xf1800000u) == 0x11000000u) {
+			/* an F32F32 surface holding two halves a word (stored as words, below): its words back as they are, not as
+			 * floats made halves (Assassin's Creed III: Liberation's puddles blend into its scene buffer in the shader) */
+			UWord *bank = fl->native_color ? finst.o : finst.pa;
+			for (int k = 0; k < (fl->color_comps + 1) / 2; k++) memcpy(&bank[(fl->color_pa_start + k) % 160].u, &cur[k], 4);
+		} else usse_preload_color(&finst, fl, cur);
+	}
 	uint64_t t0 = usse_profile_on() ? now_ns() : 0;
 	/* RECOMP_TRACE_DRAW=k with RECOMP_DEBUG_PIXEL=x,y: that pixel's fragment program instruction by
 	 * instruction (the vertex trace above covers vertex 0 only; a text glyph's alpha went negative
@@ -1917,6 +1954,15 @@ static void shade_interp(const Tri *t, const DrawRec *r, int x, int y, float b0,
 	if (!probed && (fl->color_type == 8 /* TY_U32 */ || fl->color_type == 9 /* TY_S32 */)) {   /* a probe shows as floats even on a raw-word target */
 		const UWord *bank = fl->native_color ? finst.o : finst.pa;
 		int n = fl->color_comps > 0 && fl->color_comps <= 4 ? fl->color_comps : 1;
+		for (int k = 0; k < n; k++) raw[k] = bank[(fl->color_pa_start + k) % 160].u;
+		*nraw = n;
+	} else if (!probed && fl->color_type == 5 /* TY_F16 */ && fl->color_comps > 2 && (target.format & 0xf1800000u) == 0x11000000u) {
+		/* more half-float components than an F32F32 surface has channels: the pixel back end stores the output words as
+		 * they are, two halves a word (Vita3K-Plus's fragment output packing, "used in assassin creed 3"), and the passes
+		 * after read the surface back as four halves. Converted to two floats, Assassin's Creed III: Liberation's scene
+		 * buffer came out green and magenta with noise everywhere (2026-11-22). */
+		const UWord *bank = fl->native_color ? finst.o : finst.pa;
+		int n = (fl->color_comps + 1) / 2;
 		for (int k = 0; k < n; k++) raw[k] = bank[(fl->color_pa_start + k) % 160].u;
 		*nraw = n;
 	}
@@ -2477,12 +2523,15 @@ static void shot(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch) {
 	fclose(f);
 }
 static int shot_window(void) { return (long)frame >= shot_from && (shot_to < 0 || (long)frame <= shot_to); }
-int gfx_soft_shot_due(void) { init(); return shot_every && frame % shot_every == 0 && shot_window(); }   /* will this present write a RECOMP_SHOT? (gfx_gpu.c syncs guest memory only then) */
+/* the frames written: every RECOMP_SHOT-th in the window, and the RECOMP_SHOT_LAST frame the test reads whether the series lands
+ * on it or not (SHOT_EVERY=60 with TEST_FRAMES=5800 exited at 5800 without its shot, and the test failed: "no frame 5800") */
+static int shot_due(void) { return (shot_every && frame % shot_every == 0 && shot_window()) || (shot_last >= 0 && (long)frame >= shot_last); }
+int gfx_soft_shot_due(void) { init(); return shot_due(); }   /* will this present write a RECOMP_SHOT? (gfx_gpu.c syncs guest memory only then) */
 int gfx_soft_skip_window;   /* set by gfx_gpu.c when it has shown the frame itself */
 void gfx_soft_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format) {
 	init();
 	if ((long)frame == dump_frame) fprintf(stderr, " present frame %llu: %u draws\n", (unsigned long long)frame, ndraw);
-	if (shot_every && frame % shot_every == 0 && shot_window()) shot(base, width, height, pitch);
+	if (shot_due()) shot(base, width, height, pitch);
 	if (shot_last >= 0 && (long)frame >= shot_last) { fprintf(stderr, "frame %llu shot: the last one asked for (RECOMP_SHOT_LAST), exiting\n", (unsigned long long)frame); fflush(stderr); gfx_gpu_builds_stop(); exit(0); }   /* a scripted test used to run to its timeout: minutes for a frame that takes seconds */
 	usse_profile_report();
 	extern void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch);

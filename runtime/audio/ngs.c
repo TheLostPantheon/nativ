@@ -27,7 +27,8 @@
 #include "third_party/libatrac9/libatrac9.h"   /* MIT, vendored unmodified */
 
 
-enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM_AT9, DEF_COMPRESSOR, DEF_SIDECHAIN, DEF_TEMPLATE1, DEF_ATRAC9 };
+enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM_AT9, DEF_COMPRESSOR, DEF_SIDECHAIN, DEF_TEMPLATE1, DEF_ATRAC9, DEF_SIMPLE_AT9,
+       DEF_MIXER, DEF_EQ, DEF_DISTORTION };
 /* DEF_TEMPLATE1 (sceNgsVoiceDefGetTemplate1) and DEF_ATRAC9 (sceNgsVoiceDefGetAtrac9Voice): the long voices, a PCM player or an ATRAC9
  * decoder and then generator, mixer, equalizer, envelope, distortion and four more equalizers (Vita3K's BUSS_NORMAL_PLAYER, BUSS_ATRAC9).
  * The stages are found by their parameter blocks' ids (stage_module), not their places, so they run as the shorter voices' do. Asked for
@@ -35,10 +36,15 @@ enum { DEF_MASTER = 1, DEF_SIMPLE, DEF_REVERB, DEF_OTHER, DEF_SCREAM, DEF_SCREAM
 /* a bus that passes what reaches it through (no dynamics yet): the compressor, and the side-chain
  * compressor -- the same with a second input (1) carrying the key signal that drives its gain
  * reduction, which is never part of its output */
-#define PASS_BUS(d) ((d) == DEF_COMPRESSOR || (d) == DEF_SIDECHAIN)
+#define PASS_BUS(d) ((d) == DEF_COMPRESSOR || (d) == DEF_SIDECHAIN || (d) == DEF_MIXER || (d) == DEF_EQ || (d) == DEF_DISTORTION)
+/* (DEF_MIXER, DEF_EQ, DEF_DISTORTION: sceNgsVoiceDefGetMixerBuss / EqBuss / DistortionBuss, buses that gather what is routed to
+ * them, passed through as the compressor is -- no equalisation or distortion yet. They came back 0: a rack of silent voices,
+ * and everything Need for Speed Most Wanted's races routed through them dropped) */
 /* voices whose module 0 is a PCM player (the simple voice FMOD uses; Sony's Scream library's) */
 #define PCM_PLAYER(d) ((d) == DEF_SIMPLE || (d) == DEF_SCREAM || (d) == DEF_TEMPLATE1)
-#define AT9_VOICE(d) ((d) == DEF_SCREAM_AT9 || (d) == DEF_ATRAC9)   /* a voice whose module 0 is the ATRAC9 decoder */
+/* (DEF_SIMPLE_AT9, sceNgsVoiceDefGetSimpleAtrac9Voice: the simple voice with the ATRAC9 decoder for its player -- Need for
+ * Speed Most Wanted's; it came back 0 and those racks were silent) */
+#define AT9_VOICE(d) ((d) == DEF_SCREAM_AT9 || (d) == DEF_ATRAC9 || (d) == DEF_SIMPLE_AT9)   /* a voice whose module 0 is the ATRAC9 decoder */
 #define PLAYER_VOICE(d) (PCM_PLAYER(d) || AT9_VOICE(d))   /* a voice that plays data and can finish */
 /* ATRAC9 player parameters: descriptor, four buffers of 16 bytes {data, bytes, s16 loops, s16 next,
  * s16 discard at start, s16 at end}, +72 float frequency, +76 float scalar, +88 s8 channels,
@@ -90,9 +96,9 @@ typedef struct Voice {
 	 * channel (the equalizer's four filters, then the filter module's) */
 	int env_pt, releasing, released_out; float env_ms, env_level, rel_from, rel_ms;
 	float bq[5][2][2];
-	uint64_t at9_waited, at9_decoded;   /* RECOMP_NGS_AT9_LOG: output samples spent waiting for data, source samples decoded */
+	uint64_t at9_decoded;   /* RECOMP_NGS_AT9_LOG: source samples decoded */
 } Voice;
-typedef struct { uint32_t src, dst, input; float vol[2][2]; int active; } Patch;
+typedef struct { uint32_t src, out, sub, dst, input; float vol[2][2]; int active; } Patch;
 #define ENV_ID 0x5ce3   /* the envelope module's parameter block id (voice_stages, below) */
 static int stages_off(void); static int stage_module(const Voice *v, uint32_t id);
 
@@ -301,6 +307,7 @@ static void dump_log_line(Voice *v, const char *what, const char *extra) {
 	        (int8_t)RD8(pp + (at9 ? A_CHANNELS : P_CHANNELS)), at9 ? 9 : (int8_t)RD8(pp + P_TYPE), at9 ? 0 : RD8(pp + P_START),
 	        at9 ? 0 : RD32(pp + 64), at9 ? 0 : RD32(pp + 68), at9 ? 0 : RD32(pp + 72), at9 ? 0 : RD8(pp + 77), at9 ? 0 : RD8(pp + 78),
 	        st->src.ch ? st->src.bytes / (2 * st->src.ch) : 0, st->out.bytes / 4, extra ? extra : "");
+	{ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); fprintf(dump_log, "    at t %.3f\n", ts.tv_sec + ts.tv_nsec / 1e9); }   /* (the host's clock: lines up with other logs) */
 	if (at9) for (int i = 0; i < 4; i++) fprintf(dump_log, "    at9 buf %d: data %#x bytes %u loops %d next %d skip %d/%d\n", i, RD32(pp + A_BUF(i)), RD32(pp + A_BUF(i) + 4), (int16_t)RD16(pp + A_BUF(i) + 8), (int16_t)RD16(pp + A_BUF(i) + 10), (int16_t)RD16(pp + A_BUF(i) + 12), (int16_t)RD16(pp + A_BUF(i) + 14));
 	else for (int i = 0; i < 4; i++) fprintf(dump_log, "    buf %d: data %#x bytes %u loops %d next %d\n", i, RD32(pp + P_BUF(i)), RD32(pp + P_BUF(i) + 4), (int16_t)RD16(pp + P_BUF(i) + 8), (int16_t)RD16(pp + P_BUF(i) + 10));
 	fflush(dump_log);
@@ -329,6 +336,10 @@ static void h_def_compressor(Cpu *c) { RET(defn(DEF_COMPRESSOR)); }
 static void h_def_sidechain(Cpu *c) { RET(defn(DEF_SIDECHAIN)); }
 static void h_def_template1(Cpu *c) { RET(defn(DEF_TEMPLATE1)); }
 static void h_def_atrac9(Cpu *c) { RET(defn(DEF_ATRAC9)); }
+static void h_def_simple_at9(Cpu *c) { RET(defn(DEF_SIMPLE_AT9)); }
+static void h_def_mixer(Cpu *c) { RET(defn(DEF_MIXER)); }
+static void h_def_eq(Cpu *c) { RET(defn(DEF_EQ)); }
+static void h_def_distortion(Cpu *c) { RET(defn(DEF_DISTORTION)); }
 
 /* ---- system and racks */
 static void h_sys_mem(Cpu *c) { WR32(A1, 0x10000); RET(0); }   /* (params, *size) */
@@ -360,10 +371,23 @@ static void h_rack_init(Cpu *c) {
 static void h_rack_voice(Cpu *c) { uint32_t n = RD32(A0); WR32(A2, A1 < n ? RD32(A0 + 8 + 4 * A1) : 0); RET(A1 < n ? 0 : 0x804a0005u); }
 
 /* ---- patches: (SceNgsPatchSetupInfo*: source voice, output index, sub index, destination, input index, *patch) */
+/* sceNgsPatchCreateRouting(SceNgsPatchSetupInfo *{source voice, output, sub-output, destination voice, input}, *handle). A
+ * removed patch's slot is taken again, and a voice output's sub-output holds one patch: routing it again replaces the
+ * old one. The table only grew before: Need for Speed Most Wanted re-routes its voices every few updates (52,000 patches
+ * in two minutes), so past 1024 every new patch went into the last slot, the game's next remove took that one out, and
+ * every voice was left routed nowhere -- the whole game silent (2026-11-22) */
 static void h_patch_create(Cpu *c) {
+	const uint32_t src = RD32(A0), out = RD32(A0 + 4), sub = RD32(A0 + 8);
 	pthread_mutex_lock(&lock);
-	Patch *p = &patches[npatches < 1024 ? npatches++ : 1023];
-	p->src = RD32(A0); p->dst = RD32(A0 + 12); p->input = RD32(A0 + 16);
+	int k = -1, freek = -1;
+	for (int i = 0; i < npatches && k < 0; i++) {
+		if (patches[i].active && patches[i].src == src && patches[i].out == out && patches[i].sub == sub) k = i;
+		else if (!patches[i].active && freek < 0) freek = i;
+	}
+	if (k < 0) k = freek >= 0 ? freek : npatches < (int)(sizeof patches / sizeof *patches) ? npatches++ : -1;
+	if (k < 0) { pthread_mutex_unlock(&lock); RET(0x804a0005u); return; }
+	Patch *p = &patches[k];
+	p->src = src; p->out = out; p->sub = sub; p->dst = RD32(A0 + 12); p->input = RD32(A0 + 16);
 	p->vol[0][0] = p->vol[1][1] = 1; p->vol[0][1] = p->vol[1][0] = 0; p->active = 1;
 	pthread_mutex_unlock(&lock);
 	dump_setup();
@@ -371,11 +395,29 @@ static void h_patch_create(Cpu *c) {
 	WR32(A1, 0x60000000u + (uint32_t)(p - patches)); RET(0);
 }
 static Patch *patch_of(uint32_t h) { uint32_t i = h - 0x60000000u; return i < (uint32_t)npatches ? &patches[i] : 0; }
-static void h_patch_remove(Cpu *c) { Patch *p = patch_of(A0); if (p) p->active = 0; RET(0); }
+static void h_patch_remove(Cpu *c) {
+	Patch *p = patch_of(A0); if (p) p->active = 0;
+	if (p && dump_log) { fprintf(dump_log, "upd %llu patch %d removed\n", (unsigned long long)updates, (int)(p - patches)); fflush(dump_log); }
+	RET(0);
+}
+/* sceNgsVoiceGetOutputPatch(voice, output index, sub index, *patch): the routing made from that output, and an error when
+ * there is none -- which is how a game asks whether to route it: Need for Speed Most Wanted creates the patch only when
+ * this fails. Answering success with a null handle (and before that, as a stub, success with *patch untouched) made it
+ * believe every output was routed: its compressor never reached the master bus and the game had no sound at all
+ * (2026-11-22) */
+static void h_voice_output_patch(Cpu *c) {
+	uint32_t h = 0;
+	pthread_mutex_lock(&lock);
+	for (int i = npatches - 1; i >= 0; i--)
+		if (patches[i].active && patches[i].src == A0 && patches[i].out == A1 && patches[i].sub == A2) { h = 0x60000000u + (uint32_t)i; break; }
+	pthread_mutex_unlock(&lock);
+	if (A3) WR32(A3, h);
+	RET(h ? 0 : 0x804a0005u);
+}
 static void h_patch_volumes(Cpu *c) {   /* (patch, SceNgsVolumeMatrix*: float m[2][2]) */
 	Patch *p = patch_of(A0);
 	if (p && A1) for (int i = 0; i < 4; i++) { float f; memcpy(&f, G(A1 + 4 * i), 4); p->vol[i / 2][i % 2] = f; }
-	if (p && dump_log) { Voice *s = voice_of(p->src); fprintf(dump_log, "upd %llu patch %d vol: v %d -> v %d  %.3f %.3f / %.3f %.3f\n", (unsigned long long)updates, (int)(p - patches), s ? VIDX(s) : -1, voice_of(p->dst) ? VIDX(voice_of(p->dst)) : -1, p->vol[0][0], p->vol[0][1], p->vol[1][0], p->vol[1][1]); }
+	if (p && dump_log) { Voice *s = voice_of(p->src); fprintf(dump_log, "upd %llu patch %d vol: v %d -> v %d  %.4g %.4g / %.4g %.4g (lr 0x%08x)\n", (unsigned long long)updates, (int)(p - patches), s ? VIDX(s) : -1, voice_of(p->dst) ? VIDX(voice_of(p->dst)) : -1, p->vol[0][0], p->vol[0][1], p->vol[1][0], p->vol[1][1], c->r[14]); }
 	RET(0);
 }
 
@@ -438,7 +480,7 @@ static void h_voice_play(Cpu *c) {
 		v->frac = 1; memset(v->rs_h, 0, sizeof v->rs_h); v->rs_i = 0;   /* (1: the first output fetches the first source sample) */
 		v->pcm_len = v->pcm_pos = 0; v->at9_cfg = 0; v->stage_on = 0;   /* (a fresh decoder: ATRAC9 frames carry state) */
 		v->ad_valid = 0; v->ad_idx = 0; memset(v->ad_hist, 0, sizeof v->ad_hist);
-		v->at9_waited = v->at9_decoded = 0; v->env_pt = 0; v->env_ms = 0; v->env_level = 0; v->releasing = v->released_out = 0; v->rel_ms = 0; memset(v->bq, 0, sizeof v->bq);
+		v->at9_decoded = 0; v->env_pt = 0; v->env_ms = 0; v->env_level = 0; v->releasing = v->released_out = 0; v->rel_ms = 0; memset(v->bq, 0, sizeof v->bq);
 		uint32_t pp = v->params[0]; if (pp && PCM_PLAYER(v->def)) v->buffer = ngs_player_start((int8_t)RD8(pp + P_START)); }
 	dump_setup();
 	if (v && dump_dir && PLAYER_VOICE(v->def)) {
@@ -789,13 +831,13 @@ static void render_player(Voice *v, float *out /* stereo, granularity frames */)
 static int at9_log_on(void) { static int on = -1; if (on < 0) on = getenv("RECOMP_NGS_AT9_LOG") != 0; return on; }
 static void at9_log(Voice *v, uint32_t pp, uint32_t prev, const char *what) {
 	if (!at9_log_on()) return;
-	fprintf(stderr, "    at9 v%d upd %llu %s %u->%u: bytes %u discard %d/%d next-bytes %u | out %u decoded %llu waited %llu\n", VIDX(v), (unsigned long long)updates, what, prev, v->buffer,
+	fprintf(stderr, "    at9 v%d upd %llu %s %u->%u: bytes %u discard %d/%d next-bytes %u | out %u decoded %llu\n", VIDX(v), (unsigned long long)updates, what, prev, v->buffer,
 	        RD32(pp + A_BUF(prev) + 4), (int16_t)RD16(pp + A_BUF(prev) + 12), (int16_t)RD16(pp + A_BUF(prev) + 14), RD32(pp + A_BUF(v->buffer) + 4),
-	        v->samples_gen, (unsigned long long)v->at9_decoded, (unsigned long long)v->at9_waited);
+	        v->samples_gen, (unsigned long long)v->at9_decoded);
 }
-/* the next source sample of an ATRAC9 player: 1, 0 when its data ends (or fails), 2 while it waits for the game to
- * queue more */
+/* the next source sample of an ATRAC9 player: 1, or 0 when its data ends (or fails) */
 static int fetch_at9(Voice *v, uint32_t pp, float rate, float *l, float *r) {
+	int hops = 0;
 	while (v->pcm_pos >= v->pcm_len) {   /* the next frame */
 		int used = 0, e;
 		if (v->stage_on) {   /* inside a superframe joined from two buffers */
@@ -809,7 +851,17 @@ static int fetch_at9(Voice *v, uint32_t pp, float rate, float *l, float *r) {
 		}
 		if (v->buffer > 3) return 0;
 		uint32_t data = RD32(pp + A_BUF(v->buffer)), bytes = RD32(pp + A_BUF(v->buffer) + 4);
-		if (!data || !bytes) return 2;   /* waiting for the game to queue data */
+		if (!data || !bytes) {   /* nothing in this buffer: on to its next, or the end of the data (ngs_rules.h, the PCM player's
+			 * rule; Vita3K's ATRAC9 module ends there too). The player waited here for the game to queue more, and a voice
+			 * never ended: Borderlands 2's Wwise queues a whole line as buffer 0 with next 1 and leaves buffer 1 empty, then
+			 * waits for the voice to stop -- the intro's first line never finished and the player never got control */
+			int next = ngs_player_pass_empty(data, (int16_t)RD16(pp + A_BUF(v->buffer) + 10), hops++);
+			if (next < 0) { at9_log(v, pp, v->buffer, "end at an empty buffer"); return 0; }
+			uint32_t prev = v->buffer;
+			v->byte_pos = 0; v->loops_done = 0; v->at9_frame = 0; v->buffer = (uint32_t)next;
+			player_event(v, EV_SWAPPED, prev, RD32(pp + A_BUF(next)));
+			continue;
+		}
 		if (v->byte_pos >= bytes) {   /* this buffer is done: repeat it, or move to the next */
 			int16_t loops = (int16_t)RD16(pp + A_BUF(v->buffer) + 8), next = (int16_t)RD16(pp + A_BUF(v->buffer) + 10);
 			v->byte_pos = 0; v->at9_frame = 0;
@@ -835,7 +887,7 @@ static int fetch_at9(Voice *v, uint32_t pp, float rate, float *l, float *r) {
 				at9_log(v, pp, prev, "swap (joined)");
 			}
 			uint32_t ndata = RD32(pp + A_BUF(v->buffer));
-			if (!ndata) return 2;
+			if (!ndata) return 0;   /* the next buffer holds nothing: the data ends there (above) */
 			memcpy(v->stage + part, G(ndata), (size_t)v->at9_sf_bytes - part);
 			v->byte_pos = (uint32_t)v->at9_sf_bytes - part; v->bytes_consumed += (uint32_t)v->at9_sf_bytes;
 			v->stage_on = 1; v->stage_pos = 0;
@@ -884,9 +936,8 @@ static void render_at9(Voice *v, float *out) {
 	rs_init();
 	for (uint32_t f = 0; f < granularity; f++) {
 		while (v->frac >= 1.0) {   /* past the newest source sample: the next one */
-			float l, r; int st = fetch_at9(v, pp, freq * scal, &l, &r);
-			if (st == 0) { v->playing = 0; return; }
-			if (st == 2) { v->at9_waited += granularity - f; return; }
+			float l, r;
+			if (!fetch_at9(v, pp, freq * scal, &l, &r)) { v->playing = 0; return; }
 			rs_push(v, l, r); v->frac -= 1.0;
 		}
 		float l, r; rs_read(v, step, &l, &r);
@@ -1224,10 +1275,15 @@ static void h_voice_state(Cpu *c) {
 	RET(0);
 }
 static void h_ok(Cpu *c) { RET(0); }
-static void h_patch_info(Cpu *c) {   /* (patch, SceNgsPatchRouteInfo*: output channels, input channels, float matrix[2][2]) */
+/* sceNgsPatchGetInfo(patch, SceNgsPatchRouteInfo*: output channels, input channels, float matrix[2][2], SceNgsPatchSystemInfo*:
+ * source voice, output, sub-output, destination voice, input). The system info wasn't written: Need for Speed Most Wanted
+ * checks its destination against the voice it means to reach and, on the garbage it read, removed and re-made every patch
+ * every few updates */
+static void h_patch_info(Cpu *c) {
 	Patch *p = patch_of(A0);
-	if (!p) { RET(0x804a0005u); return; }
+	if (!p || !p->active) { RET(0x804a0005u); return; }
 	if (A1) { WR32(A1, 2); WR32(A1 + 4, 2); memcpy(G(A1 + 8), p->vol, 16); }
+	if (A2) { WR32(A2, p->src); WR32(A2 + 4, p->out); WR32(A2 + 8, p->sub); WR32(A2 + 12, p->dst); WR32(A2 + 16, p->input); }
 	RET(0);
 }
 /* (start sample, samples, config, SceNgsAT9SkipBufferInfo*: start byte, bytes, samples to skip at
@@ -1249,6 +1305,8 @@ const HleEntry hle_ngs[] = {
 	{"sceNgsVoiceDefGetReverbBuss", h_def_reverb}, {"sceNgsVoiceDefGetScreamVoice", h_def_scream},
 	{"sceNgsVoiceDefGetScreamAtrac9Voice", h_def_scream_at9}, {"sceNgsVoiceDefGetCompressorBuss", h_def_compressor},
 	{"sceNgsVoiceDefGetCompressorSideChainBuss", h_def_sidechain}, {"sceNgsVoiceDefGetTemplate1", h_def_template1}, {"sceNgsVoiceDefGetAtrac9Voice", h_def_atrac9},
+	{"sceNgsVoiceDefGetSimpleAtrac9Voice", h_def_simple_at9}, {"sceNgsVoiceDefGetMixerBuss", h_def_mixer},
+	{"sceNgsVoiceDefGetEqBuss", h_def_eq}, {"sceNgsVoiceDefGetDistortionBuss", h_def_distortion}, {"sceNgsVoiceGetOutputPatch", h_voice_output_patch},
 	{"sceNgsVoiceSetFinishedCallback", h_voice_finished_cb}, {"sceNgsVoiceSetModuleCallback", h_voice_module_cb},
 	{"sceNgsVoiceGetParamsOutOfRange", h_params_out_of_range}, {"sceNgsVoiceInit", h_ok}, {"sceNgsPatchGetInfo", h_patch_info},
 	{"sceNgsAT9GetSectionDetails", h_at9_section},

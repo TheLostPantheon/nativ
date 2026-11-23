@@ -1130,7 +1130,7 @@ void usse_spirv_key(const UsseProgram *prog, const UsseFragLayout *fl, const uin
 	if (fl) for (int i = 0; i < fl->niters; i++) if (fl->iters[i].is_tex && fl->iters[i].tex_unit >= 0 && fl->iters[i].tex_unit < 16) used |= 1u << fl->iters[i].tex_unit;
 	if (cube_mask) *cube_mask &= used;
 	if (snap_mask) *snap_mask &= used;
-	if (color_kind && *color_kind >= 0) *color_kind = *color_kind == 5 ? 5 : fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes; kind 5 packs every colour) */
+	if (color_kind && *color_kind >= 0) *color_kind = *color_kind == 5 || *color_kind == 6 ? *color_kind : fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes; kind 5 packs every colour; kind 6: half floats packed in an F32F32 surface's words) */
 }
 uint32_t usse_spirv_predict_cube(const UsseProgram *prog, const UsseFragLayout *fl, const uint32_t sa_tex_unit[256]) {
 	uint32_t m = 0; int n = 0; const UOp *code = usse_program_code(prog, 0, &n);
@@ -1288,9 +1288,27 @@ static void emit_depthf(Gen *g, const UOp *op, int *ok) {
  * VDP into pa10.y (pa11) -- taken as the pointer's writer, every skinned caster fell to the CPU */
 static int writes_word(const UOp *w, int bank, int word) {
 	if (w->dst.bank != bank) return 0;
+	if (w->op == OP_VBW) {   /* one 32-bit word a repeat, whatever its mask says (usse.c exec_vbw): Assassin's Creed III: Liberation's
+	                          * skinning builds the bone index with VBWs into pa0-pa2 between the I32MAD that forms the pointer in pa5
+	                          * and its LDST -- taken as writing pa2-pa5, every skinned mesh fell to the CPU and a level ran at a few fps.
+	                          * (SMLSI mode without the program at hand: a wider guess; ldst_pointer_sa has it: vbw_writes_word) */
+		const int n = w->reps > 0 ? w->reps : 1;
+		return word >= w->dst.num && word < w->dst.num + (w->repmode == RM_SLMSI ? 4 * n : n);
+	}
 	if (!w->mask || w->op == OP_LDST || w->op == OP_I32MAD || w->op == OP_I32MAD2 || w->op == OP_I16MAD || w->op == OP_I8MAD) return w->dst.num == word;
 	int lpw = lpw_of(w->dst.type);
 	for (int c = 0; c < 4; c++) if ((w->mask >> c) & 1 && w->dst.num + c / lpw == word) return 1;
+	return 0;
+}
+static void sm_state_apply(int8_t inc[4][17], const UOp *op);   /* (below) */
+/* the words code[j] (a VBW) writes: one a repeat, at dst + the repeat's destination offset -- in SMLSI mode the increments in
+ * force there, which are the program-order state (as the translation fixes them) */
+static int vbw_writes_word(const UOp *code, int j, int word) {
+	const UOp *w = &code[j]; const int n = w->reps > 0 ? w->reps : 1;
+	if (w->repmode != RM_SLMSI) return word >= w->dst.num && word < w->dst.num + n;
+	int8_t inc[4][17]; for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) inc[sl][r] = (int8_t)r;
+	for (int k = 0; k < j; k++) if (code[k].op == OP_SMLSI || code[k].op == OP_SMBO) sm_state_apply(inc, &code[k]);
+	for (int r = 0; r < n && r <= 16; r++) if (w->dst.num + inc[3][r] == word) return 1;
 	return 0;
 }
 static int ldst_pointer_sa(const UOp *code, int i) {
@@ -1300,7 +1318,7 @@ static int ldst_pointer_sa(const UOp *code, int i) {
 	for (int j = i - 1; j >= 0; j--) {   /* the latest writer of the base register */
 		const UOp *w = &code[j];
 		if (w->op == OP_NOP || w->op == OP_SMLSI || w->op == OP_SMBO || w->op == OP_BR || w->op == OP_KILL) continue;
-		if (!writes_word(w, op->s0.bank, op->s0.num)) continue;
+		if (w->op == OP_VBW ? w->dst.bank != op->s0.bank || !vbw_writes_word(code, j, op->s0.num) : !writes_word(w, op->s0.bank, op->s0.num)) continue;
 		if (w->op == OP_I32MAD && w->sub2 == 2 && w->s2.bank == BK_SA) return w->s2.num;   /* a full-width addend from SA: the pointer */
 		if (w->op == OP_I32MAD2 && !w->sub2 && w->s2.bank == BK_SA && !(w->s2.negabs & 1)) return w->s2.num;   /* I32MAD2's addend is always whole (Killzone's quarter-res pass: (960y + x) * 32 + SA11) */
 		return -1;
@@ -1718,6 +1736,14 @@ static void emit_frag_color_preload(Gen *g, uint32_t texel, int *ok) {
 	o.bank = (uint8_t)(fl->native_color ? BK_O : BK_PA); o.num = (uint16_t)fl->color_pa_start; o.type = (uint8_t)fl->color_type;
 	for (int k = 0; k < 4; k++) o.swiz[k] = (uint8_t)k;
 	int n = fl->color_comps > 0 ? fl->color_comps : 4;
+	if (g->color_kind == 6 && o.type == TY_F16) {   /* an F32F32 surface holding two halves a word (kind 6, as the epilogue
+		 * stores them): its words back as they are. Converted as floats, Assassin's Creed III: Liberation's puddles, which
+		 * blend into the scene buffer in the shader, covered the street under them with noise (2026-11-23) */
+		UOperand ow = o; ow.type = TY_U32;
+		for (int w = 0; w < (n + 1) / 2 && *ok; w++)
+			write_raw_comp(g, &ow, 0, w, result1(s, &s->func, SpvOpBitcast, t_uint(s), composite_extract1(s, t_float(s), texel, (uint32_t)w)), ok);
+		return;
+	}
 	int norm = o.type == TY_U8 || o.type == TY_S8 || o.type == TY_U16 || o.type == TY_S16;
 	for (int c = 0; c < n && c < 4 && *ok; c++) {
 		uint32_t v = composite_extract1(s, t_float(s), texel, (uint32_t)c);
@@ -1787,6 +1813,17 @@ static void emit_frag_epilogue(Gen *g, int *ok) {
 		}
 	}
 	uint32_t comp[4];
+	if (g->color_kind == 6 && o.type == TY_F16) {   /* more half floats than an F32F32 surface has channels (gfx_gpu.c picks kind 6):
+		 * the pixel back end stores the output words as they are, two halves a word, into the surface's R32G32 (gfx_soft.c's
+		 * shade_interp, Assassin's Creed III: Liberation's scene buffer) */
+		UOperand ow = o; ow.type = TY_U32;
+		const int nw = (n + 1) / 2;
+		for (int c = 0; c < 4; c++) comp[c] = c < nw ? result1(s, &s->func, SpvOpBitcast, t_float(s), read_raw_comp(g, &ow, 0, c, ok)) : c_float(s, c == 3 ? 1.0f : 0.0f);
+		if (!*ok) return;
+		uint32_t id = nid(s); INS(&s->func, SpvOpCompositeConstruct, t_vec(s, t_float(s), 4), id, comp[0], comp[1], comp[2], comp[3]);
+		store(s, g->var_frag_color, id);
+		return;
+	}
 	if (o.type == TY_U32 || o.type == TY_S32) {   /* raw words (Unit 13's packed G-buffer): placed so the target holds the bits */
 		uint32_t w[4];
 		for (int k = 0; k < 4; k++) w[k] = k < n ? read_raw_comp(g, &o, 0, k, ok) : c_uint(s, 0);
@@ -2087,6 +2124,38 @@ static void emit_vertex_fetch(Gen *g, const UsseVfLayout *vf, int npa, int *ok) 
 	}
 	if (vf->index_reg >= 0 && vf->index_reg < npa) store(s, access1(s, g->ptr_priv_u, g->var_pa, c_uint(s, (uint32_t)vf->index_reg)), g->vindex);
 	if (vf->instance_reg >= 0 && vf->instance_reg < npa) store(s, access1(s, g->ptr_priv_u, g->var_pa, c_uint(s, (uint32_t)vf->instance_reg)), zero_w);
+}
+
+
+/* SMLSI/SMBO's register-increment state (Gen.inc): ports usse.c's run_program handling */
+static void sm_state_apply(int8_t inc[4][17], const UOp *op) {
+	if (op->op == OP_SMBO) { for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) inc[sl][r] = (int8_t)(r + op->args[sl]); return; }
+	for (int sl = 0; sl < 4; sl++) {
+		int v = op->args[sl], k = (int8_t)(v & 0xFF), mode2 = (v >> 8) & 1;
+		if (!mode2) for (int r = 0; r <= 16; r++) inc[sl][r] = (int8_t)(r * k);
+		else for (int r = 0; r < 4; r++) inc[sl][r] = (int8_t)((k >> (2 * r)) & 3);
+	}
+}
+/* the loop-around-a-switch form with SMLSI/SMBO past the first block: their state is fixed at translate time, in program
+ * order, which is what every path sees when each taken branch arrives with the state its target has in program order
+ * (fall-throughs always do). Assassin's Creed III: Liberation's water shader sets an increment for one instruction inside
+ * an else-block and puts the default back: either way past it, the same state -- but every SMLSI past the first block used
+ * to send such a program to the CPU, and its two draws there slowed a whole level to a crawl. Not for subroutines (a
+ * return's target isn't known at translate time) */
+static int sm_state_consistent(const UOp *code, int n, int entry) {
+	if (entry >= 0) return 0;
+	int8_t (*st)[4][17] = malloc((size_t)(n + 1) * sizeof *st), cur[4][17];
+	if (!st) return 0;
+	for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) cur[sl][r] = (int8_t)r;
+	for (int i = 0; i < n; i++) { memcpy(st[i], cur, sizeof cur); if (code[i].op == OP_SMLSI || code[i].op == OP_SMBO) sm_state_apply(cur, &code[i]); }
+	memcpy(st[n], cur, sizeof cur);
+	int ok = 1;
+	for (int i = 0; i < n && ok; i++) if (code[i].op == OP_BR) {
+		const int t = i + (int)code[i].imm;
+		if (t >= 0 && t <= n && memcmp(st[i + 1], st[t], sizeof cur)) ok = 0;
+	}
+	free(st);
+	return ok;
 }
 
 SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout *vl, const UsseFragLayout *fl,
@@ -2401,7 +2470,8 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 			if (target >= 0 && target < n) sm_lead[target] = 1;
 		}
 		int first = 1; while (first < n && !sm_lead[first]) first++;
-		for (int i = first; i < n && sm; i++) if (code[i].op == OP_SMLSI || code[i].op == OP_SMBO) sm = 0;
+		int late = 0; for (int i = first; i < n; i++) late |= code[i].op == OP_SMLSI || code[i].op == OP_SMBO;
+		if (late && sm && !sm_state_consistent(code, n, entry)) sm = 0;
 		if (sm && !g.var_pc) {
 			g.var_pc = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0)); g.var_steps = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, 0));
 			g.var_link = global_var(s, g.ptr_priv_u, SpvStoragePrivate, c_uint(s, ~0u));
@@ -2489,14 +2559,7 @@ SpirvModule usse_spirv_translate(const UsseProgram *prog, const UsseVertexLayout
 			} else if (op->pred_kind != 0 && op->op != OP_NOP) { snprintf(m.err, sizeof m.err, "predicated %s at instruction %d", op->op == OP_KILL ? "KILL" : "branch", i); ok = 0; break; }
 			switch (op->op) {
 			case OP_NOP: break;
-			case OP_SMLSI:   /* ports usse.c's run_program SMLSI handling, at translate time (see slot_off) */
-				for (int sl = 0; sl < 4; sl++) {
-					int v = op->args[sl], inc = (int8_t)(v & 0xFF), mode2 = (v >> 8) & 1;
-					if (!mode2) for (int r = 0; r <= 16; r++) g.inc[sl][r] = (int8_t)(r * inc);
-					else for (int r = 0; r < 4; r++) g.inc[sl][r] = (int8_t)((inc >> (2 * r)) & 3);
-				}
-				break;
-			case OP_SMBO: for (int sl = 0; sl < 4; sl++) for (int r = 0; r <= 16; r++) g.inc[sl][r] = (int8_t)(r + op->args[sl]); break;
+			case OP_SMLSI: case OP_SMBO: sm_state_apply(g.inc, op); break;   /* (usse.c's run_program, at translate time: see slot_off) */
 			case OP_VMAD2: emit_vmad2(&g, op, &ok); break;
 			case OP_VNMAD: emit_vnmad(&g, op, &ok); break;
 			case OP_VMAD: emit_vmad(&g, op, &ok); break;
