@@ -9,6 +9,8 @@
  *   framegen_test --objects                a dark object over a bright background at 2880x1632, each moving its own way:
  *                                          the error around the object's edges and how much of it is a light outline
  *   framegen_test --time w h [w h ...]     GPU time per game frame and per made frame at those frame sizes
+ *   framegen_test --score list             real frames: per line "prev cur truth t [out]" (a game's N, N+2 and N+1), the frame
+ *                                          made at t scored against the real one, beside a blend and the nearer frame
  *
  * Build: runtime/tests/framegen_test.sh. Exit 0 when the synthetic checks pass.
  */
@@ -188,12 +190,67 @@ static int objects(void) {
 	return fails;
 }
 
+/* a made frame against the real one, over 16x16 blocks (artifacts are local: a whole frame's mean hides them): the mean error
+ * per pixel (0-255, mean of |r|,|g|,|b|), the worst 1% of blocks' and the share of blocks visibly off (a mean above 8) */
+static int cmp_dbl(const void *x, const void *y) { double a = *(const double *)x, b = *(const double *)y; return a < b ? -1 : a > b; }
+static void block_err(const uint8_t *g, const uint8_t *t, uint32_t w, uint32_t h, double *mean, double *p99, double *bad) {
+	uint32_t bw = w / 16, bh = h / 16, n = bw * bh, nbad = 0; double *bm = malloc(sizeof(double) * n), tot = 0;
+	for (uint32_t by = 0; by < bh; by++) for (uint32_t bx = 0; bx < bw; bx++) {
+		double s = 0;
+		for (uint32_t y = by * 16; y < by * 16 + 16; y++) for (uint32_t x = bx * 16; x < bx * 16 + 16; x++) {
+			const uint8_t *p = g + 4 * (y * w + x), *q = t + 4 * (y * w + x);
+			s += (abs(p[0] - q[0]) + abs(p[1] - q[1]) + abs(p[2] - q[2])) / 3.0;
+		}
+		bm[by * bw + bx] = s / 256; tot += s; nbad += s / 256 > 8;
+	}
+	qsort(bm, n, sizeof *bm, cmp_dbl);
+	*mean = tot / (256.0 * n); *p99 = bm[(n - 1) * 99 / 100]; *bad = 100.0 * nbad / n;
+	free(bm);
+}
+/* the frame at t after the stream moves on to b (a's the frame before it, already given): what the present loop does, so
+ * state carried from pair to pair (the previous pair's motion) is used */
+static uint8_t *generate_next(const uint8_t *b, uint32_t w, uint32_t h, float t, double *ms) {
+	SDL_GPUTexture *tb = upload(b, w, h);
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
+	fg_frame(dev, cmd, tb, w, h, 1);
+	SDL_GPUTexture *g = fg_make(dev, cmd, t);
+	if (!g) { fprintf(stderr, "no frame made\n"); exit(2); }
+	uint8_t *out = download(cmd, g, w, h, ms);
+	SDL_ReleaseGPUTexture(dev, tb);
+	return out;
+}
+/* --score list: lines "prev.png cur.png truth.png t [out.png]", a game's frames N and N+2 and the real N+1 between them: the
+ * frame made at t scored against it, beside a plain blend's and the nearer frame's (what's shown without frame generation).
+ * A line whose prev is the line before's cur goes on from it, as a stream of frames does (N, N+2, N+4 ...) */
+static int score(const char *list) {
+	FILE *f = fopen(list, "r"); if (!f) { perror(list); return 2; }
+	char line[4096], last[1024] = "";
+	while (fgets(line, sizeof line, f)) {
+		char pa[1024], pb[1024], pt[1024], po[1024] = ""; float t = 0.5f;
+		if (sscanf(line, "%1023s %1023s %1023s %f %1023s", pa, pb, pt, &t, po) < 4) continue;
+		uint32_t w, h, w2, h2, w3, h3; uint8_t *a = load(pa, &w, &h), *b = load(pb, &w2, &h2), *tr = load(pt, &w3, &h3);
+		if (w != w2 || h != h2 || w != w3 || h != h3) { fprintf(stderr, "%s: the frames differ in size\n", pt); return 2; }
+		double ms; uint8_t *g = !strcmp(pa, last) ? generate_next(b, w, h, t, &ms) : generate(a, b, w, h, t, &ms), *bl = malloc(4 * w * h);
+		snprintf(last, sizeof last, "%s", pb);
+		for (uint32_t k = 0; k < 4 * w * h; k++) bl[k] = (uint8_t)(a[k] + (b[k] - a[k]) * t + 0.5f);
+		double m[3], p[3], x[3];
+		block_err(g, tr, w, h, &m[0], &p[0], &x[0]); block_err(bl, tr, w, h, &m[1], &p[1], &x[1]); block_err(t < 0.5f ? a : b, tr, w, h, &m[2], &p[2], &x[2]);
+		printf("%s  made %.2f %.1f %.2f%%  blend %.2f %.1f %.2f%%  repeat %.2f %.1f %.2f%%  (mean, worst 1%%, blocks off)\n", pt, m[0], p[0], x[0], m[1], p[1], x[1], m[2], p[2], x[2]);
+		fflush(stdout);
+		if (*po && !save(po, g, w, h)) { fprintf(stderr, "%s: %s\n", po, SDL_GetError()); return 2; }
+		free(a); free(b); free(tr); free(g); free(bl);
+	}
+	fclose(f);
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 2; }
 	dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL, false, NULL);
 	if (!dev) { fprintf(stderr, "no GPU device: %s\n", SDL_GetError()); return 2; }
 	fprintf(stderr, "device: %s\n", SDL_GetGPUDeviceDriver(dev));
 	if (argc >= 2 && !strcmp(argv[1], "--objects")) { int f = objects(); printf(f ? "%d failed\n" : "all passed\n", f); return f ? 1 : 0; }
+	if (argc >= 3 && !strcmp(argv[1], "--score")) return score(argv[2]);
 	if (argc >= 2 && !strcmp(argv[1], "--time")) { for (int i = 2; i + 1 < argc; i += 2) bench((uint32_t)atoi(argv[i]), (uint32_t)atoi(argv[i + 1])); return 0; }
 	if (argc >= 4) {
 		uint32_t w, h, w2, h2; uint8_t *a = load(argv[1], &w, &h), *b = load(argv[2], &w2, &h2);
