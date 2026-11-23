@@ -1087,9 +1087,13 @@ static SDL_GPUSamplerAddressMode gxm_addr_mode(int m) {
  * their small mip levels. (Measured 2026-10-10 on two Uncharted replays: no pixel changed, nor with every
  * sampler clamped to mip 0 -- its textures are so low-resolution that nothing on screen minifies at
  * 960x544 and up; it is here for games and scenes that do.)
- * Every linearly minified texture gets it; point-sampled ones (UI, lookup tables) stay exact. A change
- * of setting rebuilds the samplers between scenes (gfx_gpu_begin_scene). gfxreplay: off unless asked,
- * so replays compare against the software path exactly. */
+ * Every linearly minified texture with mip levels gets it; point-sampled ones and those with one level stay
+ * exact. One level: lookup tables and render targets, which the Vita never minifies blurrily anyway. Assassin's
+ * Creed III: Liberation grades its frame through a 16x256 colour LUT (a 16x16x16 cube unrolled, read bilinearly at
+ * coordinates computed from each pixel's colour): with anisotropy the footprint followed the colour's derivatives
+ * down the table, averaging its green axis to one value -- green and magenta speckle over every textured surface,
+ * in play only (2026-11-22). A change of setting rebuilds the samplers between scenes (gfx_gpu_begin_scene).
+ * gfxreplay: off unless asked, so replays compare against the software path exactly. */
 static int aniso_cur = -1;
 static int aniso_want(void) {
 	extern int settings_int(const char *, int);
@@ -1109,7 +1113,7 @@ static SDL_GPUSampler *tex_sampler(TexEntry *e, int minf, int magf, int addru, i
 	ci.mipmap_mode = trilinear ? SDL_GPU_SAMPLERMIPMAPMODE_LINEAR : SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
 	ci.address_mode_u = mu; ci.address_mode_v = mv; ci.address_mode_w = mu;
 	ci.max_lod = 1000.0f;
-	if (minf && aniso_cur > 1) {   /* with trilinear mips: Apple GPUs filter anisotropically only between levels (with nearest mips, 16x changed no pixel of a replay), and blending levels removes the mip bands the Vita's nearest-mip sampling shows on floors */
+	if (minf && aniso_cur > 1 && e->levels > 1) {   /* (mipmapped textures only, above) with trilinear mips: Apple GPUs filter anisotropically only between levels (with nearest mips, 16x changed no pixel of a replay), and blending levels removes the mip bands the Vita's nearest-mip sampling shows on floors */
 		ci.enable_anisotropy = true; ci.max_anisotropy = (float)aniso_cur; ci.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
 	}
 	return e->samp[mi][magf][iu][iv] = SDL_CreateGPUSampler(gpu(), &ci);
@@ -1282,9 +1286,11 @@ static void tring_end(SDL_GPUCommandBuffer *cmd, uint32_t lo, uint32_t hi) {   /
 }
 static void upload_texture(TexEntry *e, const GfxTexture *t) {
 	int cube = ((t->u_mode >> 4) & 3) == 3, levels = cube ? gfx_texture_cube_levels(t) : gfx_texture_levels(t), layers = cube ? 6 : 1;
+	const int had_mips = e->levels > 1;
 	e->chash = hash_bytes(G(t->data), e->span); e->levels = levels;   /* what the GPU texture holds (~10 us for 256 KB) */
 	int wide = tex_wide(t->format); uint32_t bpp = wide ? 16 : 4;
 	batch_retire(e->tex, "texture re-upload");   /* its own command buffer runs before the pending draws that sampled the old content */
+	if (had_mips != (levels > 1)) tex_release_samplers(e);   /* (anisotropy follows the mips: tex_sampler) */
 	e->layout = (t->u_mode >> 4) & 3;
 	n_tex_uploads++;
 	SDL_GPUTextureFormat bc = tex_bc_format(t, cube);
@@ -1653,7 +1659,12 @@ static void box_put_back(uint8_t *k, uint32_t addr, uint32_t width, uint32_t hei
  * blotches on Resistance's walls. As R32G32_FLOAT the words pass through untouched, as an F32F32 target's do (Unit 13's
  * G-buffer); the translator packs a float colour into halves itself (usse_spirv.c, colour kind TK_RAW), and the guest
  * memory round trip copies bytes. Learned at the first such draw (raw_target_note): that scene is drawn as before, the
- * target's next scene is TK_RAW. RECOMP_GPU_NO_RAW=1: RGBA16F as before (an A/B). */
+ * target's next scene is TK_RAW. RECOMP_GPU_NO_RAW=1: RGBA16F as before (an A/B).
+ * Not for good: a raw-word target can't blend on the GPU (a blended or FRAGCOLOR draw into one goes to the software path),
+ * so the first such draw makes it RGBA16F again from its next scene (float_target_note) -- Need for Speed Most Wanted's
+ * 640x368 scene buffer took one raw-word draw while loading and then ran every frame's ~70 blended draws on the CPU, 9 fps
+ * (2026-11-22). A target that changes its mind more than twice stays RGBA16F (raw words lose only NaN-patterned halves
+ * there; blending stays on the GPU); one RECOMP_GPU_RAW_TARGETS names stays raw. */
 enum { TK_U8, TK_F16, TK_F32, TK_U8S, TK_HDR10, TK_RAW };
 _Static_assert(TK_RAW == 5, "usse_spirv.c's colour kind 5");
 /* The F32 family (F32: one word a pixel, F32F32: two; the Vita has no wider float colour format)
@@ -1695,20 +1706,34 @@ static int target_kind(uint32_t fmt) {
 	}
 }
 #define MAXRAWT 16
-static struct { uint32_t addr, format; } raw_targets[MAXRAWT]; static int nraw_targets;
+static struct { uint32_t addr, format; int off, flips, pinned; } raw_targets[MAXRAWT]; static int nraw_targets;   /* off: RGBA16F again (float_target_note) */
 static int raw_targets_off(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_NO_RAW") != 0; return v; }
 static int raw_target_is(uint32_t addr, uint32_t fmt) {
 	static int seeded;   /* RECOMP_GPU_RAW_TARGETS=<hexaddr>[,...]: known from the start (a one-frame capture's replay draws a target's first scene only) */
 	if (!seeded) { seeded = 1; const char *v = getenv("RECOMP_GPU_RAW_TARGETS");
 		for (char *q = (char *)v; q && *q && nraw_targets < MAXRAWT; ) { uint32_t a = (uint32_t)strtoul(q, &q, 16); if (a) { raw_targets[nraw_targets].addr = a; raw_targets[nraw_targets++].format = 0; } while (*q == ',' || *q == ' ') q++; if (*q && !isxdigit((unsigned char)*q)) break; } }
-	for (int i = 0; i < nraw_targets; i++) if (raw_targets[i].addr == addr && (raw_targets[i].format == fmt || (!raw_targets[i].format && (fmt & 0xF1800000u) == 0x01000000u))) return 1;
+	for (int i = 0; i < nraw_targets; i++) if (raw_targets[i].addr == addr && (raw_targets[i].format == fmt || (!raw_targets[i].format && (fmt & 0xF1800000u) == 0x01000000u))) return !raw_targets[i].off;
 	return 0;
 }
+static int raw_target_slot(uint32_t addr, uint32_t fmt) { for (int i = 0; i < nraw_targets; i++) if (raw_targets[i].addr == addr && raw_targets[i].format == fmt) return i; return -1; }
 static int target_kind_of(const GfxTarget *t) { int k = target_kind(t->format); return k == TK_F16 && t->type == 0 && raw_target_is(t->data, t->format) ? TK_RAW : k; }
-static void raw_target_note(const TargetEntry *e) {   /* a raw-word colour drawn into an RGBA16F target: TK_RAW from its next scene (linear F16F16F16F16 only) */
-	if (raw_targets_off() || e->type != 0 || (e->format & 0xF1800000u) != 0x01000000u || nraw_targets == MAXRAWT || raw_target_is(e->addr, e->format)) return;
-	raw_targets[nraw_targets].addr = e->addr; raw_targets[nraw_targets++].format = e->format;
-	fprintf(stderr, "    gpu: target %#x %ux%u fmt %#x is written as raw words: an exact R32G32 texture from its next scene\n", e->addr, e->width, e->height, e->format);
+static void raw_target_note(const TargetEntry *e, uint32_t fprog) {   /* a raw-word colour drawn into an RGBA16F target: TK_RAW from its next scene (linear F16F16F16F16 only) */
+	if (raw_targets_off() || e->type != 0 || (e->format & 0xF1800000u) != 0x01000000u || raw_target_is(e->addr, e->format)) return;
+	const int k = raw_target_slot(e->addr, e->format);
+	if (k >= 0) {   /* RGBA16F again since a blend: raw once more, unless it has changed its mind too often */
+		if (raw_targets[k].flips >= 2) { if (!raw_targets[k].pinned++) fprintf(stderr, "    gpu: target %#x is written as raw words and blended both: it stays RGBA16F (fragment %#x)\n", e->addr, fprog); return; }
+		raw_targets[k].off = 0; raw_targets[k].flips++;
+	} else {
+		if (nraw_targets == MAXRAWT) return;
+		raw_targets[nraw_targets].addr = e->addr; raw_targets[nraw_targets].format = e->format; raw_targets[nraw_targets].off = raw_targets[nraw_targets].flips = raw_targets[nraw_targets].pinned = 0; nraw_targets++;
+	}
+	fprintf(stderr, "    gpu: target %#x %ux%u fmt %#x is written as raw words (fragment %#x): an exact R32G32 texture from its next scene\n", e->addr, e->width, e->height, e->format, fprog);
+}
+static void float_target_note(const TargetEntry *e, uint32_t fprog) {   /* a blend or FRAGCOLOR draw into a TK_RAW target: RGBA16F from its next scene */
+	const int k = raw_target_slot(e->addr, e->format);
+	if (k < 0 || raw_targets[k].off) return;   /* (RECOMP_GPU_RAW_TARGETS' entries, format 0, stay raw) */
+	raw_targets[k].off = 1; raw_targets[k].flips++;
+	fprintf(stderr, "    gpu: target %#x %ux%u is blended into (fragment %#x): RGBA16F again from its next scene\n", e->addr, e->width, e->height, fprog);
 }
 static SDL_GPUTextureFormat kind_format(int k) {
 	return k == TK_F32 || k == TK_RAW ? (f32_rg() ? SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT : SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT) : k == TK_F16 ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT
@@ -1899,11 +1924,11 @@ static TargetEntry *get_target_at(const GfxTarget *t, uint8_t sx, uint8_t sy) {
 		return e;
 	}
 	const int kind = target_kind_of(t);
-	if (kind == TK_RAW) for (int i = 0; i < ntargets; i++) {   /* the RGBA16F entry it was until now (any scale): its pixels to guest memory, which the new one starts from */
-		TargetEntry *o = &targets[i]; if (!o->color || o->addr != t->data || o->format != t->format || o->kind != TK_F16) continue;
+	if (kind == TK_RAW || kind == TK_F16) for (int i = 0; i < ntargets; i++) {   /* the other of the two it was until now (any scale): its pixels to guest memory, which the new one starts from */
+		TargetEntry *o = &targets[i]; if (!o->color || o->addr != t->data || o->format != t->format || o->kind != (kind == TK_RAW ? TK_F16 : TK_RAW)) continue;
 		readbacks_complete(o->addr, o->addr + 1);
-		if (o->gpu_dirty) { sync_why = "(now a raw-word target)"; target_download_to_guest(o); }
-		batch_retire(o->color, "target now raw-word"); target_release(o); o->addr = 0; o->used = 0;
+		if (o->gpu_dirty) { sync_why = kind == TK_RAW ? "(now a raw-word target)" : "(RGBA16F again)"; target_download_to_guest(o); }
+		batch_retire(o->color, kind == TK_RAW ? "target now raw-word" : "target RGBA16F again"); target_release(o); o->addr = 0; o->used = 0;
 	}
 	TargetEntry *e;
 	if (ntargets < MAXTARGET) e = &targets[ntargets++];
@@ -2367,7 +2392,12 @@ static GfxTarget scene_target; static int scene_first_draw, scene_soft;
  * scene that stored it left behind, on the GPU, without a round trip through guest memory. When
  * the newest content IS in guest memory (nothing GPU-side has written this surface yet: a capture's
  * recorded buffer, a CPU-rendered scene), the preload passes below write it into the texture. */
-typedef struct { uint32_t key, w, h, ds_stride, fmt; uint8_t type, sx, sy, msx, msy; SDL_GPUTexture *tex, *pre_z, *pre_s; int gpu_newer; uint64_t used, gen, zgen; } DepthEntry;   /* ds_stride: the surface's row stride in guest memory (GfxTarget.ds_stride; the texture is w = the colour stride wide); msx, msy: the surface's samples a texel of the texture across and down (depth_samples); gen: write_clock at its last change of any kind, zgen: at its last change of the depth plane (an X8U24 view reads only that); fmt, type: the surface's SceGxmDepthStencilFormat and layout (GfxTarget.ds_format/ds_type), what a view of it decodes */
+typedef struct { uint32_t key, w, h, ds_stride, fmt; uint8_t type, sx, sy, msx, msy; SDL_GPUTexture *tex, *pre_z, *pre_s, *stored; int gpu_newer, stored_ok, pre_bits; uint64_t used, gen, zgen, stored_zgen, pre_hash; } DepthEntry;   /* ds_stride: the surface's row stride in guest memory (GfxTarget.ds_stride; the texture is w = the colour stride wide); msx, msy: the surface's samples a texel of the texture across and down (depth_samples); gen: write_clock at its last change of any kind, zgen: at its last change of the depth plane (an X8U24 view reads only that); fmt, type: the surface's SceGxmDepthStencilFormat and layout (GfxTarget.ds_format/ds_type), what a view of it decodes */
+/* stored, stored_ok: the surface as the scenes that stored it left it, while a later scene without FORCE_STORE draws over tex.
+ * The hardware discards such a scene's depth and stencil at its end (they live in tile memory), so memory -- what the
+ * next force-loading scene starts from and what a texture over the surface reads -- keeps the last stored scene's. Kept
+ * only when gpu_newer (memory is stale: the GPU holds those values); stored_zgen: tex's zgen when they were copied.
+ * pre_hash, pre_bits: the guest bytes pre_z/pre_s were decoded from (depth_guest_hash) and the stencil bits they hold. */
 #define MAXDEPTHG 32
 static DepthEntry depthsg[MAXDEPTHG]; static uint64_t depthg_clock;
 /* the depth surface's samples per pixel of the scene's depth texture: an MSAA_DOWNSCALE scene draws single-sampled at its colour
@@ -2376,6 +2406,11 @@ static DepthEntry depthsg[MAXDEPTHG]; static uint64_t depthg_clock;
 static void depth_samples(const GfxTarget *t, uint8_t *mx, uint8_t *my) {
 	*mx = t->scale_mode && t->width && (uint32_t)t->rt_width * (t->ms_x ? t->ms_x : 1u) >= 2u * t->width ? 2 : 1;
 	*my = t->scale_mode && t->height && (uint32_t)t->rt_height * (t->ms_y ? t->ms_y : 1u) >= 2u * t->height ? 2 : 1;
+}
+static SDL_GPUTexture *depth_texture(const DepthEntry *d) {   /* the surface's texture: its size at its scale */
+	SDL_GPUTextureCreateInfo dci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = depth_format(), .usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,   /* SAMPLER: a depth buffer read back as an X8U24 texture is a view of this (target_view) */
+		.width = TSX(d, d->w), .height = TSY(d, d->h), .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+	return SDL_CreateGPUTexture(gpu(), &dci);
 }
 static DepthEntry *depth_entry_for(const GfxTarget *t, int sx, int sy, int *fresh) {   /* sx, sy: the scene's target's scale */
 	uint32_t key = t->ds_data ? t->ds_data : t->data;
@@ -2387,14 +2422,34 @@ static DepthEntry *depth_entry_for(const GfxTarget *t, int sx, int sy, int *fres
 		if (!d->key && !slot) slot = d;
 		if (d->used < oldest->used) oldest = d;
 	}
+	/* a shorter scene on the same surface (its address, row length and scale): the rows it covers are the top of the taller
+	 * one's texture, so that texture is its depth (a depth attachment larger than the colour target is allowed: the render
+	 * area is the colour target's). Given a new, empty texture, it tested against the stale guest copy: Assassin's Creed III:
+	 * Liberation draws its sky's cloud layer in a 704x384 scene over the 704x576 G-buffer's depth, and the clouds came out in
+	 * front of everything (2026-11-22). */
+	for (int i = 0; i < MAXDEPTHG; i++) {
+		DepthEntry *e = &depthsg[i];
+		if (e->key == key && e->tex && e->w == t->stride && e->h > t->height && e->sx == sx && e->sy == sy && e->msx == mx && e->msy == my) {
+			e->used = ++depthg_clock; e->fmt = t->ds_format; e->type = t->ds_type; if (fresh) *fresh = 0; return e;
+		}
+	}
 	DepthEntry *d = slot ? slot : oldest;
 	if (d->tex) SDL_ReleaseGPUTexture(gpu(), d->tex); if (d->pre_z) SDL_ReleaseGPUTexture(gpu(), d->pre_z); if (d->pre_s) SDL_ReleaseGPUTexture(gpu(), d->pre_s);
+	if (d->stored) SDL_ReleaseGPUTexture(gpu(), d->stored);
 	memset(d, 0, sizeof *d); d->key = key; d->w = t->stride; d->h = t->height; d->sx = (uint8_t)sx; d->sy = (uint8_t)sy; d->ds_stride = t->ds_stride ? t->ds_stride : t->stride; d->fmt = t->ds_format; d->type = t->ds_type; d->msx = mx; d->msy = my; d->used = ++depthg_clock; d->gen = d->zgen = ++write_clock;
-	SDL_GPUTextureCreateInfo dci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = depth_format(), .usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,   /* SAMPLER: a depth buffer read back as an X8U24 texture is a view of this (target_view) */
-		.width = TSX(d, d->w), .height = TSY(d, d->h), .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
-	d->tex = SDL_CreateGPUTexture(gpu(), &dci);
+	d->tex = depth_texture(d);
 	if (fresh) *fresh = 1;
 	return d;
+}
+/* a whole depth/stencil texture into another of its size and format, in a copy pass of its own (gfx_gpu_begin_scene runs
+ * between batches: nothing is pending) */
+static int depth_copy(SDL_GPUTexture *from, SDL_GPUTexture *to, const DepthEntry *d) {
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu()); if (!cmd) return 0;
+	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureLocation a = { .texture = from }, b = { .texture = to };
+	SDL_CopyGPUTextureToTexture(cp, &a, &b, TSX(d, d->w), TSY(d, d->h), 1, false);
+	SDL_EndGPUCopyPass(cp);
+	return SDL_SubmitGPUCommandBuffer(cmd);
 }
 static SDL_GPUSampler *nearest_sampler(void) {
 	static SDL_GPUSampler *smp;
@@ -2476,34 +2531,61 @@ static SDL_GPUGraphicsPipeline *preload_pipeline(int bit) {   /* -1: the depth p
 	if (!pipes[bit + 1]) fprintf(stderr, "    gpu: preload pipeline %d: %s\n", bit, SDL_GetError());
 	return pipes[bit + 1];
 }
+static uint32_t n_preload_same;   /* depth preloads of unchanged bytes (RECOMP_GPU_STATS) */
+static int ds_hash_on(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_GPU_DEPTH_REDECODE") == 0; return v; }   /* RECOMP_GPU_DEPTH_REDECODE=1: decode every preload (an A/B check) */
+/* the guest bytes a preload decodes (gfx_decode_depth_stencil: de->w x de->h samples in the surface's layout -- tiled: whole
+ * 32x32 tiles; the stencil plane too when it is separate), hashed with the layout that reads them */
+static uint64_t depth_guest_hash(const DepthEntry *de, const GfxTarget *t) {
+	const uint32_t fmt = t->ds_format, stride = t->ds_stride ? t->ds_stride : de->w;
+	const uint64_t samples = t->ds_type == 1 ? (uint64_t)((de->h + 31) / 32) * (stride / 32 ? stride / 32 : 1) * 1024 : (uint64_t)(de->h - 1) * stride + de->w;
+	const uint32_t bpp = fmt == 0x02444000u ? 2 : 4;
+	uint64_t h = hash_bytes(G(t->ds_data), (size_t)(samples * bpp)) ^ ((uint64_t)fmt << 32 | (uint64_t)t->ds_type << 31 | stride);
+	if (fmt != 0x01266000u && (fmt & 0x00022000u) && t->ds_stencil_data) h = h * 0x100000001b3ull ^ hash_bytes(G(t->ds_stencil_data), (size_t)samples);
+	return h ? h : 1;
+}
 static void depth_preload_from_guest(DepthEntry *de, const GfxTarget *t) {
 	uint32_t n = de->w * de->h;
-	float *z = malloc(sizeof(float) * n); uint8_t *st = malloc(n);
-	gfx_decode_depth_stencil(t, de->w, de->h, z, st);
-	int stbits = 0; for (uint32_t i = 0; i < n; i++) stbits |= st[i];
-	if (trace_sync()) fprintf(stderr, "gpu trace: depth preload %#x %ux%u (stencil bits %#x)\n", t->ds_data, de->w, de->h, stbits);
 	uint32_t W = TSX(de, de->w), H = TSY(de, de->h);
-	if (TSCALED(de)) {   /* render scale: each sample replicated over its block */
-		float *zs = malloc(sizeof(float) * W * H); uint8_t *ss = malloc((size_t)W * H);
-		for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) { uint32_t i = (y / (uint32_t)de->sy) * de->w + x / (uint32_t)de->sx; zs[y * W + x] = z[i]; ss[y * W + x] = st[i]; }
-		free(z); free(st); z = zs; st = ss; n = W * H;
+	/* the same bytes as the last preload: pre_z/pre_s still hold them decoded, so only the passes below run again. Assassin's Creed
+	 * III: Liberation copies one template into its depth surface every frame: decoding and uploading it (the upload 5 bytes a
+	 * texel at the render scale: 25 MB a frame at 3x) cost it a tenth of its frame rate (2026-11-22) */
+	const uint64_t gh = ds_hash_on() ? depth_guest_hash(de, t) : 0;
+	const int same = gh && gh == de->pre_hash && de->pre_z && de->pre_s;
+	float *z = 0; uint8_t *st = 0; int stbits = de->pre_bits;
+	if (!same) {
+		z = malloc(sizeof(float) * n); st = malloc(n);
+		gfx_decode_depth_stencil(t, de->w, de->h, z, st);
+		stbits = 0; for (uint32_t i = 0; i < n; i++) stbits |= st[i];
 	}
-	if (!de->pre_z) {
-		SDL_GPUTextureCreateInfo zi = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R32_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = W, .height = H, .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
-		de->pre_z = SDL_CreateGPUTexture(gpu(), &zi);
-		SDL_GPUTextureCreateInfo si = zi; si.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM; de->pre_s = SDL_CreateGPUTexture(gpu(), &si);   /* (UNORM: SDL_GPU won't sample an integer format -- its debug mode stops there -- and the shaders scale it back) */
+	if (trace_sync()) fprintf(stderr, "gpu trace: depth preload %#x %ux%u (stencil bits %#x)%s\n", t->ds_data, de->w, de->h, stbits, same ? " (unchanged: decoded already)" : "");
+	if (same) n_preload_same++;
+	else {
+		if (TSCALED(de)) {   /* render scale: each sample replicated over its block */
+			float *zs = malloc(sizeof(float) * W * H); uint8_t *ss = malloc((size_t)W * H);
+			for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) { uint32_t i = (y / (uint32_t)de->sy) * de->w + x / (uint32_t)de->sx; zs[y * W + x] = z[i]; ss[y * W + x] = st[i]; }
+			free(z); free(st); z = zs; st = ss; n = W * H;
+		}
+		if (!de->pre_z) {
+			SDL_GPUTextureCreateInfo zi = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R32_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = W, .height = H, .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+			de->pre_z = SDL_CreateGPUTexture(gpu(), &zi);
+			SDL_GPUTextureCreateInfo si = zi; si.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM; de->pre_s = SDL_CreateGPUTexture(gpu(), &si);   /* (UNORM: SDL_GPU won't sample an integer format -- its debug mode stops there -- and the shaders scale it back) */
+		}
 	}
-	if (!de->pre_z || !de->pre_s || !preload_pipeline(-1)) { free(z); free(st); return; }
+	if (!de->pre_z || !de->pre_s || !preload_pipeline(-1)) { free(z); free(st); de->pre_hash = 0; return; }
 	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu());
-	SDL_GPUTransferBufferCreateInfo xzi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = 4u * n }, xsi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = n };
-	SDL_GPUTransferBuffer *xz = SDL_CreateGPUTransferBuffer(gpu(), &xzi), *xs = SDL_CreateGPUTransferBuffer(gpu(), &xsi);
-	void *mz = SDL_MapGPUTransferBuffer(gpu(), xz, false); memcpy(mz, z, 4u * n); SDL_UnmapGPUTransferBuffer(gpu(), xz);
-	void *ms = SDL_MapGPUTransferBuffer(gpu(), xs, false); memcpy(ms, st, n); SDL_UnmapGPUTransferBuffer(gpu(), xs);
-	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
-	SDL_GPUTextureTransferInfo srcz = { .transfer_buffer = xz, .pixels_per_row = W, .rows_per_layer = H }, srcs = { .transfer_buffer = xs, .pixels_per_row = W, .rows_per_layer = H };
-	SDL_GPUTextureRegion dz = { .texture = de->pre_z, .w = W, .h = H, .d = 1 }, ds = { .texture = de->pre_s, .w = W, .h = H, .d = 1 };
-	SDL_UploadToGPUTexture(cp, &srcz, &dz, false); SDL_UploadToGPUTexture(cp, &srcs, &ds, false);
-	SDL_EndGPUCopyPass(cp);
+	SDL_GPUTransferBuffer *xz = 0, *xs = 0;
+	if (!same) {
+		SDL_GPUTransferBufferCreateInfo xzi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = 4u * n }, xsi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = n };
+		xz = SDL_CreateGPUTransferBuffer(gpu(), &xzi); xs = SDL_CreateGPUTransferBuffer(gpu(), &xsi);
+		void *mz = SDL_MapGPUTransferBuffer(gpu(), xz, false); memcpy(mz, z, 4u * n); SDL_UnmapGPUTransferBuffer(gpu(), xz);
+		void *ms = SDL_MapGPUTransferBuffer(gpu(), xs, false); memcpy(ms, st, n); SDL_UnmapGPUTransferBuffer(gpu(), xs);
+		SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+		SDL_GPUTextureTransferInfo srcz = { .transfer_buffer = xz, .pixels_per_row = W, .rows_per_layer = H }, srcs = { .transfer_buffer = xs, .pixels_per_row = W, .rows_per_layer = H };
+		SDL_GPUTextureRegion dz = { .texture = de->pre_z, .w = W, .h = H, .d = 1 }, ds = { .texture = de->pre_s, .w = W, .h = H, .d = 1 };
+		SDL_UploadToGPUTexture(cp, &srcz, &dz, false); SDL_UploadToGPUTexture(cp, &srcs, &ds, false);
+		SDL_EndGPUCopyPass(cp);
+		de->pre_hash = gh; de->pre_bits = stbits;
+	}
 	SDL_GPUViewport vp = { 0, 0, (float)W, (float)H, 0, 1 }; SDL_Rect sc = { 0, 0, (int)W, (int)H };
 	/* pass 1: depth from the texture (the pass clears depth and stencil first: every pixel is rewritten) */
 	SDL_GPUDepthStencilTargetInfo dti = { .texture = de->tex, .clear_depth = t->ds_background_depth, .load_op = SDL_GPU_LOADOP_CLEAR, .store_op = SDL_GPU_STOREOP_STORE,
@@ -2524,10 +2606,12 @@ static void depth_preload_from_guest(DepthEntry *de, const GfxTarget *t) {
 		SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0); SDL_EndGPURenderPass(rp);
 	}
 	SDL_SubmitGPUCommandBuffer(cmd);
-	SDL_ReleaseGPUTransferBuffer(gpu(), xz); SDL_ReleaseGPUTransferBuffer(gpu(), xs);
+	if (xz) SDL_ReleaseGPUTransferBuffer(gpu(), xz); if (xs) SDL_ReleaseGPUTransferBuffer(gpu(), xs);
 	free(z); free(st);
 }
 static DepthEntry *scene_depth_entry;
+static int scene_ds_memory;   /* the scene's depth surface is guest memory's (not gpu_newer) and the scene doesn't store it: memory still holds it after */
+static uint32_t n_depth_keeps;   /* depth copies for scenes without FORCE_STORE (RECOMP_GPU_STATS) */
 static void apply_render_scale(int n);   /* below, with present */
 /* a depth-only scene (no colour surface: Unit 13's cascaded shadow atlas, ~150 draws into a 1024x1024
  * D16 surface every frame) renders here like any other, into its depth texture, with this scratch
@@ -3218,6 +3302,23 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 		int fresh = 0; DepthEntry *de = depth_entry_for(t, scene_entry->sx, scene_entry->sy, &fresh);
 		if (de && de->tex) {
 			scene_depth_entry = de; scene_entry->depth = de->tex;
+			/* no FORCE_STORE: the hardware throws this scene's depth and stencil away at its end, and the surface in memory
+			 * stays the last stored scene's (DepthEntry.stored). Assassin's Creed III: Liberation copies a template into its
+			 * depth surface every frame -- far depth, and in the stencil an 8x8 pattern of 0-63 its G-buffer pass fades
+			 * objects by and its lighting splits pixels by (bit 5: which half of a pair of chroma channels a pixel keeps) --
+			 * then draws a depth-only scene over it without storing, then force-loads it: with that scene's cleared stencil
+			 * instead, the whole world came out green and magenta in a checker (2026-11-22). RECOMP_GPU_DEPTH_STORE_ALL=1:
+			 * every scene's depth kept, as before */
+			static int store_all = -1; if (store_all < 0) store_all = getenv("RECOMP_GPU_DEPTH_STORE_ALL") != 0;
+			const int discard = t->ds_data && !t->ds_force_store && !store_all;
+			scene_ds_memory = discard && !de->gpu_newer;   /* memory has it: this scene leaves gpu_newer clear */
+			if (discard && de->gpu_newer) {   /* the GPU has it: kept aside before this scene changes tex, once (the scenes after find it there) */
+				if (!de->stored_ok) {
+					if (!de->stored) de->stored = depth_texture(de);
+					if (de->stored && depth_copy(de->tex, de->stored, de)) { de->stored_ok = 1; de->stored_zgen = de->zgen; n_depth_keeps++; }
+				} else if (t->ds_force_load && depth_copy(de->stored, de->tex, de)) { de->gen = de->zgen = ++write_clock; n_depth_keeps++; }   /* force-loaded: it starts from them */
+				if (trace_sync()) fprintf(stderr, "gpu trace: depth %#x %ux%u: scene without FORCE_STORE: the stored surface %s\n", de->key, de->w, de->h, t->ds_force_load ? "kept and loaded" : "kept");
+			}
 			if (t->ds_data && t->ds_force_load) {
 				static int no_preload = -1; if (no_preload < 0) no_preload = getenv("RECOMP_GPU_NO_DEPTH_PRELOAD") != 0;
 				/* force-load: the surface as it stands -- on the GPU if a GPU scene wrote it last, else from guest memory */
@@ -3471,7 +3572,7 @@ void gfx_gpu_guest_written(uint32_t addr, uint32_t len) {
 	for (int i = 0; i < MAXDEPTHG; i++) {
 		DepthEntry *de = &depthsg[i]; if (!de->tex) continue;
 		uint32_t hi = de->key + 4u * de->w * de->h;   /* generous: every depth/stencil format is at most 4 bytes a sample */
-		if (addr < hi && addr + len > de->key) de->gpu_newer = 0;
+		if (addr < hi && addr + len > de->key) de->gpu_newer = de->stored_ok = 0;
 	}
 }
 /* every GPU target -> guest memory (gfxreplay's RECOMP_REPLAY_DRAWS dump: the state mid-frame) */
@@ -3563,6 +3664,8 @@ void gfx_gpu_end_scene(void) {
 	if (scene_soft) { gfx_soft_end_scene(); scene_soft = 0; }
 	if (gpu()) {
 		batch_flush("end of scene");
+		if (scene_depth_entry && scene_target.depth && scene_target.ds_force_store && scene_depth_entry->gpu_newer) scene_depth_entry->stored_ok = 0;   /* stored: tex is the surface (DepthEntry.stored) */
+		scene_ds_memory = 0;
 		const SsaoCamera *cam = ao_scene && ao_draws >= 30 && scene_entry && scene_depth_entry && scene_depth_entry->tex ? ao_camera() : 0;
 		if (cam && ssao_apply(gpu(), scene_entry->color, kind_format(scene_entry->kind), scene_depth_entry->tex, TSX(scene_entry, scene_entry->width), TSY(scene_entry, scene_entry->height), cam)) { n_ao++; box_all(scene_entry); }   /* before anything reads the scene */
 		ao_scene = 0;
@@ -4096,9 +4199,10 @@ static TexEntry *target_view(const GfxTexture *tex, TargetEntry **exact) {
 				if (msx > 1 || msy > 1) { u.tgt_w = dbest->w; u.tgt_h = dbest->h; u.ms_x = msx; u.ms_y = msy; }   /* a sample -> the texture's pixel holding it (drawn single-sampled) */
 				SDL_GPUTextureFormat vfmt = view_format(1, (int)u.mode, 0, tex->min_filter || tex->mag_filter); u.vfmt = (uint32_t)vfmt;
 				v = view_entry(tex, vfmt, dbest->sx, dbest->sy); v->vlinear = 0;
-				if (v->view_src != dbest || v->view_gen != dbest->zgen || !v->view_depth) {
-					if (trace_sync()) fprintf(stderr, "gpu trace: view of depth %#x %ux%u for texture %#x fmt %#x %ux%u u%#x (rebuilt)\n", dbest->key, dbest->w, dbest->h, tex->data, tex->format, tex->width, tex->height, tex->u_mode);
-					if (view_render(v, dbest->tex, 1, &u)) { v->view_src = dbest; v->view_gen = dbest->zgen; v->view_depth = 1; } else v = 0;
+				SDL_GPUTexture *src = dbest->stored_ok ? dbest->stored : dbest->tex; const uint64_t zg = dbest->stored_ok ? dbest->stored_zgen : dbest->zgen;   /* (memory: the last stored scene's) */
+				if (v->view_src != dbest || v->view_gen != zg || !v->view_depth) {
+					if (trace_sync()) fprintf(stderr, "gpu trace: view of depth %#x %ux%u for texture %#x fmt %#x %ux%u u%#x (rebuilt%s)\n", dbest->key, dbest->w, dbest->h, tex->data, tex->format, tex->width, tex->height, tex->u_mode, dbest->stored_ok ? ", stored" : "");
+					if (view_render(v, src, 1, &u)) { v->view_src = dbest; v->view_gen = zg; v->view_depth = 1; } else v = 0;
 				}
 				if (v) return v;
 			}
@@ -4429,6 +4533,61 @@ int gfx_gpu_transfer_downscale(uint32_t src, uint32_t sw, uint32_t sh, uint32_t 
 	SDL_SubmitGPUCommandBuffer(cmd);
 	d->cpu_dirty = 0; d->gpu_dirty = 1; d->gen = ++write_clock; box_all(d); d->prev_drawn_frame = d->drawn_frame; d->drawn_frame = gpu_frame_no; d->used = ++target_clock;
 	readback_enqueue(d);
+	return 1;
+#undef DECLINE
+}
+/* sceGxmTransferFill over a GPU colour target, on the GPU. On the CPU the fill wrote guest memory, so the target came down first
+ * (a fence wait and a download of every byte), the fill ran over it, and the whole target went back up before its next draw.
+ * Assassin's Creed III: Liberation clears its 704x576 F32F32 G-buffer (3.2 MB) with two fills a frame (1024 and 384 pixels of
+ * four bytes a row: the hardware's widest fill is 1024), 8 ms of CPU fill on top of the download and upload (2026-11-22). A
+ * zero fill (a clear: zero bits are zero in every texel format here) of a rectangle a linear target holds at its own pitch, in
+ * whole pixels of it, becomes an upload of zeros into that texel rectangle (at the render scale), ordered after the pending
+ * draws; guest memory under it stays behind as it does under any draw. Returns 0 for the CPU path to do it. */
+static SDL_GPUTransferBuffer *zero_xb; static uint32_t zero_xb_size;
+static SDL_GPUTransferBuffer *zero_buffer(uint32_t bytes) {   /* an upload buffer of zeros, kept (never written again, so never cycled) */
+	if (zero_xb && zero_xb_size >= bytes) return zero_xb;
+	if (zero_xb) { SDL_ReleaseGPUTransferBuffer(gpu(), zero_xb); zero_xb = 0; zero_xb_size = 0; }
+	SDL_GPUTransferBufferCreateInfo ci = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = bytes };
+	SDL_GPUTransferBuffer *b = SDL_CreateGPUTransferBuffer(gpu(), &ci); if (!b) return 0;
+	void *p = SDL_MapGPUTransferBuffer(gpu(), b, false);
+	if (!p) { SDL_ReleaseGPUTransferBuffer(gpu(), b); return 0; }
+	memset(p, 0, bytes); SDL_UnmapGPUTransferBuffer(gpu(), b);
+	zero_xb = b; zero_xb_size = bytes;
+	return b;
+}
+int gfx_gpu_transfer_fill(uint32_t base, uint32_t w, uint32_t h, uint32_t stride, uint32_t color, uint32_t bytes) {
+	if (!gpu() || !gpu_transfer_on() || gfxcap_active()) return 0;
+	static int trace = -1; if (trace < 0) trace = getenv("RECOMP_GPU_TRANSFER_TRACE") != 0;
+#define DECLINE(why) do { if (trace) fprintf(stderr, "gpu transfer: fill %ux%u at %#x stays on the CPU: %s\n", w, h, base, why); return 0; } while (0)
+	if (!bytes || bytes > 4 || (bytes < 4 ? color & ((1u << (8 * bytes)) - 1) : color)) DECLINE("a colour other than zero");
+	TargetEntry *t = 0; uint32_t x0 = 0, x1 = 0, y0 = 0;
+	for (int i = 0; i < ntargets; i++) {   /* the newest linear colour target holding the rectangle's rows at its own pitch, in whole pixels */
+		TargetEntry *e = &targets[i];
+		if (!e->color || e->type != 0) continue;
+		const uint32_t bpp = (uint32_t)target_bpp_entry(e), pitch = bpp * e->width;
+		if (!bpp || stride != pitch || base < e->addr) continue;
+		const uint32_t off = base - e->addr, xo = off % pitch, yy = off / pitch, xb = w * bytes;
+		if (xo % bpp || xb % bpp || xo + xb > pitch || yy + h > e->height) continue;
+		if (!t || e->gen > t->gen) { t = e; x0 = xo / bpp; x1 = (xo + xb) / bpp; y0 = yy; }
+	}
+	if (!t) DECLINE("no linear GPU target holds the rectangle at its own pitch");
+	if (scene_open && t == scene_entry) DECLINE("it fills the scene being drawn");
+	const uint32_t rw = (x1 - x0) * t->sx, rh = h * t->sy;
+	SDL_GPUTransferBuffer *zb = zero_buffer(rw * rh * kind_bytes(t->kind));
+	if (!zb) DECLINE("no upload buffer");
+	batch_flush("transfer");   /* the pending draws (which may write the target) first */
+	target_sync_for_gpu(t);    /* guest bytes newer than the texture elsewhere in it go up first */
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu());
+	if (!cmd) return 0;
+	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureTransferInfo src = { .transfer_buffer = zb, .offset = 0, .pixels_per_row = rw, .rows_per_layer = rh };
+	SDL_GPUTextureRegion dst = { .texture = t->color, .x = x0 * t->sx, .y = y0 * t->sy, .w = rw, .h = rh, .d = 1 };
+	SDL_UploadToGPUTexture(cp, &src, &dst, false);
+	SDL_EndGPUCopyPass(cp);
+	SDL_SubmitGPUCommandBuffer(cmd);
+	t->gpu_dirty = 1; t->gen = ++write_clock; box_add(t, (int)x0, (int)y0, (int)x1, (int)(y0 + h)); t->used = ++target_clock;
+	readback_enqueue(t);
+	if (trace) fprintf(stderr, "gpu transfer: fill %ux%u at %#x on the GPU: target %#x pixels %u..%u rows %u..%u\n", w, h, base, t->addr, x0, x1, y0, y0 + h);
 	return 1;
 #undef DECLINE
 }
@@ -5816,9 +5975,9 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	 * themselves.) */
 	static int gpu_fetch = -1; if (gpu_fetch < 0) gpu_fetch = getenv("RECOMP_GPU_NO_FETCH") == 0;
 	if (fl && fl->frag_color_used && !gpu_fetch) { soft_fallback(d, "framebuffer colour (FRAGCOLOR)"); return; }
-	if (scene_entry->kind == TK_F16 && usse_frag_raw_color(fl)) raw_target_note(scene_entry);
-	/* a raw-word target holds words, not colours: nothing to blend with or read back as one */
-	if (scene_entry->kind == TK_RAW && ((fl && fl->frag_color_used) || (d->blend.present && (d->blend.color_func || d->blend.alpha_func)))) { soft_fallback(d, "a blend into a raw-word target"); return; }
+	if (scene_entry->kind == TK_F16 && usse_frag_raw_color(fl)) raw_target_note(scene_entry, d->fprog);
+	/* a raw-word target holds words, not colours: nothing to blend with or read back as one (this scene: from its next, RGBA16F again) */
+	if (scene_entry->kind == TK_RAW && ((fl && fl->frag_color_used) || (d->blend.present && (d->blend.color_func || d->blend.alpha_func)))) { float_target_note(scene_entry, d->fprog); soft_fallback(d, "a blend into a raw-word target"); return; }
 	__atomic_add_fetch(&n_gpu_draws, 1, __ATOMIC_RELAXED); n_gpu_indices += d->count;
 	t_setup += us_now() - td0;
 	uint64_t tsh0 = us_now();
@@ -5853,7 +6012,9 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		for (int i = 0; i < ntold; i++) if (told[i] == h) seen = 1;
 		if (!seen && ntold < 64) { told[ntold++] = h; fprintf(stderr, "    gpu: fragment %#x reads the framebuffer and %s blending, no copy\n", d->fprog, what[g_fzero_draw]); }
 	}
-	ShaderEntry *fs = get_shader(d->fprog, fp, vp, vl, fl, sa_for_smp, scene_entry->kind, cube_mask, snap_mask, 0, 0);
+	/* an F32F32 surface given more half floats than it has channels: their words stored as they are (usse_spirv.c kind 6) */
+	const int fkind = scene_entry->kind == TK_F32 && (scene_entry->format & 0xf1800000u) == 0x11000000u && fl && fl->color_type == 5 /* TY_F16 */ && fl->color_comps > 2 ? 6 : scene_entry->kind;
+	ShaderEntry *fs = get_shader(d->fprog, fp, vp, vl, fl, sa_for_smp, fkind, cube_mask, snap_mask, 0, 0);
 	{	/* RECOMP_GXM_PATCHER_LOG=1: each fragment program's first draw, against when the game's shader patcher made it (hooks.c gxm_fp_create) */
 		static int on = -1; if (on < 0) on = getenv("RECOMP_GXM_PATCHER_LOG") != 0;
 		if (on) { static uint32_t seen[4096]; static int ns; int k = 0; for (; k < ns && seen[k] != d->fprog; k++) {}
@@ -6285,7 +6446,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		int st_on = ds_stencil_ok && (d->stencil_func != 7 || d->stencil_fail || d->depth_fail || d->depth_pass);   /* get_pipeline's enable_stencil_test */
 		int zwrites = ds_clear || (ds_depth_ok && d->depth_write);
 		int writes = zwrites || (st_on && d->stencil_wmask && (d->stencil_fail || d->depth_fail || d->depth_pass));
-		scene_depth_entry->gpu_newer = 1;
+		if (!scene_ds_memory) scene_depth_entry->gpu_newer = 1;   /* (a scene that doesn't store it leaves memory the surface's) */
 		if (writes) scene_depth_entry->gen = ++write_clock;
 		if (zwrites) scene_depth_entry->zgen = scene_depth_entry->gen;
 	}
@@ -6382,6 +6543,7 @@ static void apply_render_scale(int n) {
 	for (int i = 0; i < MAXDEPTHG; i++) {
 		DepthEntry *d = &depthsg[i];
 		if (d->tex) SDL_ReleaseGPUTexture(gpu(), d->tex); if (d->pre_z) SDL_ReleaseGPUTexture(gpu(), d->pre_z); if (d->pre_s) SDL_ReleaseGPUTexture(gpu(), d->pre_s);
+		if (d->stored) SDL_ReleaseGPUTexture(gpu(), d->stored);
 		memset(d, 0, sizeof *d);
 	}
 	for (int i = 0; i < nviews; i++) {
@@ -6524,11 +6686,11 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 			        n_tex_binds, n_tex_checked, (unsigned long long)n_pages_hashed, n_tex_changed, n_tex_new, n_tex_moved, n_tex_deferred, n_tex_missed ? " -- WATCH MISSED WRITES" : "", gwatch_on() ? "on" : "off", wf, wm, wp);
 			n_tex_binds = n_tex_checked = n_tex_changed = n_tex_new = n_tex_moved = n_tex_missed = n_tex_deferred = 0; n_pages_hashed = 0; }
 		/* the scene command buffers (one copy pass + one render pass each) and why each batch was submitted */
-		fprintf(stderr, "    gpu batch: %u draws in %u scene command buffers, %u render passes (%u FRAGCOLOR copies, %u narrowed, %u additive, and %u view passes: %u hoisted to the head, %u in draw order, %u in their own command buffer), %u LDST windows placed, %u reused, flushed at", n_batch_draws, n_batch_cmd, n_batch_pass, n_batch_fetch, n_fetch_narrowed, n_batch_additive, n_batch_views, n_views_hoisted, n_views_inorder, n_views_alone, n_ldst_new, n_ldst_reused);
+		fprintf(stderr, "    gpu batch: %u draws in %u scene command buffers, %u render passes (%u FRAGCOLOR copies, %u narrowed, %u additive, and %u view passes: %u hoisted to the head, %u in draw order, %u in their own command buffer), %u LDST windows placed, %u reused, %u depth copies around unstored scenes, %u depth preloads of unchanged bytes, flushed at", n_batch_draws, n_batch_cmd, n_batch_pass, n_batch_fetch, n_fetch_narrowed, n_batch_additive, n_batch_views, n_views_hoisted, n_views_inorder, n_views_alone, n_ldst_new, n_ldst_reused, n_depth_keeps, n_preload_same);
 		for (int i = 0; i < n_flush_why; i++) fprintf(stderr, "%s %s %u", i ? "," : "", flush_why[i].why, flush_why[i].n);
 		fprintf(stderr, "\n");
 		n_batch_additive = n_ldst_new = n_ldst_reused = 0;
-		n_batch_draws = n_batch_cmd = n_batch_pass = n_batch_fetch = n_fetch_narrowed = n_batch_views = n_views_hoisted = n_views_inorder = n_views_alone = 0; n_flush_why = 0; t_flush = 0;
+		n_batch_draws = n_batch_cmd = n_batch_pass = n_batch_fetch = n_fetch_narrowed = n_batch_views = n_views_hoisted = n_views_inorder = n_views_alone = 0; n_flush_why = 0; t_flush = 0; n_depth_keeps = n_preload_same = 0;
 		__atomic_store_n(&n_gpu_draws, 0, __ATOMIC_RELAXED); __atomic_store_n(&n_fallback, 0, __ATOMIC_RELAXED); n_fallback_why = 0; n_shader_builds = n_vring_wraps = 0; n_tex_uploads = n_tex_bc = 0; t_total = t_vfetch = t_texhash = t_texup = t_tsync = t_view = t_submit = t_shader = t_pipe = t_bind = t_setup = t_vbuf = t_pass = t_map = t_acq = t_scene_sync = 0;
 	}
 	gpu_frame_no++;   /* textures are re-checked against guest memory from here on */
@@ -6569,7 +6731,11 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 		/* an sRGB frame goes to the window as raw texels (a copy, not a blit) where the backend copies between the sRGB and
 		 * plain forms of a format: Vulkan does. Through guest memory instead, Killzone's windowed frames each cost a download
 		 * and a wait for the whole frame, and the window showed the 1x frame at any render scale (2026-10-26) */
-		static int srgb_copy = -1; if (srgb_copy < 0) { const char *dv = SDL_GetGPUDeviceDriver(gpu()); srgb_copy = dv && !strcmp(dv, "vulkan"); }
+		/* an sRGB frame reaches the window on the GPU where its bytes can move as they are: Vulkan's copy, Metal's
+		 * re-encoding pass (post.c post_srgb_raw); elsewhere through guest memory (RECOMP_GPU_SRGB_PRESENT_SYNC=1: always) */
+		static int srgb_copy = -1;
+		if (srgb_copy < 0) { extern int post_srgb_raw_ready(SDL_GPUDevice *); const char *dv = SDL_GetGPUDeviceDriver(gpu());
+			srgb_copy = getenv("RECOMP_GPU_SRGB_PRESENT_SYNC") ? 0 : (dv && !strcmp(dv, "vulkan")) || post_srgb_raw_ready(gpu()); }
 		const int via_gpu = e->gpu_dirty && !gfx_soft_shot_due() && format == 0 && window_active() && !no_gpu_present && (e->kind != TK_U8S || srgb_copy);
 		hist_record(base, e, TSX(e, width), TSY(e, height), via_gpu);
 		{ const int m = __atomic_exchange_n(&hist_save_mark, 0, __ATOMIC_ACQ_REL); if (m) hist_save(m); }

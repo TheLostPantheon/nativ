@@ -252,6 +252,8 @@ typedef struct { uint32_t draws, fallback, shaders, pipes, tex_uploads, tex_new,
 void gfx_gpu_last_frame_costs(GfxGpuFrameCosts *out);
 void gfx_gpu_builds_stop(void);   /* before exit(): the build workers stop (gfx_gpu.c) */
 void gfx_gpu_builds_wait(void);   /* asynchronous shader/pipeline builds (RECOMP_GPU_ASYNC): wait for every queued one */
+int gfx_gpu_transfer_fill(uint32_t base, uint32_t w, uint32_t h, uint32_t stride, uint32_t color, uint32_t bytes);   /* sceGxmTransferFill of zeros over a GPU target, on the GPU (1: done) */
+int gfx_transfer_fill(uint32_t base, uint32_t w, uint32_t h, uint32_t stride, uint32_t color, uint32_t bytes);
 void gfx_gpu_guest_writing(uint32_t addr, uint32_t len);   /* guest memory is about to change behind the GPU's back: overlapping GPU-drawn targets download first */
 void gfx_gpu_guest_written(uint32_t addr, uint32_t len);   /* ... and has changed: overlapping targets re-upload before their next GPU use */
 void gfx_guest_writing(uint32_t addr, uint32_t len);

@@ -1130,7 +1130,7 @@ void usse_spirv_key(const UsseProgram *prog, const UsseFragLayout *fl, const uin
 	if (fl) for (int i = 0; i < fl->niters; i++) if (fl->iters[i].is_tex && fl->iters[i].tex_unit >= 0 && fl->iters[i].tex_unit < 16) used |= 1u << fl->iters[i].tex_unit;
 	if (cube_mask) *cube_mask &= used;
 	if (snap_mask) *snap_mask &= used;
-	if (color_kind && *color_kind >= 0) *color_kind = *color_kind == 5 ? 5 : fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes; kind 5 packs every colour) */
+	if (color_kind && *color_kind >= 0) *color_kind = *color_kind == 5 || *color_kind == 6 ? *color_kind : fl && (fl->color_type == TY_U32 || fl->color_type == TY_S32) && (*color_kind == 1 || *color_kind == 2) ? *color_kind : 0;   /* (emit_frag_epilogue: raw words by kind 1, 2, else bytes; kind 5 packs every colour; kind 6: half floats packed in an F32F32 surface's words) */
 }
 uint32_t usse_spirv_predict_cube(const UsseProgram *prog, const UsseFragLayout *fl, const uint32_t sa_tex_unit[256]) {
 	uint32_t m = 0; int n = 0; const UOp *code = usse_program_code(prog, 0, &n);
@@ -1736,6 +1736,14 @@ static void emit_frag_color_preload(Gen *g, uint32_t texel, int *ok) {
 	o.bank = (uint8_t)(fl->native_color ? BK_O : BK_PA); o.num = (uint16_t)fl->color_pa_start; o.type = (uint8_t)fl->color_type;
 	for (int k = 0; k < 4; k++) o.swiz[k] = (uint8_t)k;
 	int n = fl->color_comps > 0 ? fl->color_comps : 4;
+	if (g->color_kind == 6 && o.type == TY_F16) {   /* an F32F32 surface holding two halves a word (kind 6, as the epilogue
+		 * stores them): its words back as they are. Converted as floats, Assassin's Creed III: Liberation's puddles, which
+		 * blend into the scene buffer in the shader, covered the street under them with noise (2026-11-23) */
+		UOperand ow = o; ow.type = TY_U32;
+		for (int w = 0; w < (n + 1) / 2 && *ok; w++)
+			write_raw_comp(g, &ow, 0, w, result1(s, &s->func, SpvOpBitcast, t_uint(s), composite_extract1(s, t_float(s), texel, (uint32_t)w)), ok);
+		return;
+	}
 	int norm = o.type == TY_U8 || o.type == TY_S8 || o.type == TY_U16 || o.type == TY_S16;
 	for (int c = 0; c < n && c < 4 && *ok; c++) {
 		uint32_t v = composite_extract1(s, t_float(s), texel, (uint32_t)c);
@@ -1805,6 +1813,17 @@ static void emit_frag_epilogue(Gen *g, int *ok) {
 		}
 	}
 	uint32_t comp[4];
+	if (g->color_kind == 6 && o.type == TY_F16) {   /* more half floats than an F32F32 surface has channels (gfx_gpu.c picks kind 6):
+		 * the pixel back end stores the output words as they are, two halves a word, into the surface's R32G32 (gfx_soft.c's
+		 * shade_interp, Assassin's Creed III: Liberation's scene buffer) */
+		UOperand ow = o; ow.type = TY_U32;
+		const int nw = (n + 1) / 2;
+		for (int c = 0; c < 4; c++) comp[c] = c < nw ? result1(s, &s->func, SpvOpBitcast, t_float(s), read_raw_comp(g, &ow, 0, c, ok)) : c_float(s, c == 3 ? 1.0f : 0.0f);
+		if (!*ok) return;
+		uint32_t id = nid(s); INS(&s->func, SpvOpCompositeConstruct, t_vec(s, t_float(s), 4), id, comp[0], comp[1], comp[2], comp[3]);
+		store(s, g->var_frag_color, id);
+		return;
+	}
 	if (o.type == TY_U32 || o.type == TY_S32) {   /* raw words (Unit 13's packed G-buffer): placed so the target holds the bits */
 		uint32_t w[4];
 		for (int k = 0; k < 4; k++) w[k] = k < n ? read_raw_comp(g, &o, 0, k, ok) : c_uint(s, 0);

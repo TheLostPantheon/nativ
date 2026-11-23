@@ -786,11 +786,17 @@ void window_present_gpu(void *src, uint32_t w, uint32_t h, int raw) {
 		SDL_GPUCommandBuffer *cmd = gtex[n] ? SDL_AcquireGPUCommandBuffer(gpu) : 0;
 		if (cmd && raw) {
 			/* raw: an sRGB frame (Killzone's). A blit would decode it on the way into this plain texture; a copy moves
-			 * the bytes as they are, which is what the display scans out */
-			SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
-			SDL_GPUTextureLocation s = { .texture = src }, d = { .texture = gtex[n] };
-			SDL_CopyGPUTextureToTexture(cp, &s, &d, w, h, 1, false);
-			SDL_EndGPUCopyPass(cp);
+			 * the bytes as they are, which is what the display scans out. Metal copies only between identical formats:
+			 * there post.c's pass reads the frame and encodes it back (byte for byte) */
+			extern int post_srgb_raw(SDL_GPUDevice *, SDL_GPUCommandBuffer *, SDL_GPUTexture *, SDL_GPUTexture *, uint32_t, uint32_t);
+			const char *dv = SDL_GetGPUDeviceDriver(gpu);
+			if (!(dv && !strcmp(dv, "vulkan")) && post_srgb_raw(gpu, cmd, src, gtex[n], w, h)) {}
+			else {
+				SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+				SDL_GPUTextureLocation s = { .texture = src }, d = { .texture = gtex[n] };
+				SDL_CopyGPUTextureToTexture(cp, &s, &d, w, h, 1, false);
+				SDL_EndGPUCopyPass(cp);
+			}
 		} else if (cmd) {
 			SDL_GPUBlitInfo blit = { .source = { .texture = src, .w = w, .h = h }, .destination = { .texture = gtex[n], .w = w, .h = h }, .load_op = SDL_GPU_LOADOP_DONT_CARE, .filter = SDL_GPU_FILTER_NEAREST };
 			SDL_BlitGPUTexture(cmd, &blit);

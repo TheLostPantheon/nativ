@@ -83,6 +83,17 @@ static const char post_msl[] =
 	"  return float4(clamp((b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w), 0.0, 1.0), 1.0);\n"
 	"}\n";
 
+/* an sRGB frame's bytes into a plain texture (post_srgb_raw): the read decodes them, this encodes them back */
+static const char srgb_raw_msl[] =
+	"#include <metal_stdlib>\n"
+	"using namespace metal;\n"
+	"struct VOut { float4 pos [[position]]; };\n"
+	"fragment float4 srgb_raw_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+	"  float4 c = t.read(uint2(in.pos.xy));\n"
+	"  float3 e = select(1.055 * powr(c.rgb, 1.0 / 2.4) - 0.055, 12.92 * c.rgb, c.rgb <= 0.0031308);\n"
+	"  return float4(e, c.a);\n"
+	"}\n";
+
 typedef struct { float rcp[2], origin[2], k[4]; } PostU;
 static SDL_GPUShader *vs, *fs_fxaa, *fs_cas;
 static SDL_GPUGraphicsPipeline *p_fxaa, *p_cas; static SDL_GPUTextureFormat cas_fmt = SDL_GPU_TEXTUREFORMAT_INVALID;
@@ -147,6 +158,53 @@ static void pass(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *dst, SDL_GPULoadOp l
 	SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof u);
 	SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
 	SDL_EndGPURenderPass(rp);
+}
+
+/* an sRGB frame (src, R8G8B8A8_UNORM_SRGB) into the plain texture dst (R8G8B8A8_UNORM), byte for byte, as the display
+ * scans its bytes out. Vulkan copies across the two formats; Metal refuses any copy between different pixel formats,
+ * and a blit decodes, so before this every sRGB game on a Mac took its frame down to guest memory and back up each
+ * present (gfx_gpu.c: a fence wait and 4.4 ms a frame in Borderlands 2, Killzone, LBP, Assassin's Creed III:
+ * Liberation; 2026-11-23). 1: done; 0: unavailable (no MSL), the caller keeps the old way. */
+static SDL_GPUGraphicsPipeline *srgb_raw_p; static int srgb_raw_state;   /* 0 untried, 1 ready, -1 unavailable */
+int post_srgb_raw_ready(SDL_GPUDevice *gpu) {   /* (Metal only: Vulkan copies) */
+	static SDL_GPUShader *v, *f;
+	if (!srgb_raw_state) {
+		srgb_raw_state = -1;
+		if (!(SDL_GetGPUShaderFormats(gpu) & SDL_GPU_SHADERFORMAT_MSL)) return 0;
+		SDL_GPUShaderCreateInfo ci = { .code = (const Uint8 *)post_msl, .code_size = sizeof post_msl, .entrypoint = "post_vs", .format = SDL_GPU_SHADERFORMAT_MSL, .stage = SDL_GPU_SHADERSTAGE_VERTEX };
+		v = SDL_CreateGPUShader(gpu, &ci);
+		SDL_GPUShaderCreateInfo cf = { .code = (const Uint8 *)srgb_raw_msl, .code_size = sizeof srgb_raw_msl, .entrypoint = "srgb_raw_fs", .format = SDL_GPU_SHADERFORMAT_MSL,
+			.stage = SDL_GPU_SHADERSTAGE_FRAGMENT, .num_samplers = 1 };
+		f = SDL_CreateGPUShader(gpu, &cf);
+		if (v && f) {
+			SDL_GPUColorTargetDescription ct = { .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM };
+			SDL_GPUGraphicsPipelineCreateInfo pi = {0};
+			pi.vertex_shader = v; pi.fragment_shader = f; pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+			pi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE; pi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+			pi.target_info.color_target_descriptions = &ct; pi.target_info.num_color_targets = 1;
+			srgb_raw_p = SDL_CreateGPUGraphicsPipeline(gpu, &pi);
+		}
+		if (!srgb_raw_p) { SDL_Log("post: sRGB present pass unavailable (%s): frames go through guest memory", SDL_GetError()); return 0; }
+		if (!smp) {
+			SDL_GPUSamplerCreateInfo sci = {0};
+			sci.address_mode_u = sci.address_mode_v = sci.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+			smp = SDL_CreateGPUSampler(gpu, &sci);
+		}
+		if (!smp) return 0;
+		srgb_raw_state = 1;
+	}
+	return srgb_raw_state > 0;
+}
+int post_srgb_raw(SDL_GPUDevice *gpu, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, SDL_GPUTexture *dst, uint32_t w, uint32_t h) {
+	if (!post_srgb_raw_ready(gpu) || !src || !dst) return 0;
+	SDL_GPUColorTargetInfo ct = { .texture = dst, .load_op = SDL_GPU_LOADOP_DONT_CARE, .store_op = SDL_GPU_STOREOP_STORE };
+	SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(cmd, &ct, 1, NULL);
+	SDL_GPUViewport vp = { 0, 0, (float)w, (float)h, 0.0f, 1.0f }; SDL_SetGPUViewport(rp, &vp);
+	SDL_BindGPUGraphicsPipeline(rp, srgb_raw_p);
+	SDL_GPUTextureSamplerBinding b = { .texture = src, .sampler = smp }; SDL_BindGPUFragmentSamplers(rp, 0, &b, 1);
+	SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+	SDL_EndGPURenderPass(rp);
+	return 1;
 }
 
 /* the frame src (sw x sh, `levels` mip levels: window.c gives a frame over twice the window's size a mip
