@@ -595,7 +595,34 @@ class Analyser:
 
     def is_prologue(self, a):
         hw, hw2 = self.half(a), self.half(a + 2)
-        return hw is not None and hw2 is not None and ((hw & 0xff00) == 0xb500 or (hw == 0xe92d and hw2 & 0x4000 and not hw2 & 0x8000))
+        if hw is None or hw2 is None:
+            return False
+        if (hw & 0xff00) == 0xb500 or (hw == 0xe92d and hw2 & 0x4000 and not hw2 & 0x8000):   # push {..., lr} / push.w {..., lr}
+            return True
+        # mov ip, sp before the pushes: the caller's sp kept in ip (varargs functions push r0-r3 first, then {..., ip, lr}).
+        # Need for Speed Most Wanted's 0x8161c460, called only through a pointer built at run time (2026-11-22)
+        return hw == 0x46ec and ((hw2 & 0xfe00) == 0xb400 or hw2 == 0xe92d)
+
+    def leaf_after_end(self, a, covered_at):
+        """a few instructions ending in bx lr right where the function before ends (bx lr, pop {pc}, b), none of them
+        anything else that leaves: a leaf function no push marks -- an empty virtual method (a lone bx lr), a
+        `return 0`. covered_at(x): x belongs to a body already"""
+        if not self.ends_function(a):
+            return False
+        x = a
+        for _ in range(6):
+            if covered_at(x):
+                return False
+            i = self.insn(x, False)
+            if i is None or self.conditional(i, False):
+                return False
+            if i.id == A.ARM_INS_BX:
+                return i.op_str == "lr"
+            if i.id in (A.ARM_INS_B, A.ARM_INS_BL, A.ARM_INS_BLX, A.ARM_INS_CBZ, A.ARM_INS_CBNZ, A.ARM_INS_TBB, A.ARM_INS_TBH, A.ARM_INS_POP) \
+               or i.id in LDM or "pc" in i.op_str or i.mnemonic in ("nop", "udf", "bkpt", "svc"):
+                return False
+            x += i.size
+        return False
 
     def ends_function(self, a):
         """the instruction before a ends a function (bx lr, pop {pc}, b) and a isn't padding"""
@@ -631,6 +658,8 @@ def analyse(elf, out, compare=None, base=None, link=(), var_base=VAR_BASE):
     m = Module(elf)
     if base is not None:
         m.relocate(base)
+    import guestfix   # known bugs in Sony's libraries as games ship them, fixed in the code before it is read
+    guestfix.apply(m.mem[(m.loads[0][2] + m.delta) & 0xffffffff], log=lambda s: print(s, file=sys.stderr))
     names = known_names()
     linked = {}
     for path, lbase in link:
@@ -737,7 +766,8 @@ def analyse(elf, out, compare=None, base=None, link=(), var_base=VAR_BASE):
 
 
 def prologues(an, bodies):
-    """push {..., lr} at addresses no body covers, as (address, ARM): Thumb push / push.w, and ARM's
+    """push {..., lr} at addresses no body covers, as (address, ARM): Thumb push / push.w (or mov ip, sp before one), a
+    Thumb leaf right after a function's end (Analyser.leaf_after_end), and ARM's
     stmdb sp!, {..., lr} (0xe92d4xxx as a word -- a pattern Thumb's push.w, whose halfwords sit the
     other way round, never makes), which system modules' callbacks start with"""
     covered = bytearray(len(an.code) // 2 + 1)
@@ -745,13 +775,23 @@ def prologues(an, bodies):
         if an.in_text(lo):
             for x in range((lo - an.lo) // 2, min((hi - an.lo) // 2 + 1, len(covered))):
                 covered[x] = 1
-    out = []
+    out, own_to = [], 0
     for h in range(0, len(an.code) // 2 - 1):
         if covered[h]:
             continue
         a = an.lo + 2 * h
-        if an.is_prologue(a):   # push {..., lr} / push.w {..., lr}
+        if a < own_to:   # the pushes of the mov ip, sp prologue just found: its own, not functions of their own
+            continue
+        if an.is_prologue(a):   # push {..., lr} / push.w {..., lr}, or mov ip, sp before them
             out.append((a, False))
+            if an.half(a) == 0x46ec:
+                own_to = a + 2
+                for _ in range(2):   # (up to two pushes: r0-r3, then {..., ip, lr})
+                    if an.half(own_to) == 0xe92d: own_to += 4
+                    elif (an.half(own_to) or 0) & 0xfe00 == 0xb400: own_to += 2
+                    else: break
+        elif an.leaf_after_end(a, lambda x: covered[(x - an.lo) // 2] if 0 <= (x - an.lo) // 2 < len(covered) else True):
+            out.append((a, False))   # a leaf: bx lr within a few instructions of the function before's end
         elif not a & 3 and not covered[h + 1]:
             w = an.half(a) | (an.half(a + 2) or 0) << 16
             if w >> 16 == 0xe92d and w & 0x4000:   # ARM stmdb sp!, {..., lr}

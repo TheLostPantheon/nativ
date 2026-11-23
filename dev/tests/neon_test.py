@@ -57,6 +57,8 @@ __thread uint64_t recomp_excl_val64; __thread uint32_t recomp_tpidruro;
 void recomp_call_external(Cpu *c, uint32_t a) { (void)a; c->stop = 2; }
 void recomp_unimplemented(Cpu *c, uint32_t a) { (void)a; c->stop = 1; }
 GuestFn recomp_lookup(uint32_t a) { (void)a; return 0; }
+#define recomp_lookup_here recomp_lookup   /* (as the main program's generated header defines it) */
+void recomp_missed_jump(Cpu *c, uint32_t a, int thumb) { (void)a; (void)thumb; c->stop = 1; }
 const char *recomp_import_name(uint32_t a) { (void)a; return 0; }
 _Static_assert(sizeof(Cpu) == 352, "Cpu layout");
 %s
@@ -119,10 +121,14 @@ def fmin(a, b):
     x, y = f32(a), f32(b)
     if x == y: return a | b   # FPMin: -0 wins
     return a if x < y else b
+def f32_bits(x):   # a double rounded to float32 (round to nearest): past the largest float32, infinity
+    try: return struct.unpack("<I", struct.pack("<f", x))[0]
+    except OverflowError: return 0x7f800000 if x > 0 else 0xff800000
 def fadd(a, b):
     a, b = fzf(a), fzf(b)
-    r = struct.unpack("<I", struct.pack("<f", f32(a) + f32(b)))[0] if not (f32(a) != f32(a) or f32(b) != f32(b)) else 0x7fc00000
-    return fzf(r)
+    if f32(a) != f32(a) or f32(b) != f32(b): return 0x7fc00000
+    s = f32(a) + f32(b)
+    return fzf(0x7fc00000 if s != s else f32_bits(s))
 
 def sat(v, bits, signed):
     if signed: return max(-(1 << (bits - 1)), min((1 << (bits - 1)) - 1, v))

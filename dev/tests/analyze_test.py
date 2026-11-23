@@ -51,8 +51,37 @@ def it_return():
     check("IT: ends_function false after A's bxeq", not a.ends_function(ent["A"] + 6))
     check("IT: ends_function true after B's bx lr", a.ends_function(ent["B"] + 4))
 
+def gap_functions():
+    # K: push {r4,lr}; movs r0,#1; pop {r4,pc}           (a known body)
+    # nop                                                 (padding)
+    # M: mov ip,sp; push.w {r0-r3}; push.w {r4,r5,ip,lr}; movs r0,#2; pop.w {r4,r5,ip,lr}; add sp,#16; bx lr
+    # N: push {r4,lr}; movs r0,#3; pop {r4,pc}           (a known body)
+    # E: bx lr                                            (an empty method between N and P)
+    # P: push {r4,lr}; movs r0,#4; pop {r4,pc}           (a known body)
+    # Z: movs r0,#0; bx lr                                (a `return 0` right after P)
+    # Q: push {r4,lr}; pop {r4,pc}; .word 0x81001235      (a known body, then a literal pool: no function)
+    # nop; M2: mov ip,sp; push {r4,lr}; movs r0,#5; pop {r4,pc}   (one prologue, not two)
+    blocks = [("K", hw(0xb510, 0x2001, 0xbd10), True), ("pad", hw(0xbf00), None),
+              ("M", hw(0x46ec, 0xe92d, 0x000f, 0xe92d, 0x5030, 0x2002, 0xe8bd, 0x5030, 0xb004, 0x4770), False),
+              ("N", hw(0xb510, 0x2003, 0xbd10), True), ("E", hw(0x4770), False), ("P", hw(0xb510, 0x2004, 0xbd10), True),
+              ("Z", hw(0x2000, 0x4770), False), ("Q", hw(0xb510, 0xbd10), True), ("pool", struct.pack("<I", 0x81001235), None),
+              ("pad2", hw(0xbf00), None), ("M2", hw(0x46ec, 0xb510, 0x2005, 0xbd10), False)]
+    code, ent, bodies = b"", {}, []
+    for n, blk, known in blocks:
+        ent[n] = LO + len(code)
+        if known: bodies.append([ent[n], ent[n] + len(blk) - 1, ent[n]])
+        code += blk
+    a = an.Analyser(Mod(code), LO, LO + len(code))
+    found = {x for x, arm in an.prologues(a, bodies)}
+    check("gap: mov ip, sp before the pushes is a prologue", ent["M"] in found)
+    check("gap: a lone bx lr after a function's end is a function", ent["E"] in found)
+    check("gap: a `return 0` leaf after a function's end is a function", ent["Z"] in found)
+    check("gap: mov ip, sp; push {r4,lr} is one prologue", ent["M2"] in found and ent["M2"] + 2 not in found)
+    check("gap: nothing inside M, and no function in the literal pool", not (found - {ent["M"], ent["E"], ent["Z"], ent["M2"]}))
+
 def main():
     it_return()
+    gap_functions()
     print("all passed" if not fails else f"{fails} failed")
     return 1 if fails else 0
 

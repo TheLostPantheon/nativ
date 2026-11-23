@@ -122,6 +122,47 @@ GuestFn recomp_lookup(uint32_t a) { return 0; }
 int main(''', 1).replace("recomp_run(&c, fn & ~1u);", "{ GuestFn mf = modlk(fn & ~1u); if (mf) mf(&c); else recomp_unimplemented(&c, fn); }", 1)
 assert "modlk(fn" in MODULE_HARNESS
 
+# a NEON helper that names one d register and moves a whole q register (vext.64 q0, q0, q0, #1: swap q0's halves). The
+# emitter copies the q register through its first d register's address; the register-locals rewrite once counted only
+# that one, so d1 was neither loaded nor written back and the swap returned garbage (Assassin's Creed III: Liberation's
+# matrix inverse, its whole world culled). The callers hand both halves in and take both back.
+Q_HALVES = PRELUDE + r'''
+.fpu neon
+.thumb
+TFN g_swap_q0
+ vext.64 q0, q0, q0, #1
+ bx lr
+END g_swap_q0
+TFN g_zip_d0d1
+ vzip.32 d0, d1
+ bx lr
+END g_zip_d0d1
+TFN t_swap_halves
+ push {r4, lr}
+ vmov d0, r0, r1
+ vmov d1, r2, r3
+ bl g_swap_q0
+ vmov r0, r1, d0
+ vmov r2, r3, d1
+ eor r0, r0, r1, ror #7
+ eor r0, r0, r2, ror #13
+ eor r0, r0, r3, ror #19
+ pop {r4, pc}
+END t_swap_halves
+TFN t_zip_halves
+ push {r4, lr}
+ vmov d0, r0, r1
+ vmov d1, r2, r3
+ bl g_zip_d0d1
+ vmov r0, r1, d0
+ vmov r2, r3, d1
+ eor r0, r0, r1, ror #7
+ eor r0, r0, r2, ror #13
+ eor r0, r0, r3, ror #19
+ pop {r4, pc}
+END t_zip_halves
+'''
+
 fails = checks = 0
 
 
@@ -313,6 +354,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="recomp_synth_") as tmp:
         run_case("lr_tail", LR_TAIL, tmp)
         run_case("jump_entry", JUMP_ENTRY, tmp)
+        run_case("q_halves", Q_HALVES, tmp)
         run_case("jump_entry_module", JUMP_ENTRY, tmp, flags=("--module", "m"), harness=MODULE_HARNESS)
         mode_cases(tmp)
         prefix_case(tmp)

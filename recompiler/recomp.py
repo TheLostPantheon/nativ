@@ -674,7 +674,7 @@ class Fn:
             else:
                 r = self.r(ops[0].reg, i)
                 body = [f"{{ uint32_t t = {r};" + (f" c->r[14] = 0x{nxt | self.tbit:x}u;" if mn == "blx" else "")
-                        + " GuestFn f = recomp_lookup(t & ~1u); if (f) f(c); else recomp_call_external(c, t); }",
+                        + " GuestFn f = RECOMP_LOOKUP_IC(t & ~1u); if (f) f(c); else recomp_call_external(c, t); }",   # (rt.h: a cache at the site)
                         "if (c->stop) return;"] + (["return;"] if mn == "bx" else [])
             return body if cc == 15 else [f"if (COND(c, {cc})) {{"] + body + ["}"]
         if mn in ("tbb", "tbh"):
@@ -1643,6 +1643,38 @@ _FLAGS_USED = re.compile(r"\b(ADDC|SUBC|NZ|SHIFT|COND)\(c,|\bc->[nzcv]\b|VMRS_AP
 # no calls) then keep their whole computation in host registers.
 _VREF = re.compile(r"c->vfp\.(s|f|d|fd)\[(\d+)\]")
 _VANY = re.compile(r"c->vfp\b")
+_VADDR = re.compile(r"&c->vfp\.(s|f|d|fd)\[(\d+)\]")
+
+
+def _vfp_spans(line):
+    """the d registers a line's memcpy calls reach through a register's address, and whether every such size is known. A q
+    register is two d registers and the NEON emitters copy it whole: memcpy(t, &c->vfp.d[0], 16) reads d0 AND d1, while the
+    reference names d0 only. Counting d0 alone left d1 out of the locals, so it was neither loaded nor written back: a function
+    of one vext.64 q0, q0, q0, #1 (swap q0's halves) returned d1's garbage in d0 and dropped d0 (Assassin's Creed III:
+    Liberation's matrix inverse came out NaN and its whole world was culled, 2026-11-22)."""
+    spans, known, i = set(), True, 0
+    while True:
+        j = line.find("memcpy(", i)
+        if j < 0: return spans, known
+        k, depth, start, args = j + 7, 0, j + 7, []
+        while k < len(line):
+            ch = line[k]
+            if ch == "(": depth += 1
+            elif ch == ")":
+                if depth == 0: args.append(line[start:k]); break
+                depth -= 1
+            elif ch == "," and depth == 0: args.append(line[start:k]); start = k + 1
+            k += 1
+        i = k + 1
+        if len(args) != 3: continue
+        size = args[2].strip()
+        for a in args[:2]:
+            m = _VADDR.search(a)
+            if not m: continue
+            if not size.isdigit(): known = False; continue
+            first = int(m.group(2)) * (4 if m.group(1) in ("s", "f") else 8)
+            last = first + int(size) - 1 + (8 if re.search(r"\)\s*\+", a) else 0)   # (an offset into the register: its neighbour too, to be safe)
+            spans.update(range(first // 8, min(last // 8, 31) + 1))
 # Only in functions that call out a few times at most: each call writes back and reloads every d register the function uses,
 # and Uncharted's biggest functions (4,000 instructions, 180 calls, all 32 d registers) grew to 600 KB of C that the C
 # compiler took over a quarter of an hour on. The hot float code is small and calls little (most of it nothing).
@@ -1665,10 +1697,12 @@ def reg_locals(lines, head):
     locals: see REG_LOCALS"""
     used = sorted({int(n) for l in lines for n in _RREF.findall(l)} - {15})
     flags = any(_FLAGS_USED.search(l) for l in lines[head:])
-    vd = set()
+    vd, sizes_known = set(), True
     for l in lines[head:]:
         for kind, n in _VREF.findall(l): vd.add(int(n) >> 1 if kind in ("s", "f") else int(n))
-    vfp = (bool(vd) and all(len(_VANY.findall(l)) == len(_VREF.findall(l)) for l in lines[head:])   # (only constant register numbers)
+        if "memcpy(" in l and "&c->vfp." in l:   # (a whole q register copied through its first d register's address)
+            spans, known = _vfp_spans(l); vd |= spans; sizes_known &= known
+    vfp = (bool(vd) and sizes_known and all(len(_VANY.findall(l)) == len(_VREF.findall(l)) for l in lines[head:])   # (only constant register numbers)
            and sum(len(_CALLOUT.findall(l)) for l in lines[head:]) <= VFP_MAX_CALLS)
     vd = sorted(vd) if vfp else []
     if not used and not flags and not vfp: return lines
@@ -1736,7 +1770,8 @@ def main():
     # a computed jump's target is looked up in this file's own table first: a module's functions are in its own
     # recomp_lookup_<module>, which the main program's recomp_lookup knows nothing of
     out += ([f"GuestFn recomp_lookup{sfx}(uint32_t a);",
-             f"static inline GuestFn recomp_lookup_here(uint32_t a) {{ GuestFn f = recomp_lookup{sfx}(a); return f ? f : recomp_lookup(a); }}"]
+             f"static inline GuestFn recomp_lookup_here(uint32_t a) {{ GuestFn f = recomp_lookup{sfx}(a); return f ? f : recomp_lookup(a); }}",
+             "#undef RECOMP_IC_MISS", "#define RECOMP_IC_MISS recomp_lookup_here"]
             if mod else ["#define recomp_lookup_here recomp_lookup"])
     fns, total, bad = [], 0, []
     # a function can be several code chunks: each chunk belongs to its owner when the export says,
