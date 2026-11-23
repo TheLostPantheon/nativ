@@ -36,11 +36,15 @@ __thread uint32_t recomp_tpidruro;      /* the guest thread's TLS pointer */
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;   /* the allocator and the call log */
 static uint64_t ncalls, budget = 200000, nlog = 400, log_from;
 
+/* RECOMP_NANTAG=1 (a NANTRAP build's, rt.h): NaNs keep the place they were made in their payload, so default NaN is off */
+int recomp_nan_tag;
+__attribute__((constructor)) static void nan_tag_init(void) { const char *e = getenv("RECOMP_NANTAG"); recomp_nan_tag = e && *e == '1'; }
 /* the Vita runs user code in RunFast mode (flush-to-zero, default NaN): the same on each host
  * thread that runs guest code (the FP control register is per thread) */
 void recomp_runfast(void) {
 #if defined(__aarch64__)
 	uint64_t f; __asm__ volatile("mrs %0, fpcr" : "=r"(f)); f |= (1u << 24) | (1u << 25);
+	if (recomp_nan_tag) f &= ~(1ull << 25);
 	__asm__ volatile("msr fpcr, %0" :: "r"(f));
 #elif defined(__x86_64__)
 	uint32_t m; __asm__ volatile("stmxcsr %0" : "=m"(m)); m |= 0x8040; __asm__ volatile("ldmxcsr %0" :: "m"(m));
@@ -70,6 +74,10 @@ uint32_t guest_alloc(uint32_t size, uint32_t align) {
 	return a;
 }
 
+#define RESOLVE_SLOTS 4096   /* (hle_resolve, below: each import stub resolved once) */
+/* calls: the import's calls through this stub (the summary's histogram adds them up by name), counted without host_lock */
+typedef struct { uint32_t addr; HleFn fn; uint32_t target; unsigned flags; int known; const char *name; uint64_t calls; } Resolved;
+static Resolved resolved[RESOLVE_SLOTS];
 /* ---- calls out of recompiled code */
 typedef struct { const char *name; uint64_t n; } Count;
 static Count counts[1024];
@@ -129,11 +137,19 @@ static void gaps_line(void) {   /* the summary's one line: how much of the game'
 	fprintf(stderr, "%s\n", b);
 }
 static void summary(const char *why) {
-	qsort(counts, ncounts, sizeof *counts, by_n);
-	fprintf(stderr, "\n== %s after %llu import calls; %d distinct:\n", why, (unsigned long long)ncalls, ncounts);
-	for (int i = 0; i < ncounts; i++)
-		fprintf(stderr, "  %8llu  %s%s\n", (unsigned long long)counts[i].n, counts[i].name,
-		        hle_find(counts[i].name) ? "" : "   (stub)");
+	static Count all[1024 + RESOLVE_SLOTS]; int nall = ncounts;   /* the histogram: the stubs' counts (resolved[]) by name, and the rest */
+	memcpy(all, counts, sizeof *counts * (size_t)ncounts);
+	for (int i = 0; i < RESOLVE_SLOTS; i++) {
+		const uint64_t n = __atomic_load_n(&resolved[i].calls, __ATOMIC_RELAXED); if (!n || !resolved[i].name) continue;
+		int j; for (j = 0; j < nall && all[j].name != resolved[i].name; j++);
+		if (j == nall) all[nall++] = (Count){ resolved[i].name, 0 };
+		all[j].n += n;
+	}
+	qsort(all, nall, sizeof *all, by_n);
+	fprintf(stderr, "\n== %s after %llu import calls; %d distinct:\n", why, (unsigned long long)ncalls, nall);
+	for (int i = 0; i < nall; i++)
+		fprintf(stderr, "  %8llu  %s%s\n", (unsigned long long)all[i].n, all[i].name,
+		        hle_find(all[i].name) ? "" : "   (stub)");
 	summary_threads();
 	gaps_line(); gaps_write();
 	{ extern void kernel_report_locks(void); kernel_report_locks(); }   /* who holds what the waiting threads want */
@@ -248,8 +264,6 @@ static int host_preferred(const char *n) {
 	return 0;
 }
 
-#define RESOLVE_SLOTS 4096
-static struct { uint32_t addr; HleFn fn; uint32_t target; unsigned flags; int known; } resolved[RESOLVE_SLOTS];
 /* what recomp_call_external asks of an import's name, worked out once with its resolution: it compared the name against
  * a list of formatting functions (and setjmp, longjmp) on every call, 1.9% of Uncharted's main thread (2026-11-01) */
 enum { RF_FMT = 1, RF_SETJMP = 2, RF_LONGJMP = 4, RF_GXM = 8 };
@@ -264,10 +278,11 @@ static unsigned name_flags(const char *n) {
 }
 /* an import: the host's implementation, or (*target) a loaded module's export -- which with a host
  * function as well (the GXM boundary's observers) runs after it; *flags: its name's RF_ bits */
-static HleFn hle_resolve(uint32_t addr, const char *name, uint32_t *target, unsigned *flags) {
+static HleFn hle_resolve(uint32_t addr, const char *name, uint32_t *target, unsigned *flags, Resolved **slot) {
 	uint32_t h = (addr >> 4) & (RESOLVE_SLOTS - 1);
+	*slot = 0;
 	for (uint32_t k = 0; k < RESOLVE_SLOTS; k++, h = (h + 1) & (RESOLVE_SLOTS - 1)) {
-		if (__atomic_load_n(&resolved[h].known, __ATOMIC_ACQUIRE) && resolved[h].addr == addr) { *target = resolved[h].target; *flags = resolved[h].flags; return resolved[h].fn; }   /* acquire: pairs with the release below, so addr/fn/target are seen filled */
+		if (__atomic_load_n(&resolved[h].known, __ATOMIC_ACQUIRE) && resolved[h].addr == addr) { *target = resolved[h].target; *flags = resolved[h].flags; if (resolved[h].name == name) *slot = &resolved[h]; return resolved[h].fn; }   /* acquire: pairs with the release below, so addr/fn/target are seen filled */
 		if (!resolved[h].known) {   /* benign race: two threads may both resolve the same import */
 			HleFn fn = hle_find(name);
 			uint32_t t = fn && host_preferred(name) ? 0 : export_addr(name);
@@ -275,7 +290,7 @@ static HleFn hle_resolve(uint32_t addr, const char *name, uint32_t *target, unsi
 			else if (!fn && !strncmp(name, "sceGxm", 6)) {   /* no libgxm loaded: the game's GXM calls have nowhere to go */
 				static int said; if (!said) { said = 1; fprintf(stderr, "%s: GXM is Sony's code -- add libgxm_es4 libgpu_es4 to the game's MODULES (packs/<title>/pack.toml)\n", name); }
 			}
-			resolved[h].addr = addr; resolved[h].fn = fn; resolved[h].target = t; resolved[h].flags = name_flags(name);
+			resolved[h].addr = addr; resolved[h].fn = fn; resolved[h].target = t; resolved[h].flags = name_flags(name); resolved[h].name = name;
 			__atomic_store_n(&resolved[h].known, 1, __ATOMIC_RELEASE);
 			*target = t; *flags = resolved[h].flags;
 			return fn;
@@ -351,6 +366,47 @@ static void watch_check(const uint32_t v[4], const char *name, Cpu *c) {
 		fprintf(stderr, "    watch: %#x %#x -> %#x during %s (lr %#x, r0 %#x r1 %#x)\n", watch_at[i], v[i], now, name, c->r[14], c->r[0], c->r[1]);
 	}
 }
+/* RECOMP_TRACE_PTR=<guest address of a code pointer>[:label],... -- a debugging aid for code reached only through
+ * pointers (a game engine's native-function tables: Borderlands 2's UnrealScript natives, 2026-11-23): before the game
+ * starts, each such pointer is pointed at a marker address; a call through it lands in recomp_call_external, which
+ * prints the label, the frame and r0-r3 (to RECOMP_TRACE_PTR_LOG, default stderr) and runs the original. Debugging
+ * only: a pointer the game itself rewrites later stops being traced. */
+#define TRACE_PTR_BASE 0xfffe0000u
+#define TRACE_PTR_MAX 32
+static struct { uint32_t orig; char label[48]; uint64_t n; } trace_ptr[TRACE_PTR_MAX]; static int ntrace_ptr;
+static FILE *trace_ptr_log;
+static void trace_ptr_install(void) {
+	const char *e = getenv("RECOMP_TRACE_PTR");
+	if (!e || !*e) return;
+	const char *lp = getenv("RECOMP_TRACE_PTR_LOG"); trace_ptr_log = lp ? fopen(lp, "w") : 0; if (!trace_ptr_log) trace_ptr_log = stderr;
+	for (const char *q = e; *q && ntrace_ptr < TRACE_PTR_MAX; ) {
+		char *end; uint32_t at = (uint32_t)strtoul(q, &end, 16); q = end;
+		const char *lab = ""; size_t ll = 0;
+		if (*q == ':') { lab = ++q; while (*q && *q != ',') q++; ll = (size_t)(q - lab); }
+		if (*q == ',') q++;
+		if (!at) continue;
+		const int k = ntrace_ptr++;
+		trace_ptr[k].orig = RD32(at);
+		snprintf(trace_ptr[k].label, sizeof trace_ptr[k].label, "%.*s", (int)(ll < 47 ? ll : 47), lab);
+		WR32(at, (TRACE_PTR_BASE + 8u * (uint32_t)k) | (trace_ptr[k].orig & 1u));
+		fprintf(trace_ptr_log, "trace ptr %#x (%s): %#x\n", at, trace_ptr[k].label, trace_ptr[k].orig);
+	}
+	fflush(trace_ptr_log);
+}
+static int trace_ptr_call(Cpu *c, uint32_t addr) {
+	const uint32_t a = addr & ~1u;
+	if (a < TRACE_PTR_BASE || a >= TRACE_PTR_BASE + 8u * TRACE_PTR_MAX || (a - TRACE_PTR_BASE) % 8) return 0;
+	const int k = (int)((a - TRACE_PTR_BASE) / 8);
+	if (k >= ntrace_ptr) return 0;
+	extern uint64_t display_frames(void);
+	const uint64_t n = __atomic_add_fetch(&trace_ptr[k].n, 1, __ATOMIC_RELAXED);
+	fprintf(trace_ptr_log, "%llu %s #%llu lr %#x r0 %#x r1 %#x r2 %#x r3 %#x\n", (unsigned long long)display_frames(), trace_ptr[k].label,
+	        (unsigned long long)n, c->r[14], c->r[0], c->r[1], c->r[2], c->r[3]);
+	fflush(trace_ptr_log);
+	GuestFn f = guest_lookup(trace_ptr[k].orig & ~1u);
+	if (f) f(c); else recomp_call_external(c, trace_ptr[k].orig);
+	return 1;
+}
 void recomp_call_external(Cpu *c, uint32_t addr) {
 #ifdef RECOMP_VERIFY
 	extern int verify_external(Cpu *c, uint32_t addr);   /* in a checker's child: ends the native run */
@@ -361,6 +417,7 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 	 * higher-priority thread, which the hardware would switch to at once) */
 	if (recomp_sched_on) sched_yield_if_preempted();
 	const char *name = import_name_any(addr);
+	if (!name && ntrace_ptr && trace_ptr_call(c, addr)) return;   /* (RECOMP_TRACE_PTR) */
 	if (!name) {   /* another module's function (its table isn't the caller's) */
 		GuestFn f = guest_lookup(addr & ~1u);
 		if (f) { f(c); return; }
@@ -388,7 +445,8 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 		summary("stopped"); exit(2);
 	}
 	uint32_t target; unsigned fl;
-	HleFn fn = hle_resolve(addr, name, &target, &fl);
+	Resolved *slot;
+	HleFn fn = hle_resolve(addr, name, &target, &fl, &slot);
 	if (fl & RF_LONGJMP) recomp_longjmp(c);   /* (returns only to fall back) */
 	if (fl & RF_SETJMP) { static int warned; if (!warned++) fprintf(stderr, "setjmp called through a pointer (lr %#x): a longjmp to it can't unwind\n", c->r[14]); }
 	if (target) {   /* a loaded module's export: its recompiled code */
@@ -428,16 +486,22 @@ void recomp_call_external(Cpu *c, uint32_t addr) {
 		}
 	}
 	gfxcov_api(name, fn, c, 0);   /* RECOMP_GFX_COVERAGE */
-	pthread_mutex_lock(&host_lock);
-	uint64_t k = ++ncalls;
-	count(name);
-	if (!my_last && nlasts < 64) my_last = &lasts[nlasts++];
+	/* the call's bookkeeping, without host_lock in the common case: every import call took it (and scanned the histogram's
+	 * names) -- Assassin's Creed III: Liberation's three job threads queued on it (2026-11-22). The count goes in the stub's
+	 * resolve slot, the thread's last call in its own record; the lock is for a thread's first call, the log and the end */
+	const uint64_t k = __atomic_add_fetch(&ncalls, 1, __ATOMIC_RELAXED);
+	if (slot) __atomic_add_fetch(&slot->calls, 1, __ATOMIC_RELAXED);
+	else { pthread_mutex_lock(&host_lock); count(name); pthread_mutex_unlock(&host_lock); }
+	static __thread int my_last_tried;
+	if (!my_last_tried) { my_last_tried = 1; pthread_mutex_lock(&host_lock); if (nlasts < 64) my_last = &lasts[nlasts++]; pthread_mutex_unlock(&host_lock); }
 	if (my_last) { my_last->name = name; my_last->lr = c->r[14]; my_last->r0 = c->r[0]; my_last->r1 = c->r[1]; my_last->n++; my_last->at = k; }
-	if ((k <= nlog || (log_from && k >= log_from)) && log_frame_ok())
+	if ((k <= nlog || (log_from && k >= log_from)) && log_frame_ok()) {
+		pthread_mutex_lock(&host_lock);
 		fprintf(stderr, "%6llu t%d %-40s %08x %08x %08x %08x lr %08x%s\n", (unsigned long long)k, my_last ? (int)(my_last - lasts) : -1,
 		        name, c->r[0], c->r[1], c->r[2], c->r[3], c->r[14], fn ? "" : "  (stub)");
-	if (k >= budget) { summary("budget reached"); exit(0); }
-	pthread_mutex_unlock(&host_lock);
+		pthread_mutex_unlock(&host_lock);
+	}
+	if (k >= budget) { pthread_mutex_lock(&host_lock); summary("budget reached"); exit(0); }
 	uint32_t a0 = c->r[0], a1 = c->r[1], a2 = c->r[2], a3 = c->r[3];
 	/* no implementation and no module export: the call returns 0 -- or, for the device/network
 	 * families the host doesn't emulate (NP, networking, HTTP/SSL, voice chat, Near), that family's
@@ -508,6 +572,74 @@ void recomp_unimplemented(Cpu *c, uint32_t addr) {
 	if (*hle_last_format) fprintf(stderr, "last formatted string: %s\n", hle_last_format);
 	summary("stopped"); exit(2);
 }
+
+/* a NANTRAP build's report (rt.h's NANCHK): a float operation in recompiled code made a NaN out of numbers. Named by the
+ * host function it's in (fn_<guest address>) and the offset into it -- lldb's `disassemble -s` there, or the guest
+ * function's code, finds the instruction -- the first time each place does it, with the frame and the thread. */
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <stdatomic.h>
+/* (where the compiler kept a helper out of line -- NANCHK, FZF, RSQRTS_F32 -- the recompiled function is a frame or two
+ * further up: frame pointers are always kept on arm64 Apple and Linux) */
+static uint32_t nan_report(const char *what, void *at, void *up1, void *up2, uint32_t addr, int has_addr) {   /* -> the place's number */
+	/* counted by the raw return address first (a hash, no lock: a place that stores NaN every frame costs a probe), named
+	 * by dladdr only when it's reported */
+	enum { N = 1 << 15 };
+	static void *_Atomic keys[N]; static uint32_t _Atomic counts[N];
+	/* RECOMP_NANTRAP_FROM=<frame>: nothing before that frame, then every place afresh -- an engine that keeps NaN as a
+	 * "not set" value makes and stores it from the start, and the place that matters fired harmlessly long before */
+	static long from = -1; extern uint64_t display_frames(void);
+	if (from < 0) { const char *e = getenv("RECOMP_NANTRAP_FROM"); from = e ? atol(e) : 0; }
+	/* a place: the return address and the one above it (a helper kept out of line -- NANCHK, FZF -- is one address for
+	 * all its callers; the caller's tells them apart) */
+	uintptr_t k = (uintptr_t)at ^ ((uintptr_t)up1 * 0x9E3779B97F4A7C15ull) ^ (uintptr_t)what;
+	uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 49), n = 0;
+	for (uint32_t probe = 0; probe < 64; probe++, h = (h + 1) & (N - 1)) {
+		void *cur = atomic_load_explicit(&keys[h], memory_order_relaxed);
+		if (!cur) { void *z = NULL; if (!atomic_compare_exchange_strong(&keys[h], &z, (void *)k) && z != (void *)k) continue; cur = (void *)k; }
+		if (cur == (void *)k) { n = atomic_fetch_add_explicit(&counts[h], 1, memory_order_relaxed) + 1; break; }
+	}
+	if ((long)display_frames() < from) return h;
+	if (n != 1 && (n & (n - 1))) return h;   /* the first time, then at each power of two (and a full table: every time) */
+	Dl_info d0, d1;
+	if (dladdr(at, &d0) && d0.dli_sname && strncmp(d0.dli_sname, "fn_", 3)) {
+		if (up1 && dladdr(up1, &d1) && d1.dli_sname && !strncmp(d1.dli_sname, "fn_", 3)) at = up1;
+		else if (up2 && dladdr(up2, &d1) && d1.dli_sname && !strncmp(d1.dli_sname, "fn_", 3)) at = up2;
+	}
+	Dl_info d; char name[32] = "", to[24] = "";
+	plat_thread_name(name, sizeof name);
+	if (has_addr) snprintf(to, sizeof to, " to %#x", addr);
+	if (!has_addr && recomp_nan_tag) snprintf(to, sizeof to, " tag %#x", 0x7fe00000u | h);
+	if (dladdr(at, &d) && d.dli_sname)
+		fprintf(stderr, "nan %s: %s+%#lx%s frame %llu thread %s (x%u)\n", what, d.dli_sname, (unsigned long)((uint8_t *)at - (uint8_t *)d.dli_saddr),
+		        to, (unsigned long long)display_frames(), name, n);
+	else fprintf(stderr, "nan %s: %p%s frame %llu thread %s (x%u)\n", what, at, to, (unsigned long long)display_frames(), name, n);
+	/* RECOMP_NANTRAP_BT=n: the first n recompiled functions up the host stack too (the callers that handed the NaN in) */
+	static int bt = -1; if (bt < 0) { const char *e = getenv("RECOMP_NANTRAP_BT"); bt = e ? atoi(e) : 0; }
+	if (bt > 0 && n == 1) {
+		void *frames[32]; int nf = backtrace(frames, 32), shown = 0; char line[512]; int len = 0;
+		for (int f = 1; f < nf && shown < bt; f++) {
+			Dl_info fi; if (!dladdr(frames[f], &fi) || !fi.dli_sname || strncmp(fi.dli_sname, "fn_", 3)) continue;
+			len += snprintf(line + len, sizeof line - len, " <- %s+%#lx", fi.dli_sname, (unsigned long)((uint8_t *)frames[f] - (uint8_t *)fi.dli_saddr));
+			if (len >= (int)sizeof line) break;
+			shown++;
+		}
+		fprintf(stderr, "    nan stack:%s\n", line);
+	}
+	return h;
+}
+__attribute__((noinline)) uint32_t recomp_nan_born(void) {
+	uint32_t h = nan_report("born", __builtin_return_address(0), __builtin_return_address(1), __builtin_return_address(2), 0, 0);
+	return recomp_nan_tag ? 0x7fe00000u | h : 0;   /* (h < 2^15: bit 21 marks a tag) */
+}
+__attribute__((noinline)) void recomp_nan_stored(uint32_t a) {
+	nan_report("stored", __builtin_return_address(0), __builtin_return_address(1), __builtin_return_address(2), a, 1);
+}
+__attribute__((noinline)) void recomp_nan_loaded(uint32_t a) {
+	nan_report("loaded", __builtin_return_address(0), __builtin_return_address(1), __builtin_return_address(2), a, 1);
+}
+#endif
 
 /* a computed jump inside a recompiled function to an address that is none of its instructions and no function's entry: code
  * the analysis never saw (a block reached only through a table or arithmetic it didn't follow). Recorded as a function in the
@@ -673,6 +805,7 @@ static void *game(void *arg) {
 		fprintf(stderr, "module %#x start\n", module_starts[i]);
 		fprintf(stderr, "module start returned %#x\n", kernel_run_thread("module_start", module_starts[i]));
 	}
+	trace_ptr_install();
 	fprintf(stderr, "module_start %#x\n", game_entry);
 	guest_lookup(game_entry & ~1u)(&c);
 	fprintf(stderr, "module_start returned %#x\n", c.r[0]);

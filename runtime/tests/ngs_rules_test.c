@@ -19,6 +19,9 @@ int main(void) {
 	struct { uint32_t data, bytes; int16_t loops, next; } fm[4] = {{0x22baabd0, 0, 0, 1}, {0x22baabd0, 76796, -1, 2}, {0x22bbd7cc, 4, 0, -1}, {0, 0, 0, 0}};
 	check("the empty buffer 0 goes on to the ring", ngs_player_pass_empty(fm[0].data, fm[0].next, 0) == 1);
 	check("an unfilled slot (no data address) ends the chain", ngs_player_pass_empty(fm[3].data, fm[3].next, 0) == -1);
+	/* Borderlands 2's Wwise (ATRAC9): a whole line in buffer 0 chained to buffer 1, which it never fills */
+	struct { uint32_t data, bytes; int16_t loops, next; } ww[2] = {{0x1d3070d0, 28192, 0, 1}, {0, 0, 0, 2}};
+	check("a stream's last buffer chained to an unfilled slot ends there", ngs_player_pass_empty(ww[1].data, ww[1].next, 0) == -1 && ww[0].next == 1);
 	check("an empty buffer with no next ends it", ngs_player_pass_empty(0x1000, -1, 0) == -1 && ngs_player_pass_empty(0x1000, 4, 0) == -1);
 	int at = 0, hops = 0, empty[4] = {1, 1, 1, 1};   /* four empty buffers in a cycle 0 -> 1 -> 2 -> 3 -> 0 */
 	while (at >= 0 && empty[at]) at = ngs_player_pass_empty(0x1000, (int16_t)((at + 1) & 3), hops++);

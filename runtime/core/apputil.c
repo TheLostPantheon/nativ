@@ -99,6 +99,40 @@ static void h_save_slot_param(Cpu *c) {   /* (slot id, SceAppUtilSaveDataSlotPar
 	if (A1) memcpy(G(A1), p, SLOT_PARAM_SIZE);
 	RET(0);
 }
+/* (SceAppUtilWorkBuffer *work {buf, size}, cond {type: 0 existing slots, 1 empty ones; from, range; sort key: 0 id,
+ * 1 userParam, 2 size, 3 modified time; order: 0 ascending, 1 descending}, result {hitNum, slotList}, mount point): the
+ * slots in [from, from + range) that match, as SceAppUtilSaveDataSlot {id, status, userParam, emptyParam} (16 bytes)
+ * written into the work buffer, which the result's slotList points at -- the caller passes the work buffer only (sized
+ * for range slots) and reads hitNum and slotList back. Borderlands 2 keeps its save's padding in the slot's userParam
+ * (the save file is its whole 64 KB buffer; the size is the file's minus userParam's top half): with the stub, which
+ * answered success and filled nothing, every save it had written read back as corrupt (2026-11-23) */
+static void h_save_slot_search(Cpu *c) {
+	const uint32_t work = A0, cond = A1, res = A2;
+	if (!work || !cond || !res) { RET(0x80100600u); return; }   /* SCE_APPUTIL_ERROR_PARAMETER */
+	const uint32_t wbuf = RD32(work), wsize = RD32(work + 4), type = RD32(cond), from = RD32(cond + 4), range = RD32(cond + 8);
+	const uint32_t key = RD32(cond + 12), desc = RD32(cond + 16) == 1;
+	typedef struct { uint32_t id, status; int32_t user, kb; uint8_t when[12]; } Hit;
+	enum { MAXHIT = 256 }; Hit hit[MAXHIT]; uint32_t n = 0;
+	for (uint32_t id = from; id < from + range && id < from + 4096u && n < MAXHIT; id++) {
+		uint8_t p[SLOT_PARAM_SIZE]; const int exists = slot_read(id, p);
+		if (exists != (type == 0)) continue;
+		Hit h = { id, 0, 0, 0, {0} };
+		if (exists) { memcpy(&h.status, p, 4); memcpy(&h.user, p + 0x304, 4); memcpy(&h.kb, p + 0x308, 4); for (int k = 0; k < 6; k++) { h.when[2 * k] = p[0x30c + 2 * k + 1]; h.when[2 * k + 1] = p[0x30c + 2 * k]; } }   /* (the date's halves big end first: compares in order) */
+		hit[n++] = h;
+	}
+	for (uint32_t i = 1; i < n; i++) for (uint32_t j = i; j > 0; j--) {   /* (a stable insertion sort: a few dozen slots) */
+		const Hit *a = &hit[j - 1], *b = &hit[j];
+		int cmp = key == 1 ? (a->user > b->user) - (a->user < b->user) : key == 2 ? (a->kb > b->kb) - (a->kb < b->kb)
+		        : key == 3 ? memcmp(a->when, b->when, sizeof a->when) : (a->id > b->id) - (a->id < b->id);
+		if (cmp == 0) cmp = (a->id > b->id) - (a->id < b->id);
+		if (desc ? cmp >= 0 : cmp <= 0) break;
+		Hit t = hit[j]; hit[j] = hit[j - 1]; hit[j - 1] = t;
+	}
+	const uint32_t room = wbuf ? wsize / 16 : 0, put = n < room ? n : room;
+	for (uint32_t i = 0; i < put; i++) { const uint32_t e = wbuf + 16 * i; WR32(e, hit[i].id); WR32(e + 4, hit[i].status); WR32(e + 8, (uint32_t)hit[i].user); WR32(e + 12, 0); }
+	WR32(res, put); WR32(res + 4, put ? wbuf : 0);
+	RET(0);
+}
 static void h_save_slot_set_param(Cpu *c) { RET(slot_write(A0, A1) == 0 ? 0 : 0x80100600u); }   /* (slot id, param, mount point): a slot not yet created is created */
 /* (SceAppUtilSaveDataFileSlot * (id +0, slotParam +4), SceAppUtilSaveDataFile[], count, mount point, *required KB)
  * file: path +0, buf +4, size +8, offset +16 (64-bit), mode +24; 64 bytes each */
@@ -129,6 +163,43 @@ static void h_save_data_remove(Cpu *c) {   /* (slot, SceAppUtilSaveDataRemoveIte
 		for (char *q = hp + strlen(fs_root()); *q; q++) if (*q == '\\') *q = '/';
 		unlink(hp);
 	}
+	RET(0);
+}
+/* safe memory (sceAppUtilSaveSafeMemory / LoadSafeMemory (buf, size, SceOff offset: r2-r3)): 64 KiB the console keeps for a
+ * game apart from its saves, read back as zeros until written; <fs>/safemem.bin here. Each returns the bytes it moved.
+ * Unimplemented, a save went nowhere (Need for Speed Most Wanted saves 16 times by its title screen). */
+#define SAFE_MEM_SIZE 0x10000
+static int safe_mem_range(uint32_t size, uint64_t off) { return off <= SAFE_MEM_SIZE && size <= SAFE_MEM_SIZE - off; }
+static void safe_mem_path(char *buf, size_t n) { snprintf(buf, n, "%s/safemem.bin", fs_root()); }
+static void h_save_safe_memory(Cpu *c) {
+	const uint64_t off = (uint64_t)c->r[3] << 32 | c->r[2];
+	if (!A0 || !safe_mem_range(A1, off)) { RET(0x80100600u); return; }   /* SCE_APPUTIL_ERROR_PARAMETER */
+	char p[1024]; safe_mem_path(p, sizeof p);
+	int fd = open(p, O_RDWR | O_CREAT, 0644); if (fd < 0) { RET(0x80100600u); return; }
+	if (ftruncate(fd, SAFE_MEM_SIZE) != 0) {}
+	ssize_t w = pwrite(fd, G(A0), A1, (off_t)off); close(fd);
+	RET(w == (ssize_t)A1 ? A1 : 0x80100600u);
+}
+static void h_load_safe_memory(Cpu *c) {
+	const uint64_t off = (uint64_t)c->r[3] << 32 | c->r[2];
+	if (!A0 || !safe_mem_range(A1, off)) { RET(0x80100600u); return; }
+	memset(G(A0), 0, A1);
+	char p[1024]; safe_mem_path(p, sizeof p);
+	int fd = open(p, O_RDONLY); if (fd >= 0) { if (pread(fd, G(A0), A1, (off_t)off) < 0) {} close(fd); }
+	RET(A1);
+}
+/* sceAppUtilSaveDataGetQuota(*quotaKiB, *usedKiB, mount): it returned 0 and left both unwritten, so a game read its own stack
+ * as how much room it has. The quota: room enough for any Vita game's saves (the card's 1 GiB); used: what savedata0 holds */
+static void h_save_quota(Cpu *c) {
+	uint64_t used = 0; char d[1024]; snprintf(d, sizeof d, "%s/savedata0", fs_root());
+	DIR *dir = opendir(d);
+	if (dir) {
+		struct dirent *e;
+		while ((e = readdir(dir))) { char f[2048]; struct stat st; snprintf(f, sizeof f, "%s/%s", d, e->d_name); if (!stat(f, &st) && S_ISREG(st.st_mode)) used += (uint64_t)st.st_size; }
+		closedir(dir);
+	}
+	if (A0) WR32(A0, 1024 * 1024);
+	if (A1) WR32(A1, (uint32_t)((used + 1023) / 1024));
 	RET(0);
 }
 
@@ -783,8 +854,9 @@ const HleEntry hle_apputil[] = {
 	{"SceCommonDialog_D1858A78", h_eula_dlg_result}, {"SceCommonDialog_BEBAEF25", h_eula_dlg_term}, {"SceCommonDialog_B55CF0E3", h_eula_dlg_term},
 	{"sceCommonDialogUpdate", h_zero},
 	{"sceAppMgrIsGameProgram", h_is_game},   /* 1: a game -- libfios2 picks its default file mode by it */
-	{"sceAppUtilSaveDataSlotGetParam", h_save_slot_param}, {"sceAppUtilSaveDataSlotCreate", h_save_slot_create}, {"sceAppUtilSaveDataSlotDelete", h_save_slot_delete}, {"sceAppUtilSaveDataSlotSetParam", h_save_slot_set_param},
+	{"sceAppUtilSaveDataSlotGetParam", h_save_slot_param}, {"sceAppUtilSaveDataSlotSearch", h_save_slot_search}, {"sceAppUtilSaveDataSlotCreate", h_save_slot_create}, {"sceAppUtilSaveDataSlotDelete", h_save_slot_delete}, {"sceAppUtilSaveDataSlotSetParam", h_save_slot_set_param},
 	{"sceAppUtilSaveDataDataSave", h_save_data_save},
 	{"sceAppUtilSaveDataDataRemove", h_save_data_remove},
+	{"sceAppUtilSaveSafeMemory", h_save_safe_memory}, {"sceAppUtilLoadSafeMemory", h_load_safe_memory}, {"sceAppUtilSaveDataGetQuota", h_save_quota},
 	{0, 0},
 };

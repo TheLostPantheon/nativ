@@ -18,7 +18,9 @@ static inline uint32_t ngs_player_start(int8_t start) { return start >= 0 && sta
  * finished at the next update: in Resistance: Burning Skies no line of dialogue played (each stream was opened,
  * buffered and freed within 40 ms) and the menu music jumped to another segment several times a second. The buffer to
  * move to, or -1 where the chain ends: a buffer with no data address (a slot the game never filled), one with no
- * next, or the fifth empty buffer in a row (empty buffers in a cycle). */
+ * next, or the fifth empty buffer in a row (empty buffers in a cycle). The ATRAC9 player follows it too (its buffers
+ * hold superframes, so empty there means no bytes): it used to wait at an empty buffer for data, and Borderlands 2's
+ * Wwise, which ends a stream by chaining its last buffer to an unfilled slot, never saw the voice stop. */
 static inline int ngs_player_pass_empty(uint32_t data, int16_t next, int hops) {
 	return data && next >= 0 && next < 4 && hops < 4 ? next : -1;
 }

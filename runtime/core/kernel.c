@@ -1221,6 +1221,18 @@ static void h_cancel_evf(Cpu *c) {
 	if (A2) WR32(A2, n);
 	RET(0);
 }
+/* sceKernelCancelSema(uid, setCount, *numWaitThreads): the same for a semaphore -- every waiter released with WAIT_CANCEL,
+ * then the count is setCount (a negative one: the count it was created with; more than its maximum is refused before
+ * anything changes) and *numWaitThreads how many were released. Unimplemented, it returned 0 and woke no one: Need for
+ * Speed Most Wanted calls it about 1,300 times a second (2026-11-21). */
+static void h_cancel_sema(Cpu *c) {
+	Obj *o = by_uid(A0, SEMA); if (!o) { RET(E_UNKNOWN_SEMA_ID); return; }
+	const int32_t set = (int32_t)A1;
+	if (o->max && set > o->max) { RET(E_ILLEGAL_COUNT); return; }
+	pthread_mutex_lock(&o->m); uint32_t n = cancel_waiters(o); o->count = set < 0 ? o->init : set; pthread_mutex_unlock(&o->m);
+	if (A2) WR32(A2, n);
+	RET(0);
+}
 static void h_delete_evf(Cpu *c) { h_delete_uid(c, EVF, E_UNKNOWN_EVF_ID); }
 static void h_evf_info(Cpu *c) {   /* (uid, *SceKernelEventFlagInfo 0x38) */
 	Obj *o = by_uid(A0, EVF);
@@ -2035,7 +2047,7 @@ const HleEntry hle_kernel[] = {
 	{"sceKernelGetStdin", h_stdin}, {"sceKernelGetStdout", h_stdout}, {"sceKernelGetStderr", h_stderr},
 	{"sceKernelCreateSema", h_create_sema}, {"sceKernelCreateSema_16XX", h_create_sema},
 	{"sceKernelWaitSema", h_wait_sema}, {"sceKernelWaitSemaCB", h_wait_sema_cb}, {"sceKernelPollSema", h_poll_sema},
-	{"sceKernelSignalSema", h_signal_sema}, {"sceKernelDeleteSema", h_delete_sema}, {"sceKernelGetSemaInfo", h_sema_info},
+	{"sceKernelSignalSema", h_signal_sema}, {"sceKernelDeleteSema", h_delete_sema}, {"sceKernelGetSemaInfo", h_sema_info}, {"sceKernelCancelSema", h_cancel_sema},
 	{"sceKernelOpenSema", h_open_sema}, {"sceKernelCloseSema", h_zero_ok}, {"sceKernelOpenMutex", h_open_mutex}, {"sceKernelCloseMutex", h_zero_ok},
 	{"sceKernelCreateEventFlag", h_create_evf}, {"sceKernelWaitEventFlag", h_wait_evf}, {"sceKernelWaitEventFlagCB", h_wait_evf_cb},
 	{"sceKernelPollEventFlag", h_poll_evf}, {"sceKernelSetEventFlag", h_set_evf}, {"sceKernelClearEventFlag", h_clear_evf}, {"sceKernelCancelEventFlag", h_cancel_evf},

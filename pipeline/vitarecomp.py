@@ -876,10 +876,14 @@ def test_timeout(g):   # a scripted run's limit in seconds: TIMEOUT for one run,
 
 
 def timed(argv, env, cwd, stdout, stderr, seconds):
-    """`timeout <seconds> cmd || true`: stopped (SIGTERM) when the time is up"""
+    """`timeout <seconds> cmd || true`: stopped (SIGTERM) when the time is up, killed if it doesn't stop. A wedged
+    run can't take SIGTERM: one whose code pages couldn't be read back from an external disk faulted in every thread
+    for two hours past its 15 minutes (2026-11-20)"""
     p = start_game(argv, env=env, cwd=cwd, stdout=stdout, stderr=stderr)
     try: return p.wait(timeout=seconds)
-    except subprocess.TimeoutExpired: p.terminate(); return p.wait()
+    except subprocess.TimeoutExpired: p.terminate()
+    try: return p.wait(timeout=20)
+    except subprocess.TimeoutExpired: p.kill(); return p.wait()
 
 
 def cmd_test(g):
