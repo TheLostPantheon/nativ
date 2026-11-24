@@ -67,11 +67,12 @@ int guest_mem_ranges(uint32_t lo[], uint32_t hi[], int max) {
 	lo[n] = GUEST_HEAP; hi[n] = heap_top; n++;
 	return n;
 }
+static void heap_exhausted(uint32_t size);   /* (below: the import that asked, and every thread's last) */
 uint32_t guest_alloc(uint32_t size, uint32_t align) {
 	if (align < 16) align = 16;
 	pthread_mutex_lock(&host_lock);
 	uint32_t a = (heap_top + align - 1) & ~(align - 1);
-	if (a + size > GUEST_HEAP_END || a + size < a) { fprintf(stderr, "guest heap exhausted (%#x)\n", size); exit(3); }
+	if (a + size > GUEST_HEAP_END || a + size < a) heap_exhausted(size);
 	heap_top = a + size;
 	pthread_mutex_unlock(&host_lock);
 	return a;
@@ -102,6 +103,14 @@ static void summary_threads(void) {
 	for (int i = 0; i < nlasts; i++)
 		fprintf(stderr, "  thread %d: %llu calls, last #%llu %s(%#x, %#x) from %#x\n", i, (unsigned long long)lasts[i].n,
 		        (unsigned long long)lasts[i].at, lasts[i].name, lasts[i].r0, lasts[i].r1, lasts[i].lr);
+}
+/* the guest heap can't give size bytes: which import asked (this thread's, mid-call) and where every thread is -- a request
+ * far past any real need (AC Liberation on Windows asked for 0x80800000 as its intro video started) is a value gone wrong */
+static void heap_exhausted(uint32_t size) {
+	if (my_last && my_last->name) fprintf(stderr, "guest heap exhausted (%#x) in %s(%#x, %#x) from %#x\n", size, my_last->name, my_last->r0, my_last->r1, my_last->lr);
+	else fprintf(stderr, "guest heap exhausted (%#x)\n", size);
+	summary_threads();
+	exit(3);
 }
 void host_summary(const char *why);   /* window.c: the import-call histogram when the window is closed */
 
