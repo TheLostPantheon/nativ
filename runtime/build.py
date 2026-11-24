@@ -80,6 +80,32 @@ def newer(a, b):   # zsh's a -nt b
     except FileNotFoundError: return os.path.exists(a)
 
 
+def made_from(paths):
+    """what an object is compiled from, each input's size and modification time: the object is current while these are
+    exactly what they were, whichever way the clock has moved. "Newer than its object" missed changed sources under objects
+    stamped in the future: a PC that dual-boots with Linux reads its hardware clock (UTC) as local time until Windows syncs
+    it, 7 hours ahead here, and every part file the next session changed looked older than its object -- WipEout's missed
+    function, regenerated with it, was never compiled, and each rebuild stopped at the same call (Windows, 2026-11-24)"""
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p); out.append(f"{p}\t{st.st_mtime_ns}\t{st.st_size}")
+        except OSError:
+            out.append(f"{p}\t-")
+    return "\n".join(out) + "\n"
+
+
+def object_current(o, record):   # (record: made_from of its inputs now; an object with none of its own is compiled again)
+    try:
+        return os.path.isfile(o) and open(o + ".from", encoding="utf-8").read() == record
+    except OSError:
+        return False
+
+
+def object_made(o, record):
+    with open(o + ".from", "w", encoding="utf-8", newline="\n") as f: f.write(record)
+
+
 def out_of(cmd):
     try: return subprocess.run(cmd, capture_output=True, text=True).stdout.split()
     except OSError: return []
@@ -200,7 +226,8 @@ def main(argv):
     work = []
     for s in srcs:
         o = os.path.join(OBJ, os.path.splitext(os.path.basename(s))[0] + ".o")
-        if not os.path.isfile(o) or newer(s, o) or newer(rt, o): work.append(([CC, "-c"] + FLAGS + [s, "-o", o], s, o, CC, False))
+        rec = made_from([s, rt])
+        if not object_current(o, rec): work.append(([CC, "-c"] + FLAGS + [s, "-o", o], s, o, CC, False, rec))
     # (the rule above is for parts of ~10-12 MB of C; a compiler's memory grows with its file, so larger parts take
     # proportionally fewer at once: recomp.py caps a part near 23 MB, and a game split before that cap could have 113 MB ones)
     if work and not ENV.get("JOBS"):
@@ -231,8 +258,9 @@ def main(argv):
     CXXFLAGS += ["-I", IMGUIOBJ]
     for s in imgui_srcs:
         o = os.path.join(IMGUIOBJ, os.path.splitext(os.path.basename(s))[0] + ".o")
-        if not os.path.isfile(o) or newer(s, o) or newer(os.path.join(RT, "ui", "overlay.h"), o) or (s.endswith("overlay.cpp") and newer(PROMPTS_H, o)):
-            work.append(([CXX, "-c"] + CXXFLAGS + [s, "-o", f"{o}.{os.getpid()}"], s, o, CXX, True))
+        rec = made_from([s, os.path.join(RT, "ui", "overlay.h")] + ([PROMPTS_H] if s.endswith("overlay.cpp") else []))
+        if not object_current(o, rec):
+            work.append(([CXX, "-c"] + CXXFLAGS + [s, "-o", f"{o}.{os.getpid()}"], s, o, CXX, True, rec))
 
     # A generated file the compiler fails on is compiled once more with its vectorizers off: the code is ours, but the
     # optimiser has bugs of its own. Apple clang 21's loop vectorizer made an add between a 4- and a 16-lane vector out of
@@ -242,12 +270,13 @@ def main(argv):
     gcc = "Free Software Foundation" in " ".join(out_of([CC, "--version"]))
     NOVEC = ["-fno-tree-vectorize"] if gcc else ["-fno-vectorize", "-fno-slp-vectorize"]
     def compile_one(w):
-        argv, s, o, cc, tmp = w
+        argv, s, o, cc, tmp, rec = w
         generated = not tmp and not s.startswith(os.path.join(ROOT, "third_party"))
         r = subprocess.run(argv, capture_output=generated, text=generated)
         if r.returncode and generated:
             r2 = subprocess.run(argv[:-3] + NOVEC + argv[-3:])   # (after -O2: clang takes an -O level as turning them back on, the last word wins)
             if not r2.returncode:
+                object_made(o, rec)
                 say(f"  {cc} {os.path.basename(s)} (again with the vectorizers off: the compiler failed on it)")
                 return None
             sys.stderr.write(r.stderr)
@@ -256,6 +285,7 @@ def main(argv):
             return s
         if generated and r.stderr: sys.stderr.write(r.stderr)
         if tmp: os.replace(argv[-1], o)
+        object_made(o, rec)
         say(f"  {cc} {os.path.basename(s)}")
         return None
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex: failed = [f for f in ex.map(compile_one, work) if f]
@@ -344,6 +374,8 @@ def main(argv):
         if subprocess.run(argv).returncode: _rm(argv[-1]); return s
         os.replace(argv[-1], o)
         with open(o + ".cmd", "w") as f: f.write(cmd)
+        deps = host_deps(o)
+        if deps is not None: object_made(o, made_from(deps))
         return None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(jobs, 4)) as ex: failed = [f for f in ex.map(compile_host, hwork) if f]
     if failed: die("build: " + ", ".join(os.path.basename(f) for f in failed) + " did not compile")
@@ -362,18 +394,23 @@ def main(argv):
     return 0
 
 
-def host_object_current(o, cmd):
-    """o, compiled by exactly cmd, newer than its source and every header in its dependency list (.d)"""
+def host_deps(o):
+    """the source and headers o was compiled from, its dependency list (.d); None if there is none"""
     try:
-        if open(o + ".cmd").read() != cmd: return False
-        t = os.path.getmtime(o)
         deps = open(o + ".d").read().replace("\\\n", " ").split(": ", 1)[1]   # (after "target: "; a Windows target has a drive letter's colon)
     except (OSError, IndexError):
+        return None
+    return [d.replace("\\ ", " ") for d in re.split(r"(?<!\\)\s+", deps.strip()) if d]
+
+
+def host_object_current(o, cmd):
+    """o, compiled by exactly cmd, from its source and every header in its dependency list (.d) as they are now (made_from)"""
+    try:
+        if open(o + ".cmd").read() != cmd: return False
+    except OSError:
         return False
-    for d in re.split(r"(?<!\\)\s+", deps.strip()):
-        d = d.replace("\\ ", " ")
-        if d and (not os.path.exists(d) or os.path.getmtime(d) > t): return False
-    return True
+    deps = host_deps(o)
+    return deps is not None and object_current(o, made_from(deps))
 
 
 def _rm(p):
