@@ -1585,6 +1585,7 @@ typedef struct {
 	uint8_t sx, sy;  /* its texels a guest pixel, across and down: the render scale, or a boosted target's (target_scale) */
 	SDL_GPUTexture *mv; uint64_t mv_frame; uint32_t mv_n;   /* the motion target beside it (RECOMP_MV: mv_target), the frame it was
 	                                                          * last cleared in (mv_qframe + 1) and its motion draws that frame */
+	float mv_ew, mv_eh;           /* how far right and down its motion draws' viewports reached that frame (texels): what of the target the scene fills */
 	uint8_t box_said;             /* box_keep has kept guest bytes of it once: logged */
 	uint16_t bx0, by0, bx1, by1;  /* the box (guest pixels, end exclusive) the GPU has changed since guest memory last held all of it:
 	                               * draws add their region (box_add), an upload or download empties it, a whole-texture write fills
@@ -2892,7 +2893,9 @@ void gfx_gpu_fsr_toggle(void) {
 	overlay_toast(fsr_live ? "FSR 3.1 anti-aliasing on" : "FSR 3.1 anti-aliasing off", 2.0);
 	fprintf(stderr, "    fsr: %s (F4)\n", fsr_live ? "on" : "off");
 }
-static int mv_on(void) { static int env = -1; if (env < 0) env = getenv("RECOMP_MV") != 0; return env || fsr_on(); }
+static int fg_vec_on;   /* frame generation wants the game's motion (gfx_gpu_frame_gen_vectors, from window.c's present loop) */
+static int mv_on(void) { static int env = -1; if (env < 0) env = getenv("RECOMP_MV") != 0; return env || fsr_on() || __atomic_load_n(&fg_vec_on, __ATOMIC_RELAXED); }
+void gfx_gpu_frame_gen_vectors(int on) { __atomic_store_n(&fg_vec_on, on, __ATOMIC_RELAXED); }
 int gfx_gpu_mv_on(void) { return mv_on(); }
 static int mv_scene;                                      /* the open scene gets a motion pass */
 static TargetEntry *mv_best; static uint32_t mv_best_n;  /* this frame's target with the most motion draws (the dump's) */
@@ -3041,10 +3044,29 @@ static float mv_sa_dist(const uint32_t *a, const uint32_t *b, float stop) {   /*
 	}
 	return d;
 }
+/* An unmatched draw's previous SA from a sibling: a draw of the same vertex program that did match this frame. Words the two
+ * share (the camera, the frame's constants) take the sibling's previous values; words they don't (a draw's own placement)
+ * stay its own. Borderlands 2's snow drew as terrain patches from one vertex buffer, re-tessellated as the camera moves: each
+ * frame's patches came with new index lists (counts 1246 -> 1150 -> 190), so a third of them matched nothing and got this
+ * frame's SA, no motion, in the middle of a turn (2026-11-23). A program whose camera is folded into each draw's own matrix
+ * shares nothing with its siblings and keeps no motion, as before. Not for LDST programs (their pointer words point at
+ * windows). A draw that comes before any sibling has matched is patched when one does, if its batch is still open
+ * (mv_pend, gfx_gpu_draw) */
+typedef struct { uint32_t vprog; const uint32_t *cur, *prev; } MvSib;
+static MvSib mv_sib[64]; static int mv_nsib; static uint32_t mv_sib_fresh, mv_sibbed, mv_sib_late;   /* fresh: the vertex program this draw matched with (gfx_gpu_draw patches its pending siblings) */
+static uint32_t mv_syn[256]; static int mv_npend;   /* (mv_pend_d's count, beside the batch)*/
+static const MvSib *mv_sib_find(uint32_t vprog) { for (int i = 0; i < mv_nsib; i++) if (mv_sib[i].vprog == vprog) return &mv_sib[i]; return 0; }
+static void mv_sib_note(uint32_t vprog, const uint32_t *cur, const uint32_t *prev) {
+	MvSib *s = (MvSib *)mv_sib_find(vprog);
+	if (!s && mv_nsib < 64) s = &mv_sib[mv_nsib++];
+	if (s) { s->vprog = vprog; s->cur = cur; s->prev = prev; }
+	mv_sib_fresh = vprog;
+}
+static void mv_sib_apply(uint32_t *out, const uint32_t *cur, const MvSib *s) { for (int i = 0; i < 256; i++) out[i] = cur[i] == s->cur[i] ? s->prev[i] : cur[i]; }
 static int mv_match_time(void) { static int v = -1; if (v < 0) v = getenv("RECOMP_MV_MATCH_TIME") != 0; return v; }   /* (the matching's CPU time a frame, logged) */
 static double mv_match_ns; static uint32_t mv_match_n;
 /* this frame's SA of the draw recorded, and the previous frame's of the same draw returned (0: unmatched) */
-static const uint32_t *mv_match(const GfxDraw *d, const uint32_t *sa) {
+static const uint32_t *mv_match(const GfxDraw *d, const uint32_t *sa, int ldst) {
 	static int by_order = -1; if (by_order < 0) { const char *e = getenv("RECOMP_MV_MATCH"); by_order = e && !strcmp(e, "order"); }
 	if (!mv_tab[0]) { mv_tab[0] = calloc(MV_TAB, sizeof(MvRec)); mv_tab[1] = calloc(MV_TAB, sizeof(MvRec)); }
 	if (!mv_tab[0] || !mv_tab[1]) return 0;
@@ -3069,9 +3091,18 @@ static const uint32_t *mv_match(const GfxDraw *d, const uint32_t *sa) {
 		}
 		if (p) { p->taken = 1; if (p != own) mv_moved++; }
 	}
-	if (p) mv_matched++; else mv_unmatched++;
+	const MvSib *sib = 0;
+	if (p) { mv_matched++; if (r) mv_sib_note(d->vprog, r->sa, p->sa); }
+	else if (!ldst && (sib = mv_sib_find(d->vprog))) { mv_sib_apply(mv_syn, sa, sib); mv_sibbed++; }
+	else mv_unmatched++;
+	{	/* RECOMP_MV_MATCH_LOG=<from>-<to> (frames queued): each motion draw, matched or not, with what its key is made of */
+		static long lf = -2, lt; if (lf == -2) { const char *e = getenv("RECOMP_MV_MATCH_LOG"); lf = -1; if (e && sscanf(e, "%ld-%ld", &lf, &lt) != 2) lf = -1; }
+		if (lf >= 0 && (long)mv_qframe >= lf && (long)mv_qframe <= lt)
+			fprintf(stderr, "    mv match: frame %llu vprog %#x count %u prim %u indices %#x streams %u: %#x %#x, occurrence %d of %d before: %s\n", (unsigned long long)mv_qframe, d->vprog, d->count, d->prim, d->indices,
+			        d->nstream, d->nstream > 0 ? d->stream[0] : 0, d->nstream > 1 ? d->stream[1] : 0, occ, np, p ? (by_order || p == mv_slot(prev, mv_occ_key(k, occ), 0) ? "matched" : "matched another occurrence") : sib ? "a sibling's shared words" : "UNMATCHED");
+	}
 	if (mv_match_time()) { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1); mv_match_ns += (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec); mv_match_n++; }
-	return p ? p->sa : 0;
+	return p ? p->sa : sib ? mv_syn : 0;
 }
 /* M2: a motion draw's LDST windows (bone palettes) as they were when it drew, by guest address, once per address a frame:
  * the next frame's motion pass places the snapshots in the LDST ring beside that frame's windows, and its previous-frame
@@ -3089,7 +3120,7 @@ static void mv_win_snap(uint32_t base) {
 }
 static void mv_frame_end(void) {   /* this frame's records become the previous frame's */
 	if (mv_match_time() && mv_match_n) fprintf(stderr, "    mv match: %u draws, %.3f ms\n", mv_match_n, mv_match_ns / 1e6);
-	mv_match_ns = 0; mv_match_n = 0;
+	mv_match_ns = 0; mv_match_n = 0; mv_nsib = 0; mv_sib_fresh = 0; mv_npend = 0;
 	if (!mv_tab[0]) return;
 	mv_cur ^= 1; mv_nwin[mv_cur] = 0;   /* (the snapshots' buffers kept for reuse) */
 	for (int i = 0; i < MV_TAB; i++) mv_tab[mv_cur][i].key = 0;
@@ -3243,14 +3274,44 @@ static void fsr_run(TargetEntry *e) {
  * thread flips the last one, and those draws would match against the wrong frame and clear a motion target mid-frame.
  * The frame's capture (RECOMP_MV_DUMP), a line of counts every 300 frames, then this frame's records become the previous */
 static const char *fsr_time_str(void) { static char b[800]; b[0] = 0; if (n_fsr && t_fsr_ms > 0) { const char *p = fsr_profile(); snprintf(b, sizeof b, "; %.2f ms each, of which an empty round trip %.2f%s%s", t_fsr_ms / n_fsr, t_fsr_empty_ms / n_fsr, *p ? "; by pass: " : "", p); } return b; }
+/* Frame generation's copy of each frame's motion (fg_vectors, window.c), taken as the game queues the frame: by present, the
+ * render thread can be drawing the next frame, whose first motion draw clears the target. Keyed by the colour target of the
+ * frame's last scene, the buffer the game queued (gfx_gpu_present finds it by that address) and handed over once. Four
+ * slots: triple buffering and one more */
+#define FGV_N 4
+static struct { uint32_t addr; SDL_GPUTexture *tex; uint32_t w, h, rw, rh; uint64_t seq; } fgv[FGV_N];
+static uint64_t fgv_seq; static uint32_t fgv_last;   /* fgv_last: the colour target of the last scene begun */
+static void fgv_snapshot(TargetEntry *e, uint32_t addr) {
+	const uint32_t w = TSX(e, e->width), h = TSY(e, e->height);
+	int k = 0;
+	for (int i = 0; i < FGV_N; i++) { if (fgv[i].addr == addr) { k = i; break; } if (fgv[i].seq < fgv[k].seq) k = i; }
+	if (fgv[k].tex && (fgv[k].w != w || fgv[k].h != h)) { SDL_ReleaseGPUTexture(gpu(), fgv[k].tex); fgv[k].tex = 0; }
+	fgv[k].addr = 0;
+	if (!fgv[k].tex) {
+		SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+			.width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+		if (!(fgv[k].tex = SDL_CreateGPUTexture(gpu(), &ci))) return;
+		fgv[k].w = w; fgv[k].h = h;
+	}
+	batch_flush("frame generation's motion");   /* (the motion pass first, then the copy, on the one queue) */
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu()); if (!cmd) return;
+	SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureLocation src = { .texture = e->mv }, dst = { .texture = fgv[k].tex };
+	SDL_CopyGPUTextureToTexture(cp, &src, &dst, w, h, 1, false);
+	SDL_EndGPUCopyPass(cp); SDL_SubmitGPUCommandBuffer(cmd);
+	fgv[k].addr = addr; fgv[k].seq = ++fgv_seq;
+	fgv[k].rw = e->mv_ew >= 1.0f && e->mv_ew < (float)w ? (uint32_t)(e->mv_ew + 0.5f) : w;   /* (the part the scene filled: Borderlands 2 draws 960 of its 1024) */
+	fgv[k].rh = e->mv_eh >= 1.0f && e->mv_eh < (float)h ? (uint32_t)(e->mv_eh + 0.5f) : h;
+}
 void gfx_gpu_frame_queued(void) {
 	if (!mv_on()) return;
 	TargetEntry *e = mv_best;
+	if (__atomic_load_n(&fg_vec_on, __ATOMIC_RELAXED) && e && e->mv && e->mv_frame == mv_qframe + 1 && fgv_last) fgv_snapshot(e, fgv_last);
 	mv_capture(e, mv_qframe);
 	if (mv_qframe % 300 == 0) {
-		fprintf(stderr, "    gpu mv: frame %llu: %llu motion draws so far, %u pipelines, this frame's target %ux%u (%u draws); matched %u (%u to another occurrence of their key), unmatched %u, reading LDST windows %u (%u with their previous pose); jittered %u draws in %u scenes (%u of them on the main depth only); FSR ran %u times (%u of them reset as cuts%s) since the last line\n",
-		        (unsigned long long)mv_qframe, (unsigned long long)n_mv_draws, n_mv_pipes, e ? TSX(e, e->width) : 0, e ? TSY(e, e->height) : 0, mv_best_n, mv_matched, mv_moved, mv_unmatched, mv_windowed, mv_posed, mv_jit_draws, mv_jit_scenes, mv_jit_depth_scenes, n_fsr, n_fsr_cuts, fsr_time_str());
-		mv_matched = mv_moved = mv_unmatched = mv_windowed = mv_posed = 0; mv_jit_draws = mv_jit_scenes = mv_jit_depth_scenes = 0; n_fsr = n_fsr_cuts = 0; t_fsr_ms = t_fsr_empty_ms = 0;
+		fprintf(stderr, "    gpu mv: frame %llu: %llu motion draws so far, %u pipelines, this frame's target %ux%u (%u draws); matched %u (%u to another occurrence of their key), unmatched %u (and %u from a sibling's shared words, %u of them patched later), reading LDST windows %u (%u with their previous pose); jittered %u draws in %u scenes (%u of them on the main depth only); FSR ran %u times (%u of them reset as cuts%s) since the last line\n",
+		        (unsigned long long)mv_qframe, (unsigned long long)n_mv_draws, n_mv_pipes, e ? TSX(e, e->width) : 0, e ? TSY(e, e->height) : 0, mv_best_n, mv_matched, mv_moved, mv_unmatched - mv_sib_late, mv_sibbed + mv_sib_late, mv_sib_late, mv_windowed, mv_posed, mv_jit_draws, mv_jit_scenes, mv_jit_depth_scenes, n_fsr, n_fsr_cuts, fsr_time_str());
+		mv_matched = mv_moved = mv_unmatched = mv_windowed = mv_posed = 0; mv_sibbed = mv_sib_late = 0; mv_jit_draws = mv_jit_scenes = mv_jit_depth_scenes = 0; n_fsr = n_fsr_cuts = 0; t_fsr_ms = t_fsr_empty_ms = 0;
 	}
 	mv_main_entry = mv_best; mv_main_depth = mv_best ? mv_best_depth : 0;   /* (next frame's main target: jitter, the scene log) */
 	mv_lit = mv_lit_cur ? mv_lit_cur : mv_best; mv_lit_cur = 0; fsr_forward = !mv_best || mv_lit == mv_best;   /* (FSR's colour next frame) */
@@ -3282,6 +3343,7 @@ void gfx_gpu_begin_scene(const GfxTarget *t) {
 	batch_flush("scene begun without an end");   /* normally empty: gfx_gpu_end_scene flushed (targets and depth surfaces may be evicted below) */
 	vis_complete(0);   /* visibility counters the GPU has finished: into guest memory */
 	scene_target = *t;
+	fgv_last = t->data;   /* (frame generation's motion goes with the frame drawn here last: fgv_snapshot) */
 	scene_hud = hud_scene(t->data); scene_disp_draws = 0;
 	static int no_depth_only = -1; if (no_depth_only < 0) no_depth_only = getenv("RECOMP_GPU_NO_DEPTH_ONLY") != 0;   /* RECOMP_GPU_NO_DEPTH_ONLY=1: depth-only scenes on the software path, as before */
 	scene_entry = t->data ? get_target(t) : t->depth && t->ds_data && t->width && !no_depth_only ? scratch_target(t) : 0;
@@ -4455,6 +4517,8 @@ static int batch_uses(SDL_GPUTexture *tex) {
 }
 static int batch_uses_pipe(const PipeEntry *p) { for (int i = 0; i < batch.n; i++) if (batch.d[i].pipe == p) return 1; return 0; }
 static void batch_retire(SDL_GPUTexture *tex, const char *why) { if (tex && (batch.n || batch.nev) && batch_uses(tex)) batch_flush(why); }
+static uint32_t batch_gen;   /* batches flushed so far (mv_pend: a pending draw's batch still open) */
+static struct { int idx; uint32_t gen, vprog; } mv_pend_d[64];   /* this frame's unmatched motion draws no sibling had matched yet (mv_sib_apply) */
 static BatchDraw *batch_add(void) {
 	if (batch.n == batch.cap) { batch.cap = batch.cap ? 2 * batch.cap : 256; batch.d = realloc(batch.d, (size_t)batch.cap * sizeof *batch.d); }
 	BatchDraw *b = &batch.d[batch.n++]; b->hud = 0;
@@ -4834,7 +4898,7 @@ static void batch_flush_body(const char *why) {
 		snprintf(fm_tag, sizeof fm_tag, "tgt %#x fmt %#x %ux%u rt %ux%u ms%ux%u ds %#x fmt %#x ld%d st%d: %d draws %u passes %d views %d fetchcopies (%s)%s", scene_target.data, scene_target.format, scene_target.width, scene_target.height, scene_target.rt_width, scene_target.rt_height, scene_target.ms_x, scene_target.ms_y, scene_target.ds_data, scene_target.ds_format, scene_target.ds_force_load, scene_target.ds_force_store, batch.n, n_batch_pass - pass0, nv, nf, why, nh ? " hoisted" : "");
 		fence_mark(0);
 	}
-	batch.n = batch.nev = 0; batch.nq = 0; batch.mv = 0; batch.mv_clear = 0;
+	batch.n = batch.nev = 0; batch.nq = 0; batch.mv = 0; batch.mv_clear = 0; batch_gen++;
 	t_flush += us_now() - t0; t_total += us_now() - t0;
 }
 
@@ -6208,7 +6272,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	const uint32_t *mv_psa = 0; uint32_t mv_pwin[8][4]; int mv_npwin = 0; const uint8_t *mv_psrc[8];
 	if (mv_want) {
 		uint32_t csa[256]; for (int i = 0; i < 256; i++) csa[i] = vdraw.sa[i].u;
-		mv_psa = mv_match(d, csa);
+		mv_sib_fresh = 0; mv_psa = mv_match(d, csa, vs->nldst);
 		for (int k = 0; mv_psa && k < vs->nldst && k < 8; k++) {   /* every window's snapshot, or none of them */
 			mv_psrc[k] = mv_win_find(mv_cur ^ 1, mv_psa[vs->ldst_sa[k] & 255]);
 			if (!mv_psrc[k]) { mv_npwin = 0; break; }
@@ -6359,7 +6423,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		b->mv = 1; batch.mv = mvt->mv;   /* drawn again in the motion pass (mv_on) */
 		{ const SDL_GPUCompareOp op = conv_cmp(pipe->depth_func); if (op == SDL_GPU_COMPAREOP_GREATER || op == SDL_GPU_COMPAREOP_GREATER_OR_EQUAL) mv_votes_inv++; else if (op == SDL_GPU_COMPAREOP_LESS || op == SDL_GPU_COMPAREOP_LESS_OR_EQUAL) mv_votes_fwd++; }
 		if ((const void *)scene_entry == mv_main_entry) { if (mv_psa) fsr_matched++; else fsr_unmatched++; }   /* (FSR's cut test) */
-		if (mvt->mv_frame != mv_qframe + 1) { mvt->mv_frame = mv_qframe + 1; mvt->mv_n = 0; batch.mv_clear = 1; }   /* (its first this frame: the pass clears) */
+		if (mvt->mv_frame != mv_qframe + 1) { mvt->mv_frame = mv_qframe + 1; mvt->mv_n = 0; mvt->mv_ew = mvt->mv_eh = 0; batch.mv_clear = 1; }   /* (its first this frame: the pass clears) */
 		if (!lit_after && ++scene_entry->mv_n > mv_best_n) { mv_best_n = scene_entry->mv_n; mv_best = scene_entry; mv_best_depth = scene_depth_entry; }
 	}
 	if (mv_scene_log() && ((const void *)scene_entry == mv_main_entry || (const void *)scene_entry == mv_lit) && mv_scene_nd < (int)sizeof mv_scene_draws - 1) {
@@ -6373,6 +6437,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	}
 	if (fetch_ev >= 0 && !b->hud) fetch_narrow(d, vs, &batch.ev[fetch_ev], vw, sx0, sy0, sx1, sy1);
 	b->vp = vp2; b->sc = (SDL_Rect){ sx0 * scene_sx, sy0 * scene_sy, (sx1 - sx0) * scene_sx, (sy1 - sy0) * scene_sy };
+	if (b->mv) { const float ex = fmaxf(vp2.x, vp2.x + vp2.w), ey = fmaxf(vp2.y, vp2.y + vp2.h); if (ex > mvt->mv_ew) mvt->mv_ew = ex; if (ey > mvt->mv_eh) mvt->mv_eh = ey; }   /* (the scene's extent in its motion target: fgv_snapshot) */
 	if (mv_jit_scene && !b->hud) { b->vp.x += mv_jx; b->vp.y += mv_jy; mv_jit_draws++; }   /* (M3 jitter: the motion pass draws with the same viewport, its depth test agrees) */
 	else if (!b->hud && composite_mesh(d, pipe)) { float jx, jy; mv_jitter(mv_qframe, &jx, &jy); b->vp.x += jx; b->vp.y += jy; mv_jit_draws++; }
 	b->vring_off = vring_off; b->vbytes = vbytes; b->iring_off = iring_off; b->nidx = nverts; b->first_vertex = first_vertex; b->isize = isize; b->ibytes = 4 * iwords;
@@ -6423,6 +6488,16 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		if (mvs) {
 			pipe->mv_vse = mvs; b->pvu = b->vu;
 			if (mv_psa) memcpy(b->pvu.sa, mv_psa, sizeof b->pvu.sa);
+			else if (!vs->nldst && mv_npend < 64) { mv_pend_d[mv_npend].idx = (int)(b - batch.d); mv_pend_d[mv_npend].gen = batch_gen; mv_pend_d[mv_npend++].vprog = d->vprog; }   /* (a sibling may match later in this batch) */
+			if (mv_sib_fresh == d->vprog) {   /* this draw matched: the same program's earlier unmatched draws in this batch take its shared words */
+				const MvSib *sib = mv_sib_find(d->vprog);
+				for (int i = 0; sib && i < mv_npend; ) {
+					if (mv_pend_d[i].vprog != d->vprog || mv_pend_d[i].gen != batch_gen) { i++; continue; }
+					BatchDraw *pb = &batch.d[mv_pend_d[i].idx];
+					if (pb->mv) { mv_sib_apply(pb->pvu.sa, pb->vu.sa, sib); mv_sib_late++; }
+					mv_pend_d[i] = mv_pend_d[--mv_npend];
+				}
+			}
 			if (vs->nldst) {   /* LDST windows: the previous frame's (M2), else this frame's pointers and windows (no pose motion) */
 				mv_windowed++;
 				if (mv_npwin) { memset(b->pvu.win, 0, sizeof b->pvu.win); memcpy(b->pvu.win, mv_pwin, (size_t)mv_npwin * sizeof mv_pwin[0]); mv_posed++; }
@@ -6750,6 +6825,13 @@ void gfx_gpu_present(uint32_t base, uint32_t width, uint32_t height, uint32_t pi
 			/* the frame goes to the window from the GPU texture: no fence wait, encode and re-upload
 			 * per frame. Guest memory keeps the frame before this one until something reads it (a
 			 * shot, a texture over it, a CPU write: each syncs first) */
+			{	/* this frame's motion for frame generation (fgv_snapshot), once */
+				extern void window_frame_vectors(void *mv, uint32_t w, uint32_t h, uint32_t rw, uint32_t rh);
+				int k = -1;
+				if (__atomic_load_n(&fg_vec_on, __ATOMIC_RELAXED)) for (int i = 0; i < FGV_N; i++) if (fgv[i].addr == e->addr && fgv[i].tex && (k < 0 || fgv[i].seq > fgv[k].seq)) k = i;
+				if (k >= 0) { window_frame_vectors(fgv[k].tex, fgv[k].w, fgv[k].h, fgv[k].rw, fgv[k].rh); fgv[k].addr = 0; }
+				else window_frame_vectors(0, 0, 0, 0, 0);
+			}
 			window_present_gpu(e->color, TSX(e, width), TSY(e, height), e->kind == TK_U8S); gfx_soft_skip_window = 1;
 		} else if (!window_active() && !gfx_soft_shot_due() && format == 0 && present_nosync()) { /* RECOMP_GPU_PRESENT_NOSYNC=1, headless: the frame stays on the GPU, as it does with a window (see present_nosync); window_present below is a no-op without a window */ }
 		else { sync_why = "(present)"; target_sync_for_cpu(e); }   /* guest memory must hold what the GPU rendered before anything reads it below */

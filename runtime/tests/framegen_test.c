@@ -9,8 +9,10 @@
  *   framegen_test --objects                a dark object over a bright background at 2880x1632, each moving its own way:
  *                                          the error around the object's edges and how much of it is a light outline
  *   framegen_test --time w h [w h ...]     GPU time per game frame and per made frame at those frame sizes
- *   framegen_test --score list             real frames: per line "prev cur truth t [out]" (a game's N, N+2 and N+1), the frame
- *                                          made at t scored against the real one, beside a blend and the nearer frame
+ *   framegen_test --score list             real frames: per line "prev cur truth t [out] [mv=file]" (a game's N, N+2 and N+1),
+ *                                          the frame made at t scored against the real one, beside a blend and the nearer frame;
+ *                                          mv=: the game's motion from prev to cur (RECOMP_MV_DUMP's .raw layout: width, height,
+ *                                          RG16F pairs in UV units, over the frame's own extent), given to fg_vectors
  *
  * Build: runtime/tests/framegen_test.sh. Exit 0 when the synthetic checks pass.
  */
@@ -51,10 +53,11 @@ static uint8_t *download(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *t, uint32_t 
 	return out;
 }
 /* the frame at t between a and b (frames w x h, RGBA8) */
+static SDL_GPUTexture *g_mv; static uint32_t g_mvw, g_mvh;   /* the game's motion for the pair being made (b's: --score's mv=, --objects' case_mv), or 0 */
 static uint8_t *generate(const uint8_t *a, const uint8_t *b, uint32_t w, uint32_t h, float t, double *ms) {
 	SDL_GPUTexture *ta = upload(a, w, h), *tb = upload(b, w, h);
 	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
-	fg_forget(); fg_frame(dev, cmd, ta, w, h, 1); fg_frame(dev, cmd, tb, w, h, 1);
+	fg_forget(); fg_frame(dev, cmd, ta, w, h, 1); fg_vectors(g_mv, g_mvw, g_mvh, 0); fg_frame(dev, cmd, tb, w, h, 1);
 	SDL_GPUTexture *g = fg_make(dev, cmd, t);
 	if (!g) { fprintf(stderr, "no frame made\n"); exit(2); }
 	uint8_t *out = download(cmd, g, w, h, ms);
@@ -155,6 +158,33 @@ static void paint_obj(uint8_t *px, uint8_t *mask, const ObjCase *c, float t) {
 		if (mask) mask[y * OW + x] = (uint8_t)in;
 	}
 }
+static uint16_t half(float f) {   /* (round to nearest; the vectors here are small and normal) */
+	uint32_t b; memcpy(&b, &f, 4); uint32_t sgn = (b >> 16) & 0x8000; int e = (int)((b >> 23) & 0xff) - 127 + 15; uint32_t m = b & 0x7fffff;
+	if (e <= 0) return (uint16_t)sgn; if (e >= 31) return (uint16_t)(sgn | 0x7c00);
+	return (uint16_t)(sgn | (uint32_t)e << 10 | ((m + 0x1000) >> 13));
+}
+/* the game's motion for a case's current frame, as a renderer's motion pass gives it (gfx_gpu.c: UV units, each pixel back to
+ * where it was: x - v.x * W, y + v.y * H), everything covered: the object's where it is, the background's elsewhere */
+static SDL_GPUTexture *case_mv(const ObjCase *c) {
+	uint16_t *px = malloc(4u * OW * OH);
+	for (uint32_t y = 0; y < OH; y++) for (uint32_t x = 0; x < OW; x++) {
+		int in = object((float)x - c->ox, (float)y - c->oy, c->thin);
+		float mx = in ? c->ox : c->bx, my = in ? c->oy : c->by;
+		px[2 * (y * OW + x)] = half(mx / OW); px[2 * (y * OW + x) + 1] = half(-my / OH);
+	}
+	SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = OW, .height = OH, .layer_count_or_depth = 1, .num_levels = 1 };
+	SDL_GPUTexture *t = SDL_CreateGPUTexture(dev, &ci);
+	SDL_GPUTransferBufferCreateInfo bi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = 4u * OW * OH };
+	SDL_GPUTransferBuffer *b = SDL_CreateGPUTransferBuffer(dev, &bi);
+	memcpy(SDL_MapGPUTransferBuffer(dev, b, false), px, 4u * OW * OH); SDL_UnmapGPUTransferBuffer(dev, b);
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev); SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureTransferInfo src = { .transfer_buffer = b, .pixels_per_row = OW, .rows_per_layer = OH }; SDL_GPUTextureRegion d = { .texture = t, .w = OW, .h = OH, .d = 1 };
+	SDL_UploadToGPUTexture(cp, &src, &d, false); SDL_EndGPUCopyPass(cp); SDL_SubmitGPUCommandBuffer(cmd);
+	SDL_ReleaseGPUTransferBuffer(dev, b); free(px);
+	return t;
+}
+/* each case without the game's motion (the error bounds below), then with it (case_mv): it must not do worse (3% and a
+ * little: the thin post's band error moves that much between runs of the same thing) */
 static int objects(void) {
 	int fails = 0;
 	static const ObjCase cs[] = {
@@ -166,10 +196,12 @@ static int objects(void) {
 		{ "thin post, parallax", 24, 0, 72, 0, 1 },
 	};
 	uint8_t *a = malloc(4 * OW * OH), *b = malloc(4 * OW * OH), *want = malloc(4 * OW * OH), *mask = malloc(OW * OH);
-	for (size_t i = 0; i < sizeof cs / sizeof *cs; i++) for (int k = 1; k <= 2; k++) {
-		float t = 0.25f * (float)k;
+	for (size_t i = 0; i < sizeof cs / sizeof *cs; i++) for (int k = 1; k <= 4; k++) {
+		const int gm = k > 2; float t = 0.25f * (float)(gm ? k - 2 : k);
 		paint_obj(a, 0, &cs[i], 0); paint_obj(b, 0, &cs[i], 1); paint_obj(want, mask, &cs[i], t);
+		if (gm) { g_mv = case_mv(&cs[i]); g_mvw = OW; g_mvh = OH; }
 		double ms; uint8_t *g = generate(a, b, OW, OH, t, &ms);
+		if (g_mv) { SDL_ReleaseGPUTexture(dev, g_mv); g_mv = 0; }
 		double band = 0, rest = 0; long nb = 0, nr = 0, light = 0;
 		for (uint32_t y = 24; y + 24 < OH; y++) for (uint32_t x = 24; x + 24 < OW; x++) {
 			uint8_t m = mask[y * OW + x]; int edge = 0;
@@ -179,8 +211,10 @@ static int objects(void) {
 			if (edge || (cs[i].thin && m)) { band += e; nb++; if (p[0] + p[1] + p[2] > q[0] + q[1] + q[2] + 3 * 64) light++; } else { rest += e; nr++; }
 		}
 		double eb = band / (double)nb, lp = 100.0 * (double)light / (double)nb;
-		int ok = cs[i].thin ? eb < 38.0 && lp < 24.0 : eb < 6.0 && lp < 1.0 && rest / (double)nr < 2.0;
-		printf("%-34s t %.2f: edge band error %5.2f, %5.2f%% of it light, elsewhere %.2f, %.2f ms  %s\n", cs[i].name, t, eb, lp, rest / (double)nr, ms, ok ? "ok" : "FAIL");
+		static double eb0[2];   /* (the same case and t without the game's motion) */
+		int ok = gm ? eb <= eb0[k - 3] * 1.03 + 0.3 && rest / (double)nr < 2.0 : cs[i].thin ? eb < 38.0 && lp < 24.0 : eb < 6.0 && lp < 1.0 && rest / (double)nr < 2.0;
+		if (!gm) eb0[k - 1] = eb;
+		printf("%-34s t %.2f%s: edge band error %5.2f, %5.2f%% of it light, elsewhere %.2f, %.2f ms  %s\n", cs[i].name, t, gm ? " game motion" : "", eb, lp, rest / (double)nr, ms, ok ? "ok" : "FAIL");
 		if (!ok) fails++;
 		if (getenv("FG_TEST_OUT")) { char p[512]; snprintf(p, sizeof p, "%s/obj%zu_%d_made.png", getenv("FG_TEST_OUT"), i, k); save(p, g, OW, OH);
 			snprintf(p, sizeof p, "%s/obj%zu_%d_want.png", getenv("FG_TEST_OUT"), i, k); save(p, want, OW, OH); }
@@ -207,12 +241,32 @@ static void block_err(const uint8_t *g, const uint8_t *t, uint32_t w, uint32_t h
 	*mean = tot / (256.0 * n); *p99 = bm[(n - 1) * 99 / 100]; *bad = 100.0 * nbad / n;
 	free(bm);
 }
+/* a motion file (RECOMP_MV_DUMP's .raw: width, height, then RG16F pairs) as a texture, 0 when there's none */
+static SDL_GPUTexture *load_mv(const char *path, uint32_t *w, uint32_t *h) {
+	if (!path || !*path) return 0;
+	FILE *f = fopen(path, "rb"); uint32_t wh[2];
+	if (!f || fread(wh, 4, 2, f) != 2) { fprintf(stderr, "%s: can't read\n", path); exit(2); }
+	size_t n = (size_t)wh[0] * wh[1] * 4; uint8_t *px = malloc(n);
+	if (fread(px, 1, n, f) != n) { fprintf(stderr, "%s: short\n", path); exit(2); }
+	fclose(f);
+	SDL_GPUTextureCreateInfo ci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = wh[0], .height = wh[1], .layer_count_or_depth = 1, .num_levels = 1 };
+	SDL_GPUTexture *t = SDL_CreateGPUTexture(dev, &ci);
+	SDL_GPUTransferBufferCreateInfo bi = { .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = (Uint32)n };
+	SDL_GPUTransferBuffer *b = SDL_CreateGPUTransferBuffer(dev, &bi);
+	memcpy(SDL_MapGPUTransferBuffer(dev, b, false), px, n); SDL_UnmapGPUTransferBuffer(dev, b);
+	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev); SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+	SDL_GPUTextureTransferInfo s = { .transfer_buffer = b, .pixels_per_row = wh[0], .rows_per_layer = wh[1] }; SDL_GPUTextureRegion d = { .texture = t, .w = wh[0], .h = wh[1], .d = 1 };
+	SDL_UploadToGPUTexture(cp, &s, &d, false); SDL_EndGPUCopyPass(cp); SDL_SubmitGPUCommandBuffer(cmd);
+	SDL_ReleaseGPUTransferBuffer(dev, b); free(px);
+	*w = wh[0]; *h = wh[1];
+	return t;
+}
 /* the frame at t after the stream moves on to b (a's the frame before it, already given): what the present loop does, so
  * state carried from pair to pair (the previous pair's motion) is used */
 static uint8_t *generate_next(const uint8_t *b, uint32_t w, uint32_t h, float t, double *ms) {
 	SDL_GPUTexture *tb = upload(b, w, h);
 	SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
-	fg_frame(dev, cmd, tb, w, h, 1);
+	fg_vectors(g_mv, g_mvw, g_mvh, 0); fg_frame(dev, cmd, tb, w, h, 1);
 	SDL_GPUTexture *g = fg_make(dev, cmd, t);
 	if (!g) { fprintf(stderr, "no frame made\n"); exit(2); }
 	uint8_t *out = download(cmd, g, w, h, ms);
@@ -226,8 +280,10 @@ static int score(const char *list) {
 	FILE *f = fopen(list, "r"); if (!f) { perror(list); return 2; }
 	char line[4096], last[1024] = "";
 	while (fgets(line, sizeof line, f)) {
-		char pa[1024], pb[1024], pt[1024], po[1024] = ""; float t = 0.5f;
-		if (sscanf(line, "%1023s %1023s %1023s %f %1023s", pa, pb, pt, &t, po) < 4) continue;
+		char pa[1024], pb[1024], pt[1024], x1[1024] = "", x2[1024] = "", po[1024] = "", pm[1024] = ""; float t = 0.5f;
+		if (sscanf(line, "%1023s %1023s %1023s %f %1023s %1023s", pa, pb, pt, &t, x1, x2) < 4) continue;
+		for (char *x = x1; x; x = x == x1 ? x2 : 0) { if (!strncmp(x, "mv=", 3)) snprintf(pm, sizeof pm, "%s", x + 3); else if (*x) snprintf(po, sizeof po, "%s", x); }
+		g_mv = load_mv(pm, &g_mvw, &g_mvh);
 		uint32_t w, h, w2, h2, w3, h3; uint8_t *a = load(pa, &w, &h), *b = load(pb, &w2, &h2), *tr = load(pt, &w3, &h3);
 		if (w != w2 || h != h2 || w != w3 || h != h3) { fprintf(stderr, "%s: the frames differ in size\n", pt); return 2; }
 		double ms; uint8_t *g = !strcmp(pa, last) ? generate_next(b, w, h, t, &ms) : generate(a, b, w, h, t, &ms), *bl = malloc(4 * w * h);
@@ -239,6 +295,7 @@ static int score(const char *list) {
 		fflush(stdout);
 		if (*po && !save(po, g, w, h)) { fprintf(stderr, "%s: %s\n", po, SDL_GetError()); return 2; }
 		free(a); free(b); free(tr); free(g); free(bl);
+		if (g_mv) { SDL_ReleaseGPUTexture(dev, g_mv); g_mv = 0; }
 	}
 	fclose(f);
 	return 0;

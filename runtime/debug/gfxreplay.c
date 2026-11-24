@@ -57,6 +57,7 @@ void window_present(uint32_t base, uint32_t w, uint32_t h, uint32_t pitch) { (vo
 int window_active(void) { return 0; }   /* no window: gfx_gpu.c presents through guest memory, as the shots need */
 const char *host_app0(void) { return 0; }   /* (gfx_gpu.c's shader recipes read the game's files: a replay has none, and loads no recipes) */
 void window_present_gpu(void *tex, uint32_t w, uint32_t h, int raw) { (void)tex; (void)w; (void)h; (void)raw; }
+void window_frame_vectors(void *mv, uint32_t w, uint32_t h, uint32_t rw, uint32_t rh) { (void)mv; (void)w; (void)h; (void)rw; (void)rh; }
 void *window_gpu_device(void) {
 	static SDL_GPUDevice *dev; static int tried;
 	if (!tried) {

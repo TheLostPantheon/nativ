@@ -19,14 +19,22 @@
  *               the two frames agree on best there; a projected one also wins a tie when it is further from the mean
  *               motion: a still HUD keeps its own pixels still over a moving scene, a thin object keeps its motion
  *               over a still one
+ *   G. the game's own motion, where the renderer's motion pass gives it (fg_vectors; gfx_gpu.c draws the main 3D scene's
+ *      opaque draws again with the previous frame's uniforms): gvec per working pixel at each game frame, gfield per block
+ *      once a pair, carried to t by project like the forward search's. pick tries both: the game's vector wins ties (flat
+ *      snow and sky, repeating patterns: there the measured one is a guess) unless standing still matches exactly (a HUD
+ *      drawn over the scene) or something in front lands there at t; the carried one wins as the forward motion does
  *   5. warp     the frame: each pixel the previous frame at -t*v blended with the current one at +(1-t)*v, v the one of
  *               the picked vectors around it the two agree on best at that pixel (an object's edge inside a working
  *               pixel); where none agrees, the side nearer to the pixel as the nearer frame has it, not a ghost of both
  *
+ * Borderlands 2 at its own fixed-clock route, frames N and N+2 against the real N+1 (framegen_test --score): the game's motion
+ * took the mean error per block from 1.69 to 1.39 and the worst 1% of blocks from 22.6 to 21.1, most in turns (88.8 -> 59.2).
+ *
  * A thin object (narrower than its motion over the pair) is what 3b-3c are for: the symmetric search sees the background
  * in its blocks and "still" matches it as well as its own motion; framegen_test --objects checks it.
  *
- * 1 runs once per game frame, 2-3b once per pair (on its first generated frame), 3c-5 per generated frame. The passes
+ * 1 and gvec run once per game frame, 2-3b and gfield once per pair (on its first generated frame), 3c-5 per generated frame. The passes
  * are GLSL compute shaders (*.comp here, compiled by build.sh into ../framegen_shaders.h), run as SPIR-V on Vulkan
  * and through SPIRV-Cross on Metal. Written for Nativ, not taken from an existing interpolator.
  */
@@ -50,24 +58,29 @@ int settings_int(const char *key, int def);
 #define FRADIUS 10      /* the forward search's radius at half the working size: +-20 working pixels */
 #define FEXPLAINED 0.03f   /* a forward window difference below which the symmetric vector explains a block */
 #define PRADIUS 4       /* the projection's, in blocks: a motion of up to 4 * 4 / t working pixels lands within it */
+#define GPRADIUS 8      /* the game's motion's (exact, so worth reaching further): 8 * 4 / (1 - t) */
 
-enum { P_REDUCE, P_SEARCH, P_PICK, P_WARP, P_STAT, P_FSEARCH, P_PROJECT, NP };
+enum { P_REDUCE, P_SEARCH, P_PICK, P_WARP, P_STAT, P_FSEARCH, P_PROJECT, P_GVEC, P_GFIELD, NP };
 typedef struct { const char *name; const uint32_t *code; size_t size; int nsamp, gx, gy; } Pass;
 static const Pass passes[NP] = {   /* each writes one image and takes the one constant block */
 	{ "reduce", fg_reduce, sizeof fg_reduce, 1, 8, 8 },
 	{ "search", fg_search, sizeof fg_search, 3, 8, 8 },
-	{ "pick", fg_pick, sizeof fg_pick, 5, 8, 8 },
+	{ "pick", fg_pick, sizeof fg_pick, 7, 8, 8 },
 	{ "warp", fg_warp, sizeof fg_warp, 4, 8, 8 },
 	{ "stat", fg_stat, sizeof fg_stat, 1, 16, 16 },
 	{ "fsearch", fg_fsearch, sizeof fg_fsearch, 3, 8, 8 },
 	{ "project", fg_project, sizeof fg_project, 2, 8, 8 },
+	{ "gvec", fg_gvec, sizeof fg_gvec, 1, 8, 8 },
+	{ "gfield", fg_gfield, sizeof fg_gfield, 2, 8, 8 },
 };
 typedef struct { int32_t a[4], b[4]; float c[4], d[4]; } U;   /* common.glsl's block (std140) */
 
 static struct {
 	uint32_t w, h, levels;                      /* the frames these were made for */
 	int scale, nl, flev; uint32_t lw[NL], lh[NL], fw[NL], fh[NL];   /* flev: the forward search's level (its field is the finest's grid) */
-	SDL_GPUTexture *col[2], *lum[2][NL], *fld[NL], *pix, *stat, *gen, *ffld, *proj;
+	SDL_GPUTexture *col[2], *lum[2][NL], *fld[NL], *pix, *stat, *gen, *ffld, *proj, *gv[2], *gfld, *gproj;   /* gfld, gproj: the game's motion per block (gfield.comp) and carried to t (project.comp) */   /* gv: each frame's game motion at the working size (gvec.comp) */
+	int hv[2];                                  /* whether that frame came with it */
+	SDL_GPUTexture *mv; uint32_t mvw, mvh; int mvflip;   /* fg_vectors' for the next fg_frame */
 	SDL_GPUSampler *lin;
 	SDL_GPUComputePipeline *pipe[NP]; int tried[NP];
 	int cur, have, flow, failed, said;
@@ -76,6 +89,10 @@ static struct {
 int fg_wanted(void) {
 	const char *e = getenv("RECOMP_FRAME_GEN");
 	return e && *e ? *e != '0' : settings_int("frame_gen", 0) != 0;
+}
+int fg_game_motion(void) {
+	const char *e = getenv("RECOMP_FRAME_GEN_MOTION");
+	return e && *e ? *e != '0' : settings_int("frame_gen_motion", 1) != 0;
 }
 
 #ifdef RECOMP_SPIRV_CROSS
@@ -129,13 +146,13 @@ static SDL_GPUTexture *tex(SDL_GPUDevice *dev, SDL_GPUTextureFormat fmt, uint32_
 	return t;
 }
 static void release_all(SDL_GPUDevice *dev) {
-	SDL_GPUTexture **t[7 + 3 * NL] = { &G.col[0], &G.col[1], &G.pix, &G.stat, &G.gen, &G.ffld, &G.proj }; int n = 7;
+	SDL_GPUTexture **t[11 + 3 * NL] = { &G.col[0], &G.col[1], &G.pix, &G.stat, &G.gen, &G.ffld, &G.proj, &G.gv[0], &G.gv[1], &G.gfld, &G.gproj }; int n = 11;
 	for (int k = 0; k < NL; k++) { t[n++] = &G.lum[0][k]; t[n++] = &G.lum[1][k]; t[n++] = &G.fld[k]; }
 	for (int i = 0; i < n; i++) if (*t[i]) { SDL_ReleaseGPUTexture(dev, *t[i]); *t[i] = 0; }
 }
 static int make_all(SDL_GPUDevice *dev, uint32_t w, uint32_t h, uint32_t levels) {
 	release_all(dev);
-	G.failed = 0; G.w = w; G.h = h; G.levels = levels; G.have = 0; G.flow = 0;
+	G.failed = 0; G.w = w; G.h = h; G.levels = levels; G.have = 0; G.flow = 0; G.hv[0] = G.hv[1] = 0;
 	for (G.scale = 1; G.scale < 8 && w / (uint32_t)G.scale > WORK_MAX; G.scale *= 2) {}
 	G.lw[0] = w / (uint32_t)G.scale; G.lh[0] = h / (uint32_t)G.scale; G.nl = 1;
 	while (G.nl < NL && G.lw[G.nl - 1] / 2 >= 32 && G.lh[G.nl - 1] / 2 >= 16) { G.lw[G.nl] = G.lw[G.nl - 1] / 2; G.lh[G.nl] = G.lh[G.nl - 1] / 2; G.nl++; }
@@ -147,10 +164,13 @@ static int make_all(SDL_GPUDevice *dev, uint32_t w, uint32_t h, uint32_t levels)
 		G.fld[k] = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[k], G.fh[k], 1, S | W);
 	}
 	G.pix = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.lw[0], G.lh[0], 1, S | W);
+	for (int i = 0; i < 2; i++) G.gv[i] = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.lw[0], G.lh[0], 1, S | W);
 	G.stat = tex(dev, SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT, 1, 1, 1, S | W);
 	G.flev = G.nl > 1 ? 1 : 0;
 	G.ffld = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[0], G.fh[0], 1, S | W);
 	G.proj = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[0], G.fh[0], 1, S | W);
+	G.gfld = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[0], G.fh[0], 1, S | W);
+	G.gproj = tex(dev, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, G.fw[0], G.fh[0], 1, S | W);
 	G.gen = tex(dev, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, w, h, levels, S | W | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET);   /* (a colour target: its mips) */
 	if (!G.lin) {
 		SDL_GPUSamplerCreateInfo sci = { .min_filter = SDL_GPU_FILTER_LINEAR, .mag_filter = SDL_GPU_FILTER_LINEAR, .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
@@ -165,7 +185,7 @@ static int make_all(SDL_GPUDevice *dev, uint32_t w, uint32_t h, uint32_t levels)
 
 static void run(SDL_GPUCommandBuffer *cmd, int p, SDL_GPUTexture *const *in, SDL_GPUTexture *out, const U *u, uint32_t w, uint32_t h) {
 	SDL_GPUStorageTextureReadWriteBinding tb = { .texture = out };
-	SDL_GPUTextureSamplerBinding sb[5];
+	SDL_GPUTextureSamplerBinding sb[7];
 	for (int i = 0; i < passes[p].nsamp; i++) sb[i] = (SDL_GPUTextureSamplerBinding){ .texture = in[i], .sampler = G.lin };
 	SDL_PushGPUComputeUniformData(cmd, 0, u, sizeof *u);
 	SDL_GPUComputePass *cp = SDL_BeginGPUComputePass(cmd, &tb, 1, 0, 0);
@@ -176,7 +196,8 @@ static void run(SDL_GPUCommandBuffer *cmd, int p, SDL_GPUTexture *const *in, SDL
 	SDL_EndGPUComputePass(cp);
 }
 
-void fg_forget(void) { G.have = 0; G.flow = 0; }
+void fg_forget(void) { G.have = 0; G.flow = 0; G.hv[0] = G.hv[1] = 0; }
+void fg_vectors(SDL_GPUTexture *mv, uint32_t w, uint32_t h, int flip) { G.mv = w && h ? mv : 0; G.mvw = w; G.mvh = h; G.mvflip = flip; }
 
 void fg_frame(SDL_GPUDevice *dev, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t w, uint32_t h, uint32_t levels) {
 	if (!src || !w || !h) return;
@@ -192,6 +213,13 @@ void fg_frame(SDL_GPUDevice *dev, SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src
 	for (int k = 1; k < G.nl; k++) {
 		U v = { { (int)G.lw[k], (int)G.lh[k], 2, 0 }, { 0 }, { 1.0f / (float)G.lw[k - 1], 1.0f / (float)G.lh[k - 1] } };
 		run(cmd, P_REDUCE, &G.lum[G.cur][k - 1], G.lum[G.cur][k], &v, G.lw[k], G.lh[k]);
+	}
+	G.hv[G.cur] = 0;
+	if (G.mv) {   /* the game's motion for this frame (fg_vectors): UV units, the previous position at x - v.x * W, y + v.y * H in
+		 * the target's rows (dev/mvscore.py), so the motion is (v.x * W, -v.y * H) there; a target upside down from the frame flips y */
+		U g = { { (int)G.lw[0], (int)G.lh[0], G.mvflip }, { 0 }, { 1.0f / (float)G.lw[0], 1.0f / (float)G.lh[0], (float)G.lw[0], G.mvflip ? (float)G.lh[0] : -(float)G.lh[0] }, { (float)G.mvw, (float)G.mvh } };
+		run(cmd, P_GVEC, &G.mv, G.gv[G.cur], &g, G.lw[0], G.lh[0]);
+		G.hv[G.cur] = 1; G.mv = 0;
 	}
 	if (G.have < 2) G.have++;
 	G.flow = 0;
@@ -215,13 +243,23 @@ SDL_GPUTexture *fg_make(SDL_GPUDevice *dev, SDL_GPUCommandBuffer *cmd, float t) 
 		U f = { { (int)G.lw[k], (int)G.lh[k], (int)G.fw[0], (int)G.fh[0] }, { 0, 1 << k, FRADIUS, 0 }, { 1.0f / (float)G.lw[k], 1.0f / (float)G.lh[k], FEXPLAINED, ZERO_BIAS } };
 		SDL_GPUTexture *fin[3] = { G.lum[p][k], G.lum[c][k], G.fld[0] };
 		run(cmd, P_FSEARCH, fin, G.ffld, &f, G.fw[0], G.fh[0]);
+		if (G.hv[c]) {   /* the game's motion per block, to carry like the forward search's */
+			U gf = { { (int)G.fw[0], (int)G.fh[0], (int)G.lw[0], (int)G.lh[0] } };
+			SDL_GPUTexture *gin[2] = { G.gv[c], G.stat };
+			run(cmd, P_GFIELD, gin, G.gfld, &gf, G.fw[0], G.fh[0]);
+		}
 		G.flow = 1;
 	}
 	U pj = { { (int)G.fw[0], (int)G.fh[0] }, { PRADIUS }, { 0, 0, t } };
 	SDL_GPUTexture *pin[2] = { G.ffld, G.stat };
 	run(cmd, P_PROJECT, pin, G.proj, &pj, G.fw[0], G.fh[0]);
-	U u = { { (int)G.lw[0], (int)G.lh[0], (int)G.fw[0], (int)G.fh[0] }, { 0 }, { 1.0f / (float)G.lw[0], 1.0f / (float)G.lh[0], t } };
-	SDL_GPUTexture *in[5] = { G.lum[p][0], G.lum[c][0], G.fld[0], G.proj, G.stat };
+	if (G.hv[c]) {
+		U gp = { { (int)G.fw[0], (int)G.fh[0] }, { GPRADIUS, 1 }, { 0, 0, t } };
+		SDL_GPUTexture *gpin[2] = { G.gfld, G.stat };
+		run(cmd, P_PROJECT, gpin, G.gproj, &gp, G.fw[0], G.fh[0]);
+	}
+	U u = { { (int)G.lw[0], (int)G.lh[0], (int)G.fw[0], (int)G.fh[0] }, { 0, G.hv[c] }, { 1.0f / (float)G.lw[0], 1.0f / (float)G.lh[0], t } };
+	SDL_GPUTexture *in[7] = { G.lum[p][0], G.lum[c][0], G.fld[0], G.proj, G.stat, G.gv[c], G.gproj };   /* (gv[c], gproj bound unread when the frame had no vectors) */
 	run(cmd, P_PICK, in, G.pix, &u, G.lw[0], G.lh[0]);
 	U w = { { (int)G.w, (int)G.h, (int)G.lw[0], (int)G.lh[0] }, { G.scale }, { 1.0f / (float)G.w, 1.0f / (float)G.h, t, CUT } };
 	SDL_GPUTexture *win[4] = { G.col[p], G.col[c], G.pix, G.stat };

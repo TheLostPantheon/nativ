@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The game's own motion at the working size: the renderer's motion pass (gfx_gpu.c, RECOMP_MV) leaves an RG16F target of
+// vectors in UV units, each of the current frame's pixels back to where it was in the previous one. Here each working
+// pixel takes the one at its centre (not filtered: across an object's edge an average is nobody's motion), turned into
+// working pixels from the previous frame to the current one, the way the other passes measure it.
+//   a.xy  working size      a.z  1: the target is upside down from the frame      c.xy  1 / working size
+//   c.zw  each component's scale to working pixels (y's sign: which way the target's rows run)
+//   d.xy  the frame's extent in the target, texels from its corner (the target can be wider than the frame: Borderlands 2's
+//         is 1024 wide for a 960 frame)
+// Out: xy the motion (working pixels), z 1 (a vector the game gave).
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D mv;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D gv;
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= u.a.x || p.y >= u.a.y) return;
+	vec2 uv = (vec2(p) + 0.5) * u.c.xy;
+	if (u.a.z != 0) uv.y = 1.0 - uv.y;
+	ivec2 q = clamp(ivec2(uv * u.d.xy), ivec2(0), textureSize(mv, 0) - 1);
+	imageStore(gv, p, vec4(texelFetch(mv, q, 0).xy * u.c.zw, 1.0, 0.0));
+}

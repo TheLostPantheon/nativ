@@ -665,12 +665,15 @@ void audio_output(int dev, const void *buf, uint32_t bytes) {
  * 60 Hz, 4 on 120 Hz; 1, nothing to make, at the display's own rate). The made frames come first, so the picture is
  * (n-1)/n of a game frame later than without: the price of the smoothness. A late game frame: the newest stays up. */
 static int fg_late;   /* refreshes a new game frame waits behind the made ones (the A/V sync's picture term counts them) */
-static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t w, uint32_t h, uint32_t levels, int fresh) {
+extern void gfx_gpu_frame_gen_vectors(int on);
+/* mv, mw x mh: the game's motion for src when it is fresh (the renderer's motion pass, window_frame_vectors), or 0 */
+static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t w, uint32_t h, uint32_t levels, int fresh, SDL_GPUTexture *mv, uint32_t mw, uint32_t mh) {
 	static int on, since, gaps[8], ngap, phase, n = 1;
-	static int log = -1; static unsigned made, frames; static uint64_t t_log;   /* counted each second (RECOMP_FRAME_GEN_LOG=1 logs them) */
+	static int log = -1; static unsigned made, frames, moved; static uint64_t t_log;   /* counted each second (RECOMP_FRAME_GEN_LOG=1 logs them) */
 	if (log < 0) log = getenv("RECOMP_FRAME_GEN_LOG") != 0;
-	if (!fg_wanted()) { if (on) { fg_forget(); on = 0; metrics_set_frame_gen(0); } fg_late = 0; return src; }
+	if (!fg_wanted()) { if (on) { fg_forget(); on = 0; metrics_set_frame_gen(0); gfx_gpu_frame_gen_vectors(0); } fg_late = 0; return src; }
 	if (!on) { fg_forget(); on = 1; ngap = 0; since = 0; phase = 0; n = 1; }
+	gfx_gpu_frame_gen_vectors(fg_game_motion());   /* (the renderer's motion pass runs while frame generation takes its vectors) */
 	since++;
 	if (fresh) {
 		gaps[ngap++ % 8] = since; since = 0;
@@ -678,14 +681,15 @@ static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src,
 		memcpy(s, gaps, sizeof s);
 		for (int i = 1; i < k; i++) for (int j = i; j > 0 && s[j - 1] > s[j]; j--) { int x = s[j]; s[j] = s[j - 1]; s[j - 1] = x; }
 		n = s[k / 2]; if (n < 1) n = 1; if (n > 4) n = 4;
+		fg_vectors(fg_game_motion() ? mv : 0, mw, mh, 0); if (mv && fg_game_motion()) moved++;
 		fg_frame(gpu, cmd, src, w, h, levels);
 		phase = 0; frames++;
 	}
 	fg_late = n >= 2 ? n - 1 : 0;
 	if (now_us() - t_log > 1000000) {   /* each second: the frames shown, for the fps counters (metrics.c), and RECOMP_FRAME_GEN_LOG=1's cadence */
 		metrics_set_frame_gen(made ? frames + made : 0);
-		if (log) fprintf(stderr, "    framegen: every game frame shown for %d refreshes, %u game frames and %u made in the last second\n", n, frames, made);
-		made = frames = 0; t_log = now_us();
+		if (log) fprintf(stderr, "    framegen: every game frame shown for %d refreshes, %u game frames (%u with the game's motion) and %u made in the last second\n", n, frames, moved, made);
+		made = frames = moved = 0; t_log = now_us();
 	}
 	if (n < 2 || phase >= n - 1) return src;
 	SDL_GPUTexture *g = fg_make(gpu, cmd, (float)(phase + 1) / (float)n);
@@ -698,6 +702,11 @@ static SDL_GPUTexture *frame_gen(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src,
  * present loop shows the latest; three so the one being written is never the one being shown */
 static SDL_GPUTexture *gtex[3]; static uint32_t gtw[3], gth[3]; static int gidx = -1, gshow = -1, gnew;
 static uint32_t gtl[3];   /* each one's mip levels (window_present_gpu: more than one when it is over twice the window's size) */
+/* each slot's motion for frame generation (gfx_gpu.c's fgv_snapshot, through window_frame_vectors): the renderer's RG16F
+ * vectors, gmw x gmh of them covering the frame; ghv 0: none came with it */
+static SDL_GPUTexture *gmv[3]; static uint32_t gmvw[3], gmvh[3], gmw[3], gmh[3]; static int ghv[3];
+static SDL_GPUTexture *pend_mv; static uint32_t pend_w, pend_h, pend_rw, pend_rh;   /* window_frame_vectors' for the next window_present_gpu (the same thread) */
+void window_frame_vectors(void *mv, uint32_t w, uint32_t h, uint32_t rw, uint32_t rh) { pend_mv = mv; pend_w = w; pend_h = h; pend_rw = rw; pend_rh = rh; }
 void window_pixel_size(uint32_t *w, uint32_t *h) { *w = win_pw; *h = win_ph; }
 static uint64_t gready_us[3];   /* when each was handed over (the game's flip, as the GPU backend presents it): RECOMP_LATENCY_LOG */
 static int frames_in_flight = 2;
@@ -780,7 +789,7 @@ void window_present_gpu(void *src, uint32_t w, uint32_t h, int raw) {
 		pthread_mutex_unlock(&lock);
 		int done = osd_round_trip(src, dst, w, h);
 		pthread_mutex_lock(&lock);
-		if (done) { gidx = n; gnew = 1; new_frame = 0; gready_us[n] = now_us(); } else osd = 0;
+		if (done) { gidx = n; gnew = 1; new_frame = 0; gready_us[n] = now_us(); ghv[n] = 0; pend_mv = 0; } else osd = 0;
 	}
 	if (!osd) {
 		SDL_GPUCommandBuffer *cmd = gtex[n] ? SDL_AcquireGPUCommandBuffer(gpu) : 0;
@@ -801,6 +810,23 @@ void window_present_gpu(void *src, uint32_t w, uint32_t h, int raw) {
 			SDL_GPUBlitInfo blit = { .source = { .texture = src, .w = w, .h = h }, .destination = { .texture = gtex[n], .w = w, .h = h }, .load_op = SDL_GPU_LOADOP_DONT_CARE, .filter = SDL_GPU_FILTER_NEAREST };
 			SDL_BlitGPUTexture(cmd, &blit);
 		}
+		ghv[n] = 0;
+		if (cmd && pend_mv) {   /* the frame's motion beside it (frame_gen) */
+			if (gmv[n] && (gmvw[n] != pend_w || gmvh[n] != pend_h)) { SDL_ReleaseGPUTexture(gpu, gmv[n]); gmv[n] = 0; }
+			if (!gmv[n]) {
+				SDL_GPUTextureCreateInfo mci = { .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+					.width = pend_w, .height = pend_h, .layer_count_or_depth = 1, .num_levels = 1, .sample_count = SDL_GPU_SAMPLECOUNT_1 };
+				gmv[n] = SDL_CreateGPUTexture(gpu, &mci); gmvw[n] = pend_w; gmvh[n] = pend_h;
+			}
+			if (gmv[n]) {
+				SDL_GPUCopyPass *mcp = SDL_BeginGPUCopyPass(cmd);
+				SDL_GPUTextureLocation ms = { .texture = (SDL_GPUTexture *)pend_mv }, md = { .texture = gmv[n] };
+				SDL_CopyGPUTextureToTexture(mcp, &ms, &md, pend_w, pend_h, 1, false);
+				SDL_EndGPUCopyPass(mcp);
+				ghv[n] = 1; gmw[n] = pend_rw; gmh[n] = pend_rh;
+			}
+		}
+		pend_mv = 0;
 		if (cmd) {
 			if (gtl[n] > 1) SDL_GenerateMipmapsForGPUTexture(cmd, gtex[n]);
 			SDL_SubmitGPUCommandBuffer(cmd);
@@ -1546,6 +1572,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 		int fresh = 0;   /* a new game frame this refresh (frame generation's cadence) */
 		if (gnew) { gshow = gidx; gnew = 0; fresh = 1; }
 		SDL_GPUTexture *gsrc = gshow >= 0 ? gtex[gshow] : 0; uint32_t gw = gshow >= 0 ? gtw[gshow] : 0, gh = gshow >= 0 ? gth[gshow] : 0, gl = gshow >= 0 ? gtl[gshow] : 1;
+		SDL_GPUTexture *gmvs = gshow >= 0 && ghv[gshow] ? gmv[gshow] : 0; uint32_t gmvw2 = gshow >= 0 ? gmw[gshow] : 0, gmvh2 = gshow >= 0 ? gmh[gshow] : 0;   /* (its motion: frame_gen) */
 		if (have_frame && gpu && ensure_src_texture(pw, ph)) {
 			void *dst = SDL_MapGPUTransferBuffer(gpu, xfer, true);
 			/* the overlay goes on AFTER the game frame, into this upload copy -- never into
@@ -1563,7 +1590,7 @@ void window_run(void *(*fn)(void *), void *arg) {
 			SDL_UploadToGPUTexture(cp, &src, &dst, true);
 			SDL_EndGPUCopyPass(cp);
 		}
-		if (got_swap && swap && gsrc) gsrc = frame_gen(cmd, gsrc, gw, gh, gl, fresh);
+		if (got_swap && swap && gsrc) gsrc = frame_gen(cmd, gsrc, gw, gh, gl, fresh, gmvs, gmvw2, gmvh2);
 		if (got_swap && swap && (gsrc || src_tex)) {
 			/* the 960x544-aspect frame inside the (resizable) window, in whichever aspect mode the
 			 * overlay's Display page picked (present_rect, above: fit/stretch/fill) */
