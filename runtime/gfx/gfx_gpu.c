@@ -3461,7 +3461,10 @@ static void readback_complete(Readback *r) {
 	             || (r->kind == TK_RAW && kind_bytes(TK_RAW) == 8 && r->t.type == 0 && r->t.stride == r->t.width);   /* (target_raw_ok: the bytes as they are) */
 	const uint32_t gbytes = (uint32_t)gfx_target_bpp(&r->t) * npx;
 	float *f = raw ? 0 : malloc(16u * npx);
-	const uint8_t *map = SDL_MapGPUTransferBuffer(gpu(), r->xb, false);
+	/* (no memory for the floats: this copy doesn't land, and the target stays the GPU's -- guest memory keeps its last
+	 * bytes. The machine was out of memory: on Windows a 33 GB analysis beside Resistance, whose present then wrote
+	 * through the null pointer and crashed, 2026-11-24) */
+	const uint8_t *map = raw || f ? SDL_MapGPUTransferBuffer(gpu(), r->xb, false) : 0;
 	if (map) {
 		if (raw) { gwatch_write_begin(r->t.data, gbytes); uint8_t *keep = box_keep(r->t.data, r->t.stride, r->t.height, r->t.type, (uint32_t)gfx_target_bpp(&r->t), r->box);
 		           memcpy(G(r->t.data), map, gbytes); box_put_back(keep, r->t.data, r->t.stride, r->t.height, (uint32_t)gfx_target_bpp(&r->t), r->box); gwatch_write_end(r->t.data, gbytes); }
