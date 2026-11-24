@@ -80,6 +80,18 @@ def is_licence_name(name: str) -> bool:
     return low.endswith(".rif") or (low.startswith("work") and low.endswith(".bin"))
 
 
+def looks_like_licence(path: str) -> bool:
+    """a file of a licence's size whose contents are one, whatever its name: download tools save a PKG's work.bin under
+    its zRIF code, with no extension (a folder's other files of that size don't parse with a title id)"""
+    try:
+        if os.path.getsize(path) not in (RIF.RIF_SIZE, 2 * RIF.RIF_SIZE):
+            return False
+        with open(path, "rb") as f:
+            return _title_like(RIF.parse_rif(f.read(RIF.RIF_SIZE)).title_id)
+    except (OSError, ValueError):
+        return False
+
+
 def import_paths(paths: list[str]) -> list[tuple[str, str, str]]:
     """(status, content id, file) for each licence file at the paths (folders searched, linked ones followed once)."""
     out, seen = [], set()
@@ -93,7 +105,7 @@ def import_paths(paths: list[str]) -> list[tuple[str, str, str]]:
                     continue
                 seen.add(real)
                 dn[:] = [d for d in dn if not d.startswith(".")]
-                files += [os.path.join(dp, f) for f in fn if is_licence_name(f)]
+                files += [os.path.join(dp, f) for f in fn if is_licence_name(f) or looks_like_licence(os.path.join(dp, f))]
         elif os.path.isfile(p):
             files.append(p)
         for f in files:
@@ -231,9 +243,17 @@ def selftest() -> None:
         with open(os.path.join(tmp, "pkgs", "Resistance", "work-1.bin"), "wb") as f:
             f.write(other)
         with open(os.path.join(tmp, "pkgs", "Resistance", "data.bin"), "wb") as f:
-            f.write(other)   # (not a licence's name: not read)
+            f.write(bytes(range(256)) * 2)   # (a licence's size, not one: not taken)
         assert [(s, c) for s, c, _f in import_paths([os.path.join(tmp, "pkgs")])] == [("added", "UP9000-PCSA00008_00-RESISTANCEVITAUS")]
         assert is_licence_name("work (2).bin") and is_licence_name("WORK.BIN") and not is_licence_name("data.bin")
+        # a work.bin saved under its zRIF code (no extension), and a 512-byte file that isn't a licence
+        third = RIF.build_rif("UP9012-PCSE00383_00-BORDERLANDS2PSV1", bytes(range(2, 18)))
+        os.makedirs(os.path.join(tmp, "pkgs2", "Borderlands"))
+        with open(os.path.join(tmp, "pkgs2", "Borderlands", "KO5ifR1dQ+eHBlgaGBpBTTW2MAbZ7"), "wb") as f:
+            f.write(third)
+        with open(os.path.join(tmp, "pkgs2", "Borderlands", "padding"), "wb") as f:
+            f.write(bytes(512))
+        assert [(s, c) for s, c, _f in import_paths([os.path.join(tmp, "pkgs2")])] == [("added", "UP9012-PCSE00383_00-BORDERLANDS2PSV1")]
     print("licenses.py self-test: OK")
 
 
