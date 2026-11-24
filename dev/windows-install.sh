@@ -47,6 +47,19 @@ if [[ "$(cat "$OUT/toolchain/llvm-mingw/.nativ-version" 2>/dev/null)" != "$LM_VE
   mv "$OUT/toolchain/llvm-mingw.tmp/llvm-mingw-$LM_VER-ucrt-x86_64" "$OUT/toolchain/llvm-mingw"; rmdir "$OUT/toolchain/llvm-mingw.tmp"
   echo "$LM_VER" > "$OUT/toolchain/llvm-mingw/.nativ-version"
 fi
+# clang's stack: its program header reserves 16 MB, and the optimiser recursed past that on Borderlands 2's largest
+# generated file (game_part11.c, 23 MB): clang ended without a word and the build stopped. 1 GB reserved, committed only
+# as it is used -- macOS and Linux raise the limit instead (runtime/build.py _roomy_stack). One field of the header, set
+# on every run, so an update fixes an install made before
+"$PYX" - "$OUT/toolchain/llvm-mingw/bin" <<'PY'
+import glob, os, re, struct, sys
+for p in glob.glob(os.path.join(sys.argv[1], "clang-*.exe")):
+    if not re.fullmatch(r"clang-\d+\.exe", os.path.basename(p)): continue   # (the compiler itself; clang.exe is its wrapper)
+    d = bytearray(open(p, "rb").read()); pe, = struct.unpack_from("<I", d, 0x3C); opt = pe + 24
+    if d[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", d, opt)[0] != 0x20B: sys.exit(f"{p}: not a 64-bit Windows program")
+    if struct.unpack_from("<Q", d, opt + 0x48)[0] < 1 << 30:   # (SizeOfStackReserve)
+        struct.pack_into("<Q", d, opt + 0x48, 1 << 30); open(p, "wb").write(d)
+PY
 
 # Python for Windows, and requirements.txt's packages as Windows wheels (pip here picks them for that platform)
 if [[ "$(cat "$OUT/python/.nativ-version" 2>/dev/null)" != "$PY_VER+$PY_REL" ]]; then
