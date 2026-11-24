@@ -41,7 +41,7 @@ player's machine needs nothing else. Each sits in the install with its licence (
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) (macOS) | vulkan-sdk-1.4.363.0 | Apache 2.0 | `toolchain/spirv-cross/share/licenses/` |
 | [Zig](https://ziglang.org), its Clang and LLVM (Linux) | 0.15.2 | MIT; LLVM: Apache 2.0 with LLVM exceptions | `toolchain/zig/` |
 | [zlib](https://zlib.net) (Linux, Windows) | 1.3.1 | zlib | `toolchain/zlib/share/licenses/` |
-| [llvm-mingw](https://github.com/mstorsjo/llvm-mingw), its Clang, LLVM and mingw-w64 (Windows) | 20261006 | ISC; LLVM: Apache 2.0 with LLVM exceptions; mingw-w64: ZPL and public domain | `toolchain/llvm-mingw/` |
+| [llvm-mingw](https://github.com/mstorsjo/llvm-mingw), its Clang, LLVM and mingw-w64 (Windows) | 20261006 | ISC; LLVM: Apache 2.0 with LLVM exceptions; mingw-w64: ZPL and public domain | `toolchain/llvm-mingw/` (one change: the compiler's stack reserve, raised to 1 GB in its program header by `dev/windows-install.sh`) |
 | [AppImage's runtime](https://github.com/AppImage/type2-runtime) (Linux) | 20251108 | MIT; it includes libfuse 3 (LGPL 2.1) and squashfuse (BSD 2-clause) | the start of the `.AppImage` file |
 | [Python](https://www.python.org), from [python-build-standalone](https://github.com/astral-sh/python-build-standalone) | 3.13.17 | PSF, and its parts' own | `python/` |
 | [Capstone](https://www.capstone-engine.org) | 5.0.9 | BSD 3-clause | `python/`, installed by pip with its licence |
