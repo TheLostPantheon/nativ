@@ -82,6 +82,10 @@ static void write_frame(const char *path, uint32_t base, uint32_t w, uint32_t h,
 int main(int argc, char **argv) {
 	if (argc < 2) { fprintf(stderr, "usage: gfxreplay <capture.vfc> [out.ppm]\n"); return 1; }
 	setenv("RECOMP_SHADER_CACHE", "0", 0);   /* gfx_gpu.c's MSL cache is opt-in here (RECOMP_SHADER_CACHE=dir): a replay run from any directory leaves no shader_cache/ behind, and RECOMP_GPU_STATS times real translations */
+	setenv("RECOMP_GPU_NO_READ_WATCH", "1", 1);   /* no game here to read a target on the CPU: the watch saw this loop's own compares of memory
+	 * records against target memory, read those targets back after every scene, and later records then wrote the
+	 * capture's old bytes over this replay's drawing -- on some backends and not others, as timing fell. AC III:
+	 * Liberation's frame_1073 came out 99% different on NVIDIA from Metal, 0.03% without it (2026-11-23) */
 	const char *outp = argc > 2 ? argv[2] : "replay.ppm";
 	recomp_mem = plat_reserve(1ull << 32);
 	if (!recomp_mem) { fprintf(stderr, "can't reserve the 4 GiB guest address space\n"); return 1; }
