@@ -23,6 +23,10 @@ DEST=${1:?usage: macos-install.sh <folder>}; mkdir -p "$DEST"; DEST=$(cd "$DEST"
 APP="$DEST/Project Nativ.app"; OUT="$APP/Contents/Resources"; mkdir -p "$OUT" "$APP/Contents/MacOS"
 MT=${ATIV_MAC_TOOLCHAIN:-$HOME/toolchains/ativ-mac}
 [[ -f $MT/SDL3/lib/libSDL3.0.dylib && -f $MT/spirv-cross/lib/libspirv-cross-c.a ]] || { echo "no Mac toolchain at $MT: run runtime/platform/macos/setup-toolchain.sh"; exit 1; }
+# its FFmpeg built with the decoders its setup script builds today (stamped by it): toolchains built before AAC and MP3
+# were added decoded only H.264, and an install made from one couldn't play a movie with AAC sound (2026-11-24)
+want=$(sed -n 's/^FF_CODECS="\(.*\)"$/\1/p' "$ROOT/runtime/platform/macos/setup-toolchain.sh")
+[[ "$(cut -d' ' -f2- "$MT/ffmpeg/.nativ-codecs" 2>/dev/null)" == "$want" ]] || { echo "$MT's FFmpeg isn't built with today's decoders ($want): run runtime/platform/macos/setup-toolchain.sh again"; exit 1; }
 PYX=${PYTHON:-$ROOT/.venv/bin/python}; [[ -x $PYX ]] || PYX=python3
 
 # the tools

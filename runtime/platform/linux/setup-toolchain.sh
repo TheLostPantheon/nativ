@@ -77,6 +77,11 @@ if [[ ! -f SDL3/lib/libSDL3.so.0 ]]; then
     -DSDL_HIDAPI_LIBUSB=OFF -DSDL_JACK=OFF -DSDL_SNDIO=OFF -DSDL_KMSDRM=OFF -DSDL_RPATH=OFF > sdl-configure.log
   cmake --build sdl-build -j"$(nproc)" > sdl-build.log 2>&1 && cmake --install sdl-build >> sdl-build.log 2>&1
 fi
+# FFmpeg's decoders: the build is stamped with them (ffmpeg/.nativ-codecs) and made again when they change -- AAC and MP3
+# (sceAudiodec, #116) were added after the toolchains of the time were built, and never reached them: every install
+# made from those decoded only H.264, and Assassin's Creed III Liberation's first movie asked for an error code as memory
+FF_CODECS="--enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc"
+[[ "$(cat ffmpeg/.nativ-codecs 2>/dev/null)" == "$FFMPEG $FF_CODECS" ]] || rm -rf ffmpeg
 if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
   rm -rf ffmpeg-src; mkdir ffmpeg-src; tar xJf "dl/ffmpeg-$FFMPEG.tar.xz" -C ffmpeg-src --strip-components 1
   ASM=--disable-x86asm; command -v nasm >/dev/null && ASM=
@@ -85,9 +90,10 @@ if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
   ( cd ffmpeg-src && ./configure --prefix="$D/ffmpeg" --cc="$CC" --cxx="$D/bin/c++" --ar="$D/bin/ar" --ranlib="$D/bin/ranlib" --nm=nm \
       --enable-static --disable-shared --enable-pic --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
       --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-avfilter --disable-debug \
-      --enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc $ASM > ../ffmpeg-configure.log \
+      $FF_CODECS $ASM > ../ffmpeg-configure.log \
     && sed -i 's/^#define HAVE_SYSCTL 1/#define HAVE_SYSCTL 0/' config.h \
-    && make -j"$(nproc)" > ../ffmpeg-build.log 2>&1 && make install >> ../ffmpeg-build.log 2>&1 )
+    && make -j"$(nproc)" > ../ffmpeg-build.log 2>&1 && make install >> ../ffmpeg-build.log 2>&1 \
+    && echo "$FFMPEG $FF_CODECS" > "$D/ffmpeg/.nativ-codecs" )
 fi
 # their licences beside them, as SDL's own install does and zig's folder already has (an install ships these: zlib's and
 # the LGPL ask for the text, and the LGPL for where the source is)

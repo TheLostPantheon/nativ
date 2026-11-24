@@ -22,7 +22,7 @@ esac
 mkdir -p "$D/dl"; cd "$D/dl"
 # a download's sha256 against its pin above, so a tampered or changed archive stops the script
 verify() { local h; h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}'); [[ -n $h ]] || h=$(shasum -a 256 "$1" | awk '{print $1}'); [[ $h == "$2" ]] && return; echo "checksum mismatch: $1 (expected $2, got $h)"; rm -f "$1"; exit 1; }
-fetch() { [[ -f $2 ]] || curl -fL --retry 3 -o "$2.part" "$1" && verify "$2.part" "$3" && mv -f "$2.part" "$2" 2>/dev/null || true; }
+fetch() { [[ -f $2 ]] || { curl -fL --retry 3 -o "$2.part" "$1" && verify "$2.part" "$3" && mv -f "$2.part" "$2"; }; }   # (grouped: a file already here is not checked as a download -- run again, it stopped every time)
 fetch "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW/$ASSET" "$ASSET" "$ASSET_SHA"
 fetch "https://github.com/libsdl-org/SDL/releases/download/release-$SDL/SDL3-devel-$SDL-mingw.tar.gz" "SDL3-devel-$SDL-mingw.tar.gz" "$SDL_SHA"
 fetch "https://github.com/madler/zlib/releases/download/v$ZLIB/zlib-$ZLIB.tar.gz" "zlib-$ZLIB.tar.gz" "$ZLIB_SHA"
@@ -37,6 +37,11 @@ if [[ ! -f zlib/lib/libz.a ]]; then
   ( cd zlib-src && for f in adler32 crc32 deflate infback inffast inflate inftrees trees zutil compress uncompr gzclose gzlib gzread gzwrite; do "$CC" -O2 -c $f.c -o $f.o; done
     "$D/llvm-mingw/bin/llvm-ar" rcs ../zlib/lib/libz.a *.o; cp zlib.h zconf.h ../zlib/include/ )
 fi
+# FFmpeg's decoders: the build is stamped with them (ffmpeg/.nativ-codecs) and made again when they change -- AAC and MP3
+# (sceAudiodec, #116) were added after the toolchains of the time were built, and never reached them: every install
+# made from those decoded only H.264, and Assassin's Creed III Liberation's first movie asked for an error code as memory
+FF_CODECS="--enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc"
+[[ "$(cat ffmpeg/.nativ-codecs 2>/dev/null)" == "$FFMPEG $FF_CODECS" ]] || rm -rf ffmpeg
 if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
   rm -rf ffmpeg-src; mkdir ffmpeg-src; tar xJf "dl/ffmpeg-$FFMPEG.tar.xz" -C ffmpeg-src --strip-components 1
   ASM=--disable-x86asm; command -v nasm >/dev/null && ASM=
@@ -44,7 +49,8 @@ if [[ ! -f ffmpeg/lib/libavcodec.a ]]; then
       --cross-prefix=x86_64-w64-mingw32- --cc=x86_64-w64-mingw32-clang --cxx=x86_64-w64-mingw32-clang++ --ar=llvm-ar --nm=llvm-nm --ranlib=llvm-ranlib \
       --enable-static --disable-shared --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
       --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-avfilter --disable-debug \
-      --enable-decoder=h264 --enable-decoder=aac --enable-decoder=mp3float --enable-parser=h264 --enable-parser=hevc $ASM > ../ffmpeg-configure.log \
-    && PATH="$D/llvm-mingw/bin:$PATH" make -j"$( (nproc || sysctl -n hw.ncpu) 2>/dev/null)" > ../ffmpeg-build.log 2>&1 && PATH="$D/llvm-mingw/bin:$PATH" make install >> ../ffmpeg-build.log 2>&1 )
+      $FF_CODECS $ASM > ../ffmpeg-configure.log \
+    && PATH="$D/llvm-mingw/bin:$PATH" make -j"$( (nproc || sysctl -n hw.ncpu) 2>/dev/null)" > ../ffmpeg-build.log 2>&1 && PATH="$D/llvm-mingw/bin:$PATH" make install >> ../ffmpeg-build.log 2>&1 \
+    && echo "$FFMPEG $FF_CODECS" > "$D/ffmpeg/.nativ-codecs" )
 fi
 echo "toolchain: $D ($("$CC" --version | head -1); SDL3 $SDL; zlib $ZLIB; FFmpeg $FFMPEG $([[ -f ffmpeg/lib/libavcodec.a ]] && echo built || echo MISSING))"
