@@ -277,25 +277,62 @@ def build_image(m, names, linked=None, var_base=VAR_BASE):
     return blocks, var_names
 
 
+class Mem:
+    __slots__ = ("base", "index", "disp")
+
+    def __init__(self, m):
+        self.base, self.index, self.disp = m.base, m.index, m.disp
+
+
+class Op:
+    __slots__ = ("type", "reg", "imm", "mem")
+
+    def __init__(self, o):
+        self.type, self.reg, self.imm = o.type, o.reg, o.imm   # (capstone's union read both ways, as it reads them)
+        self.mem = Mem(o.mem) if o.type == ARM_OP_MEM else None
+
+
+class Ins:
+    """What the analysis reads of a decoded instruction. Capstone's own, with its detail, takes about 4 KB, and every
+    one was kept: Assassin's Creed III Liberation's 13 million needed 54 GB, which stopped the analysis on a 32 GB PC
+    (Windows: out of virtual memory; Linux: killed) and only finished on a Mac by compressing it (2026-11-24)."""
+    __slots__ = ("address", "size", "id", "mnemonic", "op_str", "cc", "operands")
+
+    def __init__(self, i):
+        self.address, self.size, self.id, self.cc = i.address, i.size, i.id, i.cc
+        self.mnemonic, self.op_str = sys.intern(i.mnemonic), i.op_str
+        self.operands = tuple(Op(o) for o in i.operands)
+
+
+_MISSING = object()
+
+
 class Analyser:
+    CACHE = 1 << 18   # decoded instructions kept, twice over: the walk of a function asks again for its own, rarely for others'
+
     def __init__(self, m, text_lo, text_hi):
         self.m, self.lo, self.hi = m, text_lo, text_hi
         self.code = m.mem[text_lo]
         self.th = Cs(CS_ARCH_ARM, CS_MODE_THUMB); self.th.detail = True
         self.arm = Cs(CS_ARCH_ARM, CS_MODE_ARM); self.arm.detail = True
-        self.cache = {}
+        self.cache, self.older = {}, {}   # two generations: the current one, and the one before it (looked in, then promoted)
         self.noreturn = set()   # import stubs that never return
 
     def insn(self, a, arm):
-        k = (a, arm)
-        if k not in self.cache:
-            o = a - self.lo
-            if not (0 <= o < len(self.code) - 1):
-                self.cache[k] = None
-            else:
-                got = next((arm and self.arm or self.th).disasm(bytes(self.code[o:o + 4]), a, 1), None)
-                self.cache[k] = got
-        return self.cache[k]
+        k = a << 1 | (1 if arm else 0)
+        got = self.cache.get(k, _MISSING)
+        if got is _MISSING:
+            got = self.older.get(k, _MISSING)
+            if got is _MISSING:
+                o = a - self.lo
+                got = None
+                if 0 <= o < len(self.code) - 1:
+                    i = next((arm and self.arm or self.th).disasm(bytes(self.code[o:o + 4]), a, 1), None)
+                    got = Ins(i) if i is not None else None
+            if len(self.cache) >= self.CACHE:
+                self.older, self.cache = self.cache, {}
+            self.cache[k] = got
+        return got
 
     def word(self, a):
         o = a - self.lo

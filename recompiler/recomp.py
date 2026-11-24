@@ -21,7 +21,7 @@ has none) -- for a constant a function builds mid-body (a pack's IHOOKS).
 --unordered-loads: plain loads everywhere (A/B only). By default a function that uses exclusives or
 barriers (lock-free code) gets ordered loads (rt.h RD32A...); see SYNC_MN.
 """
-import array, bisect, json, os, re, sys
+import array, bisect, json, os, re, struct, sys
 from capstone import Cs, CS_ARCH_ARM, CS_MODE_THUMB, CS_MODE_ARM
 from capstone.arm import (ARM_OP_REG, ARM_OP_IMM, ARM_OP_MEM, ARM_OP_FP, ARM_SFT_INVALID, ARM_CC_AL, ARM_CC_INVALID)
 B_MN = re.compile(r"b(eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?(\.w|\.n)?$")   # B and its conditions: no bl, bx, blx
@@ -45,6 +45,114 @@ ORDERED_LOADS = [True]   # --unordered-loads clears it
 # recompiled function is a C function, and Sony's longjmp, recompiled, could only return to its caller
 # (every Lua error crashed: Lua 5.1 raises them with longjmp; 2026-10-13)
 SETJMP_STUBS = set()
+
+
+# Decoded instructions, as the translator reads them. Every function's decode is kept to the end (the passes below look
+# across functions before any is written), and capstone's own instruction, with its detail, takes about 4 KB: Assassin's
+# Creed III Liberation's 13 million needed 56 GB (2026-11-24). These keep what is read, and share what repeats (an
+# operand's shift, register lists' operands, mnemonics). Reads of capstone's operand union under another type than the
+# operand's (.mem of a register, .fp of an immediate) give what capstone's would: the union's bytes.
+class _Mem:
+    __slots__ = ("base", "index", "scale", "disp", "lshift")
+
+    def __init__(self, base, index, scale, disp, lshift):
+        self.base, self.index, self.scale, self.disp, self.lshift = base, index, scale, disp, lshift
+
+
+class _Shift:
+    __slots__ = ("type", "value")
+
+    def __init__(self, t, v):
+        self.type, self.value = t, v
+
+
+class _Op:
+    __slots__ = ("type", "reg", "imm", "_fp", "_mem", "shift", "vector_index", "subtracted")
+
+    @property
+    def fp(self):
+        if self._fp is not None:
+            return self._fp
+        lo, hi = (self._mem.base, self._mem.index) if self._mem else (self.reg & 0xffffffff, 0)
+        return struct.unpack("<d", struct.pack("<II", lo, hi))[0]
+
+    @property
+    def mem(self):
+        if self._mem is not None:
+            return self._mem
+        if self._fp is not None:
+            lo, hi = struct.unpack("<II", struct.pack("<d", self._fp))
+            return _Mem(lo, hi, 0, 0, 0)
+        return _Mem(self.reg & 0xffffffff, 0, 0, 0, 0)
+
+
+_shared = {}   # shifts and operands that repeat: one object each (none is ever changed)
+
+
+def _op(o):
+    t, mem = o.type, None
+    if t == ARM_OP_MEM:
+        m = o.mem; mem = (m.base, m.index, m.scale, m.disp, m.lshift)
+    k = (t, o.reg, o.imm, o.fp if t == ARM_OP_FP else None, mem, o.shift.type, o.shift.value, o.vector_index, o.subtracted)
+    p = _shared.get(k)
+    if p is None:
+        p = _Op(); p.type, p.reg, p.imm, p._fp = t, o.reg, o.imm, k[3]
+        p._mem = _Mem(*mem) if mem else None
+        sk = ("shift", k[5], k[6]); p.shift = _shared.get(sk) or _shared.setdefault(sk, _Shift(k[5], k[6]))
+        p.vector_index, p.subtracted = o.vector_index, o.subtracted
+        _shared[k] = p
+    return p
+
+
+class Insn:
+    __slots__ = ("address", "size", "id", "mnemonic", "op_str", "cc", "operands", "update_flags", "writeback", "arm")
+    image = None   # main's code(lo, hi): the bytes decoded, read again where an instruction's own are asked for
+
+    def __init__(self, i, arm):
+        self.address, self.size, self.id, self.cc, self.arm = i.address, i.size, i.id, i.cc, arm
+        self.mnemonic, self.op_str = sys.intern(i.mnemonic), sys.intern(i.op_str)
+        self.operands = tuple(_op(o) for o in i.operands)
+        self.update_flags, self.writeback = i.update_flags, i.writeback
+
+    @property
+    def bytes(self):
+        return bytes(Insn.image(self.address, self.address + self.size))
+
+    def regs_access(self):   # (decoded again: capstone answers it from the whole instruction)
+        return next((md_arm if self.arm else md).disasm(self.bytes, self.address, 1)).regs_access()
+
+    @staticmethod
+    def reg_name(r):
+        return md.reg_name(r)
+
+
+class _Starts:
+    """every decoded instruction's address -> the function it was decoded in (the later one where two have it, as a dict
+    built in that order keeps): two arrays sorted by address, 8 bytes an instruction. The dict of Assassin's Creed III
+    Liberation's 11 million took 2 GB"""
+    def __init__(self, fns):
+        assert len(fns) < 1 << 20
+        keys = [i.address << 20 | n for n, f in enumerate(fns) for i in f.insns]
+        keys.sort()
+        self.fns, self.a, self.f = list(fns), array.array("I"), array.array("I")
+        for k in keys:
+            if self.a and self.a[-1] == k >> 20:
+                self.f[-1] = k & 0xfffff
+            else:
+                self.a.append(k >> 20); self.f.append(k & 0xfffff)
+
+    def _at(self, a):
+        k = bisect.bisect_left(self.a, a)
+        return k if k < len(self.a) and self.a[k] == a else -1
+
+    def __contains__(self, a):
+        return self._at(a) >= 0
+
+    def __getitem__(self, a):
+        k = self._at(a)
+        if k < 0:
+            raise KeyError(a)
+        return self.fns[self.f[k]]
 
 
 class Unsupported(Exception):
@@ -1759,6 +1867,7 @@ def main():
             if s <= lo and hi <= s + len(bb):
                 return bb[lo - s:hi - s]
         return None
+    Insn.image = code
     entries = sorted({v & ~1 for v in d["functions"].values()})
     # body ranges: [first, last byte] (Ghidra), or [first, last, owner entry] (analyze.py, which knows)
     bodies = sorted(tuple(b) for b in d["bodies"])
@@ -1799,7 +1908,7 @@ def main():
             pos = 0
             while c and pos < len(c):
                 got = list(dis.disasm(c[pos:], lo + pos))
-                insns += got
+                insns += [Insn(i, arm_mode) for i in got]
                 pos = (got[-1].address + got[-1].size - lo) if got else pos
                 if pos < len(c) and (not got or got[-1].address + got[-1].size - lo == pos):
                     pos += step
@@ -1923,8 +2032,8 @@ def main():
     # code reached only through a pointer (a callback the module installs for itself) can sit inside
     # what Ghidra made one function: any Thumb code pointer in the image's words that lands on an
     # instruction of a function, not at its entry, gets its own entry (that function, entered there)
-    starts = {i.address: f for f in fns for i in f.insns}
-    arm_starts = {a for a, f in starts.items() if f.arm}
+    starts = _Starts(fns)
+    arm_starts = {i.address for f in fns if f.arm for i in f.insns if starts[i.address].arm}
     alt = set()
     # a word that is itself a decoded ARM instruction holds no pointer, however it looks: an ARM
     # "bhi" encodes as 0x8Axxxxxx, which inside a module loaded at 0x8A000000 reads as a code pointer
@@ -2039,7 +2148,7 @@ def main():
         print(f"{ngap} functions in gaps between Ghidra's bodies (reached through pointers)")
     for a in sorted(set(HOOKS) - {f.entry for f in fns}):   # a typo, or an address that moved: say so now, not after a run shows nothing changed
         print(f"warning: --hooks {a:#x}:{HOOKS[a]} is not a function entry; that hook will never run")
-    insn_addrs = {i.address for f in fns for i in f.insns}
+    insn_addrs = {i.address for f in fns for i in f.insns} if IHOOKS else set()   # (every instruction's: built only to check hooks)
     for a in sorted(set(IHOOKS) - insn_addrs):
         print(f"warning: --insn-hooks {a:#x}:{IHOOKS[a]} is not an instruction of any function; that hook will never run")
     decls = [f"extern void recomp_hook_{n}(Cpu *c);" for n in sorted(set(HOOKS.values()))]
@@ -2070,19 +2179,28 @@ def main():
         while os.path.exists(f"{base}_part{n}.c"): os.remove(f"{base}_part{n}.c"); n += 1
     per = (sum(len(f.insns) for f in fns) // max(nsplit, 1)) + 1
     k = acc = 0
+    # each part is written once it is full, and a function's instructions and lines let go once it is built: the parts
+    # fill in order, and nothing after this reads them. All of Assassin's Creed III Liberation's 1.7 GB of C, held as
+    # lines until the end, was most of its 11.7 GB
+    def write_part(n):
+        write_if_changed(f"{base}_part{n}.c", "\n".join([f'#include "{os.path.basename(base)}.h"', preamble_tag] + parts[n]) + "\n")
+        parts[n] = []
     for f in fns:
         body = f.build()
-        total += len(f.insns)
+        n_insns = len(f.insns)
+        total += n_insns
         bad += f.unimpl
+        f.insns, f.lines, f.prefix = (), [], []
         if nsplit:
             parts[k] += body
-            acc += len(f.insns)
+            acc += n_insns
             if acc >= per and k < nsplit - 1:
+                write_part(k)
                 k, acc = k + 1, 0
         else:
             out += body
-    for n, part in enumerate(parts):
-        write_if_changed(f"{base}_part{n}.c", "\n".join([f'#include "{os.path.basename(base)}.h"', preamble_tag] + part) + "\n")
+    for n in range(k, nsplit):   # (the last part, and any left empty: the build compiles every part file it finds)
+        write_part(n)
     # the import stubs and the functions by address: lists hashed before main() (rt.h RecompAddrMap)
     out.append(f"static const RecompAddrEntry import_list{sfx}[] = {{")
     out += [f'\t{{0x{a:x}u, "{names[a]}"}},' for a in sorted(stubs)]
