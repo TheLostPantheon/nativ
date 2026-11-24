@@ -95,6 +95,10 @@ int main(int argc, char **argv) {
 	char magic[4]; uint32_t version;
 	if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "VFCP", 4) || fread(&version, 4, 1, f) != 1 || version != 1) { fprintf(stderr, "%s: not a capture\n", argv[1]); return 1; }
 	int scenes = 0, draws = 0; uint64_t membytes = 0;
+	/* RECOMP_REPLAY_TIMES=n: the capture n times over, as n frames in a row -- what the renderer learns about a target
+	 * takes effect from its next scene (gfx_gpu.c's raw-word targets), which a single frame's replay never reaches
+	 * (RECOMP_REPLAY_DRAWS counts on through the passes) */
+	const long records = ftell(f); int times = getenv("RECOMP_REPLAY_TIMES") ? atoi(getenv("RECOMP_REPLAY_TIMES")) : 1;
 	if (getenv("RECOMP_REPLAY_WIDEN")) {   /* the HUD layout runs on presented surfaces: a capture's presents noted first (one frame presents after its scenes) */
 		extern void gfx_gpu_hud_note_present(uint32_t base);
 		long start = ftell(f); char t[4]; uint32_t l, p[5];
@@ -302,7 +306,7 @@ int main(int argc, char **argv) {
 			gfx_present(p[0], p[1], p[2], p[3], p[4]);
 			{ extern void gfx_frame_queued(void); gfx_frame_queued(); }   /* (as the display queue's observer: RECOMP_MV's frames) */
 			write_frame(outp, p[0], p[1], p[2], p[3]);
-		} else if (!memcmp(tag, "DONE", 4)) break;
+		} else if (!memcmp(tag, "DONE", 4)) { if (--times > 0 && !fseek(f, records, SEEK_SET)) continue; break; }
 		else { fprintf(stderr, "unknown record %.4s\n", tag); return 1; }
 	}
 	fprintf(stderr, "replayed %d scenes, %d draws (%.1f MB of memory records) -> %s\n", scenes, draws, membytes / 1048576.0, outp);

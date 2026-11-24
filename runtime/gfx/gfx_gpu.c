@@ -1662,7 +1662,8 @@ static void box_put_back(uint8_t *k, uint32_t addr, uint32_t width, uint32_t hei
  * memory round trip copies bytes. Learned at the first such draw (raw_target_note): that scene is drawn as before, the
  * target's next scene is TK_RAW. RECOMP_GPU_NO_RAW=1: RGBA16F as before (an A/B).
  * Not for good: a raw-word target can't blend on the GPU (a blended or FRAGCOLOR draw into one goes to the software path),
- * so the first such draw makes it RGBA16F again from its next scene (float_target_note) -- Need for Speed Most Wanted's
+ * so the first such draw that writes colours makes it RGBA16F again from its next scene (float_target_note; one that
+ * reads and writes raw words, Resistance's G-buffer decals, keeps it raw) -- Need for Speed Most Wanted's
  * 640x368 scene buffer took one raw-word draw while loading and then ran every frame's ~70 blended draws on the CPU, 9 fps
  * (2026-11-22). A target that changes its mind more than twice stays RGBA16F (raw words lose only NaN-patterned halves
  * there; blending stays on the GPU); one RECOMP_GPU_RAW_TARGETS names stays raw. */
@@ -6044,8 +6045,14 @@ void gfx_gpu_draw(const GfxDraw *d) {
 	static int gpu_fetch = -1; if (gpu_fetch < 0) gpu_fetch = getenv("RECOMP_GPU_NO_FETCH") == 0;
 	if (fl && fl->frag_color_used && !gpu_fetch) { soft_fallback(d, "framebuffer colour (FRAGCOLOR)"); return; }
 	if (scene_entry->kind == TK_F16 && usse_frag_raw_color(fl)) raw_target_note(scene_entry, d->fprog);
-	/* a raw-word target holds words, not colours: nothing to blend with or read back as one (this scene: from its next, RGBA16F again) */
-	if (scene_entry->kind == TK_RAW && ((fl && fl->frag_color_used) || (d->blend.present && (d->blend.color_func || d->blend.alpha_func)))) { float_target_note(scene_entry, d->fprog); soft_fallback(d, "a blend into a raw-word target"); return; }
+	/* a raw-word target holds words, not colours: nothing to blend with or read back as one. A draw that writes colours
+	 * into it (Need for Speed's blends) makes it RGBA16F again from its next scene; one that reads the words and writes
+	 * words back doesn't: Resistance's G-buffer decals (fragment 0x17205de0, the framebuffer's words through bitwise ops)
+	 * turned its G-buffer RGBA16F for good, and every colour word that reads as a NaN came back as 0x7E00 (green specks) */
+	if (scene_entry->kind == TK_RAW && ((fl && fl->frag_color_used) || (d->blend.present && (d->blend.color_func || d->blend.alpha_func)))) {
+		if (!usse_frag_raw_color(fl)) float_target_note(scene_entry, d->fprog);
+		soft_fallback(d, "a blend into a raw-word target"); return;
+	}
 	__atomic_add_fetch(&n_gpu_draws, 1, __ATOMIC_RELAXED); n_gpu_indices += d->count;
 	t_setup += us_now() - td0;
 	uint64_t tsh0 = us_now();
