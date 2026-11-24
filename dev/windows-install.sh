@@ -2,7 +2,7 @@
 # A self-contained Windows install of Project Nativ in one folder, made on macOS or Linux: windows-install.sh <folder>
 #   <folder>/                   the shipped tools (vitarecomp dist: pipeline, runtime, packs, ...) and version.txt
 #   <folder>/toolchain/         llvm-mingw for Windows hosts (the compiler a game build runs on the player's PC), SDL3,
-#                               zlib and FFmpeg's H.264 decoder built for Windows (runtime/platform/win/setup-toolchain.sh's,
+#                               zlib and FFmpeg's H.264, AAC and MP3 decoders built for Windows (runtime/platform/win/setup-toolchain.sh's,
 #                               without its downloads and build trees), each with its licence
 #   <folder>/python/            python-build-standalone for Windows, requirements.txt's packages in its site-packages
 #   <folder>/Project Nativ.exe  the launcher, SDL3.dll beside it; it finds the folder from where it sits
@@ -21,6 +21,10 @@ H=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$H")
 OUT=${1:?usage: windows-install.sh <folder>}; mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 WT=${ATIV_WIN_TOOLCHAIN:-$HOME/toolchains/ativ-win}
 [[ -f $WT/SDL3/x86_64-w64-mingw32/bin/SDL3.dll && -f $WT/ffmpeg/lib/libavcodec.a && -f $WT/zlib/lib/libz.a ]] || { echo "no Windows cross toolchain at $WT: run runtime/platform/win/setup-toolchain.sh"; exit 1; }
+# its FFmpeg built with the decoders its setup script builds today (stamped by it): toolchains built before AAC and MP3
+# were added decoded only H.264, and an install made from one couldn't play a movie with AAC sound (2026-11-24)
+want=$(sed -n 's/^FF_CODECS="\(.*\)"$/\1/p' "$ROOT/runtime/platform/win/setup-toolchain.sh")
+[[ "$(cut -d' ' -f2- "$WT/ffmpeg/.nativ-codecs" 2>/dev/null)" == "$want" ]] || { echo "$WT's FFmpeg isn't built with today's decoders ($want): run runtime/platform/win/setup-toolchain.sh again"; exit 1; }
 PYX=${PYTHON:-$ROOT/.venv/bin/python}; [[ -x $PYX ]] || PYX=python3
 DL=$WT/dl; mkdir -p "$DL"
 verify() { local h; h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}'); [[ -n $h ]] || h=$(shasum -a 256 "$1" | awk '{print $1}'); [[ $h == "$2" ]] && return; echo "checksum mismatch: $1 (expected $2, got $h)"; rm -f "$1"; exit 1; }
@@ -38,7 +42,7 @@ mkdir -p "$OUT/toolchain/zlib/share/licenses" "$OUT/toolchain/ffmpeg/share/licen
 cp "$WT/zlib-src/LICENSE" "$OUT/toolchain/zlib/share/licenses/LICENSE"
 cp "$WT/ffmpeg-src/LICENSE.md" "$WT/ffmpeg-src/COPYING.LGPLv2.1" "$OUT/toolchain/ffmpeg/share/licenses/"
 FV=$(cat "$WT/ffmpeg-src/VERSION" 2>/dev/null || cat "$WT/ffmpeg-src/RELEASE")
-printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/win/setup-toolchain.sh with only the H.264 decoder\n' "$FV" "$FV" > "$OUT/toolchain/ffmpeg/share/licenses/SOURCE"
+printf 'FFmpeg %s (LGPL 2.1 or later), unmodified: https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\nbuilt by runtime/platform/win/setup-toolchain.sh with only the H.264, AAC and MP3 decoders\n' "$FV" "$FV" > "$OUT/toolchain/ffmpeg/share/licenses/SOURCE"
 if [[ "$(cat "$OUT/toolchain/llvm-mingw/.nativ-version" 2>/dev/null)" != "$LM_VER" ]]; then
   A=llvm-mingw-$LM_VER-ucrt-x86_64.zip
   fetch "$A" "https://github.com/mstorsjo/llvm-mingw/releases/download/$LM_VER/$A" "$LM_SHA"
