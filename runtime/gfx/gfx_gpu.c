@@ -1810,7 +1810,11 @@ static int want_rscale_x(int n) {
  * presentation and now and then with vsync: the RTX laptop's driver (617.42) reported an invalid write inside another
  * 64 MB image while that copy ran (VK_LAYER_LUNARG_crash_diagnostic, 3 of 3 dumps), with validation and sync validation
  * clean. As a blit: 0 losses in 17 runs, and byte-identical frames (frame_4739 replayed at 3x, 2026-10-26). Metal keeps
- * the copy. RECOMP_GPU_FETCH_BLIT=0|1 picks. */
+ * the copy. RECOMP_GPU_FETCH_BLIT=0|1 picks.
+ * Not for a target whose texels are words rather than colours (TK_F32, TK_RAW: BatchEvent.exact): a blit passes them
+ * through as floats, and RADV changes some on the way (likely denormals flushed). Assassin's Creed III: Liberation's
+ * puddles read its F32F32 scene buffer, two halves a word, and drew as dark slabs on the Radeon 890M only: 3.4% of
+ * frame_13655 off, 0.06% with the copy; NVIDIA's blit kept the words (2026-11-23). */
 static int fetch_blit(void) {
 	static int v = -1;
 	if (v < 0) { const char *e = getenv("RECOMP_GPU_FETCH_BLIT"), *dv = gpu() ? SDL_GetGPUDeviceDriver(gpu()) : 0; v = e && *e ? *e != '0' : dv && !strcmp(dv, "vulkan"); }
@@ -4358,7 +4362,7 @@ typedef struct {
 /* between draws pos-1 and pos: the FRAGCOLOR copy of src into dst (view 0; the region (x, y, w, h): the draw's
  * scissor rectangle, all its fragments can read), or a view pass of src into dst (hoisted: a view of another
  * scene's target, put at pos 0 ahead of the scene's first render pass -- see batch_add_view). Kept sorted by pos. */
-typedef struct { int pos, view, from_depth, hoisted, job; SDL_GPUTexture *src, *dst; uint32_t x, y, w, h; ViewU u; } BatchEvent;   /* job: a FRAGCOLOR copy's extent still being measured (fjobs[job - 1], fetch_join) */
+typedef struct { int pos, view, from_depth, hoisted, job, exact; SDL_GPUTexture *src, *dst; uint32_t x, y, w, h; ViewU u; } BatchEvent;   /* job: a FRAGCOLOR copy's extent still being measured (fjobs[job - 1], fetch_join); exact: a byte copy even where fetch_blit (the target's texels are words) */
 static struct {
 	BatchDraw *d; int n, cap;
 	BatchEvent *ev; int nev, evcap;
@@ -4781,7 +4785,7 @@ static void batch_flush_body(const char *why) {
 		if (e == batch.nev) break;
 		BatchEvent *ev = &batch.ev[e];
 		if (ev->view) view_pass(cmd, ev->dst, ev->src, ev->from_depth, &ev->u);
-		else if (fetch_blit()) {   /* the same copy as a blit (fetch_blit: Vulkan) */
+		else if (fetch_blit() && !ev->exact) {   /* the same copy as a blit (fetch_blit: Vulkan) */
 			SDL_GPUBlitInfo bl = { .source = { .texture = ev->src, .x = ev->x, .y = ev->y, .w = ev->w, .h = ev->h }, .destination = { .texture = ev->dst, .x = ev->x, .y = ev->y, .w = ev->w, .h = ev->h }, .load_op = SDL_GPU_LOADOP_LOAD, .filter = SDL_GPU_FILTER_NEAREST };
 			SDL_BlitGPUTexture(cmd, &bl);
 		} else {   /* the framebuffer copy the next draw's FRAGCOLOR reads: the colour target as every earlier draw left it */
@@ -6330,6 +6334,7 @@ void gfx_gpu_draw(const GfxDraw *d) {
 		int cw = (sx1 - sx0) * scene_sx, ch = (sy1 - sy0) * scene_sy;
 		if (cw > 0 && ch > 0) {
 			BatchEvent *e = batch_event(); e->src = scene_entry->color; e->dst = scene_entry->fetch_copy; e->x = (uint32_t)(sx0 * scene_sx); e->y = (uint32_t)(sy0 * scene_sy); e->w = (uint32_t)cw; e->h = (uint32_t)ch;
+			e->exact = scene_entry->kind == TK_F32 || scene_entry->kind == TK_RAW;   /* words, not colours (fetch_blit) */
 			n_batch_fetch++; fetch_ev = batch.nev - 1;
 		}
 	}
