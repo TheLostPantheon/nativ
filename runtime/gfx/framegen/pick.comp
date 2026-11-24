@@ -7,7 +7,13 @@
 // (project.comp): taken when it agrees better, or as well (within TIE) and is further from the scene's mean motion than
 // the pick so far -- a thin object moving over a flat background matches "still" just as well as its own motion (the
 // background is the same either way), and is in front of it; a HUD over a moving scene keeps zero by the same rule.
-//   a.xy  working size      a.zw  field size (blocks)      c.xy  1 / working size      c.z  t
+// Then the game's own motion where the renderer gave it (gvec.comp, and gproj: carried to t like the forward motion): its
+// vector here wins whenever the frames agree on it about as well (GTIE) -- in flat snow and sky, and over repeating
+// patterns, the frames agree on many vectors and the measured one is a guess; the game's is the motion. Not where standing
+// still matches exactly (a still HUD drawn over the scene), not over a carried pick, and not where something in front lands
+// here at t. Where it plainly disagrees (a particle or a reflection the motion pass doesn't draw) the measured pick stays.
+// The carried game motion is taken as the forward motion is.
+//   a.xy  working size      a.zw  field size (blocks)      b.y  1: the game's motion is bound      c.xy  1 / working size      c.z  t
 // Out: xy the vector (working pixels), z the agreement it had.
 #include "common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -16,7 +22,11 @@ layout(set = 0, binding = 1) uniform sampler2D cur;
 layout(set = 0, binding = 2) uniform sampler2D fld;
 layout(set = 0, binding = 3) uniform sampler2D proj;
 layout(set = 0, binding = 4) uniform sampler2D stat;
+layout(set = 0, binding = 5) uniform sampler2D gv;
+layout(set = 0, binding = 6) uniform sampler2D gproj;
 #define TIE 0.004
+#define GTIE 0.01
+#define EXACT 0.0005   /* a difference this small is the same pixels (8-bit frames: under a step in 9 samples) */
 layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D pix;
 vec2 P; float T;
 float cost(vec2 v) {
@@ -46,14 +56,37 @@ void main() {
 		c = cost(v);
 		if (c < bc) { bc = c; best = v; raw = c; }
 	}
-	/* the forward motion carried here (the tie against the pick's own difference: the biases above are for ties among
-	 * the symmetric ones). Only the block's own: its neighbours' as well filled a thin object's gaps a little more but
-	 * cost the HUD and moving edges more than that (framegen_test) */
+	/* the forward motion carried here, the measured (proj) and, after the game's own below, the game's (gproj): taken when
+	 * it agrees better, or as well (the tie against the pick's own difference: the biases above are for ties among the
+	 * symmetric ones) and is further from the scene's mean motion -- in front. Only the block's own: its neighbours' as well
+	 * filled a thin object's gaps a little more but cost the HUD and moving edges more than that (framegen_test) */
+	vec2 mean = texelFetch(stat, ivec2(0), 0).gb; bool carried = false;
 	vec4 pj = texelFetch(proj, clamp(b, ivec2(0), hi), 0);
 	if (pj.z > 0.5 && pj.xy != best) {
-		vec2 mean = texelFetch(stat, ivec2(0), 0).gb;
 		float cp = cost(pj.xy);
-		if (cp < bc || (cp <= raw + TIE && dot(pj.xy - mean, pj.xy - mean) > dot(best - mean, best - mean))) { bc = cp; best = pj.xy; raw = cp; }
+		if (cp < bc || (cp <= raw + TIE && dot(pj.xy - mean, pj.xy - mean) > dot(best - mean, best - mean))) { bc = cp; best = pj.xy; raw = cp; carried = true; }
+	}
+	/* the game's motion: given at the current frame's pixels, so read where this one's content is in the current frame
+	 * (one step: the vector here, then the one where it points). It wins ties (GTIE), but not over standing still where
+	 * that matches exactly: a HUD drawn over the scene is the same pixels in both frames, and the scene's vector under it
+	 * matches as well (both frames' samples land on the scene behind a thin stroke) -- Borderlands 2's subtitles came out
+	 * torn and its bars smeared; moving scenery never matches still exactly, flat snow included. Nor where something in
+	 * front of it lands here at t (gproj: carried from the current frame, further from the mean motion): there the
+	 * current frame shows the background a thin object has just left, and its vector is the background's */
+	if (u.b.y != 0) {
+		vec4 gp = texelFetch(gproj, clamp(b, ivec2(0), hi), 0);
+		ivec2 whi = u.a.xy - 1;
+		vec2 g = texelFetch(gv, p, 0).xy;
+		g = texelFetch(gv, clamp(ivec2(floor(P + 0.5 + (1.0 - T) * g)), ivec2(0), whi), 0).xy;
+		bool covered = gp.z > 0.5 && dot(gp.xy - mean, gp.xy - mean) > dot(g - mean, g - mean) + 1.0;
+		if (rz > EXACT && !covered && g != best && g != vec2(0.0)) {   /* (zero: still, or nothing the motion pass drew -- the sky; zero is tried above) */
+			float cg = cost(g);
+			if (carried ? cg < bc : cg <= raw + GTIE) { bc = cg; best = g; raw = cg; }
+		}
+		if (gp.z > 0.5 && gp.xy != best) {   /* (the HUD keeps still: it is further from the mean than the scene carried under it) */
+			float cp = cost(gp.xy);
+			if (cp < bc || (cp <= raw + TIE && dot(gp.xy - mean, gp.xy - mean) > dot(best - mean, best - mean))) { bc = cp; best = gp.xy; raw = cp; }
+		}
 	}
 	imageStore(pix, p, vec4(best, bc, 0.0));
 }

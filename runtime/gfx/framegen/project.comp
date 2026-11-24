@@ -4,7 +4,8 @@
 // searched blocks of fsearch.comp (the same grid) whose content lands on it at t -- a block at c moving by f is at c + t*f
 // then -- and of those, the one whose motion differs most from the scene's mean (the background moves with the mean;
 // what lands on top of it is in front of it). That vector is a candidate pick.comp tries beside the symmetric ones.
-//   a.xy  the field's size (blocks)      b.x  radius (blocks)      c.z  t
+// b.y 1: the blocks are the current frame's instead (the game's motion, gfield.comp): at c - (1-t)*f at t.
+//   a.xy  the field's size (blocks)      b.x  radius (blocks)      b.y  1: current-frame blocks      c.z  t
 // Out: xy the vector (working pixels), z 1 when a searched block lands here.
 #include "common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -21,7 +22,7 @@ void main() {
 		ivec2 s = b + ivec2(i, j);
 		if (s.x < 0 || s.y < 0 || s.x > hi.x || s.y > hi.y) continue;
 		vec4 e = texelFetch(ffld, s, 0); if (e.z < 0.5) continue;   /* (explained by the symmetric field: nothing to carry) */
-		vec2 f = e.xy, at = vec2(s * 4) + 2.0 + u.c.z * f;   /* where the searched block's centre is at t */
+		vec2 f = e.xy, at = vec2(s * 4) + 2.0 + (u.b.y != 0 ? (u.c.z - 1.0) : u.c.z) * f;   /* where the block's centre is at t */
 		if (abs(at.x - c.x) > 2.0 || abs(at.y - c.y) > 2.0) continue;   /* (it covers this block's centre) */
 		float d = dot(f - mean, f - mean);
 		if (d > far) { far = d; best = f; found = 1.0; }

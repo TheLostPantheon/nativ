@@ -161,7 +161,8 @@ has a menu with that game's own options. Some worth knowing:
 - **Frame rate**: 30 or 60. 60 is experimental: parts of a game timed in fixed 1/30 second steps can run fast.
 - **Frame generation** (off by default): on a display that refreshes faster than the game draws (a 30 fps game on a 60 Hz
   screen, or 60 fps on 120 Hz), it shows a frame made between each two of the game's, for smoother motion. The frames
-  are made from the finished pictures alone, so it works in any game, and a still HUD stays sharp. The game's own frames
+  are made from the finished pictures, so it works in any game, and a still HUD stays sharp; where the renderer can tell
+  how the game's 3D scene moved, that motion is used too, which keeps turns and flat ground cleaner. The game's own frames
   show a little later (17 ms on a 60 Hz screen), so leave it off where reactions matter most. Fast motion, or something
   appearing suddenly, can leave a faint smear in a made frame, and a thin thing moving fast (a pole in a quick turn) can
   flicker. The frame rate counters show the game's own frames, with the frames shown beside them ("frame gen 120").

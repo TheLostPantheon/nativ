@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The game's motion (gvec.comp) per block of the finest field (4x4 working pixels), for project.comp to carry to the made
+// frame's time: of the block's 16, the one furthest from the scene's mean motion, so an object thinner than a block (a post,
+// a pole) keeps its own motion instead of the background's around it.
+//   a.xy  the field's size (blocks)      a.zw  working size
+// Out: xy the vector (working pixels), z 1 (a block to carry).
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D gv;
+layout(set = 0, binding = 1) uniform sampler2D stat;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D gfld;
+void main() {
+	ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+	if (b.x >= u.a.x || b.y >= u.a.y) return;
+	vec2 mean = texelFetch(stat, ivec2(0), 0).gb, best = vec2(0.0); float far = -1.0;
+	ivec2 hi = u.a.zw - 1;
+	for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {
+		vec2 g = texelFetch(gv, min(b * 4 + ivec2(i, j), hi), 0).xy;
+		float d = dot(g - mean, g - mean);
+		if (d > far) { far = d; best = g; }
+	}
+	imageStore(gfld, b, vec4(best, 1.0, 0.0));
+}
