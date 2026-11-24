@@ -233,7 +233,7 @@ def scan(root: str, packs: str, dumps: str, firmware: str, import_licences: bool
                     found.append((kind, "pkg", title, version, name, p, cid))
                 elif low.endswith(".pup"):
                     found.append(("firmware", "pup", "", pup_version(p), "PS Vita system software", p, ""))
-                elif low == "work.bin" or low.endswith(".rif"):
+                elif LIC.is_licence_name(fn):   # (a renamed work.bin too: work-1.bin beside its PKG, as a browser saves a second)
                     cid = licence_content_id(p)
                     if cid:
                         licences.setdefault(cid, p)

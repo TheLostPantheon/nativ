@@ -74,8 +74,10 @@ def kept() -> list[str]:
 
 
 def is_licence_name(name: str) -> bool:
+    """a .rif, or a work.bin -- a copy the browser or the system renamed too (work-1.bin, "work (2).bin"); the contents
+    decide whether it is one (add_bytes)"""
     low = name.lower()
-    return low == "work.bin" or low.endswith(".rif")
+    return low.endswith(".rif") or (low.startswith("work") and low.endswith(".bin"))
 
 
 def import_paths(paths: list[str]) -> list[tuple[str, str, str]]:
@@ -223,6 +225,15 @@ def selftest() -> None:
             f.write(fake)
         assert [s for s, _c, _f in import_paths([dupe_path])] == ["known"]
         assert kept() == ["UP9000-PCSA00107_00-KZV0000000000000"]
+        # a work.bin the browser renamed beside its PKG (a second download: work-1.bin), and a game's other .bin files
+        other = RIF.build_rif("UP9000-PCSA00008_00-RESISTANCEVITAUS", bytes(range(1, 17)))
+        os.makedirs(os.path.join(tmp, "pkgs", "Resistance"))
+        with open(os.path.join(tmp, "pkgs", "Resistance", "work-1.bin"), "wb") as f:
+            f.write(other)
+        with open(os.path.join(tmp, "pkgs", "Resistance", "data.bin"), "wb") as f:
+            f.write(other)   # (not a licence's name: not read)
+        assert [(s, c) for s, c, _f in import_paths([os.path.join(tmp, "pkgs")])] == [("added", "UP9000-PCSA00008_00-RESISTANCEVITAUS")]
+        assert is_licence_name("work (2).bin") and is_licence_name("WORK.BIN") and not is_licence_name("data.bin")
     print("licenses.py self-test: OK")
 
 
