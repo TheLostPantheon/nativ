@@ -48,6 +48,25 @@ DARWIN = platform.system() == "Darwin"
 _print_lock = threading.Lock()
 
 
+def _roomy_stack():
+    """the compilers' stack: as much as the hard limit allows, up to 1 GB (they inherit it). Linux gives a process 8 MB, and
+    clang 23 ran out of it on one of Borderlands 2's generated files (game_part11.c, 22 MB): a SIGSEGV with no message, the
+    vectorizer-free retry the same, 73 s and done with the limit raised (2026-11-23). macOS's hard limit is 64 MB"""
+    try:
+        import resource
+    except ImportError:   # (Windows)
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        want = 1 << 30 if hard == resource.RLIM_INFINITY else min(1 << 30, hard)
+        if soft != resource.RLIM_INFINITY and soft < want: resource.setrlimit(resource.RLIMIT_STACK, (want, hard))
+    except (ValueError, OSError):
+        pass
+
+
+_roomy_stack()
+
+
 def say(s):
     with _print_lock: print(s, flush=True)
 

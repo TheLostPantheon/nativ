@@ -9,6 +9,9 @@
  * env:   RECOMP_LOG=n   print the first n import calls in full (default 400)
  *        RECOMP_LOG_FROM=n   and every call from the n-th on
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* glibc: dladdr and Dl_info (the NaN and bad-call reports below), before any header */
+#endif
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
