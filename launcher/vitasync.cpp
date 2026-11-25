@@ -333,11 +333,15 @@ std::vector<Vita> find(int ms, bool sweep) {
 	std::string last = get("vita_addr");
 	if (!last.empty() && inet_pton(AF_INET, last.c_str(), &a.sin_addr) == 1) sendto(s, "NSYNC1?", 7, 0, (struct sockaddr *)&a, sizeof a);
 	uint32_t me = sweep ? own_address() : 0;
-	if (me && (me >> 24) != 127)
+	if (me && (me >> 24) != 127) {
+		/* (Linux keeps each probe to an empty address in the send buffer while ARP gives up on it, about 3 s: the default
+		 *  buffer fills before the /24 is through and sendto waits. Asking for more doubles it, which holds them all.) */
+		int big = 1 << 20; setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&big, sizeof big);
 		for (uint32_t h = 1; h < 255; h++) {
 			uint32_t to = (me & 0xFFFFFF00u) | h; if (to == me) continue;
 			a.sin_addr.s_addr = htonl(to); sendto(s, "NSYNC1?", 7, 0, (struct sockaddr *)&a, sizeof a);
 		}
+	}
 	auto t0 = std::chrono::steady_clock::now();
 	for (;;) {
 		int left = ms - (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
