@@ -310,7 +310,20 @@ static bool recv_line(sock_t s, std::string &l) {
 }
 static bool send_line(sock_t s, const std::string &l) { std::string x = l + "\n"; return send_all(s, x.data(), x.size()); }
 
-std::vector<Vita> find(int ms) {   /* broadcast, and the paired Vita's last address directly (some networks drop broadcasts) */
+static uint32_t own_address(void) {   /* this computer's address on the network it reaches the internet by (host order), or 0 */
+	sock_t s = socket(AF_INET, SOCK_DGRAM, 0); if (s == BAD_SOCK) return 0;
+	struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons(9);
+	inet_pton(AF_INET, "8.8.8.8", &a.sin_addr);   /* (a UDP connect only picks the route: nothing is sent) */
+	socklen_t n = sizeof a; uint32_t r = 0;
+	if (connect(s, (struct sockaddr *)&a, sizeof a) == 0 && getsockname(s, (struct sockaddr *)&a, &n) == 0) r = ntohl(a.sin_addr.s_addr);
+	close_sock(s);
+	return r;
+}
+
+/* Broadcast, and the paired Vita's last address directly. With `sweep`, every other address of this computer's /24 too:
+ * a firewall on this computer (ufw, firewalld) drops the Vita's answer to a broadcast, as it isn't an answer to anything
+ * sent to the Vita's own address, and some networks drop broadcasts altogether. */
+std::vector<Vita> find(int ms, bool sweep) {
 	std::vector<Vita> out;
 	sock_t s = socket(AF_INET, SOCK_DGRAM, 0); if (s == BAD_SOCK) return out;
 	int one = 1; setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof one);
@@ -319,6 +332,16 @@ std::vector<Vita> find(int ms) {   /* broadcast, and the paired Vita's last addr
 	sendto(s, "NSYNC1?", 7, 0, (struct sockaddr *)&a, sizeof a);
 	std::string last = get("vita_addr");
 	if (!last.empty() && inet_pton(AF_INET, last.c_str(), &a.sin_addr) == 1) sendto(s, "NSYNC1?", 7, 0, (struct sockaddr *)&a, sizeof a);
+	uint32_t me = sweep ? own_address() : 0;
+	if (me && (me >> 24) != 127) {
+		/* (Linux keeps each probe to an empty address in the send buffer while ARP gives up on it, about 3 s: the default
+		 *  buffer fills before the /24 is through and sendto waits. Asking for more doubles it, which holds them all.) */
+		int big = 1 << 20; setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&big, sizeof big);
+		for (uint32_t h = 1; h < 255; h++) {
+			uint32_t to = (me & 0xFFFFFF00u) | h; if (to == me) continue;
+			a.sin_addr.s_addr = htonl(to); sendto(s, "NSYNC1?", 7, 0, (struct sockaddr *)&a, sizeof a);
+		}
+	}
 	auto t0 = std::chrono::steady_clock::now();
 	for (;;) {
 		int left = ms - (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -426,7 +449,10 @@ static bool connect_vita(Conn &c, int ms) {   /* the last address, else where th
 	std::string addr = get("vita_addr");
 	if (!addr.empty() && c.open(addr, ms)) return true;
 	if (c.err == "unpaired") return false;
-	for (auto &v : find(std::min(ms, 1500))) if (v.id == get("vita_id")) {   /* (it moved: DHCP) */
+	static std::atomic<long long> swept{0};   /* (the /24 asked at most every five minutes: the worker tries every 30 s while the Vita is away) */
+	long long now = (long long)std::time(nullptr), was = swept.load();
+	bool sweep = now - was >= 300 && swept.compare_exchange_strong(was, now);
+	for (auto &v : find(std::min(ms, 1500), sweep)) if (v.id == get("vita_id")) {   /* (it moved: DHCP) */
 		if (v.addr != addr) set("vita_addr", v.addr);
 		return v.addr != addr && c.open(v.addr, ms);
 	}

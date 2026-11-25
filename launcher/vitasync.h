@@ -27,7 +27,7 @@ void set_enabled(bool on);
 bool game_on(const std::string &id);
 void set_game_on(const std::string &id, bool on);
 
-std::vector<Vita> find(int ms);                                   /* (blocking) */
+std::vector<Vita> find(int ms, bool sweep = true);                 /* (blocking; sweep: each address of this computer's /24 asked too) */
 std::string pair(const Vita &v, const std::string &code);         /* "" when paired, else why not (blocking) */
 void unpair();
 

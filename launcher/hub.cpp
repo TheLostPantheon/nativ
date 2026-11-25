@@ -1429,7 +1429,7 @@ static struct { std::atomic<bool> busy{false}; std::mutex m; std::vector<vsync::
 static void vita_sync_page(void) {
 	const float em = ImGui::GetFontSize();
 	if (!vsync::paired()) {
-		ui::row("Vita sync", "Your saves kept the same on your PS Vita and here: a game syncs before it starts and after it closes, on either side, and asks only when both changed. Your Vita needs Nativ Sync (VitaDB) and the same network as this computer.");
+		ui::row("Vita sync", "Your saves kept the same on your PS Vita and here: a game syncs before it starts and after it closes, on either side, and asks only when both changed. Your Vita needs the Nativ Sync app (the player guide says where to get it) and the same network as this computer.");
 		std::vector<vsync::Vita> found; bool searched; int pick; std::string msg;
 		{ std::lock_guard<std::mutex> l(g_vpair.m); found = g_vpair.found; searched = g_vpair.searched; pick = g_vpair.pick; msg = g_vpair.msg; }
 		ImGui::BeginDisabled(g_vpair.busy);
