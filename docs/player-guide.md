@@ -211,9 +211,10 @@ update. Copy that folder somewhere safe to back them up.
 ## Vita sync
 
 Nativ can keep a game's saves the same on your PS Vita and here, so you can play on either and carry on on the other.
-Your Vita needs the Nativ Sync app (from VitaDB), and both need to be on the same network.
+Your Vita needs the Nativ Sync app: install `nativ_sync.vpk` from [its releases page](https://github.com/TheLostPantheon/nativ-sync/releases)
+with VitaShell. Both need to be on the same network.
 
-1. On the Vita, open Nativ Sync and choose **Pair with a computer**. It shows a six-digit code.
+1. On the Vita, open Nativ Sync and press △ (**Pair a computer**). It shows a six-digit code.
 2. In Nativ, open **Settings**, **Vita sync**, **Find my Vita**, pick your Vita and type the code.
 
 From then on a game syncs before it starts and after it closes, here and on the Vita. When both sides have new
